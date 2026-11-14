@@ -70,10 +70,10 @@ use std::time::Duration;
 
 use frust::authoring::{
     Affine, AnyView, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, Color, CornerRadii,
-    ErasedArgCallback, ErasedCallback, EventCtx, EventResult, InputEvent, LayoutCtx, PaintCtx,
-    PaintScene, Point, PointerPhase, Rect, SemanticsCtx, Size, Vec2, View, Widget, any,
-    build_child, erase_callback, erase_callback_arg, rebuild_child, route_event_single,
-    teardown_child,
+    DismissCause, DismissDecision, ErasedArgCallback, ErasedCallback, EventCtx, EventResult,
+    InputEvent, LayoutCtx, PaintCtx, PaintScene, Point, PointerPhase, Rect, SemanticsCtx, Size,
+    Vec2, View, Widget, any, build_child, erase_callback, erase_callback_arg, rebuild_child,
+    route_event_single, teardown_child,
     text::{FontWeight, TextStyle},
     visit_children,
 };
@@ -405,6 +405,31 @@ impl<State: 'static> BottomSheetView<State> {
     /// finishes the exit a dismissal staged.
     pub fn on_close<F: Fn() + 'static>(mut self, on_close: F) -> Self {
         self.inner = self.inner.on_close(on_close);
+        self
+    }
+
+    /// Set the dismiss veto, asked before Escape, a backdrop click or a back
+    /// press closes the sheet — see [`ModalView::on_dismiss_request`]. A drag
+    /// past the dismiss threshold is the panel's own gesture and is not asked.
+    pub fn on_dismiss_request<F>(mut self, on_dismiss_request: F) -> Self
+    where
+        F: Fn(&mut State, DismissCause) -> DismissDecision + 'static,
+    {
+        self.inner = self.inner.on_dismiss_request(on_dismiss_request);
+        self
+    }
+
+    /// Make the first Escape only leave a focused field (default `false`) —
+    /// see [`ModalView::escape_leaves_field_first`].
+    pub fn escape_leaves_field_first(mut self, on: bool) -> Self {
+        self.inner = self.inner.escape_leaves_field_first(on);
+        self
+    }
+
+    /// Return focus to the control that held it once the sheet closes
+    /// (default `true`) — see [`ModalView::return_focus`].
+    pub fn return_focus(mut self, on: bool) -> Self {
+        self.inner = self.inner.return_focus(on);
         self
     }
 

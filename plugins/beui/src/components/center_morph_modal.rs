@@ -38,11 +38,12 @@
 //!   which reads as near-clear glass without it, so the dimming
 //!   [`MorphingBackdrop::Scrim`] is the default here — the same call, for the
 //!   same reason, as [`crate::components::morphing_modal`]'s.
-//! - **No focus trap, and no focus restore.** Upstream cycles Tab inside the
-//!   panel and returns focus to the trigger on close. frust has no "focus that
-//!   widget" call a plugin-tier widget can aim, and no tab-order API to close a
-//!   ring with; [`crate::overlay::anchored`] records the same gap for its own
-//!   dismissal. The host's barrier is what keeps interaction inside the panel.
+//! - **No focus trap.** Upstream cycles Tab inside the panel; frust has no
+//!   tab-order API a plugin-tier widget can close a ring with. The host's
+//!   barrier is what keeps interaction inside the panel. Focus restore is the
+//!   host's: once the fold-back settles, focus returns to the control that held
+//!   it as the modal opened, upstream's return to the trigger
+//!   ([`CenterMorphModalView::return_focus`] turns it off).
 //! - **No auto-focus on open.** Upstream focuses the first focusable descendant
 //!   on the frame the modal appears. There is no auto-focus-on-appear hook; the
 //!   host claims focus on the first press that lands on it, which is what makes
@@ -64,9 +65,10 @@ use std::time::Duration;
 
 use frust::authoring::{
     Action, Affine, AnyView, BezPath, BoxConstraints, Brush, BuildCtx, ChangeFlags, ChildPod,
-    ErasedCallback, EventCtx, EventResult, InputEvent, KeyEvent, LayoutCtx, PaintCtx, PaintScene,
-    Point, PointerPhase, Rect, Role, SemanticsCtx, Size, View, Widget, any, build_child,
-    erase_callback, rebuild_child, route_event_single, teardown_child, visit_children,
+    DismissCause, DismissDecision, ErasedCallback, EventCtx, EventResult, InputEvent, KeyEvent,
+    LayoutCtx, PaintCtx, PaintScene, Point, PointerPhase, Rect, Role, SemanticsCtx, Size, View,
+    Widget, any, build_child, erase_callback, rebuild_child, route_event_single, teardown_child,
+    visit_children,
 };
 use frust::{Curve, FrameTime, Theme};
 
@@ -264,6 +266,30 @@ impl<State: 'static> CenterMorphModalView<State> {
     /// finishes the fold-back.
     pub fn on_close<F: Fn() + 'static>(mut self, on_close: F) -> Self {
         self.inner = self.inner.on_close(on_close);
+        self
+    }
+
+    /// Set the dismiss veto, asked before Escape, a backdrop click or a back
+    /// press closes the modal — see [`ModalView::on_dismiss_request`].
+    pub fn on_dismiss_request<F>(mut self, on_dismiss_request: F) -> Self
+    where
+        F: Fn(&mut State, DismissCause) -> DismissDecision + 'static,
+    {
+        self.inner = self.inner.on_dismiss_request(on_dismiss_request);
+        self
+    }
+
+    /// Make the first Escape only leave a focused field (default `false`) —
+    /// see [`ModalView::escape_leaves_field_first`].
+    pub fn escape_leaves_field_first(mut self, on: bool) -> Self {
+        self.inner = self.inner.escape_leaves_field_first(on);
+        self
+    }
+
+    /// Return focus to the control that held it once the modal closes
+    /// (default `true`) — see [`ModalView::return_focus`].
+    pub fn return_focus(mut self, on: bool) -> Self {
+        self.inner = self.inner.return_focus(on);
         self
     }
 }
