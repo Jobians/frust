@@ -112,6 +112,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         let live = self.focus_active.then(|| LiveSession {
             epoch: self.focus_epoch,
             surface: self.focus_surface,
+            claimed: self.focus_returns.claimed_surface(self.focus_epoch),
             holders: keys.iter().filter(|e| e.1).map(|e| e.0).collect(),
         });
         self.focus_returns.settle(scopes, live.as_ref())

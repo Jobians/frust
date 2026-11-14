@@ -1040,7 +1040,9 @@ impl<'a> PaintCtx<'a> {
     /// and must register it every paint while open; the paint in which it stops is its close,
     /// after which focus returns to the control that held it as the scope opened. A session this
     /// widget or a descendant still holds as it closes is ended and replaced by the return; one
-    /// started outside the scope after the close is never taken over. An Interactive
+    /// started outside the scope after the close is never taken over. Held is read from this
+    /// widget's focus path at its last registered paint: a host that a control inside can close
+    /// registers once more in the paint that closes it, or releases focus itself. An Interactive
     /// `OverlayKeys::Modal` overlay entry is a scope already, so its owner needs no key.
     pub fn register_focus_scope(&mut self, key: crate::focus_scope::FocusScopeKey) {
         self.note_publication();
