@@ -12,8 +12,10 @@
 //! cleared surface, an unmount) keeps it. An opening scope pushes it; a closing one pops it, with
 //! every scope above, and the next rebuild, or the end of the next event pass, grants it back once
 //! if the stop is still in the traversal walk. A session held inside the closing scope as it
-//! closed is ended first; one started outside it after the close is never taken over. See
-//! `docs/CORE_ARCHITECTURE.md`'s traversal notes.
+//! closed is ended first; one started outside it after the close is never taken over. Inside is
+//! exact for an overlay scope (the claim's own surface). A widget scope knows it from its host's
+//! focus path at its last registered paint, so a host a control inside can close registers
+//! through that closing paint too. See `docs/CORE_ARCHITECTURE.md`'s traversal notes.
 
 use std::cell::Cell;
 
@@ -111,7 +113,7 @@ impl FocusReturn {
     /// Whether `live` is held inside this scope as it closes.
     fn holds(&self, live: &LiveSession) -> bool {
         match self.scope {
-            ScopeId::Overlay(key) => live.surface == Some(key),
+            ScopeId::Overlay(key) => live.surface == Some(key) || live.claimed == Some(key),
             ScopeId::Widget(_) => self.held == Some(live.epoch),
         }
     }
@@ -123,6 +125,8 @@ pub(crate) struct LiveSession {
     pub(crate) epoch: u64,
     /// The floated surface holding it, as resolved before this paint's resolution.
     pub(crate) surface: Option<OverlayKey>,
+    /// The floated surface its claim was committed through, known with no paint since.
+    pub(crate) claimed: Option<OverlayKey>,
     /// The widget scopes whose host held its focus path this paint.
     pub(crate) holders: Vec<FocusScopeKey>,
 }
@@ -131,6 +135,8 @@ pub(crate) struct LiveSession {
 #[derive(Debug, Default)]
 pub(crate) struct FocusReturns {
     last: Option<FocusTarget>,
+    /// The live session's epoch and the floated surface its claim was committed through.
+    claim: Option<(u64, OverlayKey)>,
     /// The scopes the last paint registered.
     painted: Vec<ScopeId>,
     /// One entry per open scope, outermost first.
@@ -143,6 +149,18 @@ impl FocusReturns {
     /// Record the target a claim or grant just committed.
     pub(crate) fn commit(&mut self, target: Option<FocusTarget>) {
         self.last = target;
+    }
+
+    /// Record the floated `surface` the claim behind session `epoch` was committed through.
+    pub(crate) fn claim_through(&mut self, epoch: u64, surface: Option<OverlayKey>) {
+        self.claim = surface.map(|surface| (epoch, surface));
+    }
+
+    /// The floated surface session `epoch`'s claim was committed through, if it was one.
+    pub(crate) fn claimed_surface(&self, epoch: u64) -> Option<OverlayKey> {
+        self.claim
+            .filter(|claim| claim.0 == epoch)
+            .map(|claim| claim.1)
     }
 
     /// Forget the target: the user ended the session.
@@ -301,6 +319,7 @@ mod tests {
         LiveSession {
             epoch,
             surface,
+            claimed: None,
             holders,
         }
     }
@@ -318,6 +337,31 @@ mod tests {
         returns.settle(Vec::new(), Some(&live(6, None, Vec::new())));
         let moved = returns.take_pending().unwrap();
         assert_eq!(moved.held, None, "a session started after that paint");
+    }
+
+    #[test]
+    fn an_overlay_close_owes_a_session_claimed_through_it_with_no_paint_since() {
+        let mut returns = FocusReturns::default();
+        let (key, other) = (OverlayKey::next(), OverlayKey::next());
+        returns.commit(target(1));
+        returns.settle(vec![ScopeId::Overlay(key)], None);
+        returns.claim_through(5, Some(key));
+        assert_eq!(returns.claimed_surface(5), Some(key));
+        assert_eq!(returns.claimed_surface(6), None, "another session's claim");
+        let unpainted = LiveSession {
+            claimed: returns.claimed_surface(5),
+            ..live(5, None, Vec::new())
+        };
+        returns.settle(Vec::new(), Some(&unpainted));
+        assert_eq!(returns.take_pending().unwrap().held, Some(5));
+
+        returns.settle(vec![ScopeId::Overlay(key)], None);
+        let elsewhere = LiveSession {
+            claimed: Some(other),
+            ..live(7, None, Vec::new())
+        };
+        returns.settle(Vec::new(), Some(&elsewhere));
+        assert_eq!(returns.take_pending().unwrap().held, None);
     }
 
     #[test]

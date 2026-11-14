@@ -228,7 +228,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         }
         self.resolve_focus_session(&frame, focus_claim_honoured);
         if focus_claim_honoured {
-            self.commit_focus_target();
+            self.commit_focus_target(event);
         }
         self.record_key_forward(forward_slot.take());
         drop(forward_slot);
@@ -459,7 +459,14 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
 
     /// Record the deepest traversal stop on the session a claim just committed, with the keyboard
     /// flag as it stands (a landing Tab step sets it after): the target a scope opening returns to.
-    fn commit_focus_target(&mut self) {
+    /// The floated surface `event` was routed through goes with it, so a scope closing before the
+    /// next paint still knows the session is its own.
+    fn commit_focus_target(&mut self, event: &InputEvent) {
+        let surface = match event {
+            InputEvent::Overlay(overlay) => Some(overlay.key),
+            _ => None,
+        };
+        self.focus_returns.claim_through(self.focus_epoch, surface);
         let stop = self.focus_stops().into_iter().rfind(|stop| stop.current);
         let keyboard = self.keyboard_focus;
         let target = stop.map(|stop| FocusTarget {
