@@ -7,7 +7,7 @@ use super::RenderRoot;
 use super::session::traps_focus;
 use crate::anim::{FrameTime, animation_time_scale};
 use crate::event::ImeState;
-use crate::focus_scope::{FocusScopeKey, FocusScopePass, ScopeId};
+use crate::focus_scope::{FocusScopeKey, FocusScopePass, LiveSession, ScopeId};
 use crate::overlay::{
     OverlayEntry, OverlayHit, OverlayKey, OverlayPaintPass, sort_into_paint_order,
 };
@@ -104,11 +104,17 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
 
     /// Diff this paint's focus-return scopes, the widget registrations then every trapping overlay
     /// entry, against the last paint's; returns whether a closed scope owes a return.
-    fn settle_focus_scopes(&mut self, keys: Vec<FocusScopeKey>) -> bool {
-        let mut scopes: Vec<ScopeId> = keys.into_iter().map(ScopeId::Widget).collect();
+    /// The live session goes with them, its surface as the last resolution left it.
+    fn settle_focus_scopes(&mut self, keys: Vec<(FocusScopeKey, bool)>) -> bool {
+        let mut scopes: Vec<ScopeId> = keys.iter().map(|&(key, _)| ScopeId::Widget(key)).collect();
         let modal = self.overlay_hits.iter().filter(|hit| traps_focus(hit));
         scopes.extend(modal.map(|hit| ScopeId::Overlay(hit.key)));
-        self.focus_returns.settle(scopes)
+        let live = self.focus_active.then(|| LiveSession {
+            epoch: self.focus_epoch,
+            surface: self.focus_surface,
+            holders: keys.iter().filter(|e| e.1).map(|e| e.0).collect(),
+        });
+        self.focus_returns.settle(scopes, live.as_ref())
     }
 
     /// Settle which branch's IME surface the shell is configured with, from the

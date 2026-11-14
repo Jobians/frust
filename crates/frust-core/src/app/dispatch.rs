@@ -161,7 +161,13 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
     /// followed in the same call by a [`FileDropPhase::Ended`] broadcast to the
     /// whole tree; an unhandled `Key` goes on (`dispatch_declined_key`); the outcome folds all.
     pub fn event(&mut self, state: &mut State, event: &InputEvent) -> EventOutcome {
-        self.dispatch_pass(state, event, None).0
+        let mut outcome = self.dispatch_pass(state, event, None).0;
+        // A return owed when an event beats the rebuild runs after it, so that event never
+        // reaches the restored control; nested deliveries call `dispatch_pass`, never this.
+        if !matches!(event, InputEvent::Housekeeping) && self.run_focus_return(state) {
+            outcome.needs_redraw = true;
+        }
+        outcome
     }
 
     /// `event`'s body, as a traversal grant pass when `grant` is `Some(root_is_target)`; also
@@ -175,9 +181,6 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         let Some(root_id) = self.root_id else {
             return (EventOutcome::default(), false);
         };
-        // An owed return runs here when an event beats the rebuild, which runs it after its own
-        // broadcasts; the grant re-enters this pass with the return already taken.
-        let returned = !matches!(event, InputEvent::Housekeeping) && self.run_focus_return(state);
         self.trap_modal_focus();
         let (unwrapped, pointer_id) = unwrap_contact(event);
         let event = unwrapped.as_ref().unwrap_or(event);
@@ -237,7 +240,6 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             self.dispatch_declined_key(state, event, carried)
         };
         let mut outcome = self.build_outcome(&frame, &root, carried);
-        outcome.needs_redraw |= returned;
         self.file_drop_follow_up(state, event, &mut outcome);
         (outcome, focus_claim_honoured)
     }
@@ -468,22 +470,30 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
     }
 
     /// Grant the return a closed focus-return scope owes, consuming it (`crate::focus_scope`):
-    /// never over a live session, and only to a stop the walk the root would use now reaches,
-    /// restoring the keyboard flag it was committed with. Returns whether it landed.
+    /// a session still held inside the scope as it closed is ended first (a structural release),
+    /// any other live session is never taken over, and only a stop the walk the root would use now
+    /// reaches is granted, with the keyboard flag it was committed with. Returns whether focus
+    /// moved.
     pub(super) fn run_focus_return(&mut self, state: &mut State) -> bool {
-        let owed = self.focus_returns.take_pending();
-        let Some(target) = owed.and_then(|entry| entry.target) else {
+        let Some(owed) = self.focus_returns.take_pending() else {
             return false;
         };
-        if self.focus_active {
+        let Some(target) = owed.target else {
             return false;
+        };
+        let held_inside = self.focus_active && owed.held == Some(self.focus_epoch);
+        if self.focus_active && !held_inside {
+            return false;
+        }
+        if held_inside {
+            self.release_focus_session();
         }
         let stops = self.focus_stops();
         let Some(stop) = stops.iter().find(|stop| stop.id == target.stop) else {
-            return false;
+            return held_inside;
         };
         if !self.grant_focus(state, stop) {
-            return false;
+            return held_inside;
         }
         self.set_keyboard_focus(target.keyboard);
         self.focus_returns.set_keyboard(target.keyboard);
@@ -852,7 +862,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         carried: &mut EventOutcome,
     ) -> bool {
         let probe = DeliveryProbe::enter();
-        let outcome = self.event(state, delivery);
+        let outcome = self.dispatch_pass(state, delivery, None).0;
         let answered = probe.handled() || outcome.handled;
         carried.needs_redraw |= outcome.needs_redraw || answered;
         carried.handled |= answered;
@@ -890,7 +900,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
                 position: Point::ZERO,
                 paths: Vec::new(),
             });
-            let follow_up = self.event(state, &ended);
+            let follow_up = self.dispatch_pass(state, &ended, None).0;
             outcome.handled |= follow_up.handled;
             outcome.needs_redraw |= follow_up.needs_redraw;
         }
@@ -967,9 +977,9 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
                     key: hit.key,
                     kind: kind.clone(),
                 });
-                // Shallow re-entry through the front door: the routed broadcast
-                // passes straight through the route and gets the full pass.
-                return OverlayRoute::Consumed(self.event(state, &routed));
+                // Shallow re-entry: the routed broadcast passes straight through
+                // the route and gets the full pass (an owed return waits for `event`).
+                return OverlayRoute::Consumed(self.dispatch_pass(state, &routed, None).0);
             }
         }
 
@@ -999,7 +1009,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
                 key: hit.key,
                 kind: OverlayEventKind::OutsideDown,
             });
-            let outcome = self.event(state, &routed);
+            let outcome = self.dispatch_pass(state, &routed, None).0;
             carried.handled |= outcome.handled;
             carried.needs_redraw |= outcome.needs_redraw;
             // Tell every notified surface before consuming.

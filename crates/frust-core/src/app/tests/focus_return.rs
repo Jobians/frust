@@ -16,13 +16,15 @@ struct Log {
     open: HashSet<&'static str>,
     /// Main-tree pods the next rebuild unmounts, by debug label.
     gone: HashSet<&'static str>,
+    activated: Vec<&'static str>,
 }
 
 type Shared = Rc<RefCell<Log>>;
 
 const MODAL_RECT: Rect = Rect::new(100.0, 100.0, 200.0, 200.0);
 
-/// A focusable field: claims on `Down`, releases on Escape, publishes an IME surface while focused.
+/// A focusable field: claims on `Down`, releases on Escape, activates on Enter, publishes an IME
+/// surface while focused.
 struct Field {
     name: &'static str,
     log: Shared,
@@ -50,6 +52,10 @@ impl Widget for Field {
             }
             InputEvent::Key(key) if key.key == Key::Named(NamedKey::Escape) => {
                 ctx.release_focus();
+                EventResult::Handled
+            }
+            InputEvent::Key(key) if key.key == Key::Named(NamedKey::Enter) => {
+                self.log.borrow_mut().activated.push(self.name);
                 EventResult::Handled
             }
             _ => EventResult::Ignored,
@@ -530,7 +536,8 @@ fn a_live_session_at_restore_time_is_never_stolen() {
             claims: true,
             ..ScopeSpec::default()
         };
-        column(vec![field("field", log), scope_host("dialog", spec, log)])
+        let dialog = scope_host("dialog", spec, log);
+        column(vec![field("field", log), dialog, field("other", log)])
     });
     h.tap(5.0, 5.0);
     h.open("dialog");
@@ -540,9 +547,11 @@ fn a_live_session_at_restore_time_is_never_stolen() {
         h.root.is_focus_active(),
         "the host closed holding the session"
     );
-    h.rebuild();
-    h.paint();
-    assert_eq!(h.focused(), None, "the field took nothing");
+    h.root
+        .event(&mut (), &pointer(PointerPhase::Down, 5.0, 45.0));
+    assert!(h.root.is_focus_active(), "the user took another control");
+    h.send(&pointer(PointerPhase::Up, 5.0, 45.0));
+    assert_eq!(h.focused(), Some("other"), "the field took nothing");
     assert!(h.root.focus_returns.take_pending().is_none(), "consumed");
 }
 
@@ -553,7 +562,7 @@ fn an_event_before_the_rebuild_runs_the_return_and_the_rebuild_does_not_repeat_i
     h.open("modal");
     h.close("modal");
     let outcome = h.root.event(&mut (), &key(NamedKey::ArrowLeft));
-    assert!(h.root.is_focus_active(), "returned at the head of the pass");
+    assert!(h.root.is_focus_active(), "returned by the end of the pass");
     assert!(outcome.needs_redraw);
 
     h.tap(150.0, 5.0);
@@ -632,4 +641,96 @@ fn a_light_dismiss_menu_neither_captures_nor_restores() {
     h.paint();
     assert!(!h.root.is_focus_active());
     assert_eq!(h.focused(), None);
+}
+
+fn claiming_dialog(log: &Shared) -> Column {
+    let spec = ScopeSpec {
+        claims: true,
+        ..ScopeSpec::default()
+    };
+    column(vec![field("field", log), scope_host("dialog", spec, log)])
+}
+
+#[test]
+fn a_modal_closed_while_a_stop_inside_holds_focus_returns_it() {
+    let mut h = Harness::new(field_and_modal);
+    h.tap(5.0, 5.0);
+    h.open("modal");
+    h.tab();
+    assert_eq!(h.focused(), Some("m1"), "Tab moved into the modal");
+
+    h.close("modal");
+    assert!(h.root.is_focus_active(), "m1 still holds the session");
+    h.rebuild();
+    assert!(h.root.is_focus_active(), "one rebuild returned the session");
+    h.paint();
+    assert_eq!(h.focused(), Some("field"));
+    assert!(h.root.ime_state().is_some(), "the field publishes again");
+    assert!(h.ringed().is_empty(), "with the pointer origin it had");
+}
+
+#[test]
+fn a_scope_host_that_closes_holding_the_session_gives_it_back() {
+    let mut h = Harness::new(claiming_dialog);
+    h.tap(5.0, 5.0);
+    h.open("dialog");
+    h.tap(5.0, 25.0);
+    assert_eq!(h.focused(), None, "the host holds the session");
+
+    h.escape();
+    assert!(h.root.is_focus_active(), "no release as it closed");
+    h.rebuild();
+    assert!(h.root.is_focus_active());
+    h.paint();
+    assert_eq!(h.focused(), Some("field"));
+    assert!(h.root.ime_state().is_some());
+}
+
+#[test]
+fn a_session_started_after_a_modal_closed_holding_focus_is_kept() {
+    let mut h = Harness::new(|log| {
+        let children = vec![
+            field("field", log),
+            field("other", log),
+            modal("modal", &["m1"], log),
+        ];
+        column(children)
+    });
+    h.tap(5.0, 5.0);
+    h.open("modal");
+    h.tab();
+    h.close("modal");
+
+    h.root
+        .event(&mut (), &pointer(PointerPhase::Down, 5.0, 25.0));
+    h.send(&pointer(PointerPhase::Up, 5.0, 25.0));
+    assert_eq!(h.focused(), Some("other"));
+    h.frame();
+    assert_eq!(h.focused(), Some("other"), "nothing returns later either");
+}
+
+#[test]
+fn a_key_that_beats_the_rebuild_never_reaches_the_restored_control() {
+    let mut h = Harness::new(field_and_modal);
+    h.tab();
+    h.open("modal");
+    h.tab();
+    h.escape();
+    h.close("modal");
+
+    let enter = InputEvent::Key(KeyEvent {
+        key: Key::Named(NamedKey::Enter),
+        modifiers: Modifiers::default(),
+        repeat: true,
+    });
+    let outcome = h.root.event(&mut (), &enter);
+    assert!(
+        h.log.borrow().activated.is_empty(),
+        "the repeat found no session"
+    );
+    assert!(h.root.is_focus_active(), "and focus returned after it");
+    assert!(outcome.needs_redraw);
+    h.paint();
+    assert_eq!(h.focused(), Some("field"));
+    assert_eq!(h.ringed(), ["field"]);
 }
