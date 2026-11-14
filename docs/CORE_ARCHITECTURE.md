@@ -21,7 +21,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for how CORE relates to the other units.
 | `frust-core::retained` | `RetainedLedger`/`RetainedEntry` (`from_entries`, keyed by `RetainedKey`) — the renderer's resident-key ledger (each retained page's key, extent and scale as rasterized), published by the shell after submit and threaded into every paint through `PaintCtx::with_retained_ledger`; empty until a shell publishes |
 | `frust-core::hotpatch` (feature `hotpatch`) | The hot-patch seam. `build_erased::<C>` routes `Component::build` through the jump table and erases the view **inside** the hot function (L1: the return type crossing the patch boundary is the fixed `Result<AnyView<State>, LayoutMismatch>`; the call carries the `// erasure: keep hot-patch boundary type must be layout-fixed` tripwire marker). `init` never goes through it and never re-runs on a patch. A `SeamWitness` (size/align of `C::State` and `C`) is written by the image that creates the state and checked before any `C`-generic code touches it; on a difference the toucher calls `report_layout_mismatch` and backs off — `rebuild` is skipped, `teardown` does not proceed, and `Drop` disposes the owner but leaks the state box (`mem::forget`) because `ComponentWidget` stores it as `Option<Box<State>>`, keeping `frust-core` `unsafe`-free. This witness (L2) covers only components hosted in their own `Box<dyn Widget>` (including a typed child pod); inline hosts (`Either`/`EitherOfN`, an app `View` whose `Element` embeds a child element) are covered by the host's layout gate (L3) alone, and soundness rests on L1 plus L3, with L2 a backstop. `set_patch_listener(Arc<dyn Fn() + Send + Sync>)` registers a callback (appended, not replaced) that runs on the thread that applied the patch and must only signal; each shell supplies one, see [SHELLS_ARCHITECTURE.md](SHELLS_ARCHITECTURE.md). `set_anchor` registers the app's `__frust_hotpatch_anchor` (defined by `frust::app!` in debug builds, registered through a `#[doc(hidden)]` facade fn that is a no-op without the feature) |
 | `frust-core::sliver` | The sliver layout protocol, opt-in beside `Widget::layout` and never inside it: `SliverConstraints` in, `SliverGeometry` out (Flutter's `RenderSliver`), `ScrollAxis`/`GrowthDirection` (Forward only)/`ScrollDirection`, and the `SliverWidget` trait; consumed by WIDGETS' sliver viewport |
-| `frust-core::event` / `animation` / `semantics` | Input/gesture routing, animation curve vocabulary, window insets (incl. window-control corners), and pull-based accesskit semantics. `event/` splits into `pointer`, `key`, `ime`, `input`, `flags`, `pass`, `contact` and `ctx` |
+| `frust-core::event` / `animation` / `semantics` | Input/gesture routing, animation curve vocabulary, window insets (incl. window-control corners), and pull-based accesskit semantics (`RenderRoot::focus_info` -> `FocusInfo`, `SemanticsCtx::has_focus`: baseline Button, Checkbox, Radio and Slider publish their focused node). `event/` splits into `pointer`, `key`, `ime`, `input`, `flags`, `pass`, `contact` and `ctx` |
 | `frust-core::shortcuts` | `Chord` (spec parsing and display), `ShortcutDecl`/`ShortcutId`/`ShortcutScope`/`ShortcutHint`, and the per-paint declaration table the root matches declined keys against — see Keyboard Shortcuts and Traversal |
 | `frust-scene::scene` / `builder` | `Scene`/`SceneBuilder`/`Command` — the renderer-agnostic vector display list consumed by `frust-render`. `Command::SceneTexture { id, dest, transform }` draws a caller-owned GPU texture scaled to fill `dest`; `id` is opaque scene-layer data (the same precedent `ShaderProgram`'s own id sets) only the render backend resolves — an unregistered id draws nothing. `Command::ShaderQuad`'s fragment-shader output is treated as premultiplied alpha and rendered by the engine into such a texture ahead of the scene pass |
 | `frust-scene::glyph` / `shader` | Carries shaped text and opaque WGSL shader handles from `frust-text` through the `Scene` |
@@ -378,64 +378,61 @@ releases the session, so the root's cached focus/IME state can never outlive the
 
 ## Keyboard Shortcuts and Traversal
 
-**Declaration.** A widget declares a `ShortcutDecl` (id, `Chord`, label, `ShortcutScope`) from its own
-`paint` through `PaintCtx::register_shortcut`, the same per-paint shape as an overlay entry: the
-table is rebuilt every paint, so a declarer that stops (or unmounts) stops matching after the next
-one, and a declaration counts as a paint publication so a retained page around it re-records. One
-made while the root paints a floated pod is stamped with that pod's `OverlayKey`. `Chord::parse`
-reads `"Mod+K"`-style specs with `Mod` fixed at compile time (Command on macOS/iOS, Ctrl elsewhere,
-`wasm32` included) and accepts `F1`–`F24` (`NamedKey::F1..F24`, delivered by the desktop and web
-shells; Android and iOS have no hardware-key path); `Chord::display` renders ⌘K or Ctrl+K by the
-same rule. A symbol key — a character neither alphanumeric nor whitespace, such as `?` or `+` — is
-Shift-insensitive, since shells report Shift for the keys that need it: `Chord::new` clears Shift
-and `matches` ignores it, so `"Shift+?"` is `"?"`; letters, digits, Space and named keys compare
-exactly. `RenderRoot::shortcut_hints(filter)`, `BuildCtx::shortcut_hints()` and
-`PaintCtx::shortcut_hints()` return the *previous* paint's declarations in paint order, masked and
-unreachable ones included, for a palette or help surface. The snapshot is per root: `RenderRoot`
-owns it and seeds its build and paint contexts (a component's inner build included); a context no
-root seeded reads empty.
+**Declaration.** A widget declares a `ShortcutDecl` (id, `Chord`, label, `ShortcutScope`) from its own `paint` through
+`PaintCtx::register_shortcut`, the same per-paint shape as an overlay entry: the table is rebuilt every paint, so a
+declarer that stops (or unmounts) stops matching after the next one, and a declaration counts as a paint publication
+so a retained page around it re-records. One made while the root paints a floated pod is stamped with that pod's
+`OverlayKey`. `Chord::parse` reads `"Mod+K"`-style specs with `Mod` fixed at compile time (Command on macOS/iOS, Ctrl
+elsewhere, `wasm32` included) and accepts `F1`–`F24` (`NamedKey::F1..F24`, delivered by the desktop and web shells;
+Android and iOS have no hardware-key path); `Chord::display` renders ⌘K or Ctrl+K by the same rule. A symbol key — a
+character neither alphanumeric nor whitespace, such as `?` or `+` — is Shift-insensitive, since shells report Shift
+for the keys that need it: `Chord::new` clears Shift and `matches` ignores it, so `"Shift+?"` is `"?"`; letters,
+digits, Space and named keys compare exactly. `RenderRoot::shortcut_hints(filter)`, `BuildCtx::shortcut_hints()` and
+`PaintCtx::shortcut_hints()` return the *previous* paint's declarations in paint order, masked and unreachable ones
+included, for a palette or help surface. The snapshot is per root: `RenderRoot` owns it and seeds its build and paint
+contexts (a component's inner build included); a context no root seeded reads empty.
 
-**The declined-key chain.** A `Key` no widget on the focus path handled is offered on, each offer a
-full dispatch of its own, until one is answered:
+**The declined-key chain.** A `Key` no widget on the focus path handled is offered on, each offer a full dispatch of
+its own, until one is answered:
 
 1. to the focus session's forward target — an owner calls `EventCtx::forward_declined_keys_to` so
-   keys its focused editable declines reach its floated pod as `OverlayEventKind::Key` (bound to the
-   session live after that pass, Interactive pods only), answered by `EventCtx::consume_overlay_key`;
-2. an Escape, to the topmost **modal** pod the same way — one that is Interactive and either
-   `OverlayKeys::Modal` or `OutsideTap::Notify { consume: true }`; a focused `TextInput` blurs on a
-   bare Escape and declines it, so this step runs on the first press;
-3. to the shortcut table in tier order — declarations stamped with the topmost Interactive pod, then
-   main-tree `Local`, then `AppGlobal`, newest first within a tier, so a nested binding beats an
-   enclosing one for the same chord; while a modal pod is open only its own tier is tried. Each
-   candidate gets an `InputEvent::Shortcut(id)` broadcast (an `OverlayEventKind::Shortcut` through
-   the owner's slot for a stamped one); its declarer answers that id alone `Handled`, which the
-   `ChildPod` dispatch probe reports to the root past containers that return `Ignored`, and an
-   unanswered delivery falls through to the next candidate;
-4. a bare Tab or Shift+Tab, to focus traversal — unless `RenderRoot::set_tab_traversal(false)`
-   leaves it unhandled for the host.
+keys its focused editable declines reach its floated pod as `OverlayEventKind::Key` (bound to the session live after
+that pass, Interactive pods only), answered by `EventCtx::consume_overlay_key`; 2. an Escape, to the topmost **modal**
+pod the same way — one that is Interactive and either `OverlayKeys::Modal` or `OutsideTap::Notify { consume: true }`;
+a focused `TextInput` blurs on a bare Escape and declines it, so this step runs on the first press; 3. to the shortcut
+table in tier order — declarations stamped with the topmost Interactive pod, then main-tree `Local`, then `AppGlobal`,
+newest first within a tier, so a nested binding beats an enclosing one for the same chord; while a modal pod is open
+only its own tier is tried. Each candidate gets an `InputEvent::Shortcut(id)` broadcast (an
+`OverlayEventKind::Shortcut` through the owner's slot for a stamped one); its declarer answers that id alone
+`Handled`, which the `ChildPod` dispatch probe reports to the root past containers that return `Ignored`, and an
+unanswered delivery falls through to the next candidate; 4. a bare Tab or Shift+Tab, to focus traversal — unless
+`RenderRoot::set_tab_traversal(false)` leaves it unhandled for the host.
 
-**Traversal.** The walk is pre-order over `Widget::visit_focus_children` (default: `visit_children`)
-and stops on pods whose widget answers `Widget::is_focusable` (default `false`), the root widget
-included; `Box<dyn Widget>`, `Either`/`EitherOfN` and the `shortcuts` wrapper forward both, and a
-container showing only some children narrows the visit (WIDGETS_CODE_STANDARDS.md's Keyboard Focus
-and Shortcuts). While a modal pod is open the walk runs inside it alone; a Transparent pod is never
-a stop, and a non-modal floated pod is reached through its owner — the portal calls
-`OverlaySlot::visit_focus_pod` after its child, so the pod's stops follow the owner's. Movement
-wraps; with nothing focused Tab lands on the first stop and Shift+Tab on the last. Each step
-delivers a grant — an `InputEvent::Shortcut` carrying an id private to the root, addressed to the
-target pod — that the pod records like `EventCtx::request_focus`. Only a landing grant releases the
-old session and commits the claim, so a step that lands from a live session advances `focus_epoch`
-twice; a stop the grant cannot reach is skipped for the next, and when none lands short of the
-focused stop the session, `focus_epoch` and the keyboard flag stay untouched and Tab is reported
-unhandled. A paint that registers an Interactive `OverlayKeys::Modal` pod ends a main-tree session at once (one a floated pod
-holds survives), so a field behind the modal takes no more keys; closing the modal restores nothing.
+**Traversal.** The walk is pre-order over `Widget::visit_focus_children` (default: `visit_children`) and stops on pods
+whose widget answers `Widget::is_focusable` (default `false`), the root widget included; `Box<dyn Widget>`,
+`Either`/`EitherOfN` and the `shortcuts` wrapper forward both, and a container showing only some children narrows the
+visit (WIDGETS_CODE_STANDARDS.md's Keyboard Focus and Shortcuts). While a modal pod is open the walk runs inside it
+alone; a Transparent pod is never a stop, and a non-modal floated pod is reached through its owner — the portal calls
+`OverlaySlot::visit_focus_pod` after its child, so the pod's stops follow the owner's. Movement wraps; with nothing
+focused Tab lands on the first stop and Shift+Tab on the last. Each step delivers a grant — an `InputEvent::Shortcut`
+carrying an id private to the root, addressed to the target pod — that the pod records like `EventCtx::request_focus`.
+Only a landing grant releases the old session and commits the claim, so a step that lands from a live session advances
+`focus_epoch` twice; a stop the grant cannot reach is skipped for the next, and when none lands short of the focused
+stop the session, `focus_epoch` and the keyboard flag stay untouched and Tab is reported unhandled. A paint that
+registers an Interactive `OverlayKeys::Modal` pod ends a main-tree session at once (one a floated pod holds survives),
+so a field behind the modal takes no more keys. Focus returns when a focus-return scope (`focus_scope`) closes: an
+Interactive `Modal` entry is one implicitly, a widget opts in with `PaintCtx::register_focus_scope(FocusScopeKey)`
+every paint it is open. The root records the deepest traversal stop of the last committed claim or Tab grant with its
+keyboard flag (a user blur forgets it, a structural release keeps it); the return runs at the end of
+`RenderRoot::event` (after the event that beat the rebuild is routed) and in `rebuild`, granting that stop once if it
+is still in the current walk. A session started elsewhere is never taken over; one still held inside the closing scope
+is ended and replaced.
 
-**Focus ring.** `PaintCtx::is_focused_for_ring()` is `has_focus` gated by the root's
-`FocusRingPolicy` (`Never`, `KeyboardOnly` by default, `Always`; `RenderRoot::set_focus_ring_policy`).
-Under `KeyboardOnly` it holds while the live focus came from a landing traversal grant; a pointer
-`Down`, any claim honoured outside a grant and any session release clear that flag — the analog of
-CSS `:focus-visible`. A ring change bumps the paint epoch, so retained pages re-record. The facade
-re-exports this vocabulary flat and under `frust::authoring`.
+**Focus ring.** `PaintCtx::is_focused_for_ring()` is `has_focus` gated by the root's `FocusRingPolicy` (`Never`,
+`KeyboardOnly` by default, `Always`; `RenderRoot::set_focus_ring_policy`). Under `KeyboardOnly` it holds while the
+live focus came from a landing traversal grant; a pointer `Down`, any claim honoured outside a grant and any session
+release clear that flag — the analog of CSS `:focus-visible`. A ring change bumps the paint epoch, so retained pages
+re-record. The facade re-exports this vocabulary flat and under `frust::authoring`.
 
 ## Hover and Cursor
 
@@ -545,13 +542,12 @@ nothing to unregister and no way to leak an entry. Between passes the root retai
 only — key, band, input class, outside-tap policy, rect — never the pod, so a pod's lifetime stays
 exactly its owner's.
 
-An entry's `OverlayKeys` (default `Pass`) says whether it claims declined keys (see Keyboard
-Shortcuts and Traversal). v1 deliberately excludes three things: no focus restore (a modal pod
-masks shortcuts, confines traversal and ends a main-tree session, but nothing auto-focuses its first
-stop or restores focus on dismiss); no nesting (a surface that itself needs one registers both from the single owner); and no
-visibility to `RenderRoot::inspect()` or the semantics pass — a floated pod publishes no
-accessibility node and devtools sees the owner, not the surface, so an assistive-technology user
-reaches a floated surface through the owner's own node.
+An entry's `OverlayKeys` (default `Pass`) says whether it claims declined keys (see Keyboard Shortcuts and Traversal).
+v1 deliberately excludes three things: no auto-focus (a modal pod masks shortcuts, confines traversal and ends a
+main-tree session, but nothing focuses its first stop on open; focus returns to the opener on dismiss); no nesting (a
+surface that itself needs one registers both from the single owner); and no visibility to `RenderRoot::inspect()` or
+the semantics pass — a floated pod publishes no accessibility node and devtools sees the owner, not the surface, so an
+assistive-technology user reaches a floated surface through the owner's own node.
 
 The selection toolbar is the first consumer. A field publishes one `SelectionToolbarRequest` per
 paint (`PaintCtx::publish_selection_toolbar` — the selection's window-space anchor plus the verb set

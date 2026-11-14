@@ -2924,12 +2924,12 @@ the cursor API (merged 2026-08-17, `49bc7657`) listed this among its limitations
 whole app — owner-hosted, root-painted after the main tree, root-routed ahead of it — and the v1
 seam declines six things, each named in its own source:
 
-1. **No focus restore.** A modal pod (`OverlayKeys::Modal`, or a consuming outside tap) masks
-   main-tree shortcuts, confines Tab traversal to itself, and ends a main-tree focus session on the
-   paint that registers it, but nothing returns focus to the opener on dismiss and the pod's first
-   focusable is not auto-focused (`overlay-no-auto-focus-on-appear`), so after the modal closes the
-   next Tab starts from the first stop. Traversal also never stops in a Transparent pod, a
-   non-Current navigator page or an unselected `IndexedStack` child.
+1. **No auto-focus on open.** A modal pod (`OverlayKeys::Modal`, or a consuming outside tap)
+   masks main-tree shortcuts, confines Tab traversal to itself, and ends a main-tree focus session
+   on the paint that registers it; focus returns to the opener on dismiss (`focus_scope`), but the
+   pod's first focusable is not auto-focused (`overlay-no-auto-focus-on-appear`). Traversal also
+   never stops in a Transparent pod, a non-Current navigator page or an unselected `IndexedStack`
+   child.
 2. **Declined-key forwarding carries keys only, on request.** Key, IME and edit-command events
    stay focus-routed (`InputEvent::is_focus_routed`). A declined `Key` reaches a pod only when its
    owner asked for the focus session's declined keys (`EventCtx::forward_declined_keys_to`) or, for
@@ -2993,7 +2993,7 @@ per frame, and the broadcast is the only route that reaches an owner without kno
 
 **Evidence**: `crates/frust-core/src/overlay.rs`'s "Not in v1" section (focus trap, inspection,
 nesting), its declined-key paragraph and its per-pass registry contract;
-`crates/frust-core/src/app/session.rs`'s `trap_modal_focus` ("Not restored when the modal closes");
+`crates/frust-core/src/app/session.rs`'s `trap_modal_focus` (the structural release a return later undoes);
 `crates/frust-core/src/app/dispatch.rs`'s `dispatch_declined_key` and `focus_stops`; `crates/frust-widgets/src/overlay.rs`'s
 own "Not in v1" section (semantics, hover, IME); `crates/frust-core/src/event/input.rs`'s
 `InputEvent::Overlay` routing contract (the broadcast); `plugins/shadcn/src/components/tooltip.rs`,
@@ -3003,7 +3003,7 @@ titled "Riding the framework portal") against the six unported
 `plugins/material/src/tooltip.rs`'s `TooltipWidget`/`RichTooltipWidget` `semantics` methods and
 their pre-port use of `crate::overlay::anchored` (for item (4)'s regression above).
 
-**Trigger for removal**: per item — focus restore and auto-focus for a modal pod, forwarding for IME,
+**Trigger for removal**: per item — auto-focus for a modal pod, forwarding for IME,
 edit commands and the missing named keys, the catalog hosts
 ported onto `OverlaySlot`, an overlay-aware semantics and inspection path, and a keyed dispatch
 that reaches an owner without a full walk.
