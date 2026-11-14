@@ -895,6 +895,16 @@ pub mod authoring {
         EitherWidget, either,
     };
 
+    /// The modal dismiss vocabulary a host's dismiss veto names: [`DismissCause`] says why a
+    /// dismissal was attempted (Escape, backdrop press, or back), and [`DismissDecision`] answers
+    /// whether it proceeds (`Keep` holds the host open). Also at `frust_widgets`' crate root.
+    pub use frust_widgets::{DismissCause, DismissDecision};
+
+    /// Flags that a paint-time widget needs a deferred state-bearing flush: it raises the flag and
+    /// receives a `Housekeeping` broadcast with `&mut State` on the next rebuild. Plugin modal
+    /// hosts use it to run a deferred back-press veto. Also at `frust_core`'s crate root.
+    pub use frust_core::mark_pending_result_flush;
+
     /// The sliver protocol a scrolling viewport lays its children out with —
     /// a widget implements [`SliverWidget`] and overrides
     /// [`Widget::as_sliver`] to answer [`SliverConstraints`] with a
@@ -950,6 +960,12 @@ pub mod authoring {
         Chord, ChordParseError, FocusRingPolicy, OverlayKeys, ShortcutDecl, ShortcutHint,
         ShortcutId, ShortcutScope,
     };
+
+    /// The focus-return scope key a modal host registers through
+    /// [`PaintCtx::register_focus_scope`] every paint it is open; when it stops, focus returns to
+    /// the control that held it as the scope opened (an Interactive [`OverlayKeys::Modal`]
+    /// surface is a scope already).
+    pub use frust_core::FocusScopeKey;
 
     /// The paint vocabulary [`PaintScene`]'s per-corner and dashed methods name
     /// — `fill_rounded_rect_radii`/`push_clip_rounded_radii` take a

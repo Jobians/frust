@@ -56,7 +56,7 @@ pub use frust_core::anim::with_thread_animation_time_scale;
 /// typed detail its widget attached — [`InspectDetail::Text`] (a [`TextInspect`]) on a text run,
 /// [`InspectDetail::Clip`] on a widget that clips its descendants, so a test bounding controls can
 /// stop at a clipping ancestor the way [`Tester::text_overflows`] does.
-pub use frust_core::{InspectDetail, InspectNode, TextInspect};
+pub use frust_core::{FocusInfo, InspectDetail, InspectNode, TextInspect};
 /// The reactive owner type, for a test that sets an ambient owner before constructing a
 /// [`Tester`] (`let owner = Owner::new(); owner.set();`).
 pub use frust_reactive::Owner;

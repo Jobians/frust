@@ -8,6 +8,7 @@
 //! * [`event`] — input events and the [`EventCtx`] handlers mutate state through.
 //! * `hotpatch` (feature `hotpatch`) — the hot-patch seam every `Component::build` runs through.
 //! * [`feedback`] — the haptic-feedback vocabulary and its process-wide sink.
+//! * [`focus_scope`] — the [`FocusScopeKey`] scopes that give focus back when a modal closes.
 //! * [`hit`] — hit tests for content drawn under an arbitrary [`kurbo::Affine`].
 //! * [`input`] — slop/wheel constants, [`VelocityTracker`] and fling-decay math.
 //! * [`insets`] — the [`WindowInsets`] safe-area and keyboard inset model.
@@ -27,6 +28,7 @@ pub mod app;
 pub mod component;
 pub mod event;
 pub mod feedback;
+pub mod focus_scope;
 #[cfg(feature = "hotpatch")]
 pub mod hotpatch;
 pub mod input;
@@ -169,7 +171,7 @@ pub use anim::{
     MIN_ANIMATION_TIME_SCALE, Spring, SpringDesc, Tween, animation_time_scale,
     set_animation_time_scale,
 };
-pub use app::{FocusRingPolicy, Orientation, RenderRoot, WindowMetrics};
+pub use app::{FocusInfo, FocusRingPolicy, Orientation, RenderRoot, WindowMetrics};
 pub use component::{Component, ComponentView, ComponentWidget, component};
 pub use event::{
     CursorIcon, EditCommand, EditingState, EventCtx, EventOutcome, EventResult, ImeContentType,
@@ -181,6 +183,7 @@ pub use event::{
 pub use feedback::{
     HapticFeedback, HapticSink, haptic_sink_installed, perform_haptic, set_haptic_sink,
 };
+pub use focus_scope::FocusScopeKey;
 #[cfg(feature = "hotpatch")]
 pub use hotpatch::{LayoutMismatch, SeamWitness, build_erased, set_patch_listener};
 pub use input::{

@@ -255,11 +255,14 @@ impl Widget for CheckboxWidget {
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         // A single CheckBox node carrying its toggle state and label; it fires a
         // Click to toggle.
-        ctx.push_node(Role::CheckBox, |node| {
+        let id = ctx.push_node(Role::CheckBox, |node| {
             node.set_label(self.label_text.as_str());
             node.set_toggled(Toggled::from(self.checked));
             node.add_action(Action::Click);
         });
+        if ctx.has_focus() {
+            ctx.set_focused(id);
+        }
     }
 
     /// Always a Tab stop; a primary mouse press also takes focus (see the module docs).
@@ -589,5 +592,13 @@ mod tests {
             root.event(&mut state, &key(Key::Named(NamedKey::Enter)));
             assert_eq!((state.last, state.toggles), (Some(true), 3));
         }
+    }
+
+    #[test]
+    fn focus_is_published_in_semantics_after_tab_and_cleared_after_an_empty_tap() {
+        crate::focus_test_support::assert_tab_focuses_and_empty_tap_clears(
+            Role::CheckBox,
+            |_: &mut ()| crate::column().child(checkbox(false, "agree", |_: &mut (), _| {})),
+        );
     }
 }

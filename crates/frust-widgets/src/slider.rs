@@ -363,11 +363,14 @@ impl Widget for SliderWidget {
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         // A Slider node exposing its normalized `0.0..=1.0` value and range.
-        ctx.push_node(Role::Slider, |node| {
+        let id = ctx.push_node(Role::Slider, |node| {
             node.set_numeric_value(self.value);
             node.set_min_numeric_value(0.0);
             node.set_max_numeric_value(1.0);
         });
+        if ctx.has_focus() {
+            ctx.set_focused(id);
+        }
     }
 
     /// Always a Tab stop; a primary mouse press also takes focus (see the module docs).
@@ -793,5 +796,13 @@ mod tests {
                 "clamped at the start"
             );
         }
+    }
+
+    #[test]
+    fn focus_is_published_in_semantics_after_tab_and_cleared_after_an_empty_tap() {
+        crate::focus_test_support::assert_tab_focuses_and_empty_tap_clears(
+            Role::Slider,
+            |_: &mut ()| crate::column().child(slider(0.5, |_: &mut (), _| {})),
+        );
     }
 }

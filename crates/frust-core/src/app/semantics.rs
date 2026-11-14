@@ -8,6 +8,16 @@ use crate::event::{EventOutcome, InputEvent, PointerButton, PointerEvent, Pointe
 use crate::semantics::{ROOT_NODE_ID, SemanticsCtx, SemanticsUpdate};
 use crate::view::View;
 
+/// The live focus, from [`RenderRoot::focus_info`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FocusInfo {
+    /// The node a widget published as focused, if any.
+    pub node: Option<accesskit::NodeId>,
+    /// Whether the focus is Tab-origin rather than pointer-origin.
+    pub keyboard: bool,
+}
+
 impl<State: 'static, V: View<State>> RenderRoot<State, V> {
     /// Collect the accessibility tree as a [`SemanticsUpdate`] for a platform
     /// `accesskit_*` adapter. Pull-based (the shell calls it on demand, never per
@@ -46,6 +56,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
                         root_widget_base,
                         pod.origin().to_vec2(),
                         pod.size(),
+                        false,
                         |ctx| {
                             pod.widget().semantics(ctx);
                         },
@@ -56,6 +67,18 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         // Persist the high-water mark so later pods never reuse a base.
         self.semantics_alloc.set(ctx.next_base());
         ctx.finish(root_node)
+    }
+
+    /// The live focus, or `None` with no session. Valid after [`RenderRoot::layout`] like
+    /// [`RenderRoot::semantics`]; to test, find the node in `semantics().nodes` by role and label.
+    pub fn focus_info(&self) -> Option<FocusInfo> {
+        if !self.is_focus_active() {
+            return None;
+        }
+        Some(FocusInfo {
+            node: self.semantics().focus,
+            keyboard: self.keyboard_focus,
+        })
     }
 
     /// The semantics dirty gate: bumped by a rebuild that returned change flags,

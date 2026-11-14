@@ -487,3 +487,194 @@ fn semantics_if_changed_gates_on_generation() {
     assert!(root.semantics_generation() > generation);
     assert!(root.semantics_if_changed(generation).is_some());
 }
+
+// Focus query: `RenderRoot::focus_info` and the `SemanticsCtx::has_focus` read.
+
+/// A focusable leaf publishing a `Button` node that reports focus the way the baseline
+/// controls do; Escape releases focus and a primary press claims it.
+struct FocusLeaf {
+    label: &'static str,
+}
+
+impl crate::widget::Widget for FocusLeaf {
+    fn layout(&mut self, _ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
+        bc.constrain(Size::new(40.0, 20.0))
+    }
+    fn paint(&mut self, _ctx: &mut PaintCtx, _scene: &mut dyn PaintScene) {}
+    fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
+        match event {
+            InputEvent::Key(key) if key.key == Key::Named(NamedKey::Escape) => {
+                ctx.release_focus();
+                EventResult::Handled
+            }
+            InputEvent::Pointer(p) if p.phase == PointerPhase::Down => {
+                ctx.request_focus();
+                EventResult::Handled
+            }
+            _ => EventResult::Ignored,
+        }
+    }
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let id = ctx.push_node(Role::Button, |n| n.set_label(self.label));
+        if ctx.has_focus() {
+            ctx.set_focused(id);
+        }
+    }
+    fn is_focusable(&self) -> bool {
+        true
+    }
+}
+
+/// Two `FocusLeaf`s stacked vertically (20 px each) under a routing container.
+struct FocusStack {
+    children: Vec<crate::widget::ChildPod>,
+}
+
+impl crate::widget::Widget for FocusStack {
+    fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
+        let mut y = 0.0;
+        for pod in &mut self.children {
+            let size = pod.layout_child(ctx, &BoxConstraints::loose(Size::new(200.0, 200.0)));
+            pod.set_origin(Point::new(0.0, y));
+            y += size.height;
+        }
+        bc.constrain(Size::new(200.0, y))
+    }
+    fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
+        for pod in &mut self.children {
+            pod.paint_child(ctx, scene);
+        }
+    }
+    fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
+        if event.is_broadcast() {
+            for pod in &mut self.children {
+                pod.event_child(ctx, event);
+            }
+            return EventResult::Ignored;
+        }
+        if event.is_focus_routed() {
+            return match self.children.iter_mut().find(|pod| pod.holds_live_focus()) {
+                Some(pod) => pod.event_child(ctx, event),
+                None => EventResult::Ignored,
+            };
+        }
+        let position = event.position();
+        match self.children.iter_mut().find(|pod| pod.contains(position)) {
+            Some(pod) => pod.event_child(ctx, event),
+            None => EventResult::Ignored,
+        }
+    }
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        for pod in &self.children {
+            pod.semantics_child(ctx);
+        }
+    }
+    fn visit_children(&self, visitor: &mut dyn FnMut(&crate::widget::ChildPod)) {
+        self.children.iter().for_each(visitor);
+    }
+}
+
+struct FocusStackView;
+
+impl View<()> for FocusStackView {
+    type Element = FocusStack;
+    fn build(&self, _ctx: &mut BuildCtx<'_>) -> FocusStack {
+        FocusStack {
+            children: ["First", "Second"]
+                .into_iter()
+                .map(|label| crate::widget::ChildPod::new(Box::new(FocusLeaf { label })))
+                .collect(),
+        }
+    }
+    fn rebuild(&self, _p: &Self, _e: &mut FocusStack, _c: &mut BuildCtx<'_>) -> ChangeFlags {
+        ChangeFlags::NONE
+    }
+}
+
+fn focus_root() -> RenderRoot<(), FocusStackView> {
+    let mut root: RenderRoot<(), FocusStackView> = RenderRoot::new();
+    root.rebuild(&mut |_: &mut ()| FocusStackView, &mut ());
+    root.layout(Size::new(200.0, 200.0));
+    root.paint(&mut RecordingScene::default(), FrameTime::ZERO);
+    root
+}
+
+fn labelled_node(update: &SemanticsUpdate, label: &str) -> NodeId {
+    update
+        .nodes
+        .iter()
+        .find(|(_, n)| n.role() == Role::Button && n.label() == Some(label))
+        .map(|(id, _)| *id)
+        .unwrap_or_else(|| panic!("a Button labelled {label:?} is present"))
+}
+
+fn focus_key(key: NamedKey) -> InputEvent {
+    InputEvent::Key(KeyEvent {
+        key: Key::Named(key),
+        modifiers: Modifiers::default(),
+        repeat: false,
+    })
+}
+
+fn paint_frame(root: &mut RenderRoot<(), FocusStackView>) {
+    root.paint(&mut RecordingScene::default(), FrameTime::ZERO);
+}
+
+fn press_at(root: &mut RenderRoot<(), FocusStackView>, x: f64, y: f64) {
+    for phase in [PointerPhase::Down, PointerPhase::Up] {
+        root.event(
+            &mut (),
+            &InputEvent::Pointer(PointerEvent {
+                phase,
+                position: Point::new(x, y),
+                button: PointerButton::Primary,
+            }),
+        );
+    }
+}
+
+#[test]
+fn focus_info_is_none_without_a_session() {
+    let root = focus_root();
+    assert!(!root.is_focus_active());
+    assert_eq!(root.focus_info(), None);
+}
+
+#[test]
+fn focus_info_names_the_tabbed_node_as_keyboard_origin() {
+    let mut root = focus_root();
+    root.event(&mut (), &focus_key(NamedKey::Tab));
+    paint_frame(&mut root);
+    let update = root.semantics();
+    let info = root.focus_info().expect("Tab opened a focus session");
+    assert_eq!(info.node, Some(labelled_node(&update, "First")));
+    assert_eq!(update.focus, info.node);
+    assert!(info.keyboard);
+
+    root.event(&mut (), &focus_key(NamedKey::Tab));
+    paint_frame(&mut root);
+    let info = root.focus_info().expect("still focused");
+    assert_eq!(info.node, Some(labelled_node(&root.semantics(), "Second")));
+}
+
+#[test]
+fn focus_info_reports_pointer_origin_after_a_press() {
+    let mut root = focus_root();
+    press_at(&mut root, 10.0, 30.0);
+    paint_frame(&mut root);
+    let info = root.focus_info().expect("a press claimed focus");
+    assert_eq!(info.node, Some(labelled_node(&root.semantics(), "Second")));
+    assert!(!info.keyboard);
+}
+
+#[test]
+fn focus_info_clears_after_escape() {
+    let mut root = focus_root();
+    root.event(&mut (), &focus_key(NamedKey::Tab));
+    paint_frame(&mut root);
+    assert!(root.focus_info().is_some());
+    root.event(&mut (), &focus_key(NamedKey::Escape));
+    paint_frame(&mut root);
+    assert_eq!(root.focus_info(), None);
+    assert_eq!(root.semantics().focus, None);
+}

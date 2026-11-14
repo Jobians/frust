@@ -296,11 +296,14 @@ impl Widget for RadioWidget {
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         // A single RadioButton node carrying its selected state and label; it
         // fires a Click to select.
-        ctx.push_node(Role::RadioButton, |node| {
+        let id = ctx.push_node(Role::RadioButton, |node| {
             node.set_label(self.label_text.as_str());
             node.set_selected(self.selected);
             node.add_action(Action::Click);
         });
+        if ctx.has_focus() {
+            ctx.set_focused(id);
+        }
     }
 
     /// Always a Tab stop; a primary mouse press also takes focus (see the module docs).
@@ -620,5 +623,13 @@ mod tests {
             assert_eq!(state.selects, 3, "an auto-repeat does not select again");
             assert!(widget(true).is_focusable());
         }
+    }
+
+    #[test]
+    fn focus_is_published_in_semantics_after_tab_and_cleared_after_an_empty_tap() {
+        crate::focus_test_support::assert_tab_focuses_and_empty_tap_clears(
+            Role::RadioButton,
+            |_: &mut ()| crate::column().child(radio::<()>(false, "daily")),
+        );
     }
 }

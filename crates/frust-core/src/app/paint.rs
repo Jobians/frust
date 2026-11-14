@@ -4,8 +4,10 @@
 use std::rc::Rc;
 
 use super::RenderRoot;
+use super::session::traps_focus;
 use crate::anim::{FrameTime, animation_time_scale};
 use crate::event::ImeState;
+use crate::focus_scope::{FocusScopeKey, FocusScopePass, LiveSession, ScopeId};
 use crate::overlay::{
     OverlayEntry, OverlayHit, OverlayKey, OverlayPaintPass, sort_into_paint_order,
 };
@@ -48,6 +50,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         let overlay_pass = OverlayPaintPass::enter();
         let toolbar_pass = SelectionToolbarPass::enter();
         let shortcut_pass = ShortcutPaintPass::enter();
+        let scope_pass = FocusScopePass::enter();
         // The pods compare their stamps against this root's session.
         self.publish_focus_session();
         // Number this pass (see `paint_serial`).
@@ -83,6 +86,11 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         // After the pods, so their (stamped) declarations are in the snapshot too.
         self.shortcuts = ShortcutTable::new(shortcut_pass.take());
         self.last_hints = self.shortcuts.publish();
+        // Before the session settles below; a closed scope's return runs on the frame this wakes.
+        if self.settle_focus_scopes(scope_pass.take()) {
+            outcome.needs_frame = true;
+            outcome.needs_frame_paced_only = false;
+        }
 
         self.resolve_session_surface(main_tree_ime, holder, holder_ime);
         // A modal registered by this paint ends a main-tree session now, not at the next event.
@@ -92,6 +100,22 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         self.resolve_selection_toolbar(toolbar_pass.take());
 
         outcome
+    }
+
+    /// Diff this paint's focus-return scopes, the widget registrations then every trapping overlay
+    /// entry, against the last paint's; returns whether a closed scope owes a return.
+    /// The live session goes with them, its surface as the last resolution left it.
+    fn settle_focus_scopes(&mut self, keys: Vec<(FocusScopeKey, bool)>) -> bool {
+        let mut scopes: Vec<ScopeId> = keys.iter().map(|&(key, _)| ScopeId::Widget(key)).collect();
+        let modal = self.overlay_hits.iter().filter(|hit| traps_focus(hit));
+        scopes.extend(modal.map(|hit| ScopeId::Overlay(hit.key)));
+        let live = self.focus_active.then(|| LiveSession {
+            epoch: self.focus_epoch,
+            surface: self.focus_surface,
+            claimed: self.focus_returns.claimed_surface(self.focus_epoch),
+            holders: keys.iter().filter(|e| e.1).map(|e| e.0).collect(),
+        });
+        self.focus_returns.settle(scopes, live.as_ref())
     }
 
     /// Settle which branch's IME surface the shell is configured with, from the

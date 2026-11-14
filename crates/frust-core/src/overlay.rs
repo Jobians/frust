@@ -15,7 +15,7 @@
 //!
 //! # Not in v1
 //!
-//! * No focus restore: registering a modal pod ends a main-tree session; none returns on close.
+//! * No auto-focus of a modal pod's first focusable on open ([`crate::focus_scope`]: the return).
 //! * Not seen by [`inspect`](crate::app::RenderRoot::inspect) unless the owner visits the pod.
 //! * No nesting: a registration made from inside a floated pod's paint is dropped;
 //!   register a submenu from the same owner, in the main tree's paint.

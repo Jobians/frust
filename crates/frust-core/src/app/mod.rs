@@ -27,6 +27,7 @@ use kurbo::{Rect, Size};
 
 use crate::anim::AnimationClock;
 use crate::event::{CursorIcon, EventOutcome, ImeState, PointerId};
+use crate::focus_scope::FocusReturns;
 use crate::insets::WindowInsets;
 use crate::overlay::{OverlayHit, OverlayKey};
 use crate::selection_toolbar::SelectionToolbarRequest;
@@ -38,6 +39,7 @@ use crate::widget::{ChildPod, PlatformViewFrame};
 pub use config::FocusRingPolicy;
 use layout::LayoutAudit;
 pub use metrics::{Orientation, WindowMetrics};
+pub use semantics::FocusInfo;
 
 /// Rebuild flush passes per frame: a result that navigates once, plus that page's own result.
 const MAX_PENDING_RESULT_FLUSH_PASSES: usize = 3;
@@ -93,6 +95,8 @@ pub struct RenderRoot<State: 'static, V: View<State>> {
     /// Whether traversal granted the live focus; any other claim, a release or a `Down` clears it.
     keyboard_focus: bool,
     focus_ring_policy: FocusRingPolicy,
+    /// The last committed focus target and the open focus-return scopes (`crate::focus_scope`).
+    focus_returns: FocusReturns,
     /// Whether a declined bare Tab/Shift+Tab runs traversal ([`RenderRoot::set_tab_traversal`]).
     tab_traversal: bool,
     hover_active: bool,
@@ -183,6 +187,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             focus_grant: ShortcutId::next(),
             keyboard_focus: false,
             focus_ring_policy: FocusRingPolicy::KeyboardOnly,
+            focus_returns: FocusReturns::default(),
             tab_traversal: true,
             hover_active: false,
             hover_epoch: 1,

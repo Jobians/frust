@@ -940,7 +940,7 @@ impl Widget for ButtonWidget {
         // does not expose its inner label as a separate child node. It advertises
         // the Click action it fires on release — unless loading or disabled,
         // which both report disabled semantics instead.
-        ctx.push_node(Role::Button, |node| {
+        let id = ctx.push_node(Role::Button, |node| {
             node.set_label(self.label_text.as_str());
             if self.loading || self.disabled {
                 node.set_disabled();
@@ -948,6 +948,9 @@ impl Widget for ButtonWidget {
                 node.add_action(Action::Click);
             }
         });
+        if ctx.has_focus() {
+            ctx.set_focused(id);
+        }
     }
 
     /// A Tab stop unless disabled (a loading button keeps its focus). A primary mouse press also
@@ -1742,5 +1745,13 @@ mod tests {
             let mut ctx = EventCtx::new(state_any, Point::ZERO, Size::new(100.0, 40.0));
             assert_eq!(w.event(&mut ctx, &space()), EventResult::Ignored);
         }
+    }
+
+    #[test]
+    fn focus_is_published_in_semantics_after_tab_and_cleared_after_an_empty_tap() {
+        crate::focus_test_support::assert_tab_focuses_and_empty_tap_clears(
+            Role::Button,
+            |_: &mut ()| crate::column().child(button("go", |_: &mut ()| {})),
+        );
     }
 }

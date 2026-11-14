@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use frust_core::accesskit::{Action, NodeId};
 use frust_core::{
-    DiscardScene, EventOutcome, FrameTime, InputEvent, InspectNode, PaintOutcome, PaintScene,
-    RenderRoot, SemanticsUpdate, View, WindowInsets, WindowMetrics,
+    DiscardScene, EventOutcome, FocusInfo, FrameTime, InputEvent, InspectNode, PaintOutcome,
+    PaintScene, RenderRoot, SemanticsUpdate, View, WindowInsets, WindowMetrics,
 };
 use frust_reactive::time::test_support::{VirtualClockGuard, install_virtual_clock};
 use frust_reactive::{Owner, ReactiveRuntime, provide_context};
@@ -351,6 +351,13 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
     /// The accessibility tree as of the last layout.
     pub fn semantics(&self) -> SemanticsUpdate {
         self.root.semantics()
+    }
+
+    /// Where keyboard/IME focus sits, or `None` with no live session; see
+    /// [`RenderRoot::focus_info`](frust_core::RenderRoot::focus_info). To assert which control holds
+    /// focus, find its node in [`semantics`](Self::semantics) by role and label and compare ids.
+    pub fn focus_info(&self) -> Option<FocusInfo> {
+        self.root.focus_info()
     }
 
     /// A pre-order snapshot of the retained tree with each node's absolute bounds.
@@ -995,5 +1002,36 @@ mod tests {
         let expected: Vec<Duration> = (1..=5).map(|n| ms(100 * n)).collect();
         assert_eq!(*times.borrow(), expected);
         assert_eq!(virtual_now(), ms(500));
+    }
+
+    #[test]
+    fn focus_info_is_none_until_tab_lands_and_then_names_the_button() {
+        use frust_core::accesskit::Role;
+        use frust_core::{InputEvent, Key, KeyEvent, Modifiers, NamedKey};
+
+        let mut tester = Tester::new(
+            (),
+            |_: &mut ()| crate::column().child(crate::button("Go", |_: &mut ()| {})),
+            SIZE,
+        );
+        assert_eq!(tester.focus_info(), None, "no session before any input");
+
+        tester.send(&InputEvent::Key(KeyEvent {
+            key: Key::Named(NamedKey::Tab),
+            modifiers: Modifiers::default(),
+            repeat: false,
+        }));
+        tester.pump(Duration::ZERO);
+        let update = tester.semantics();
+        let button = update
+            .nodes
+            .iter()
+            .find(|(_, n)| n.role() == Role::Button && n.label() == Some("Go"))
+            .map(|(id, _)| *id)
+            .expect("the button publishes a node");
+        let info = tester.focus_info().expect("Tab opened a focus session");
+        assert_eq!(info.node, Some(button));
+        assert!(info.keyboard);
+        assert_eq!(tester.focus_info(), tester.root.focus_info());
     }
 }

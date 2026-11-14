@@ -40,6 +40,11 @@ pub(super) fn release_focus_session_in(
     }
 }
 
+/// An entry that traps focus and opens a focus-return scope: Interactive and `OverlayKeys::Modal`.
+pub(super) fn traps_focus(hit: &OverlayHit) -> bool {
+    hit.input == OverlayInput::Interactive && hit.keys == OverlayKeys::Modal
+}
+
 impl<State: 'static, V: View<State>> RenderRoot<State, V> {
     /// Whether a captured pointer gesture is currently in flight.
     pub fn is_pointer_captured(&self) -> bool {
@@ -148,12 +153,10 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
 
     /// Modal focus trap: while an Interactive `OverlayKeys::Modal` pod is registered (a consuming
     /// outside tap alone is a light-dismiss menu, not a trap), end a session no floated pod holds
-    /// (the main tree's), so it takes no more keys. Not restored when the modal closes (v1).
+    /// (the main tree's), so it takes no more keys. Focus returns when the modal's scope closes
+    /// ([`crate::focus_scope`]): this release keeps the target that scope recorded.
     pub(super) fn trap_modal_focus(&mut self) {
-        let traps = |hit: &OverlayHit| {
-            hit.input == OverlayInput::Interactive && hit.keys == OverlayKeys::Modal
-        };
-        if !self.focus_active || !self.overlay_hits.iter().any(traps) {
+        if !self.focus_active || !self.overlay_hits.iter().any(traps_focus) {
             return;
         }
         self.publish_focus_session();
