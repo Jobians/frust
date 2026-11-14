@@ -80,6 +80,8 @@ pub struct SemanticsCtx {
     /// One frame per nesting level, gathering the child ids its container sets.
     frames: Vec<Vec<NodeId>>,
     focus: Option<NodeId>,
+    /// Whether the pod being visited holds live focus (see [`SemanticsCtx::has_focus`]).
+    has_focus: bool,
 }
 
 impl SemanticsCtx {
@@ -96,6 +98,7 @@ impl SemanticsCtx {
             nodes: Vec::new(),
             frames: vec![Vec::new()],
             focus: None,
+            has_focus: false,
         }
     }
 
@@ -213,6 +216,13 @@ impl SemanticsCtx {
         self.nodes.push((id, node));
     }
 
+    /// Whether the pod being described holds live focus: its focus link names the
+    /// live session. A read only; it adds no node. A focusable widget calls
+    /// [`set_focused`](Self::set_focused) on its own node when this is true.
+    pub fn has_focus(&self) -> bool {
+        self.has_focus
+    }
+
     /// Record `id` as the focused node; the last call in a pass wins.
     pub fn set_focused(&mut self, id: NodeId) {
         self.focus = Some(id);
@@ -243,17 +253,21 @@ impl SemanticsCtx {
         base: NonZeroU64,
         child_offset: Vec2,
         child_size: Size,
+        holds_focus: bool,
         f: impl FnOnce(&mut Self),
     ) {
         let saved_origin = self.origin;
         let saved_size = self.size;
+        let saved_has_focus = self.has_focus;
         let saved_base = self.current_base;
         let saved_slot = self.current_slot;
         self.origin = saved_origin + child_offset;
         self.size = child_size;
         self.current_base = Some(base);
         self.current_slot = 0;
+        self.has_focus = holds_focus;
         f(self);
+        self.has_focus = saved_has_focus;
         self.origin = saved_origin;
         self.size = saved_size;
         self.current_base = saved_base;
@@ -403,7 +417,7 @@ mod tests {
         // A widget contributing two nodes for its pod gets slots 0 and 1.
         let (first, second) = {
             let mut ids = (NodeId(0), NodeId(0));
-            ctx.descend_into_pod(base, Vec2::ZERO, Size::new(10.0, 10.0), |ctx| {
+            ctx.descend_into_pod(base, Vec2::ZERO, Size::new(10.0, 10.0), false, |ctx| {
                 ids.0 = ctx.push_node(Role::Label, |_| {});
                 ids.1 = ctx.push_node(Role::Label, |_| {});
             });

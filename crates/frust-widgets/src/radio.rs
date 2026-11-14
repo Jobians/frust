@@ -296,11 +296,14 @@ impl Widget for RadioWidget {
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         // A single RadioButton node carrying its selected state and label; it
         // fires a Click to select.
-        ctx.push_node(Role::RadioButton, |node| {
+        let id = ctx.push_node(Role::RadioButton, |node| {
             node.set_label(self.label_text.as_str());
             node.set_selected(self.selected);
             node.add_action(Action::Click);
         });
+        if ctx.has_focus() {
+            ctx.set_focused(id);
+        }
     }
 
     /// Always a Tab stop; a primary mouse press also takes focus (see the module docs).
@@ -620,5 +623,61 @@ mod tests {
             assert_eq!(state.selects, 3, "an auto-repeat does not select again");
             assert!(widget(true).is_focusable());
         }
+    }
+
+    #[test]
+    fn focus_is_published_in_semantics_after_tab_and_cleared_after_an_empty_tap() {
+        use frust_core::{
+            DiscardScene, FrameTime, InputEvent, Key, KeyEvent, Modifiers, NamedKey, PointerButton,
+            PointerEvent, PointerPhase, RenderRoot,
+        };
+        let key = |named| {
+            InputEvent::Key(KeyEvent {
+                key: Key::Named(named),
+                modifiers: Modifiers::default(),
+                repeat: false,
+            })
+        };
+        let node_of = |root: &RenderRoot<(), crate::FlexView<()>>| {
+            let update = root.semantics();
+            let id = update
+                .nodes
+                .iter()
+                .find(|(_, n)| n.role() == Role::RadioButton)
+                .map(|(id, _)| *id)
+                .expect("the control publishes its node");
+            (id, update.focus)
+        };
+        let mut logic = |_: &mut ()| crate::column().child(radio::<()>(false, "daily"));
+        let mut root: RenderRoot<(), crate::FlexView<()>> = RenderRoot::new();
+        let mut state = ();
+        let mut tcx = frust_text::TextContext::new();
+        root.rebuild(&mut logic, &mut state);
+        root.layout_with_text(Size::new(200.0, 200.0), &mut tcx as &mut dyn Any);
+        root.paint(&mut DiscardScene, FrameTime::ZERO);
+        assert_eq!(root.focus_info(), None, "nothing is focused yet");
+        assert_eq!(node_of(&root).1, None);
+
+        root.event(&mut state, &key(NamedKey::Tab));
+        root.paint(&mut DiscardScene, FrameTime::ZERO);
+        let (id, focus) = node_of(&root);
+        assert_eq!(focus, Some(id), "Tab lands on the control's own node");
+        let info = root.focus_info().expect("a focus session is live");
+        assert_eq!(info.node, Some(id));
+        assert!(info.keyboard);
+
+        for phase in [PointerPhase::Down, PointerPhase::Up] {
+            root.event(
+                &mut state,
+                &InputEvent::Pointer(PointerEvent {
+                    phase,
+                    position: Point::new(190.0, 190.0),
+                    button: PointerButton::Primary,
+                }),
+            );
+        }
+        root.paint(&mut DiscardScene, FrameTime::ZERO);
+        assert_eq!(node_of(&root).1, None, "a tap on empty space clears focus");
+        assert_eq!(root.focus_info(), None);
     }
 }

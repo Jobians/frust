@@ -171,7 +171,7 @@ pub use anim::{
     MIN_ANIMATION_TIME_SCALE, Spring, SpringDesc, Tween, animation_time_scale,
     set_animation_time_scale,
 };
-pub use app::{FocusRingPolicy, Orientation, RenderRoot, WindowMetrics};
+pub use app::{FocusInfo, FocusRingPolicy, Orientation, RenderRoot, WindowMetrics};
 pub use component::{Component, ComponentView, ComponentWidget, component};
 pub use event::{
     CursorIcon, EditCommand, EditingState, EventCtx, EventOutcome, EventResult, ImeContentType,

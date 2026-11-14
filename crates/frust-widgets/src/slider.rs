@@ -363,11 +363,14 @@ impl Widget for SliderWidget {
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         // A Slider node exposing its normalized `0.0..=1.0` value and range.
-        ctx.push_node(Role::Slider, |node| {
+        let id = ctx.push_node(Role::Slider, |node| {
             node.set_numeric_value(self.value);
             node.set_min_numeric_value(0.0);
             node.set_max_numeric_value(1.0);
         });
+        if ctx.has_focus() {
+            ctx.set_focused(id);
+        }
     }
 
     /// Always a Tab stop; a primary mouse press also takes focus (see the module docs).
@@ -793,5 +796,61 @@ mod tests {
                 "clamped at the start"
             );
         }
+    }
+
+    #[test]
+    fn focus_is_published_in_semantics_after_tab_and_cleared_after_an_empty_tap() {
+        use frust_core::{
+            DiscardScene, FrameTime, InputEvent, Key, KeyEvent, Modifiers, NamedKey, PointerButton,
+            PointerEvent, PointerPhase, RenderRoot,
+        };
+        let key = |named| {
+            InputEvent::Key(KeyEvent {
+                key: Key::Named(named),
+                modifiers: Modifiers::default(),
+                repeat: false,
+            })
+        };
+        let node_of = |root: &RenderRoot<(), crate::FlexView<()>>| {
+            let update = root.semantics();
+            let id = update
+                .nodes
+                .iter()
+                .find(|(_, n)| n.role() == Role::Slider)
+                .map(|(id, _)| *id)
+                .expect("the control publishes its node");
+            (id, update.focus)
+        };
+        let mut logic = |_: &mut ()| crate::column().child(slider(0.5, |_: &mut (), _| {}));
+        let mut root: RenderRoot<(), crate::FlexView<()>> = RenderRoot::new();
+        let mut state = ();
+        let mut tcx = frust_text::TextContext::new();
+        root.rebuild(&mut logic, &mut state);
+        root.layout_with_text(Size::new(200.0, 200.0), &mut tcx as &mut dyn Any);
+        root.paint(&mut DiscardScene, FrameTime::ZERO);
+        assert_eq!(root.focus_info(), None, "nothing is focused yet");
+        assert_eq!(node_of(&root).1, None);
+
+        root.event(&mut state, &key(NamedKey::Tab));
+        root.paint(&mut DiscardScene, FrameTime::ZERO);
+        let (id, focus) = node_of(&root);
+        assert_eq!(focus, Some(id), "Tab lands on the control's own node");
+        let info = root.focus_info().expect("a focus session is live");
+        assert_eq!(info.node, Some(id));
+        assert!(info.keyboard);
+
+        for phase in [PointerPhase::Down, PointerPhase::Up] {
+            root.event(
+                &mut state,
+                &InputEvent::Pointer(PointerEvent {
+                    phase,
+                    position: Point::new(190.0, 190.0),
+                    button: PointerButton::Primary,
+                }),
+            );
+        }
+        root.paint(&mut DiscardScene, FrameTime::ZERO);
+        assert_eq!(node_of(&root).1, None, "a tap on empty space clears focus");
+        assert_eq!(root.focus_info(), None);
     }
 }

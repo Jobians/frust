@@ -2071,7 +2071,8 @@ impl ChildPod {
                 }
             }
         };
-        ctx.descend_into_pod(base, offset, size, |ctx| {
+        let holds_focus = self.holds_live_focus();
+        ctx.descend_into_pod(base, offset, size, holds_focus, |ctx| {
             self.widget.semantics(ctx);
         });
     }

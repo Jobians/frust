@@ -39,6 +39,7 @@ use crate::widget::{ChildPod, PlatformViewFrame};
 pub use config::FocusRingPolicy;
 use layout::LayoutAudit;
 pub use metrics::{Orientation, WindowMetrics};
+pub use semantics::FocusInfo;
 
 /// Rebuild flush passes per frame: a result that navigates once, plus that page's own result.
 const MAX_PENDING_RESULT_FLUSH_PASSES: usize = 3;
