@@ -77,6 +77,18 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   routers in `frust-widgets` and the first-party design systems do. `frust::authoring` gains
   `retire_stale_focus_links`, `event_child_reporting_claim` and `route_event_reporting_claim` for
   this.
+- Focus now returns to the control that held it when an Interactive `OverlayKeys::Modal` surface or
+  a `frust-beui` / `frust-shadcn` modal (including the beUI command palette and the shadcn command
+  dialog) closes. It is on by default; a session still held inside the closing surface is ended by
+  the return, and on a phone the soft keyboard comes back with the focus. Migration: an app that
+  wants focus left where it ended up calls `return_focus(false)` on the modal host. One Escape still
+  closes a modal, even from a focused field; a dialog that holds a draft opts in to the veto
+  (`on_dismiss_request`) or to `escape_leaves_field_first(true)` below.
+- A platform back press on a page pushed by a `frust-shadcn` `show_modal` (and so `show_dialog`,
+  `show_sheet`, `show_drawer`, `show_alert_dialog`, `show_command_dialog`) now plays the staged exit
+  and then pops, where it used to pop at once; a non-dismissable host ignores the back press.
+  Migration: code or tests that expect the page to be gone on the back press itself must wait for
+  the exit to settle.
 
 ### Added
 
@@ -231,6 +243,22 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   exposes the stored caret to widgets that paint.
 - `TextInput::label(text)` names a field for accessibility without drawing anything. The placeholder
   is now published as the node's placeholder, and as its label when no label is set.
+- `frust-beui` and `frust-shadcn` modal hosts: `ModalView::on_dismiss_request(|state, DismissCause|
+  -> DismissDecision)`, a dismiss veto asked for Escape, a backdrop press and a back press
+  (`DismissDecision::Keep` fires no `on_dismiss`, stages no exit and still consumes the input; the
+  close X, handle and drag are explicit closes and are not asked; with a veto installed a back
+  press is decided on the next Housekeeping broadcast); `escape_leaves_field_first(bool)`, which
+  makes the Escape that blurs a focused field only blur it and the next one dismiss (the host
+  declares a local Escape shortcut labelled "Close" while armed); and `return_focus(bool)` to opt
+  out of the focus return. A veto does not hold a dialog open across `Router::go`.
+- Core focus-return scopes: `PaintCtx::register_focus_scope` and `FocusScopeKey` let a widget host
+  that owns focus while visible return it to the invoker when it closes; an Interactive
+  `OverlayKeys::Modal` overlay entry is a scope already. A custom host that a control inside can
+  close registers once more in the paint that closes it, or releases focus itself.
+- `RenderRoot::focus_info` / `FocusInfo` and `Tester::focus_info` report the live focus, and
+  `SemanticsCtx::has_focus` tells a widget's `semantics` whether it holds it.
+- `frust::authoring::{DismissCause, DismissDecision, mark_pending_result_flush}`.
+- The baseline `Button`, `Checkbox`, `Radio` and `Slider` publish their focused semantics node.
 
 ### Changed
 

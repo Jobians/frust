@@ -28,6 +28,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use frust::authoring::{DismissCause, DismissDecision};
 use frust::{
     Column, EdgeInsets, NavigatorController, Padding, PopResult, SizedBox, View, column, navigator,
     row, scroll_view, text,
@@ -37,8 +38,8 @@ use frust_shadcn::{
     alert_dialog_description, alert_dialog_footer, alert_dialog_header, alert_dialog_title, button,
     command, command_dialog, command_item, dialog, dialog_description, dialog_footer,
     dialog_header, dialog_title, drawer, drawer_description, drawer_footer, drawer_header,
-    drawer_title, sheet, sheet_description, sheet_footer, sheet_header, sheet_title,
-    show_alert_dialog, show_command_dialog, show_dialog, show_drawer, show_sheet,
+    drawer_title, input, label, sheet, sheet_description, sheet_footer, sheet_header, sheet_title,
+    show_alert_dialog, show_command_dialog, show_dialog, show_drawer, show_sheet, switch,
 };
 
 use crate::AppState;
@@ -55,6 +56,17 @@ pub struct State {
     /// next pass. Cleared when an item is selected and when the dialog is
     /// dismissed, so the next open starts blank.
     pub command_query: Rc<RefCell<String>>,
+    /// The page-side Composer field, which holds focus before the draft
+    /// dialog opens.
+    pub composer: String,
+    /// The draft dialog's text, behind a shared cell for the same reason as
+    /// `command_query`: the dialog builder never receives `&State`.
+    pub draft: Rc<RefCell<String>>,
+    pub veto_on: bool,
+    pub escape_first: bool,
+    pub return_focus: bool,
+    /// The last dismiss attempt, as the readout prints it.
+    pub last_dismiss: String,
 }
 
 impl Default for State {
@@ -63,6 +75,12 @@ impl Default for State {
             controller: NavigatorController::new(),
             last_result: "(nothing dismissed yet)".to_string(),
             command_query: Rc::new(RefCell::new(String::new())),
+            composer: String::new(),
+            draft: Rc::new(RefCell::new(String::new())),
+            veto_on: true,
+            escape_first: false,
+            return_focus: true,
+            last_dismiss: "last: none yet".to_string(),
         }
     }
 }
@@ -100,6 +118,137 @@ fn record(label: &'static str) -> impl Fn(&mut AppState, PopResult) {
         let confirmed = result.take::<bool>();
         s.overlays.last_result = format!("{label}: {confirmed:?}");
     }
+}
+
+/// The draft dialog's veto: keep it open while the draft has text, and only
+/// when the page's veto toggle was on as the dialog was built.
+fn draft_decision(veto_on: bool, draft: &str) -> DismissDecision {
+    if veto_on && !draft.is_empty() {
+        DismissDecision::Keep
+    } else {
+        DismissDecision::Dismiss
+    }
+}
+
+/// The readout line for one dismiss attempt, e.g. `last: Backdrop, kept`.
+fn dismiss_readout(cause: DismissCause, decision: DismissDecision) -> String {
+    let outcome = match decision {
+        DismissDecision::Keep => "kept",
+        _ => "dismissed",
+    };
+    format!("last: {cause:?}, {outcome}")
+}
+
+/// A labelled toggle: the switch, named for assistive tech, and its text.
+fn toggle(
+    text_label: &'static str,
+    checked: bool,
+    on_change: impl Fn(&mut AppState, bool) + 'static,
+) -> impl View<AppState> {
+    row()
+        .child(switch(checked, on_change).label(text_label))
+        .child(hgap())
+        .child(text(text_label).size(14.0))
+}
+
+/// The draft section's values as of this page build, cloned into the
+/// navigator's re-invoked root builder.
+#[derive(Clone)]
+struct DraftSnapshot {
+    composer: String,
+    veto_on: bool,
+    escape_first: bool,
+    return_focus: bool,
+    last_dismiss: String,
+}
+
+/// The draft dialog section: a Composer field and an `Open dialog` button on
+/// the page, three toggles read when the dialog is built, and a readout of
+/// the last dismiss attempt.
+fn draft_section(
+    controller: &NavigatorController<AppState>,
+    state: &DraftSnapshot,
+) -> impl View<AppState> {
+    let controller = controller.clone();
+    column()
+        .child(text("Draft dialog").size(16.0))
+        .child(SizedBox(None, Some(8.0)))
+        .child(crate::nav::caption(
+            "Type in Composer, Tab to the button and press Enter, then type a \
+             draft. With the veto on, Escape, the scrim and a back press keep \
+             the dialog while the draft has text; Discard always closes it. \
+             The toggles are read when the dialog is built.",
+        ))
+        .child(SizedBox(None, Some(8.0)))
+        .child(toggle(
+            "Veto while draft is non-empty",
+            state.veto_on,
+            |s: &mut AppState, on| s.overlays.veto_on = on,
+        ))
+        .child(SizedBox(None, Some(6.0)))
+        .child(toggle(
+            "Escape leaves the field first",
+            state.escape_first,
+            |s: &mut AppState, on| s.overlays.escape_first = on,
+        ))
+        .child(SizedBox(None, Some(6.0)))
+        .child(toggle(
+            "Return focus on close",
+            state.return_focus,
+            |s: &mut AppState, on| s.overlays.return_focus = on,
+        ))
+        .child(gap())
+        .child(label("Composer"))
+        .child(SizedBox(None, Some(6.0)))
+        .child(
+            row()
+                .child(SizedBox(Some(260.0), None).child(input(
+                    state.composer.clone(),
+                    |s: &mut AppState, v: String| s.overlays.composer = v,
+                )))
+                .child(hgap())
+                .child(button("Open dialog", move |s: &mut AppState| {
+                    let veto_on = s.overlays.veto_on;
+                    let escape_first = s.overlays.escape_first;
+                    let return_focus = s.overlays.return_focus;
+                    let read_handle = s.overlays.draft.clone();
+                    let discard_ctrl = controller.clone();
+                    show_dialog(
+                        &controller,
+                        move || {
+                            let discard_ctrl = discard_ctrl.clone();
+                            let draft = read_handle.borrow().clone();
+                            dialog((
+                                dialog_header(vec![
+                                    dialog_title("Draft"),
+                                    dialog_description("Escape keeps this open while it has text."),
+                                ]),
+                                label("Draft"),
+                                input(draft, |s: &mut AppState, v: String| {
+                                    *s.overlays.draft.borrow_mut() = v;
+                                }),
+                                dialog_footer(vec![
+                                    button("Discard", move |s: &mut AppState| {
+                                        s.overlays.draft.borrow_mut().clear();
+                                        discard_ctrl.pop_with_result(PopResult::of(true));
+                                    })
+                                    .variant(ButtonVariant::Outline),
+                                ]),
+                            ))
+                            .on_dismiss_request(move |s: &mut AppState, cause| {
+                                let decision = draft_decision(veto_on, &s.overlays.draft.borrow());
+                                s.overlays.last_dismiss = dismiss_readout(cause, decision);
+                                decision
+                            })
+                            .escape_leaves_field_first(escape_first)
+                            .return_focus(return_focus)
+                        },
+                        record("draft_dialog"),
+                    );
+                })),
+        )
+        .child(SizedBox(None, Some(8.0)))
+        .child(crate::nav::caption(state.last_dismiss.clone()))
 }
 
 /// A trigger that pushes a sheet pinned to `side`.
@@ -170,6 +319,13 @@ pub fn page(state: &mut State) -> impl View<AppState> + use<> {
     let controller = state.controller.clone();
     let last_result = state.last_result.clone();
     let command_query = state.command_query.clone();
+    let draft_snapshot = DraftSnapshot {
+        composer: state.composer.clone(),
+        veto_on: state.veto_on,
+        escape_first: state.escape_first,
+        return_focus: state.return_focus,
+        last_dismiss: state.last_dismiss.clone(),
+    };
 
     let root_controller = controller.clone();
     navigator(&controller, move || {
@@ -180,6 +336,7 @@ pub fn page(state: &mut State) -> impl View<AppState> + use<> {
         let bare_sheet_ctrl = root_controller.clone();
         let snap_ctrl = root_controller.clone();
         let command_query = command_query.clone();
+        let draft_snapshot = draft_snapshot.clone();
 
         // The scroll slot is *inside* the navigator's root page, never around
         // the navigator: a pushed modal page is laid out under the navigator's
@@ -460,6 +617,10 @@ pub fn page(state: &mut State) -> impl View<AppState> + use<> {
                         );
                     },
                 )))
+                .child(gap())
+                .child(frust_shadcn::separator())
+                .child(gap())
+                .child(draft_section(&root_controller, &draft_snapshot))
                 .child(SizedBox(None, Some(24.0))),
         )
     })
@@ -514,6 +675,27 @@ mod tests {
             "both the select and the dismiss paths clear through this helper, \
              so re-opening the palette must read empty"
         );
+    }
+
+    #[test]
+    fn the_draft_veto_keeps_only_a_non_empty_draft_with_the_toggle_on() {
+        assert_eq!(draft_decision(true, "hi"), DismissDecision::Keep);
+        assert_eq!(draft_decision(true, ""), DismissDecision::Dismiss);
+        assert_eq!(draft_decision(false, "hi"), DismissDecision::Dismiss);
+    }
+
+    #[test]
+    fn the_readout_names_the_cause_and_the_decision() {
+        assert_eq!(
+            dismiss_readout(DismissCause::Backdrop, DismissDecision::Keep),
+            "last: Backdrop, kept"
+        );
+    }
+
+    #[test]
+    fn the_toggles_default_to_veto_on_escape_first_off_return_on() {
+        let state = State::default();
+        assert!(state.veto_on && !state.escape_first && state.return_focus);
     }
 
     #[test]
