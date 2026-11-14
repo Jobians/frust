@@ -43,7 +43,9 @@
 
 use std::rc::Rc;
 
-use frust::authoring::{AnyView, BuildCtx, ChangeFlags, View, ViewSeq};
+use frust::authoring::{
+    AnyView, BuildCtx, ChangeFlags, DismissCause, DismissDecision, View, ViewSeq,
+};
 use frust::{EdgeInsets, NavigatorController, PopResult};
 
 use crate::overlay::modal::MAX_WIDTH_LG;
@@ -139,6 +141,35 @@ impl<State: 'static> DialogView<State> {
     /// [`show_dialog`] wires this to `controller.pop()`.
     pub fn on_dismiss<F: Fn(&mut State) + 'static>(mut self, on_dismiss: F) -> Self {
         self.inner = self.inner.on_dismiss(on_dismiss);
+        self
+    }
+
+    /// Set the dismiss veto, asked with `&mut State` before every dismissal
+    /// an Escape, a scrim tap or a back press would make; [`DismissDecision::Keep`] holds the
+    /// dialog open. See [`ModalView::on_dismiss_request`], including why a veto
+    /// does not hold it across `Router::go`.
+    pub fn on_dismiss_request<F>(mut self, on_dismiss_request: F) -> Self
+    where
+        F: Fn(&mut State, DismissCause) -> DismissDecision + 'static,
+    {
+        self.inner = self.inner.on_dismiss_request(on_dismiss_request);
+        self
+    }
+
+    /// Make the Escape that blurs a focused field inside the dialog only leave
+    /// the field; the next Escape dismisses. Default `false`. See
+    /// [`ModalView::escape_leaves_field_first`].
+    pub fn escape_leaves_field_first(mut self, escape_leaves_field_first: bool) -> Self {
+        self.inner = self
+            .inner
+            .escape_leaves_field_first(escape_leaves_field_first);
+        self
+    }
+
+    /// Give focus back, once the dialog closes, to the control that held it as
+    /// it opened. Default `true`. See [`ModalView::return_focus`].
+    pub fn return_focus(mut self, return_focus: bool) -> Self {
+        self.inner = self.inner.return_focus(return_focus);
         self
     }
 }
