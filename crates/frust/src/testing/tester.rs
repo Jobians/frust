@@ -1003,6 +1003,7 @@ mod tests {
         assert_eq!(*times.borrow(), expected);
         assert_eq!(virtual_now(), ms(500));
     }
+
     #[test]
     fn focus_info_is_none_until_tab_lands_and_then_names_the_button() {
         use frust_core::accesskit::Role;
