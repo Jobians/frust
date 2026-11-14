@@ -207,6 +207,8 @@ struct ScopeSpec {
     releases: bool,
     /// Publishes an inactive IME surface the paint it opens, as a navigator push does.
     clears_ime: bool,
+    /// Registers once more in the paint that closes it, as a host a control inside can close does.
+    lingers: bool,
 }
 
 /// A main-tree scope host: registers its [`FocusScopeKey`] every paint its name is open; a
@@ -225,11 +227,11 @@ impl Widget for ScopeHost {
     }
     fn paint(&mut self, ctx: &mut PaintCtx, _scene: &mut dyn PaintScene) {
         let open = self.log.borrow().open.contains(self.name);
-        if open {
+        if open || (self.spec.lingers && self.was_open) {
             ctx.register_focus_scope(self.key);
-            if self.spec.clears_ime && !self.was_open {
-                ctx.publish_ime_state(ImeState::default());
-            }
+        }
+        if open && self.spec.clears_ime && !self.was_open {
+            ctx.publish_ime_state(ImeState::default());
         }
         self.was_open = open;
     }
@@ -684,6 +686,53 @@ fn a_scope_host_that_closes_holding_the_session_gives_it_back() {
     h.paint();
     assert_eq!(h.focused(), Some("field"));
     assert!(h.root.ime_state().is_some());
+}
+
+#[test]
+fn a_modal_closed_by_a_claim_made_with_no_paint_between_still_returns_focus() {
+    let mut h = Harness::new(field_and_modal);
+    h.tap(5.0, 5.0);
+    h.open("modal");
+    // The claim and the close share a frame, as an accessibility click's Down and Up do.
+    h.root.event(&mut (), &key(NamedKey::Tab));
+    assert!(h.root.is_focus_active(), "m1 took the session unpainted");
+
+    h.close("modal");
+    assert!(h.root.is_focus_active(), "m1 still holds the session");
+    h.rebuild();
+    h.paint();
+    assert_eq!(h.focused(), Some("field"));
+    assert!(h.root.ime_state().is_some(), "the field publishes again");
+}
+
+#[test]
+fn a_scope_host_closed_in_the_frame_it_claimed_returns_focus_if_it_lingers_a_paint() {
+    let mut h = Harness::new(|log| {
+        let spec = ScopeSpec {
+            claims: true,
+            lingers: true,
+            ..ScopeSpec::default()
+        };
+        column(vec![field("field", log), scope_host("dialog", spec, log)])
+    });
+    h.tap(5.0, 5.0);
+    h.open("dialog");
+    // Claim and close with no paint between: the host's last open paint saw no focus path.
+    h.root
+        .event(&mut (), &pointer(PointerPhase::Down, 5.0, 25.0));
+    h.root.event(&mut (), &pointer(PointerPhase::Up, 5.0, 25.0));
+    h.root.event(&mut (), &key(NamedKey::Escape));
+    assert!(h.root.is_focus_active(), "no release as it closed");
+
+    h.frame();
+    assert!(
+        h.root.is_focus_active(),
+        "the lingering paint still registers"
+    );
+    h.frame();
+    h.rebuild();
+    h.paint();
+    assert_eq!(h.focused(), Some("field"));
 }
 
 #[test]
