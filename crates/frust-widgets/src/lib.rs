@@ -449,3 +449,77 @@ pub mod test_support {
         }
     }
 }
+
+/// Test-only helpers shared by the focus-semantics tests of the focusable
+/// controls. Not public API and not compiled outside tests.
+#[cfg(test)]
+mod focus_test_support {
+    use std::any::Any;
+
+    use frust_core::accesskit::Role;
+    use frust_core::{
+        DiscardScene, FrameTime, InputEvent, Key, KeyEvent, Modifiers, NamedKey, PointerButton,
+        PointerEvent, PointerPhase, RenderRoot,
+    };
+    use kurbo::{Point, Size};
+
+    use crate::FlexView;
+
+    /// Assert the focus contract shared by every focusable control: nothing is
+    /// focused at first; Tab lands on the control's own node (the one whose
+    /// role is `role`) and names it in `focus_info()` with keyboard input; a
+    /// tap on empty space clears focus again. `build` returns the root column
+    /// that holds the control under test.
+    pub(crate) fn assert_tab_focuses_and_empty_tap_clears(
+        role: Role,
+        mut build: impl FnMut(&mut ()) -> FlexView<()>,
+    ) {
+        let key = |named| {
+            InputEvent::Key(KeyEvent {
+                key: Key::Named(named),
+                modifiers: Modifiers::default(),
+                repeat: false,
+            })
+        };
+        let node_of = |root: &RenderRoot<(), FlexView<()>>| {
+            let update = root.semantics();
+            let id = update
+                .nodes
+                .iter()
+                .find(|(_, n)| n.role() == role)
+                .map(|(id, _)| *id)
+                .expect("the control publishes its node");
+            (id, update.focus)
+        };
+        let mut root: RenderRoot<(), FlexView<()>> = RenderRoot::new();
+        let mut state = ();
+        let mut tcx = frust_text::TextContext::new();
+        root.rebuild(&mut build, &mut state);
+        root.layout_with_text(Size::new(200.0, 200.0), &mut tcx as &mut dyn Any);
+        root.paint(&mut DiscardScene, FrameTime::ZERO);
+        assert_eq!(root.focus_info(), None, "nothing is focused yet");
+        assert_eq!(node_of(&root).1, None);
+
+        root.event(&mut state, &key(NamedKey::Tab));
+        root.paint(&mut DiscardScene, FrameTime::ZERO);
+        let (id, focus) = node_of(&root);
+        assert_eq!(focus, Some(id), "Tab lands on the control's own node");
+        let info = root.focus_info().expect("a focus session is live");
+        assert_eq!(info.node, Some(id));
+        assert!(info.keyboard);
+
+        for phase in [PointerPhase::Down, PointerPhase::Up] {
+            root.event(
+                &mut state,
+                &InputEvent::Pointer(PointerEvent {
+                    phase,
+                    position: Point::new(190.0, 190.0),
+                    button: PointerButton::Primary,
+                }),
+            );
+        }
+        root.paint(&mut DiscardScene, FrameTime::ZERO);
+        assert_eq!(node_of(&root).1, None, "a tap on empty space clears focus");
+        assert_eq!(root.focus_info(), None);
+    }
+}
