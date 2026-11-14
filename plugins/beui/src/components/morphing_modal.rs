@@ -89,9 +89,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use frust::authoring::{
-    AnyView, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, EventCtx, EventResult, InputEvent,
-    LayoutCtx, PaintCtx, PaintScene, Point, Rect, SemanticsCtx, Size, Vec2, View, Widget, any,
-    build_child, rebuild_child, route_event_single, teardown_child, visit_children,
+    AnyView, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, DismissCause, DismissDecision,
+    EventCtx, EventResult, InputEvent, LayoutCtx, PaintCtx, PaintScene, Point, Rect, SemanticsCtx,
+    Size, Vec2, View, Widget, any, build_child, rebuild_child, route_event_single, teardown_child,
+    visit_children,
 };
 use frust::{FrameTime, Theme};
 
@@ -329,6 +330,30 @@ impl<State: 'static> MorphingModalView<State> {
     /// finishes the return morph.
     pub fn on_close<F: Fn() + 'static>(mut self, on_close: F) -> Self {
         self.inner = self.inner.on_close(on_close);
+        self
+    }
+
+    /// Set the dismiss veto, asked before Escape, a backdrop click or a back
+    /// press closes the modal — see [`ModalView::on_dismiss_request`].
+    pub fn on_dismiss_request<F>(mut self, on_dismiss_request: F) -> Self
+    where
+        F: Fn(&mut State, DismissCause) -> DismissDecision + 'static,
+    {
+        self.inner = self.inner.on_dismiss_request(on_dismiss_request);
+        self
+    }
+
+    /// Make the first Escape only leave a focused field (default `false`) —
+    /// see [`ModalView::escape_leaves_field_first`].
+    pub fn escape_leaves_field_first(mut self, on: bool) -> Self {
+        self.inner = self.inner.escape_leaves_field_first(on);
+        self
+    }
+
+    /// Return focus to the control that held it once the modal closes
+    /// (default `true`) — see [`ModalView::return_focus`].
+    pub fn return_focus(mut self, on: bool) -> Self {
+        self.inner = self.inner.return_focus(on);
         self
     }
 

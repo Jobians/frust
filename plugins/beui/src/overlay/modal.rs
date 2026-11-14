@@ -75,6 +75,22 @@
 //!   non-dismissable modal is pushed [`BackPolicy::Veto`] instead: the back
 //!   press is consumed and does nothing.
 //!
+//! One Escape closes the modal, even with a text field focused inside it: the
+//! field blurs and declines a bare Escape, and the host takes the declined key
+//! as its dismissal. Two opt-ins change that:
+//!
+//! * [`ModalView::on_dismiss_request`] — the dismiss veto. It runs with `&mut
+//!   State` before [`ModalView::on_dismiss`] on every attempt above, naming its
+//!   [`DismissCause`]; [`DismissDecision::Keep`] keeps the modal up and still
+//!   consumes the input. The signal bump arrives on a paint, where no state
+//!   exists, so with a veto installed a back press is recorded there and
+//!   decided on the next [`InputEvent::Housekeeping`] broadcast, which the
+//!   rebuild dispatches with the state in scope.
+//! * [`ModalView::escape_leaves_field_first`] — the first Escape only leaves
+//!   the focused field; the next one dismisses. The blur ended the focus
+//!   session the key arrived down, so until then the host declares Escape as a
+//!   shortcut of its own.
+//!
 //! Which callback a dismissal reaches depends on the mount:
 //!
 //! * [`ModalView::on_dismiss`] — state-bearing, fired from the event pass the
@@ -87,17 +103,36 @@
 //!   is why this half is state-free — and why the exit-completion latch is
 //!   drained here rather than one event later, the deferral
 //!   [`crate::motion::presence`] documents for the state-bearing case.
+//!
+//! # Focus return
+//!
+//! While it is visible the host holds a focus-return scope
+//! ([`PaintCtx::register_focus_scope`]), from its first open paint through the
+//! paint its exit settles in; the next paint closes it, and focus goes back to
+//! the control that held it as the modal opened — the field on the page below
+//! a [`show_modal`] page, or beside a `Stack`-mounted host. A kept-mounted host
+//! closed and reopened opens a fresh scope; one reopened before its exit
+//! settles keeps the first. [`ModalView::return_focus`] turns it off.
+//!
+//! An Escape or backdrop dismissal hands the host's focus back as it starts (a
+//! pointer dismissal on the next key pass); a back press, reaching the host on
+//! a paint or a broadcast where no release is honoured, owes it the same way.
+//! A session still held inside the panel as the scope closes is ended by the
+//! return itself: the extra paint means the root has seen every press the
+//! panel took, since a settled host takes none.
 
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
 use frust::authoring::{
-    Affine, AnyView, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, ErasedCallback, EventCtx,
-    EventResult, InputEvent, Key, LayoutCtx, NamedKey, PaintCtx, PaintScene, Point, PointerPhase,
-    Rect, Role, SemanticsCtx, Size, Vec2, View, Widget, any, build_child, erase_callback,
-    rebuild_child, route_event_single, teardown_child, visit_children,
+    Affine, AnyView, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, Chord, DismissCause,
+    DismissDecision, ErasedCallback, EventCtx, EventResult, FocusScopeKey, InputEvent, Key,
+    LayoutCtx, NamedKey, PaintCtx, PaintScene, Point, PointerPhase, Rect, Role, SemanticsCtx, Size,
+    Vec2, View, Widget, any, build_child, erase_callback, mark_pending_result_flush, rebuild_child,
+    route_event_single, teardown_child, visit_children,
 };
+use frust::authoring::{Modifiers, ShortcutDecl, ShortcutId, ShortcutScope};
 use frust::{
     BackPolicy, FrameTime, NavigatorController, PopResult, PushOptions, Theme, TransitionSpec,
 };
@@ -557,6 +592,19 @@ pub type OnClose = Rc<StagedPop>;
 /// A view-held, typed callback (erased on build).
 type OnState<State> = Rc<dyn Fn(&mut State)>;
 
+/// A view-held, typed dismiss veto (erased on build).
+type OnDismissRequest<State> = Rc<dyn Fn(&mut State, DismissCause) -> DismissDecision>;
+
+/// The widget-held, `State`-erased half of an [`OnDismissRequest`].
+type ErasedDismissRequest = Box<dyn FnMut(&mut EventCtx, DismissCause) -> DismissDecision>;
+
+/// Erase a view-held veto into the adapter the widget calls during the event
+/// pass — [`erase_callback`]'s shape, carrying the cause and the answer.
+fn erase_dismiss_request<State: 'static>(veto: &OnDismissRequest<State>) -> ErasedDismissRequest {
+    let veto = veto.clone();
+    Box::new(move |ctx: &mut EventCtx, cause| veto(ctx.state_mut::<State>(), cause))
+}
+
 /// A modal component [`show_modal`] can wire a navigator pop into.
 ///
 /// Every modal component in the catalog implements it by wrapping a
@@ -585,6 +633,9 @@ pub fn modal<State: 'static, V: View<State>>(content: V, config: ModalConfig) ->
         open: true,
         on_dismiss: None,
         on_close: None,
+        on_dismiss_request: None,
+        escape_leaves_field_first: false,
+        return_focus: true,
     }
 }
 
@@ -600,6 +651,9 @@ pub struct ModalView<State: 'static> {
     pub(crate) open: bool,
     pub(crate) on_dismiss: Option<OnState<State>>,
     pub(crate) on_close: Option<OnClose>,
+    pub(crate) on_dismiss_request: Option<OnDismissRequest<State>>,
+    pub(crate) escape_leaves_field_first: bool,
+    pub(crate) return_focus: bool,
 }
 
 impl<State: 'static> ModalView<State> {
@@ -639,6 +693,51 @@ impl<State: 'static> ModalView<State> {
     /// flip. [`show_modal`] installs a guarded `controller.pop()` here.
     pub fn on_close<F: Fn() + 'static>(mut self, on_close: F) -> Self {
         self.on_close = Some(Rc::new(StagedPop::unguarded(on_close)));
+        self
+    }
+
+    /// Set the dismiss veto: asked, with the [`DismissCause`], before every
+    /// dismissal a [`dismissable`](ModalConfig::dismissable) modal would make —
+    /// Escape, a backdrop click, or a back press.
+    ///
+    /// [`DismissDecision::Dismiss`] proceeds exactly as with no veto.
+    /// [`DismissDecision::Keep`] keeps the modal up: no
+    /// [`on_dismiss`](Self::on_dismiss), no exit, no focus release, and the
+    /// input is still consumed — an app holding an unsaved draft answers it
+    /// here. A back press arrives on a paint, so its veto runs on the next
+    /// rebuild's [`InputEvent::Housekeeping`] broadcast rather than at once. A
+    /// non-dismissable modal never asks.
+    ///
+    /// A veto does not hold the dialog across `Router::go`, which closes
+    /// route-less pages such as a [`show_modal`] page without asking them.
+    pub fn on_dismiss_request<F>(mut self, on_dismiss_request: F) -> Self
+    where
+        F: Fn(&mut State, DismissCause) -> DismissDecision + 'static,
+    {
+        self.on_dismiss_request = Some(Rc::new(on_dismiss_request));
+        self
+    }
+
+    /// Make the first Escape only leave a focused field (default `false`).
+    ///
+    /// With it on, a bare Escape the content declined after giving up the
+    /// focus it held — a text field blurs itself and declines — is consumed
+    /// without a dismissal, and the next Escape dismisses, focus or none: the
+    /// host declares it as a shortcut until then. With no field focused, a
+    /// focus holder that keeps its focus, or a modified Escape, nothing
+    /// changes.
+    pub fn escape_leaves_field_first(mut self, on: bool) -> Self {
+        self.escape_leaves_field_first = on;
+        self
+    }
+
+    /// Return focus when the modal closes (default `true`): the control that
+    /// held focus as the modal opened gets it back once the exit settles.
+    ///
+    /// Set it before the modal opens. Turned off while the modal is up, the
+    /// scope closes there and then, and focus returns at once.
+    pub fn return_focus(mut self, on: bool) -> Self {
+        self.return_focus = on;
         self
     }
 }
@@ -687,6 +786,25 @@ pub struct ModalWidget {
     /// that requested it was a pointer event (see [`Self::request_dismiss`]),
     /// drained on this host's next `Scroll`/`Key`/`Ime` pass.
     pending_focus_release: bool,
+    /// The dismiss veto ([`ModalView::on_dismiss_request`]).
+    on_dismiss_request: Option<ErasedDismissRequest>,
+    /// A back press observed on a paint with a veto installed, owed to the
+    /// next [`InputEvent::Housekeeping`] broadcast (see
+    /// [`Self::observe_dismiss_signal`]).
+    pending_back: bool,
+    /// See [`ModalView::escape_leaves_field_first`].
+    escape_leaves_field_first: bool,
+    /// See [`ModalView::return_focus`].
+    return_focus: bool,
+    /// This host's focus-return scope, allocated once per widget.
+    scope_key: FocusScopeKey,
+    /// The Escape shortcut an armed [`Self::escape_armed`] host declares.
+    escape_shortcut: ShortcutId,
+    /// Whether an Escape just left a field under
+    /// [`ModalView::escape_leaves_field_first`]. The field's blur ended the
+    /// focus session, so the next Escape reaches the host as this shortcut
+    /// rather than down a focus path.
+    escape_armed: bool,
 }
 
 impl ModalWidget {
@@ -772,6 +890,12 @@ impl ModalWidget {
         self.scrim = scrim;
     }
 
+    /// Whether the scrim or the panel is still painted — the span the host is
+    /// a barrier for.
+    fn is_visible(&self) -> bool {
+        self.panel.is_visible() || self.scrim.is_visible()
+    }
+
     /// Whether a dismissal may still be started.
     fn dismissable(&self) -> bool {
         self.config.dismissable && !self.staged && !self.closed && self.open
@@ -781,21 +905,45 @@ impl ModalWidget {
     /// state-free close is installed to fire at the end of it.
     ///
     /// Refuses a second one — that is what makes each dismiss path fire its
-    /// callbacks exactly once.
-    fn request_dismiss(&mut self, ctx: &mut EventCtx, event: &InputEvent) {
-        if !self.dismissable() {
+    /// callbacks exactly once — and one the veto answers
+    /// [`DismissDecision::Keep`], which leaves everything as it was.
+    fn request_dismiss(&mut self, ctx: &mut EventCtx, event: &InputEvent, cause: DismissCause) {
+        if !self.dismissable() || !self.allows(ctx, cause) {
             return;
         }
         if let Some(on_dismiss) = self.on_dismiss.as_mut() {
             on_dismiss(ctx);
         }
-        if let Some(on_close) = &self.on_close {
-            on_close.arm();
-            self.staged = true;
-            self.panel.set_open(false);
-            self.scrim.set_open(false);
+        if self.stage_exit() {
             ctx.request_redraw();
         }
+        self.release_focus(ctx, event);
+    }
+
+    /// Ask the veto, if one is installed, whether a `cause` dismissal may
+    /// proceed.
+    fn allows(&mut self, ctx: &mut EventCtx, cause: DismissCause) -> bool {
+        self.on_dismiss_request
+            .as_mut()
+            .is_none_or(|veto| veto(ctx, cause) != DismissDecision::Keep)
+    }
+
+    /// Stage this host's own exit against the installed state-free close,
+    /// returning whether one was staged (none is without a close to fire).
+    fn stage_exit(&mut self) -> bool {
+        let Some(on_close) = &self.on_close else {
+            return false;
+        };
+        on_close.arm();
+        self.staged = true;
+        self.panel.set_open(false);
+        self.scrim.set_open(false);
+        true
+    }
+
+    /// Hand the host's focus back as a dismissal starts, deferring it when
+    /// `event` is of a kind the root does not honour a release on.
+    fn release_focus(&mut self, ctx: &mut EventCtx, event: &InputEvent) {
         if ctx.has_focus() {
             // Hand the keyboard chain back: the panel is leaving, and nothing
             // inside it should keep the focus path. `EventCtx::release_focus`
@@ -850,6 +998,10 @@ impl ModalWidget {
     /// paint forces: the state-bearing `on_dismiss` cannot be reached (no `&mut
     /// State` exists here), and the frame whose rebuild drains the enqueued pop
     /// has to be asked for explicitly.
+    ///
+    /// Nor can a veto be: with one installed the bump is only recorded, and
+    /// [`Self::resolve_pending_back`] decides it on the next rebuild's
+    /// [`InputEvent::Housekeeping`] broadcast, which the flush mark owes.
     fn observe_dismiss_signal(&mut self, ctx: &mut PaintCtx) {
         let Some(signal) = &self.dismiss_signal else {
             return;
@@ -862,12 +1014,39 @@ impl ModalWidget {
         if !self.dismissable() {
             return;
         }
-        if let Some(on_close) = &self.on_close {
-            on_close.arm();
-            self.staged = true;
-            self.panel.set_open(false);
-            self.scrim.set_open(false);
+        if self.on_dismiss_request.is_some() {
+            self.pending_back = true;
+            mark_pending_result_flush();
             ctx.request_frame();
+            return;
+        }
+        if self.stage_exit() {
+            self.defer_focus_release(ctx.has_focus());
+            ctx.request_frame();
+        }
+    }
+
+    /// Decide a back press [`Self::observe_dismiss_signal`] recorded for the
+    /// veto, on the `Housekeeping` broadcast that has the state in scope. A
+    /// dismissal stages exactly what the paint would have with no veto.
+    fn resolve_pending_back(&mut self, ctx: &mut EventCtx) {
+        if !std::mem::take(&mut self.pending_back) {
+            return;
+        }
+        if !self.dismissable() || !self.allows(ctx, DismissCause::Back) {
+            return;
+        }
+        if self.stage_exit() {
+            self.defer_focus_release(ctx.has_focus());
+            ctx.request_redraw();
+        }
+    }
+
+    /// Owe a focus release to the next pass the root honours one on — the back
+    /// press reaches the host on a paint or a broadcast, neither of which does.
+    fn defer_focus_release(&mut self, has_focus: bool) {
+        if has_focus {
+            self.pending_focus_release = true;
         }
     }
 
@@ -949,6 +1128,13 @@ impl<State: 'static> View<State> for ModalView<State> {
             scrim_captured: false,
             scrim_down_outside: false,
             pending_focus_release: false,
+            on_dismiss_request: self.on_dismiss_request.as_ref().map(erase_dismiss_request),
+            pending_back: false,
+            escape_leaves_field_first: self.escape_leaves_field_first,
+            return_focus: self.return_focus,
+            scope_key: FocusScopeKey::new(),
+            escape_shortcut: ShortcutId::next(),
+            escape_armed: false,
         }
     }
 
@@ -985,6 +1171,7 @@ impl<State: 'static> View<State> for ModalView<State> {
                 // that is visibly back and interactive.
                 element.staged = false;
                 element.closed = false;
+                element.escape_armed = false;
             }
             flags |= ChangeFlags::PAINT;
         }
@@ -993,6 +1180,9 @@ impl<State: 'static> View<State> for ModalView<State> {
         // one, so a hook installed on the widget by `show_modal` survives every
         // later rebuild of the component it wraps.
         element.on_dismiss = self.on_dismiss.as_ref().map(erase_callback);
+        element.on_dismiss_request = self.on_dismiss_request.as_ref().map(erase_dismiss_request);
+        element.escape_leaves_field_first = self.escape_leaves_field_first;
+        element.return_focus = self.return_focus;
         if self.on_close.is_some() {
             element.on_close = self.on_close.clone();
         }
@@ -1024,12 +1214,27 @@ impl Widget for ModalWidget {
         self.sync_motion(reduce, now);
         self.observe_dismiss_signal(ctx);
 
+        // Visible as this paint starts is what the last event pass saw, so a
+        // press the panel took since the last paint is still inside the scope:
+        // it is held through the paint whose exit settles, and ends on the next.
+        let was_visible = self.is_visible();
         let progress = self.panel.advance(now);
         let veil = self.scrim.advance(now).clamp(0.0, 1.0);
         if self.panel.is_animating() || self.scrim.is_animating() {
             ctx.request_frame();
         }
         self.fire_staged_close(ctx);
+        if self.return_focus && (was_visible || self.is_visible()) {
+            ctx.register_focus_scope(self.scope_key);
+        }
+        if self.escape_armed && self.dismissable() {
+            ctx.register_shortcut(ShortcutDecl {
+                id: self.escape_shortcut,
+                chord: Chord::new(Key::Named(NamedKey::Escape), Modifiers::default()),
+                label: "Close".to_string(),
+                scope: ShortcutScope::Local,
+            });
+        }
 
         if self.scrim.is_visible() && self.config.scrim {
             let color = super::scrim(Theme::from_paint_ctx(ctx));
@@ -1124,6 +1329,11 @@ impl Widget for ModalWidget {
         // event to have carried the release instead. Draining it ahead of the
         // early return is what keeps that path from going unreachable.
         self.drain_focus_release(ctx, event);
+        // The broadcast a vetoed back press waits for; it then goes on to the
+        // content like any other.
+        if matches!(event, InputEvent::Housekeeping) {
+            self.resolve_pending_back(ctx);
+        }
         // A settled-closed host is inert: a broadcast still reaches the content
         // (which is what keeps its pods live), and nothing else does. It stays a
         // barrier for as long as it is visible, exit included — a press on a
@@ -1140,19 +1350,40 @@ impl Widget for ModalWidget {
         if matches!(event, InputEvent::Pointer(p) if p.phase == PointerPhase::Down) {
             ctx.request_focus();
         }
+        // The Escape after one that left a field, with no focus path left to
+        // arrive down.
+        if matches!(event, InputEvent::Shortcut(id) if *id == self.escape_shortcut) {
+            if std::mem::take(&mut self.escape_armed) {
+                self.request_dismiss(ctx, event, DismissCause::Escape);
+            }
+            return EventResult::Handled;
+        }
         // Content first: an action inside the panel owns its own events, and
         // this host claims nothing before the routing — unless it already holds
         // the gesture, since a backdrop press the content declined must not be
         // re-routed into whatever control the pointer happens to travel over.
         // Broadcasts and focus-routed events are never short-circuited.
         let own_gesture = self.scrim_captured && matches!(event, InputEvent::Pointer(_));
+        // Read before the routing: a field that blurs on this Escape clears
+        // the content's link inside the pass.
+        let content_held_focus = self.content.holds_live_focus();
         if !own_gesture && route_event_single(&mut self.content, ctx, event) == EventResult::Handled
         {
             return EventResult::Handled;
         }
         if let InputEvent::Key(key) = event {
             if key.key == Key::Named(NamedKey::Escape) {
-                self.request_dismiss(ctx, event);
+                // The opt-in: an Escape that only took the content out of its
+                // field is that, and no more.
+                let m = key.modifiers;
+                let bare = !(m.shift || m.ctrl || m.alt || m.meta);
+                let left_field = content_held_focus && !self.content.holds_live_focus();
+                self.escape_armed = self.escape_leaves_field_first && bare && left_field;
+                if !self.escape_armed {
+                    self.request_dismiss(ctx, event, DismissCause::Escape);
+                } else {
+                    ctx.request_redraw();
+                }
             }
             // Every other key is swallowed too: nothing behind a modal may act
             // on a keystroke its content declined.
@@ -1188,7 +1419,7 @@ impl Widget for ModalWidget {
                 // matching the upstream backdrop being a button rather than a
                 // pointerdown listener.
                 if self.scrim_down_outside && !self.rect.contains(p.position) {
-                    self.request_dismiss(ctx, event);
+                    self.request_dismiss(ctx, event, DismissCause::Backdrop);
                 }
                 EventResult::Handled
             }
@@ -1288,6 +1519,10 @@ impl<State: 'static, V: ModalContent<State>> View<State> for StagedExit<V> {
 /// through `controller.pop_with_result(..)`. The navigator transition is
 /// [`TransitionSpec::NONE`] on purpose: the modal stages its own entrance *and*
 /// exit, so a page transition on top of it would animate the same thing twice.
+///
+/// The component's dismiss veto, field-first Escape and focus return travel
+/// with it: they are installed on the [`ModalWidget`] it builds, beneath the
+/// staged close this pass-through adds.
 ///
 /// The back-press policy is peeked once, here, from
 /// [`ModalContent::modal_dismissable`] — the push-time `PushOptions` contract
@@ -2335,6 +2570,12 @@ mod tests {
     #[derive(Default)]
     struct NavState {
         results: Vec<Option<i32>>,
+        /// Every cause a dismiss veto was asked about, in order.
+        causes: Vec<DismissCause>,
+        /// What the veto answers: `Keep` while set.
+        keep: bool,
+        /// `on_dismiss` calls.
+        dismissed: u32,
     }
 
     /// A navigator rooted on an opaque page, plus the controller driving it.
@@ -2343,15 +2584,28 @@ mod tests {
         root: RenderRoot<NavState, frust::NavigatorView<NavState>>,
         state: NavState,
         tcx: TextContext,
+        /// Whether the root page is a text field (labelled `below`) rather
+        /// than an opaque block.
+        field_below: bool,
     }
 
     impl NavHarness {
         fn new() -> Self {
+            Self::rooted(false)
+        }
+
+        /// A navigator whose root page is one full-window text field.
+        fn over_a_field() -> Self {
+            Self::rooted(true)
+        }
+
+        fn rooted(field_below: bool) -> Self {
             let mut h = NavHarness {
                 controller: NavigatorController::new(),
                 root: RenderRoot::new(),
                 state: NavState::default(),
                 tcx: TextContext::new(),
+                field_below,
             };
             h.pass();
             h
@@ -2362,8 +2616,15 @@ mod tests {
             // The raw `frust-widgets` constructor rather than the facade's:
             // the facade wires platform back-press glue, which needs a
             // reactive runtime no unit test stands up.
+            let field_below = self.field_below;
             let mut app = move |_: &mut NavState| {
-                frust_widgets::navigator(&ctrl, || any::<NavState, _>(Block(WINDOW)))
+                frust_widgets::navigator(&ctrl, move || {
+                    if field_below {
+                        any::<NavState, _>(field("below"))
+                    } else {
+                        any::<NavState, _>(Block(WINDOW))
+                    }
+                })
             };
             self.root.rebuild(&mut app, &mut self.state);
             self.root
@@ -2400,6 +2661,25 @@ mod tests {
             panic!("the frame loop never settled");
         }
 
+        /// [`Self::drive`], counting a frame asked for only by a caret's
+        /// paced blink as settled — a focused field never stops asking.
+        fn drive_fields(&mut self, from_ms: u64) {
+            for i in 0..24u64 {
+                self.pass();
+                let mut rec = Recorder::default();
+                let outcome = self.root.paint(
+                    &mut rec,
+                    FrameTime::from_nanos((from_ms + i * 100) * 1_000_000),
+                );
+                if !outcome.needs_frame || outcome.needs_frame_paced_only {
+                    // The rebuild a closing scope's return waits on.
+                    self.pass();
+                    return;
+                }
+            }
+            panic!("the frame loop never settled");
+        }
+
         fn click(&mut self, x: f64, y: f64) {
             for phase in [PointerPhase::Down, PointerPhase::Up] {
                 self.root.event(
@@ -2412,6 +2692,91 @@ mod tests {
                 );
             }
         }
+
+        fn escape(&mut self) {
+            self.root.event(
+                &mut self.state,
+                &InputEvent::Key(KeyEvent {
+                    key: Key::Named(NamedKey::Escape),
+                    modifiers: Modifiers::default(),
+                    repeat: false,
+                }),
+            );
+        }
+
+        /// The label of the node the root reports focused, if any.
+        fn focused(&self) -> Option<String> {
+            focused_label(&self.root)
+        }
+
+        /// See [`typed_into`].
+        fn typed(&mut self) -> Option<&'static str> {
+            typed_into(&mut self.root, &mut self.state)
+        }
+    }
+
+    /// The label of the node `root` reports focused, if a session is live.
+    fn focused_label<S: 'static, V: View<S>>(root: &RenderRoot<S, V>) -> Option<String> {
+        let node = root.focus_info()?.node?;
+        let tree = root.semantics();
+        let (_, focused) = tree.nodes.iter().find(|(id, _)| *id == node)?;
+        focused.label().map(str::to_string)
+    }
+
+    thread_local! {
+        /// The label of every field an edit reached, in order.
+        static TYPED: std::cell::RefCell<Vec<&'static str>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// A text field labelled `label` that records each edit in [`TYPED`].
+    fn field<S: 'static>(label: &'static str) -> frust::TextInputView<S> {
+        frust::text_input("", move |_: &mut S, _| {
+            TYPED.with(|typed| typed.borrow_mut().push(label));
+        })
+        .label(label)
+    }
+
+    /// Type one character and report which field took it — the field that
+    /// holds the session, or `None`. A granted field publishes its focus
+    /// node only once input reaches it, so the probe is the input itself.
+    fn typed_into<S: 'static, V: View<S>>(
+        root: &mut RenderRoot<S, V>,
+        state: &mut S,
+    ) -> Option<&'static str> {
+        TYPED.with(|typed| typed.borrow_mut().clear());
+        root.event(
+            state,
+            &InputEvent::Key(KeyEvent {
+                key: Key::Character("x".to_string()),
+                modifiers: Modifiers::default(),
+                repeat: false,
+            }),
+        );
+        TYPED.with(|typed| typed.borrow().last().copied())
+    }
+
+    /// Where the centred panel of a [`NavHarness`] modal sits: the window's
+    /// centre, whatever height its content hugs.
+    const PANEL_CENTRE: Point = Point::new(WINDOW.width / 2.0, WINDOW.height / 2.0);
+
+    /// A veto recording each cause and answering from [`NavState::keep`].
+    fn recording_veto(state: &mut NavState, cause: DismissCause) -> DismissDecision {
+        state.causes.push(cause);
+        if state.keep {
+            DismissDecision::Keep
+        } else {
+            DismissDecision::Dismiss
+        }
+    }
+
+    /// Whether a dialog node is published — it is withdrawn the moment an
+    /// exit is staged.
+    fn dialog_up<S: 'static, V: View<S>>(root: &RenderRoot<S, V>) -> bool {
+        root.semantics()
+            .nodes
+            .iter()
+            .any(|(_, n)| n.role() == Role::Dialog)
     }
 
     #[test]
@@ -2582,5 +2947,427 @@ mod tests {
             !closed.nodes.iter().any(|(_, n)| n.role() == Role::Dialog),
             "a panel on its way out is not there to be read"
         );
+    }
+
+    // ---- the dismiss veto, the field-first Escape and focus return --------
+
+    /// Push a modal over the harness' navigator showing a field labelled
+    /// `inside`, shaped by `shape`.
+    fn push_field_modal(
+        h: &NavHarness,
+        shape: impl Fn(ModalView<NavState>) -> ModalView<NavState> + 'static,
+    ) {
+        show_modal(
+            &h.controller,
+            move || shape(modal(field("inside"), ModalConfig::centered())),
+            |state: &mut NavState, result: PopResult| state.results.push(result.take::<i32>()),
+        );
+    }
+
+    /// Bring the pushed modal up and focus the field inside it.
+    fn focus_inside(h: &mut NavHarness) {
+        h.drive_fields(0);
+        h.click(PANEL_CENTRE.x, PANEL_CENTRE.y);
+        h.drive_fields(1_000);
+        assert_eq!(
+            h.focused().as_deref(),
+            Some("inside"),
+            "the field took focus"
+        );
+    }
+
+    #[test]
+    fn one_escape_in_a_focused_field_pops_the_page_by_default() {
+        let mut h = NavHarness::new();
+        push_field_modal(&h, |m| m);
+        focus_inside(&mut h);
+        h.escape();
+        h.drive_fields(2_000);
+        assert_eq!(h.controller.depth(), 1, "one Escape closes the dialog");
+        assert_eq!(h.state.results, vec![None]);
+    }
+
+    #[test]
+    fn a_veto_keeps_an_escape_from_a_focused_field_and_dismiss_lets_it_pop() {
+        let mut h = NavHarness::new();
+        push_field_modal(&h, |m| {
+            m.on_dismiss(|s: &mut NavState| s.dismissed += 1)
+                .on_dismiss_request(recording_veto)
+        });
+        h.state.keep = true;
+        focus_inside(&mut h);
+        h.escape();
+        h.drive_fields(2_000);
+        assert_eq!(h.state.causes, vec![DismissCause::Escape]);
+        assert_eq!(h.controller.depth(), 2, "kept: the page stays");
+        assert_eq!(h.state.dismissed, 0, "no on_dismiss on a kept dismissal");
+        assert_eq!(h.focused(), None, "the field blurred all the same");
+        assert_eq!(h.typed(), None, "and nothing holds the session");
+        assert!(dialog_up(&h.root), "no exit was staged");
+
+        h.state.keep = false;
+        h.click(PANEL_CENTRE.x, PANEL_CENTRE.y);
+        h.escape();
+        h.drive_fields(3_000);
+        assert_eq!(h.state.causes.len(), 2);
+        assert_eq!(h.state.dismissed, 1);
+        assert_eq!(h.controller.depth(), 1, "dismissed: the page pops");
+    }
+
+    #[test]
+    fn a_veto_sees_the_backdrop_and_the_back_press_and_keep_holds_both() {
+        let mut h = NavHarness::new();
+        push_field_modal(&h, |m| m.on_dismiss_request(recording_veto));
+        h.state.keep = true;
+        h.drive_fields(0);
+
+        h.click(5.0, 5.0);
+        h.drive_fields(1_000);
+        assert_eq!(h.state.causes, vec![DismissCause::Backdrop]);
+        assert_eq!(h.controller.depth(), 2);
+        assert!(dialog_up(&h.root), "no exit ramp for a kept backdrop click");
+
+        h.controller.request_back();
+        h.drive_fields(2_000);
+        assert_eq!(
+            h.state.causes,
+            vec![DismissCause::Backdrop, DismissCause::Back],
+            "the back press reached the veto on the housekeeping pass"
+        );
+        assert_eq!(h.controller.depth(), 2);
+        assert!(dialog_up(&h.root), "no exit ramp for a kept back press");
+
+        h.state.keep = false;
+        h.controller.request_back();
+        h.drive_fields(3_000);
+        assert_eq!(h.state.causes.last(), Some(&DismissCause::Back));
+        assert_eq!(h.controller.depth(), 1, "a dismissed back press pops");
+        assert_eq!(h.state.results, vec![None]);
+    }
+
+    #[test]
+    fn a_non_dismissable_page_never_asks_the_veto() {
+        let mut h = NavHarness::new();
+        show_modal(
+            &h.controller,
+            || {
+                modal(
+                    Block(Size::new(200.0, 120.0)),
+                    ModalConfig::centered().dismissable(false),
+                )
+                .on_dismiss_request(recording_veto)
+            },
+            |_: &mut NavState, _: PopResult| {},
+        );
+        h.drive(0);
+        h.click(5.0, 5.0);
+        h.controller.request_back();
+        h.drive(1_000);
+        assert!(h.state.causes.is_empty());
+        assert_eq!(h.controller.depth(), 2);
+    }
+
+    #[test]
+    fn escape_leaves_field_first_takes_two_escapes_with_a_field_and_one_without() {
+        let mut h = NavHarness::new();
+        push_field_modal(&h, |m| m.escape_leaves_field_first(true));
+        focus_inside(&mut h);
+        h.escape();
+        h.drive_fields(2_000);
+        assert_eq!(h.focused(), None, "the first Escape left the field");
+        assert_eq!(h.controller.depth(), 2, "and only that");
+        h.escape();
+        h.drive_fields(3_000);
+        assert_eq!(h.controller.depth(), 1, "the second Escape dismisses");
+
+        // With no field focused the first Escape is the dismissal.
+        let mut h = NavHarness::new();
+        push_field_modal(&h, |m| m.escape_leaves_field_first(true));
+        h.drive_fields(0);
+        // A press on the backdrop's edge of the panel seats the host's own
+        // focus without a field: the scrim press and release land apart.
+        h.root.event(
+            &mut h.state,
+            &InputEvent::Pointer(PointerEvent {
+                phase: PointerPhase::Down,
+                position: Point::new(5.0, 5.0),
+                button: PointerButton::Primary,
+            }),
+        );
+        h.root.event(
+            &mut h.state,
+            &InputEvent::Pointer(PointerEvent {
+                phase: PointerPhase::Up,
+                position: PANEL_CENTRE,
+                button: PointerButton::Primary,
+            }),
+        );
+        h.drive_fields(1_000);
+        assert_eq!(h.controller.depth(), 2, "a press-and-drag is no click");
+        h.escape();
+        h.drive_fields(2_000);
+        assert_eq!(h.controller.depth(), 1, "one Escape with no field focused");
+    }
+
+    #[test]
+    fn a_modified_escape_in_a_field_is_the_fields_own() {
+        let mut h = NavHarness::new();
+        push_field_modal(&h, |m| m.escape_leaves_field_first(true));
+        focus_inside(&mut h);
+        h.root.event(
+            &mut h.state,
+            &InputEvent::Key(KeyEvent {
+                key: Key::Named(NamedKey::Escape),
+                modifiers: Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                repeat: false,
+            }),
+        );
+        h.drive_fields(2_000);
+        assert_eq!(h.controller.depth(), 2, "the field answered it");
+    }
+
+    /// Focus the page's own field, then push a field modal over it.
+    fn over_a_focused_field(
+        shape: impl Fn(ModalView<NavState>) -> ModalView<NavState> + 'static,
+    ) -> NavHarness {
+        let mut h = NavHarness::over_a_field();
+        h.click(10.0, 10.0);
+        h.drive_fields(0);
+        assert_eq!(h.focused().as_deref(), Some("below"));
+        push_field_modal(&h, shape);
+        h.drive_fields(500);
+        assert_eq!(h.controller.depth(), 2, "the modal is up");
+        h
+    }
+
+    #[test]
+    fn a_dismissed_modal_returns_focus_to_the_field_below() {
+        let mut h = over_a_focused_field(|m| m);
+        h.click(5.0, 5.0);
+        h.drive_fields(1_000);
+        assert_eq!(h.controller.depth(), 1, "the backdrop click popped it");
+        assert_eq!(h.typed(), Some("below"), "focus came back");
+
+        let mut h = over_a_focused_field(|m| m.return_focus(false));
+        h.click(5.0, 5.0);
+        h.drive_fields(1_000);
+        assert_eq!(h.controller.depth(), 1);
+        assert_eq!(h.typed(), None, "return_focus(false) gives nothing back");
+    }
+
+    #[test]
+    fn an_escape_from_the_field_inside_returns_focus_to_the_field_below() {
+        let mut h = over_a_focused_field(|m| m);
+        h.click(PANEL_CENTRE.x, PANEL_CENTRE.y);
+        h.drive_fields(1_000);
+        assert_eq!(h.focused().as_deref(), Some("inside"));
+        h.escape();
+        h.drive_fields(2_000);
+        assert_eq!(h.controller.depth(), 1);
+        assert_eq!(h.typed(), Some("below"));
+    }
+
+    /// The deferred back path: the panel's field still holds the session as
+    /// the back press stages the exit, with a veto and without one.
+    #[test]
+    fn a_back_press_returns_focus_to_the_field_below() {
+        for veto in [false, true] {
+            let mut h = over_a_focused_field(move |m| {
+                if veto {
+                    m.on_dismiss_request(recording_veto)
+                } else {
+                    m
+                }
+            });
+            h.click(PANEL_CENTRE.x, PANEL_CENTRE.y);
+            h.drive_fields(1_000);
+            assert_eq!(h.focused().as_deref(), Some("inside"));
+            h.controller.request_back();
+            h.drive_fields(2_000);
+            assert_eq!(h.controller.depth(), 1, "veto {veto}: popped");
+            assert_eq!(
+                h.typed(),
+                Some("below"),
+                "veto {veto}: the session inside was ended and focus came back"
+            );
+            assert_eq!(h.state.causes.len(), usize::from(veto));
+        }
+    }
+
+    #[derive(Default)]
+    struct FieldState {
+        open: bool,
+        dismissed: u32,
+    }
+
+    /// A field labelled `below` with a kept-mounted host over it in a
+    /// full-area [`frust::Stack`]; the app owns the open flag.
+    struct FieldStack {
+        root: RenderRoot<FieldState, frust::StackView<FieldState>>,
+        state: FieldState,
+        tcx: TextContext,
+        return_focus: bool,
+    }
+
+    impl FieldStack {
+        fn new(return_focus: bool) -> Self {
+            let mut h = FieldStack {
+                root: RenderRoot::new(),
+                state: FieldState::default(),
+                tcx: TextContext::new(),
+                return_focus,
+            };
+            h.frame(0);
+            h
+        }
+
+        fn pass(&mut self) {
+            let return_focus = self.return_focus;
+            let mut logic = move |s: &mut FieldState| {
+                let host = modal(Block(CONTENT), ModalConfig::centered())
+                    .open(s.open)
+                    .return_focus(return_focus)
+                    .on_dismiss(|s: &mut FieldState| {
+                        s.dismissed += 1;
+                        s.open = false;
+                    });
+                frust::stack().child(field("below")).child(host)
+            };
+            self.root.rebuild(&mut logic, &mut self.state);
+            self.root
+                .layout_with_text(WINDOW, &mut self.tcx as &mut dyn Any);
+        }
+
+        /// One shell frame: rebuild, layout, paint at `ms`.
+        fn frame(&mut self, ms: u64) {
+            self.pass();
+            self.root.paint(
+                &mut Recorder::default(),
+                FrameTime::from_nanos(ms * 1_000_000),
+            );
+        }
+
+        fn pointer(&mut self, phase: PointerPhase, at: Point) {
+            self.root.event(
+                &mut self.state,
+                &InputEvent::Pointer(PointerEvent {
+                    phase,
+                    position: at,
+                    button: PointerButton::Primary,
+                }),
+            );
+        }
+
+        fn click(&mut self, at: Point) {
+            self.pointer(PointerPhase::Down, at);
+            self.pointer(PointerPhase::Up, at);
+        }
+
+        fn escape(&mut self) {
+            self.root.event(
+                &mut self.state,
+                &InputEvent::Key(KeyEvent {
+                    key: Key::Named(NamedKey::Escape),
+                    modifiers: Modifiers::default(),
+                    repeat: false,
+                }),
+            );
+        }
+
+        /// Focus the field, open the host, settle it, and press inside its
+        /// panel — which moves the session onto the host.
+        fn open_over_the_field(&mut self) {
+            self.click(Point::new(10.0, 10.0));
+            self.frame(10);
+            assert_eq!(focused_label(&self.root).as_deref(), Some("below"));
+            self.state.open = true;
+            self.frame(20);
+            self.frame(SETTLED);
+            self.click(centred_rect().center());
+            self.frame(SETTLED + 1);
+            assert_ne!(
+                focused_label(&self.root).as_deref(),
+                Some("below"),
+                "the press inside moved the focus onto the host"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stack_mounted_host_returns_focus_to_the_field_beside_it() {
+        let mut h = FieldStack::new(true);
+        h.open_over_the_field();
+        h.escape();
+        assert_eq!(h.state.dismissed, 1);
+        // The rebuild that closes it latches the exit's clock, the next one
+        // settles it, the one after closes the scope; the return runs on the
+        // rebuild after that.
+        h.frame(SETTLED + 2);
+        h.frame(SETTLED + EXIT_SPAN);
+        h.frame(SETTLED + EXIT_SPAN * 2);
+        h.pass();
+        assert_eq!(typed_into(&mut h.root, &mut h.state), Some("below"));
+
+        let mut h = FieldStack::new(false);
+        h.open_over_the_field();
+        h.escape();
+        h.frame(SETTLED + 2);
+        h.frame(SETTLED + EXIT_SPAN);
+        h.frame(SETTLED + EXIT_SPAN * 2);
+        h.pass();
+        assert_eq!(
+            typed_into(&mut h.root, &mut h.state),
+            None,
+            "return_focus(false)"
+        );
+    }
+
+    /// A press the panel takes on the frame before its exit settles is still
+    /// inside the scope: the host keeps registering through the settling
+    /// paint, so the session it seated is ended and focus still returns.
+    #[test]
+    fn a_press_on_the_panel_just_before_the_exit_settles_still_returns_focus() {
+        let mut h = FieldStack::new(true);
+        h.open_over_the_field();
+        h.click(Point::new(2.0, 2.0));
+        assert_eq!(h.state.dismissed, 1, "the backdrop click dismissed it");
+        h.frame(SETTLED + 2);
+        h.frame(SETTLED + EXIT_SPAN / 4);
+        // Still exiting, so the host still takes the press and the focus.
+        h.pointer(PointerPhase::Down, centred_rect().center());
+        h.pointer(PointerPhase::Up, centred_rect().center());
+        h.frame(SETTLED + EXIT_SPAN * 2);
+        h.frame(SETTLED + EXIT_SPAN * 3);
+        h.pass();
+        assert_eq!(typed_into(&mut h.root, &mut h.state), Some("below"));
+    }
+
+    #[test]
+    fn a_reopened_kept_mounted_host_returns_focus_again() {
+        let mut h = FieldStack::new(true);
+        h.open_over_the_field();
+        h.escape();
+        h.frame(SETTLED + 2);
+        h.frame(SETTLED + EXIT_SPAN);
+        h.frame(SETTLED + EXIT_SPAN * 2);
+        h.pass();
+        assert_eq!(typed_into(&mut h.root, &mut h.state), Some("below"));
+
+        // A second episode on the same widget.
+        h.state.open = true;
+        h.frame(10_000);
+        h.frame(10_000 + SETTLED);
+        h.click(centred_rect().center());
+        h.frame(10_000 + SETTLED + 1);
+        h.escape();
+        assert_eq!(h.state.dismissed, 2);
+        h.frame(10_000 + SETTLED + 2);
+        h.frame(10_000 + SETTLED + EXIT_SPAN);
+        h.frame(10_000 + SETTLED + EXIT_SPAN * 2);
+        h.pass();
+        assert_eq!(typed_into(&mut h.root, &mut h.state), Some("below"));
     }
 }

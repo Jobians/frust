@@ -35,7 +35,36 @@
 //! plus **Escape**, once the modal holds focus — claimed on every `Down`, the
 //! `frust_material::dialog` opt-in, with the same documented gap: there is no
 //! auto-focus-on-appear hook in the framework, so a caller must complete one
-//! pointer interaction with the modal before Escape does anything.
+//! pointer interaction with the modal before Escape does anything — and a
+//! **back press**, on a page [`show_modal`] pushed: the page carries
+//! [`BackPolicy::DismissAnimated`], so the navigator bumps a shared
+//! dismiss-signal cell instead of popping, and the host stages the same exit a
+//! scrim tap stages. The panel animates out and *then* pops.
+//!
+//! # The dismiss veto, and leaving a field first
+//!
+//! [`ModalView::on_dismiss_request`] asks the app, with `&mut State`, before an
+//! Escape, a scrim tap or a back press dismisses (the [`DismissCause`]).
+//! [`DismissDecision::Keep`] holds the modal open: no `on_dismiss`, no exit
+//! ramp, no focus release, and the input is still consumed. The close X, the
+//! handle and a drag are explicit closes and do not ask. A back press arrives at
+//! paint, where no app state exists, so with a veto installed it is recorded,
+//! flagged with [`mark_pending_result_flush`], and decided in the next
+//! rebuild's [`InputEvent::Housekeeping`] broadcast.
+//!
+//! A focused text field inside the panel declines the bare Escape that blurs
+//! it, so by default one Escape leaves the field *and* closes the modal.
+//! [`ModalView::escape_leaves_field_first`] makes that Escape only leave the
+//! field, and the next one dismisses. The blur ends the focus session, so until
+//! focus comes back the host declares a local Escape shortcut, which is how that
+//! next Escape still reaches it.
+//!
+//! # Focus return
+//!
+//! [`ModalView::return_focus`], on by default, registers a [`FocusScopeKey`]
+//! every paint the modal is open, up to and including the paint that fires its
+//! close. When it stops, focus goes back to the control that held it as the
+//! modal opened, once the panel has left.
 //!
 //! # The barrier swallows keys too
 //!
@@ -66,13 +95,13 @@
 //!
 //! # Exit motion, and why the close hook is state-free
 //!
-//! Every dismiss trigger — scrim tap, Escape, the close X, the handle, a
-//! drag past its threshold — stages an **exit** instead of firing the app's
-//! dismissal on the spot: the same `progress` ramp runs back down to `0.0`
-//! (fade-zoom reverses its alpha and scale, a slide reverses its edge offset,
-//! the scrim fades with either), the barrier keeps swallowing input the whole
-//! way, a second trigger mid-exit is a no-op, and only when the ramp settles is
-//! the dismissal fired — from `paint`, which is sound because
+//! Every dismiss trigger — scrim tap, Escape, a back press, the close X, the
+//! handle, a drag past its threshold — stages an **exit** instead of firing
+//! the app's dismissal on the spot: the same `progress` ramp runs back down
+//! to `0.0` (fade-zoom reverses its alpha and scale, a slide reverses its edge
+//! offset, the scrim fades with either), the barrier keeps swallowing input
+//! the whole way, a second trigger mid-exit is a no-op, and only when the ramp
+//! settles is the dismissal fired — from `paint`, which is sound because
 //! [`NavigatorController::pop`] merely *enqueues* an op applied on the next
 //! rebuild (the `frust_material::sheet`/`frust_glyph::dialog` precedent; the
 //! same paint asks for one more frame so that rebuild is guaranteed to come).
@@ -126,22 +155,25 @@
 //! ([`ModalWidget::settle_drag`]) — the same reachability rule the Escape
 //! handler already applied by gating on `dismissable()`.
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
 use frust::authoring::{
-    Affine, AnyView, BezPath, BoxConstraints, Brush, BuildCtx, ChangeFlags, ChildPod, Color,
-    CursorIcon, ErasedCallback, EventCtx, EventResult, InputEvent, Key, LayoutCtx, NamedKey,
-    PaintCtx, PaintScene, Point, PointerPhase, Rect, Role, RoundedRect, SemanticsCtx, Shape, Size,
-    ThemeTextColor, ThemeTextType, View, ViewSeq, Widget, any, build_child, erase_callback,
-    rebuild_child, route_event_single, teardown_child, text::FontWeight, visit_children,
+    Affine, AnyView, BezPath, BoxConstraints, Brush, BuildCtx, ChangeFlags, ChildPod, Chord, Color,
+    CursorIcon, DismissCause, DismissDecision, ErasedCallback, EventCtx, EventResult,
+    FocusScopeKey, InputEvent, Key, KeyEvent, LayoutCtx, Modifiers, NamedKey, PaintCtx, PaintScene,
+    Point, PointerPhase, Rect, Role, RoundedRect, SemanticsCtx, Shape, ShortcutDecl, ShortcutId,
+    ShortcutScope, Size, ThemeTextColor, ThemeTextType, View, ViewSeq, Widget, any, build_child,
+    erase_callback, mark_pending_result_flush, rebuild_child, route_event_single, teardown_child,
+    text::FontWeight, visit_children,
 };
 use frust::input::{TOUCH_SLOP, VelocityTracker};
 use frust::motion::detent::{self, DetentRelease, Detents, DismissPolicy};
 use frust::{
-    AnimationController, CrossAxisAlignment, Curve, EdgeInsets, FlexChild, FlexView, FrameTime,
-    NavigatorController, Padding, PopResult, SizedBox, Theme, TransitionSpec, flexible, inflexible,
-    text,
+    AnimationController, BackPolicy, CrossAxisAlignment, Curve, EdgeInsets, FlexChild, FlexView,
+    FrameTime, NavigatorController, Padding, PopResult, PushOptions, SizedBox, Theme,
+    TransitionSpec, flexible, inflexible, text,
 };
 use kurbo::RoundedRectRadii;
 
@@ -524,6 +556,19 @@ impl ModalConfig {
 /// A view-held, typed dismiss callback (erased on build).
 type OnDismiss<State> = Rc<dyn Fn(&mut State)>;
 
+/// A view-held, typed dismiss veto (erased on build).
+type OnDismissRequest<State> = Rc<dyn Fn(&mut State, DismissCause) -> DismissDecision>;
+
+/// The widget-held, `State`-erased dismiss veto.
+type ErasedDismissRequest = Box<dyn FnMut(&mut EventCtx, DismissCause) -> DismissDecision>;
+
+/// Erase a view-held veto into the adapter the widget calls during the event
+/// pass, recovering `State` from the context the way [`erase_callback`] does.
+fn erase_dismiss_request<State: 'static>(veto: &OnDismissRequest<State>) -> ErasedDismissRequest {
+    let veto = veto.clone();
+    Box::new(move |ctx: &mut EventCtx, cause| veto(ctx.state_mut::<State>(), cause))
+}
+
 /// A state-free close hook, fired from `paint` when an exit ramp settles (see
 /// the [module docs](self)).
 pub type OnClose = Rc<dyn Fn()>;
@@ -532,8 +577,8 @@ pub type OnClose = Rc<dyn Fn()>;
 ///
 /// Every modal builder in the catalog implements it by storing the callback in
 /// its own `on_dismiss` slot; the trait exists so one push helper serves all
-/// five rather than each component re-deriving the same
-/// `push_transparent_for_result` call.
+/// five rather than each component re-deriving the same `push_with_options`
+/// call.
 ///
 /// Its element is the shared [`ModalWidget`] by definition — a modal component
 /// *is* a pre-configured modal host — which is what lets [`show_modal`] install
@@ -560,6 +605,9 @@ pub fn modal<State: 'static, V: View<State>>(content: V, config: ModalConfig) ->
         label: None,
         on_dismiss: None,
         on_close: None,
+        on_dismiss_request: None,
+        escape_leaves_field_first: false,
+        return_focus: true,
         snap_points: Vec::new(),
     }
 }
@@ -576,6 +624,9 @@ pub struct ModalView<State: 'static> {
     pub(crate) label: Option<String>,
     pub(crate) on_dismiss: Option<OnDismiss<State>>,
     pub(crate) on_close: Option<OnClose>,
+    pub(crate) on_dismiss_request: Option<OnDismissRequest<State>>,
+    pub(crate) escape_leaves_field_first: bool,
+    pub(crate) return_focus: bool,
     pub(crate) snap_points: Vec<f64>,
 }
 
@@ -606,6 +657,55 @@ impl<State: 'static> ModalView<State> {
     /// see [`ModalWidget`]'s `on_close` field doc for why.
     pub fn on_close<F: Fn() + 'static>(mut self, on_close: F) -> Self {
         self.on_close = Some(Rc::new(on_close));
+        self
+    }
+
+    /// Set the **dismiss veto**: asked with `&mut State`, before
+    /// [`on_dismiss`](Self::on_dismiss), on every dismissal attempt a
+    /// dismissable modal sees from an Escape, a scrim tap
+    /// ([`ModalConfig::scrim_dismiss`]) or a back press on a [`show_modal`]
+    /// page — the [`DismissCause`] says which. The close X, the drag handle and
+    /// a drag past the threshold are explicit closes and never ask.
+    ///
+    /// [`DismissDecision::Dismiss`] proceeds exactly as with no veto.
+    /// [`DismissDecision::Keep`] holds the modal open: no `on_dismiss`, no exit
+    /// ramp, no focus release, and the input that asked is still consumed. An
+    /// Escape that blurs a focused field inside the panel has already blurred
+    /// it by the time the veto runs. A back press reaches the host at paint, so
+    /// its veto runs one rebuild later, in that rebuild's `Housekeeping` pass.
+    ///
+    /// A veto does not hold the modal open across `Router::go`, which closes
+    /// route-less overlays regardless of any veto.
+    pub fn on_dismiss_request<F>(mut self, on_dismiss_request: F) -> Self
+    where
+        F: Fn(&mut State, DismissCause) -> DismissDecision + 'static,
+    {
+        self.on_dismiss_request = Some(Rc::new(on_dismiss_request));
+        self
+    }
+
+    /// Make a bare Escape that blurs a focused field inside the panel only
+    /// leave the field, rather than also closing the modal. Default `false`:
+    /// one Escape leaves the field and dismisses.
+    ///
+    /// With it on, the Escape the content gives its focus up on is consumed
+    /// and nothing is dismissed; the next Escape dismisses as usual. The blur
+    /// ends the focus session, so until focus comes back the modal declares a
+    /// local Escape shortcut that keeps that next Escape reaching it.
+    pub fn escape_leaves_field_first(mut self, escape_leaves_field_first: bool) -> Self {
+        self.escape_leaves_field_first = escape_leaves_field_first;
+        self
+    }
+
+    /// Give focus back, once the modal closes, to the control that held it as
+    /// the modal opened (the WAI-ARIA dialog pattern). Default `true`.
+    ///
+    /// While on, every paint the modal is open registers a focus-return scope
+    /// keyed to this mount, up to and including the paint that fires its close.
+    /// Read at each paint, so turning it off while the modal is open closes the
+    /// scope there and then: set it once, when the modal is built.
+    pub fn return_focus(mut self, return_focus: bool) -> Self {
+        self.return_focus = return_focus;
         self
     }
 
@@ -647,6 +747,19 @@ impl<State: 'static> ModalContent<State> for ModalView<State> {
 /// dismissal actually takes here), and as the unstaged
 /// [`ModalContent::on_modal_dismiss`] callback, which only runs for a config
 /// with no entrance to reverse. Exactly one of the two fires per dismissal.
+///
+/// # Back press
+///
+/// The page is pushed with [`BackPolicy::DismissAnimated`] and a shared
+/// dismiss-signal cell the navigator bumps instead of popping, so a back press
+/// goes through the host like any other dismissal: it plays the same staged
+/// exit a scrim tap plays and pops once that settles, exactly once, after
+/// asking [`ModalView::on_dismiss_request`] when one is installed. Every modal
+/// pushed here is dismissable (both close channels are wired), so the page is
+/// never pushed [`BackPolicy::Veto`].
+///
+/// This changed: a back press used to pop the page on the spot, with no exit
+/// ramp and without the host seeing it.
 pub fn show_modal<State, V, B, R>(controller: &NavigatorController<State>, build: B, on_result: R)
 where
     State: 'static,
@@ -656,17 +769,24 @@ where
 {
     let dismiss_ctrl = controller.clone();
     let close_ctrl = controller.clone();
-    controller.push_transparent_for_result(
+    let signal = Rc::new(Cell::new(0u64));
+    let widget_signal = signal.clone();
+    let options = PushOptions::transparent()
+        .transition(TransitionSpec::NONE)
+        .back(BackPolicy::DismissAnimated)
+        .dismiss_signal(signal)
+        .on_result(on_result);
+    controller.push_with_options(
         move || {
             let ctrl = dismiss_ctrl.clone();
             let close = close_ctrl.clone();
             any::<State, _>(StagedExit {
                 inner: build().on_modal_dismiss(Rc::new(move |_state: &mut State| ctrl.pop())),
                 on_close: Rc::new(move || close.pop()) as OnClose,
+                dismiss_signal: Some(widget_signal.clone()),
             })
         },
-        TransitionSpec::NONE,
-        on_result,
+        options,
     );
 }
 
@@ -681,9 +801,13 @@ where
 /// writes this field itself, so `StagedExit::rebuild`'s own reinstall below
 /// (which runs *after* `inner.rebuild`) is the sole rebuild-time writer on
 /// this path — it always wins rather than merely winning last.
+///
+/// It carries the page's back-press dismiss-signal cell the same way, installed
+/// at build and only re-installed on a widget that has none.
 struct StagedExit<V> {
     inner: V,
     on_close: OnClose,
+    dismiss_signal: Option<Rc<Cell<u64>>>,
 }
 
 impl<State: 'static, V: View<State, Element = ModalWidget>> View<State> for StagedExit<V> {
@@ -692,6 +816,7 @@ impl<State: 'static, V: View<State, Element = ModalWidget>> View<State> for Stag
     fn build(&self, ctx: &mut BuildCtx<'_>) -> ModalWidget {
         let mut widget = self.inner.build(ctx);
         widget.on_close = Some(self.on_close.clone());
+        widget.set_dismiss_signal(self.dismiss_signal.clone());
         widget
     }
 
@@ -703,6 +828,12 @@ impl<State: 'static, V: View<State, Element = ModalWidget>> View<State> for Stag
     ) -> ChangeFlags {
         let flags = self.inner.rebuild(&prev.inner, element, ctx);
         element.on_close = Some(self.on_close.clone());
+        // Not re-seeded: `set_dismiss_signal` takes the cell's current
+        // generation as already seen, which on the rebuild a back press itself
+        // triggers would swallow that very bump.
+        if element.dismiss_signal.is_none() {
+            element.set_dismiss_signal(self.dismiss_signal.clone());
+        }
         flags
     }
 
@@ -831,6 +962,25 @@ pub struct ModalWidget {
     /// needs a live reinstall (its own hook is a fixed `controller.pop()`
     /// closure that never changes across rebuilds anyway).
     on_close: Option<OnClose>,
+    /// The dismiss veto (see [`ModalView::on_dismiss_request`]).
+    on_dismiss_request: Option<ErasedDismissRequest>,
+    /// See [`ModalView::escape_leaves_field_first`].
+    escape_leaves_field_first: bool,
+    /// See [`ModalView::return_focus`].
+    return_focus: bool,
+    /// This mount's focus-return scope, allocated at build.
+    focus_scope: FocusScopeKey,
+    /// The shared back-press dismiss-signal cell [`show_modal`] installs, and
+    /// the last generation observed from it.
+    dismiss_signal: Option<Rc<Cell<u64>>>,
+    last_seen_dismiss: u64,
+    /// A back press observed at paint, owed to the veto (or, with no close
+    /// hook to fire from paint, to `on_dismiss`) on the next `Housekeeping`.
+    pending_back: bool,
+    /// An Escape left a field inside the panel and the session ended with it:
+    /// paint declares [`Self::escape_shortcut`] until focus comes back.
+    escape_armed: bool,
+    escape_shortcut: ShortcutId,
     /// The drawer's resting points, as authored (see [`ModalView::snap_points`]).
     snap_points: Vec<f64>,
     /// `snap_points` as the shared detent math, rebuilt only where
@@ -983,6 +1133,89 @@ impl ModalWidget {
     /// Whether this modal can be dismissed at all (either channel wired).
     fn dismissable(&self) -> bool {
         self.on_dismiss.is_some() || self.on_close.is_some()
+    }
+
+    /// Install the shared back-press dismiss-signal cell, seeding the observed
+    /// generation so the cell's current value never reads as a fresh bump.
+    fn set_dismiss_signal(&mut self, signal: Option<Rc<Cell<u64>>>) {
+        self.last_seen_dismiss = signal.as_ref().map_or(0, |s| s.get());
+        self.dismiss_signal = signal;
+    }
+
+    /// A dismissal attempt from `cause`: ask the veto, then dismiss. Returns
+    /// whether the dismissal went ahead.
+    ///
+    /// An attempt while an exit is already running, or after the close fired,
+    /// is a no-op that asks nobody — the same refusal [`Self::request_dismiss`]
+    /// applies.
+    fn attempt_dismiss(&mut self, ctx: &mut EventCtx, cause: DismissCause) -> bool {
+        if self.exiting || self.closed {
+            return false;
+        }
+        if let Some(veto) = self.on_dismiss_request.as_mut()
+            && veto(ctx, cause) == DismissDecision::Keep
+        {
+            return false;
+        }
+        self.request_dismiss(ctx);
+        true
+    }
+
+    /// Observe the back-press dismiss-signal cell, once per bump — the
+    /// [`BackPolicy::DismissAnimated`] seam's widget-side half.
+    ///
+    /// With no veto and a close hook, the exit is staged right here, exactly
+    /// as a scrim tap stages it. A veto needs `&mut State`, which no paint has,
+    /// so the attempt is recorded instead and decided in the next rebuild's
+    /// `Housekeeping` broadcast ([`Self::flush_pending_back`]); so is one with
+    /// no close hook, whose `on_dismiss` needs that state too.
+    fn observe_dismiss_signal(&mut self, ctx: &mut PaintCtx) {
+        let Some(signal) = &self.dismiss_signal else {
+            return;
+        };
+        let current = signal.get();
+        if current == self.last_seen_dismiss {
+            return;
+        }
+        self.last_seen_dismiss = current;
+        if !self.dismissable() || self.exiting || self.closed {
+            return;
+        }
+        if self.on_dismiss_request.is_some() || self.on_close.is_none() {
+            self.pending_back = true;
+            mark_pending_result_flush();
+            ctx.request_frame();
+            return;
+        }
+        if self.config.entrance == ModalEntrance::None {
+            // Nothing to reverse: close on the spot, as `request_dismiss`
+            // does for the same config.
+            if let Some(on_close) = &self.on_close {
+                self.closed = true;
+                on_close();
+            }
+        } else {
+            self.begin_ramp(0.0, true);
+        }
+        ctx.request_frame();
+    }
+
+    /// Decide a back press [`Self::observe_dismiss_signal`] recorded, now that
+    /// `&mut State` is in scope.
+    fn flush_pending_back(&mut self, ctx: &mut EventCtx) {
+        if std::mem::take(&mut self.pending_back) && self.dismissable() {
+            self.attempt_dismiss(ctx, DismissCause::Back);
+        }
+    }
+
+    /// The local Escape shortcut [`Self::escape_armed`] declares.
+    fn escape_shortcut_decl(&self) -> ShortcutDecl {
+        ShortcutDecl {
+            id: self.escape_shortcut,
+            chord: Chord::new(Key::Named(NamedKey::Escape), Modifiers::default()),
+            label: "Close".to_string(),
+            scope: ShortcutScope::Local,
+        }
     }
 
     /// Start a ramp from the current progress to `to`, over the entrance's own
@@ -1178,6 +1411,15 @@ impl<State: 'static> View<State> for ModalView<State> {
             label: self.label.clone(),
             on_dismiss: self.on_dismiss.as_ref().map(erase_callback),
             on_close: self.on_close.clone(),
+            on_dismiss_request: self.on_dismiss_request.as_ref().map(erase_dismiss_request),
+            escape_leaves_field_first: self.escape_leaves_field_first,
+            return_focus: self.return_focus,
+            focus_scope: FocusScopeKey::new(),
+            dismiss_signal: None,
+            last_seen_dismiss: 0,
+            pending_back: false,
+            escape_armed: false,
+            escape_shortcut: ShortcutId::next(),
             snap_points: self.snap_points.clone(),
             detents: Detents::new(&self.snap_points),
             panel: Rect::ZERO,
@@ -1232,6 +1474,12 @@ impl<State: 'static> View<State> for ModalView<State> {
         // `on_close` is deliberately left untouched here — see the field's
         // doc comment on `ModalWidget::on_close` for why.
         element.on_dismiss = self.on_dismiss.as_ref().map(erase_callback);
+        element.on_dismiss_request = self.on_dismiss_request.as_ref().map(erase_dismiss_request);
+        element.escape_leaves_field_first = self.escape_leaves_field_first;
+        if element.return_focus != self.return_focus {
+            element.return_focus = self.return_focus;
+            flags |= ChangeFlags::PAINT;
+        }
         flags
     }
 
@@ -1402,6 +1650,11 @@ fn hit(rect: Option<Rect>, pos: Point) -> bool {
     rect.is_some_and(|r| r.contains(pos))
 }
 
+/// Whether `key` is pressed with no modifier held.
+fn is_bare(key: &KeyEvent) -> bool {
+    key.modifiers == Modifiers::default()
+}
+
 impl Widget for ModalWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
         let area = Size::new(
@@ -1442,6 +1695,15 @@ impl Widget for ModalWidget {
 
         // The event pass has no clock of its own; this is the one it reads.
         self.last_frame_time = now;
+
+        // Decided before the settle below may fire the close: the paint that
+        // fires it still registers the scope, so a session claimed inside the
+        // panel since the last paint is recorded as held there, and the root
+        // ends it and returns focus once the scope stops on the next paint.
+        let scope_open = self.return_focus && !self.closed;
+
+        // A back press, before the ramp advances, so a staged exit seeds here.
+        self.observe_dismiss_signal(ctx);
 
         // Advance (or collapse) the running ramp. The entrance's target
         // resolves here, on the first paint, because a snap point in logical px
@@ -1486,6 +1748,20 @@ impl Widget for ModalWidget {
                 self.closed = true;
                 on_close();
                 ctx.request_frame();
+            }
+        }
+        // Before the content paints, so a scope nested inside it registers
+        // after this one (outermost first).
+        if scope_open {
+            ctx.register_focus_scope(self.focus_scope);
+        }
+        if self.escape_armed {
+            if ctx.has_focus() {
+                // Focus came back to the panel: Escape reaches it again
+                // through the focus path.
+                self.escape_armed = false;
+            } else if !self.exiting && !self.closed {
+                ctx.register_shortcut(self.escape_shortcut_decl());
             }
         }
         let progress = self.progress;
@@ -1591,8 +1867,14 @@ impl Widget for ModalWidget {
         // makes Escape reachable, and what keeps the root's focus session alive
         // while the modal is up (re-claiming while focused is a no-op; a
         // claim-once guard would kill the session on the second tap).
-        if matches!(event, InputEvent::Pointer(p) if p.phase == PointerPhase::Down) {
+        //
+        // Not once the close has fired: the panel is leaving, and a claim made
+        // after its last paint would be a session held inside a scope that
+        // never records it.
+        if matches!(event, InputEvent::Pointer(p) if p.phase == PointerPhase::Down) && !self.closed
+        {
             ctx.request_focus();
+            self.escape_armed = false;
         }
         // Content first: an action inside the panel owns its own events, and
         // this widget's own hover claims come after the routing — *unless* this
@@ -1606,17 +1888,51 @@ impl Widget for ModalWidget {
             || self.scrim_captured
             || self.drag_captured;
         let own_gesture = captured && matches!(event, InputEvent::Pointer(_));
+        // Read before routing: a focused field declines the bare Escape that
+        // blurs it, so after the routing its focus is already gone.
+        let content_focused = self.content.holds_live_focus();
         if !own_gesture && route_event_single(&mut self.content, ctx, event) == EventResult::Handled
         {
             return EventResult::Handled;
         }
-        if let InputEvent::Key(key) = event {
-            if key.key == Key::Named(NamedKey::Escape) && self.dismissable() {
-                self.request_dismiss(ctx);
+        match event {
+            InputEvent::Housekeeping => {
+                self.flush_pending_back(ctx);
+                return EventResult::Ignored;
             }
-            // The barrier swallows every other key too: nothing behind a modal
-            // may act on a keystroke its content declined.
-            return EventResult::Handled;
+            InputEvent::Shortcut(id) if *id == self.escape_shortcut => {
+                if !self.escape_armed {
+                    return EventResult::Ignored;
+                }
+                self.escape_armed = false;
+                if self.dismissable() {
+                    self.attempt_dismiss(ctx, DismissCause::Escape);
+                }
+                return EventResult::Handled;
+            }
+            InputEvent::Key(key) => {
+                if key.key == Key::Named(NamedKey::Escape) && self.dismissable() {
+                    if self.escape_leaves_field_first
+                        && content_focused
+                        && !self.content.holds_live_focus()
+                        && is_bare(key)
+                    {
+                        // The Escape only left the field. The blur ended the
+                        // session, so the next paint declares the shortcut
+                        // that lets the next Escape reach this host.
+                        self.escape_armed = true;
+                        ctx.request_redraw();
+                    } else if self.attempt_dismiss(ctx, DismissCause::Escape) && ctx.has_focus() {
+                        // Hand the keyboard back as the panel leaves: nothing
+                        // inside it should keep the session.
+                        ctx.release_focus();
+                    }
+                }
+                // The barrier swallows every other key too: nothing behind a
+                // modal may act on a keystroke its content declined.
+                return EventResult::Handled;
+            }
+            _ => {}
         }
         let InputEvent::Pointer(p) = event else {
             return EventResult::Ignored;
@@ -1730,7 +2046,7 @@ impl Widget for ModalWidget {
                 self.scrim_captured = false;
                 let released_outside = !self.panel.contains(p.position);
                 if self.config.scrim_dismiss && self.scrim_down_outside && released_outside {
-                    self.request_dismiss(ctx);
+                    self.attempt_dismiss(ctx, DismissCause::Backdrop);
                 }
                 EventResult::Handled
             }
@@ -1914,6 +2230,20 @@ pub(crate) mod tests {
     #[derive(Default)]
     struct Flags {
         dismissed: u32,
+        /// Every cause the dismiss veto was asked about, in order.
+        asked: Vec<DismissCause>,
+        /// Whether the veto answers [`DismissDecision::Keep`].
+        keep: bool,
+    }
+
+    /// The veto the tests install: record the cause, answer from `keep`.
+    fn veto(state: &mut Flags, cause: DismissCause) -> DismissDecision {
+        state.asked.push(cause);
+        if state.keep {
+            DismissDecision::Keep
+        } else {
+            DismissDecision::Dismiss
+        }
     }
 
     fn build(view: &ModalView<Flags>) -> ModalWidget {
@@ -2340,6 +2670,7 @@ pub(crate) mod tests {
         let v1 = StagedExit {
             inner: view(config),
             on_close: Rc::new(move || hook1.set(hook1.get() + 1)) as OnClose,
+            dismiss_signal: None,
         };
         let mut counter = 0u64;
         let mut w = View::<Flags>::build(&v1, &mut BuildCtx::new(&mut counter));
@@ -2352,6 +2683,7 @@ pub(crate) mod tests {
         let v2 = StagedExit {
             inner: view(config),
             on_close: Rc::new(move || hook2.set(hook2.get() + 1)) as OnClose,
+            dismiss_signal: None,
         };
         View::<Flags>::rebuild(&v2, &v1, &mut w, &mut BuildCtx::new(&mut counter));
 
@@ -3066,6 +3398,615 @@ pub(crate) mod tests {
         let mut seen = 0usize;
         Widget::visit_children(&w, &mut |_pod| seen += 1);
         assert_eq!(seen, 1);
+    }
+
+    // ---- The dismiss veto and the back-press signal, widget-level ---------
+
+    /// An entered, staged centred modal with the test veto installed.
+    fn vetoed() -> (ModalWidget, Rc<Cell<u32>>) {
+        let (view, closed) = staged(ModalConfig::centered(MAX_WIDTH_LG).close_button(true));
+        let mut w = build(&view.on_dismiss_request(veto));
+        layout(&mut w);
+        run_ramp(&mut w, 0.0);
+        (w, closed)
+    }
+
+    #[test]
+    fn a_keep_veto_holds_a_scrim_tap_and_an_escape_with_no_exit_ramp() {
+        let (mut w, closed) = vetoed();
+        let mut state = Flags {
+            keep: true,
+            ..Flags::default()
+        };
+        dispatch(&mut w, &mut state, &pointer(PointerPhase::Down, 5.0, 5.0));
+        let up = dispatch(&mut w, &mut state, &pointer(PointerPhase::Up, 5.0, 5.0));
+        assert_eq!(up, EventResult::Handled, "the tap is still consumed");
+        assert_eq!(
+            dispatch(&mut w, &mut state, &escape()),
+            EventResult::Handled,
+            "and so is the Escape"
+        );
+        assert_eq!(
+            state.asked,
+            vec![DismissCause::Backdrop, DismissCause::Escape]
+        );
+        assert!(!w.is_exiting(), "no exit ramp started");
+        run_ramp(&mut w, 3000.0);
+        assert!((w.progress() - 1.0).abs() < 1e-9, "still fully open");
+        assert_eq!((closed.get(), state.dismissed), (0, 0));
+
+        // `Dismiss` is today's behaviour.
+        state.keep = false;
+        dispatch(&mut w, &mut state, &escape());
+        assert!(w.is_exiting());
+        run_ramp(&mut w, 6000.0);
+        assert_eq!(closed.get(), 1);
+    }
+
+    #[test]
+    fn the_explicit_closes_never_ask_the_veto() {
+        let (mut w, closed) = vetoed();
+        let mut state = Flags {
+            keep: true,
+            ..Flags::default()
+        };
+        let c = w.close_rect().expect("a close box").center();
+        dispatch(&mut w, &mut state, &pointer(PointerPhase::Down, c.x, c.y));
+        dispatch(&mut w, &mut state, &pointer(PointerPhase::Up, c.x, c.y));
+        assert!(state.asked.is_empty(), "the close X is an explicit close");
+        run_ramp(&mut w, 3000.0);
+        assert_eq!(closed.get(), 1);
+    }
+
+    #[test]
+    fn a_back_press_without_a_veto_stages_the_exit_at_paint() {
+        let (view, closed) = staged(ModalConfig::centered(MAX_WIDTH_LG));
+        let mut w = build(&view);
+        let signal = Rc::new(Cell::new(7u64));
+        w.set_dismiss_signal(Some(signal.clone()));
+        layout(&mut w);
+        run_ramp(&mut w, 0.0);
+        assert!(!w.is_exiting(), "the seeded generation is not a bump");
+
+        signal.set(8);
+        frame(&mut w, 3000.0);
+        assert!(w.is_exiting(), "the same exit a scrim tap stages");
+        assert_eq!(closed.get(), 0, "and the close waits for it");
+        frame(&mut w, 3000.0 + FADE_ZOOM_MS as f64 * 2.0);
+        assert_eq!(closed.get(), 1);
+
+        signal.set(9);
+        frame(&mut w, 6000.0);
+        assert_eq!(closed.get(), 1, "a bump after the close does nothing");
+    }
+
+    #[test]
+    fn a_back_press_with_a_veto_is_decided_in_the_next_housekeeping_pass() {
+        let (mut w, closed) = vetoed();
+        let signal = Rc::new(Cell::new(0u64));
+        w.set_dismiss_signal(Some(signal.clone()));
+        let mut state = Flags {
+            keep: true,
+            ..Flags::default()
+        };
+
+        signal.set(1);
+        let mut ctx = PaintCtx::for_test(Point::ORIGIN, WINDOW, ft_ms(3000.0));
+        w.paint(&mut ctx, &mut Recorder::default());
+        assert!(
+            !w.is_exiting(),
+            "nothing stages at paint while a veto may keep"
+        );
+        assert!(
+            ctx.needs_frame(),
+            "the paint asks for the rebuild that decides"
+        );
+        assert!(state.asked.is_empty());
+
+        assert_eq!(
+            dispatch(&mut w, &mut state, &InputEvent::Housekeeping),
+            EventResult::Ignored
+        );
+        assert_eq!(state.asked, vec![DismissCause::Back]);
+        assert!(!w.is_exiting(), "Keep: no exit ramp");
+        dispatch(&mut w, &mut state, &InputEvent::Housekeeping);
+        assert_eq!(state.asked.len(), 1, "the attempt is decided once");
+
+        state.keep = false;
+        signal.set(2);
+        frame(&mut w, 4000.0);
+        dispatch(&mut w, &mut state, &InputEvent::Housekeeping);
+        assert!(w.is_exiting(), "Dismiss stages the exit");
+        run_ramp(&mut w, 5000.0);
+        assert_eq!(closed.get(), 1);
+    }
+
+    #[test]
+    fn a_back_press_on_a_non_dismissable_host_is_consumed_and_does_nothing() {
+        let mut w = build(&modal(
+            Block(Size::new(200.0, 120.0)),
+            ModalConfig::centered(MAX_WIDTH_LG),
+        ));
+        let signal = Rc::new(Cell::new(0u64));
+        w.set_dismiss_signal(Some(signal.clone()));
+        layout(&mut w);
+        run_ramp(&mut w, 0.0);
+        signal.set(1);
+        run_ramp(&mut w, 3000.0);
+        let mut state = Flags::default();
+        dispatch(&mut w, &mut state, &InputEvent::Housekeeping);
+        assert!(!w.is_exiting() && !w.pending_back);
+        assert!((w.progress() - 1.0).abs() < 1e-9);
+    }
+
+    // ---- The host in a real tree: Escape, back press, focus return --------
+
+    #[derive(Default)]
+    struct App {
+        results: Vec<Option<i32>>,
+        asked: Vec<DismissCause>,
+        keep: bool,
+        /// The `Stack` mount's open flag.
+        open: bool,
+        dismissed: u32,
+        /// The label of every field that took an edit, in order.
+        typed: Vec<&'static str>,
+    }
+
+    fn app_veto(state: &mut App, cause: DismissCause) -> DismissDecision {
+        state.asked.push(cause);
+        if state.keep {
+            DismissDecision::Keep
+        } else {
+            DismissDecision::Dismiss
+        }
+    }
+
+    /// A `frust_widgets` text field labelled `label`, recording its edits.
+    fn field(label: &'static str) -> frust_widgets::TextInputView<App> {
+        frust_widgets::text_input("", move |s: &mut App, _| s.typed.push(label)).label(label)
+    }
+
+    /// A modal's content: the `"Draft"` field, inset so the panel has a
+    /// background of its own to press.
+    fn draft_panel() -> frust_widgets::PaddingView<App> {
+        Padding(EdgeInsets::all(24.0), field("Draft"))
+    }
+
+    /// Something the tests can drive: a root plus its frame loop.
+    trait Tree {
+        fn pass(&mut self);
+        fn paint_at(&mut self, ms: u64) -> bool;
+        fn send(&mut self, event: &InputEvent);
+        fn semantics(&self) -> frust_core::SemanticsUpdate;
+        fn state(&mut self) -> &mut App;
+    }
+
+    /// The frame loop a shell runs, for a fixed second and a half: a focused
+    /// field's caret blink keeps asking for frames, so it never settles on its
+    /// own, and every ramp here is over well inside that.
+    fn drive(tree: &mut impl Tree, from_ms: u64) {
+        for i in 0..16u64 {
+            tree.pass();
+            tree.paint_at(from_ms + i * 100);
+        }
+    }
+
+    fn tap(tree: &mut impl Tree, at: Point) {
+        for phase in [PointerPhase::Down, PointerPhase::Up] {
+            tree.send(&pointer(phase, at.x, at.y));
+        }
+    }
+
+    /// The bounds of the first semantics node `pick` accepts.
+    fn bounds(tree: &impl Tree, pick: impl Fn(&frust_core::accesskit::Node) -> bool) -> Rect {
+        let update = tree.semantics();
+        let (_, node) = update
+            .nodes
+            .iter()
+            .find(|(_, n)| pick(n))
+            .expect("the node");
+        let b = node.bounds().expect("bounds");
+        Rect::new(b.x0, b.y0, b.x1, b.y1)
+    }
+
+    fn labelled(tree: &impl Tree, label: &str) -> Rect {
+        bounds(tree, |n| n.label() == Some(label))
+    }
+
+    /// A point inside the modal panel that no control covers: the
+    /// [`draft_panel`] inset left of its field.
+    fn panel_background(tree: &impl Tree) -> Point {
+        let draft = labelled(tree, "Draft");
+        Point::new(draft.x0 - 12.0, draft.center().y)
+    }
+
+    /// The field holding the live focus, if any, found the way a user finds
+    /// it: by typing. A granted field publishes no focused semantics node
+    /// until it next sees input of its own, so the semantics focus cannot say.
+    fn focused(tree: &mut impl Tree) -> Option<&'static str> {
+        tree.state().typed.clear();
+        tree.send(&InputEvent::Key(KeyEvent {
+            key: Key::Character("x".to_string()),
+            modifiers: Modifiers::default(),
+            repeat: false,
+        }));
+        tree.state().typed.pop()
+    }
+
+    /// A navigator whose root page holds the `"Main"` field.
+    struct Nav {
+        controller: NavigatorController<App>,
+        root: RenderRoot<App, frust_widgets::NavigatorView<App>>,
+        state: App,
+        tcx: TextContext,
+    }
+
+    impl Nav {
+        fn new() -> Self {
+            let mut nav = Nav {
+                controller: NavigatorController::new(),
+                root: RenderRoot::new(),
+                state: App::default(),
+                tcx: TextContext::new(),
+            };
+            drive(&mut nav, 0);
+            nav
+        }
+    }
+
+    impl Tree for Nav {
+        fn pass(&mut self) {
+            let ctrl = self.controller.clone();
+            // The raw `frust-widgets` constructor: the facade's wires platform
+            // back-press glue, which needs a reactive runtime no unit test has.
+            let mut app = move |_: &mut App| {
+                frust_widgets::navigator(&ctrl, || frust_widgets::column().child(field("Main")))
+            };
+            self.root.rebuild(&mut app, &mut self.state);
+            self.root
+                .layout_with_text(WINDOW, &mut self.tcx as &mut dyn Any);
+        }
+        fn paint_at(&mut self, ms: u64) -> bool {
+            self.root
+                .paint(
+                    &mut Recorder::default(),
+                    FrameTime::from_nanos(ms * 1_000_000),
+                )
+                .needs_frame
+        }
+        fn send(&mut self, event: &InputEvent) {
+            self.root.event(&mut self.state, event);
+        }
+        fn semantics(&self) -> frust_core::SemanticsUpdate {
+            self.root.semantics()
+        }
+        fn state(&mut self) -> &mut App {
+            &mut self.state
+        }
+    }
+
+    /// Push `build` through [`show_modal`], recording its pop result.
+    fn show<V: ModalContent<App>>(nav: &mut Nav, build: impl Fn() -> V + 'static) {
+        show_modal(&nav.controller, build, |s: &mut App, r: PopResult| {
+            s.results.push(r.take::<i32>())
+        });
+        drive(nav, 0);
+        assert_eq!(nav.controller.depth(), 2, "the modal is up");
+    }
+
+    /// Focus the `"Main"` field, then show `build` over it.
+    fn over_main<V: ModalContent<App>>(build: impl Fn() -> V + 'static) -> Nav {
+        let mut nav = Nav::new();
+        let main = labelled(&nav, "Main").center();
+        tap(&mut nav, main);
+        drive(&mut nav, 0);
+        assert_eq!(focused(&mut nav), Some("Main"));
+        show(&mut nav, build);
+        nav
+    }
+
+    /// Tap the dialog's `"Draft"` field so it holds the focus.
+    fn focus_draft(nav: &mut Nav) {
+        let draft = labelled(nav, "Draft").center();
+        tap(nav, draft);
+        drive(nav, 1000);
+        assert_eq!(focused(nav), Some("Draft"));
+    }
+
+    fn draft_dialog(
+        configure: fn(
+            crate::components::dialog::DialogView<App>,
+        ) -> crate::components::dialog::DialogView<App>,
+    ) -> Nav {
+        let mut nav = over_main(move || {
+            configure(crate::components::dialog::dialog((draft_panel(),)).label("Edit"))
+        });
+        focus_draft(&mut nav);
+        nav
+    }
+
+    #[test]
+    fn one_escape_from_a_focused_field_closes_a_dialog_unless_a_veto_keeps_it() {
+        // No veto: the Escape blurs the field and closes the dialog.
+        let mut nav = draft_dialog(|d| d);
+        nav.send(&escape());
+        drive(&mut nav, 2000);
+        assert_eq!(nav.controller.depth(), 1, "closed by one Escape");
+        assert_eq!(nav.state.results, vec![None]);
+
+        // `Keep`: the dialog stays, nothing is popped, the field still blurs.
+        let mut nav = draft_dialog(|d| d.on_dismiss_request(app_veto));
+        nav.state.keep = true;
+        nav.send(&escape());
+        drive(&mut nav, 2000);
+        assert_eq!(nav.state.asked, vec![DismissCause::Escape]);
+        assert_eq!(nav.controller.depth(), 2, "kept open");
+        assert!(nav.state.results.is_empty(), "no dismissal reached the app");
+        assert_eq!(focused(&mut nav), None, "the field blurred all the same");
+
+        // `Dismiss`: today's behaviour.
+        let mut nav = draft_dialog(|d| d.on_dismiss_request(app_veto));
+        nav.send(&escape());
+        drive(&mut nav, 2000);
+        assert_eq!(nav.controller.depth(), 1);
+        assert_eq!(nav.state.results, vec![None]);
+    }
+
+    #[test]
+    fn escape_leaves_field_first_takes_two_escapes_with_a_focused_field_and_one_without() {
+        let mut nav = draft_dialog(|d| d.escape_leaves_field_first(true));
+        nav.send(&escape());
+        drive(&mut nav, 2000);
+        assert_eq!(focused(&mut nav), None, "the first Escape left the field");
+        assert_eq!(nav.controller.depth(), 2, "and only that");
+        nav.send(&escape());
+        drive(&mut nav, 3000);
+        assert_eq!(nav.controller.depth(), 1, "the second one dismissed");
+        assert_eq!(nav.state.results, vec![None]);
+
+        // No field focused: one Escape, once the panel holds focus.
+        let mut nav = over_main(|| {
+            crate::components::dialog::dialog((draft_panel(),)).escape_leaves_field_first(true)
+        });
+        let inside = panel_background(&nav);
+        tap(&mut nav, inside);
+        drive(&mut nav, 1000);
+        nav.send(&escape());
+        drive(&mut nav, 2000);
+        assert_eq!(nav.controller.depth(), 1);
+    }
+
+    fn vetoed_modal() -> ModalView<App> {
+        modal(draft_panel(), ModalConfig::centered(MAX_WIDTH_LG)).on_dismiss_request(app_veto)
+    }
+
+    #[test]
+    fn the_veto_hears_a_scrim_tap_and_a_back_press_and_keep_holds_both() {
+        let mut nav = Nav::new();
+        show(&mut nav, vetoed_modal);
+        nav.state.keep = true;
+        tap(&mut nav, Point::new(5.0, 5.0));
+        drive(&mut nav, 1000);
+        nav.controller.request_back();
+        drive(&mut nav, 2000);
+        assert_eq!(
+            nav.state.asked,
+            vec![DismissCause::Backdrop, DismissCause::Back]
+        );
+        assert_eq!(nav.controller.depth(), 2, "both kept");
+        assert!(nav.state.results.is_empty());
+
+        nav.state.keep = false;
+        nav.controller.request_back();
+        drive(&mut nav, 3000);
+        assert_eq!(nav.controller.depth(), 1, "a Dismiss answer lets it go");
+        assert_eq!(nav.state.results, vec![None]);
+    }
+
+    #[test]
+    fn a_back_press_plays_the_staged_exit_and_then_pops_exactly_once() {
+        let mut nav = Nav::new();
+        show(&mut nav, || {
+            modal(draft_panel(), ModalConfig::centered(MAX_WIDTH_LG))
+        });
+        nav.controller.request_back();
+        nav.pass();
+        nav.paint_at(1000);
+        assert_eq!(
+            nav.controller.depth(),
+            2,
+            "the back press no longer pops on the spot"
+        );
+        // A second press mid-exit is the same exit.
+        nav.controller.request_back();
+        nav.pass();
+        nav.paint_at(1050);
+        assert_eq!(nav.controller.depth(), 2, "still running the exit");
+        drive(&mut nav, 1100);
+        assert_eq!(nav.controller.depth(), 1);
+        assert_eq!(nav.state.results, vec![None], "popped once, empty");
+    }
+
+    // ---- Focus return ------------------------------------------------------
+
+    /// Every way a [`show_modal`] page can be dismissed after a press inside
+    /// its panel claimed the focus there.
+    #[derive(Clone, Copy, Debug)]
+    enum Exit {
+        Escape,
+        Scrim,
+        CloseButton,
+        Back,
+    }
+
+    fn dismiss(nav: &mut Nav, exit: Exit) {
+        match exit {
+            Exit::Escape => nav.send(&escape()),
+            Exit::Scrim => tap(nav, Point::new(5.0, 5.0)),
+            Exit::CloseButton => {
+                let panel = bounds(nav, |n| n.role() == Role::Dialog);
+                let x = Point::new(
+                    panel.x1 - CLOSE_INSET - style::ICON_SIZE / 2.0,
+                    panel.y0 + CLOSE_INSET + style::ICON_SIZE / 2.0,
+                );
+                tap(nav, x);
+            }
+            Exit::Back => nav.controller.request_back(),
+        }
+    }
+
+    #[test]
+    fn focus_returns_to_the_main_field_after_every_dismissal_path() {
+        for exit in [Exit::Escape, Exit::Scrim, Exit::CloseButton, Exit::Back] {
+            for press in [false, true] {
+                let mut nav = over_main(|| {
+                    modal(
+                        draft_panel(),
+                        ModalConfig::centered(MAX_WIDTH_LG).close_button(true),
+                    )
+                });
+                if press {
+                    // The panel claims the session: it is held inside.
+                    let inside = panel_background(&nav);
+                    tap(&mut nav, inside);
+                } else {
+                    focus_draft(&mut nav);
+                }
+                if matches!(exit, Exit::Escape) || press {
+                    // Escape needs the panel's focus path; a press is a claim
+                    // with no paint before the dismissal.
+                } else {
+                    drive(&mut nav, 1500);
+                }
+                dismiss(&mut nav, exit);
+                drive(&mut nav, 2000);
+                assert_eq!(nav.controller.depth(), 1, "{exit:?} closed it");
+                assert_eq!(
+                    focused(&mut nav),
+                    Some("Main"),
+                    "{exit:?} (press inside: {press}) returns focus to the field"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn focus_returns_after_a_drag_closes_a_drawer() {
+        let config = ModalConfig::edge(OverlaySide::Bottom)
+            .corners(ModalCorners::Top)
+            .handle(true)
+            .drag(true);
+        let mut nav = over_main(move || modal(draft_panel(), config));
+        let panel = bounds(&nav, |n| n.role() == Role::Dialog);
+        let start = Point::new(
+            panel.center().x,
+            panel.y0 + HANDLE_INSET + HANDLE_HEIGHT / 2.0,
+        );
+        for (phase, dy) in [
+            (PointerPhase::Down, 0.0),
+            (PointerPhase::Move, 40.0),
+            (PointerPhase::Move, panel.height()),
+            (PointerPhase::Up, panel.height()),
+        ] {
+            nav.send(&pointer(phase, start.x, start.y + dy));
+        }
+        drive(&mut nav, 2000);
+        assert_eq!(nav.controller.depth(), 1, "the drag closed it");
+        assert_eq!(focused(&mut nav), Some("Main"));
+    }
+
+    #[test]
+    fn return_focus_off_leaves_nothing_focused_after_the_close() {
+        let mut nav = over_main(|| {
+            modal(draft_panel(), ModalConfig::centered(MAX_WIDTH_LG)).return_focus(false)
+        });
+        focus_draft(&mut nav);
+        nav.send(&escape());
+        drive(&mut nav, 2000);
+        assert_eq!(nav.controller.depth(), 1);
+        assert_eq!(focused(&mut nav), None);
+    }
+
+    /// A full-area `Stack` holding the `"Main"` field, with the modal mounted
+    /// over it while the app's `open` flag is set — the unstaged mount, whose
+    /// `on_dismiss` clears the flag.
+    struct Mounted {
+        root: RenderRoot<App, frust_widgets::StackView<App>>,
+        state: App,
+        tcx: TextContext,
+    }
+
+    impl Tree for Mounted {
+        fn pass(&mut self) {
+            let mut app = |s: &mut App| {
+                let host = s.open.then(|| {
+                    modal(draft_panel(), ModalConfig::centered(MAX_WIDTH_LG)).on_dismiss(
+                        |s: &mut App| {
+                            s.open = false;
+                            s.dismissed += 1;
+                        },
+                    )
+                });
+                frust_widgets::stack()
+                    .child(frust_widgets::column().child(field("Main")))
+                    .children(host)
+            };
+            self.root.rebuild(&mut app, &mut self.state);
+            self.root
+                .layout_with_text(WINDOW, &mut self.tcx as &mut dyn Any);
+        }
+        fn paint_at(&mut self, ms: u64) -> bool {
+            self.root
+                .paint(
+                    &mut Recorder::default(),
+                    FrameTime::from_nanos(ms * 1_000_000),
+                )
+                .needs_frame
+        }
+        fn send(&mut self, event: &InputEvent) {
+            self.root.event(&mut self.state, event);
+        }
+        fn semantics(&self) -> frust_core::SemanticsUpdate {
+            self.root.semantics()
+        }
+        fn state(&mut self) -> &mut App {
+            &mut self.state
+        }
+    }
+
+    #[test]
+    fn a_stack_mounted_host_returns_focus_to_the_field_it_covered() {
+        for scrim in [false, true] {
+            let mut tree = Mounted {
+                root: RenderRoot::new(),
+                state: App::default(),
+                tcx: TextContext::new(),
+            };
+            drive(&mut tree, 0);
+            let main = labelled(&tree, "Main").center();
+            tap(&mut tree, main);
+            drive(&mut tree, 0);
+            assert_eq!(focused(&mut tree), Some("Main"));
+
+            tree.state.open = true;
+            drive(&mut tree, 1000);
+            let inside = panel_background(&tree);
+            tap(&mut tree, inside);
+            if scrim {
+                tap(&mut tree, Point::new(5.0, 5.0));
+            } else {
+                tree.send(&escape());
+            }
+            assert_eq!(tree.state.dismissed, 1);
+            drive(&mut tree, 2000);
+            assert_eq!(
+                focused(&mut tree),
+                Some("Main"),
+                "dismissed by {}",
+                if scrim { "a scrim tap" } else { "Escape" }
+            );
+        }
     }
 
     // ---- Typeface: the panel title and description follow the live theme --
