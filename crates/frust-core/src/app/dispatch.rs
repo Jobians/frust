@@ -13,6 +13,7 @@ use crate::event::{
     ImeState, InputEvent, Key, KeyEvent, Modifiers, NamedKey, OverlayEvent, OverlayEventKind,
     PointerButton, PointerId, PointerPhase, PointerSource, RequestPass,
 };
+use crate::focus_scope::FocusTarget;
 use crate::input::{MOUSE_SLOP, TOUCH_SLOP};
 use crate::overlay::{OutsideTap, OverlayHit, OverlayInput, OverlayKey, OverlayPod};
 use crate::shortcuts::{DeliveryProbe, KeyForwardPass};
@@ -174,6 +175,9 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         let Some(root_id) = self.root_id else {
             return (EventOutcome::default(), false);
         };
+        // An owed return runs here when an event beats the rebuild, which runs it after its own
+        // broadcasts; the grant re-enters this pass with the return already taken.
+        let returned = !matches!(event, InputEvent::Housekeeping) && self.run_focus_return(state);
         self.trap_modal_focus();
         let (unwrapped, pointer_id) = unwrap_contact(event);
         let event = unwrapped.as_ref().unwrap_or(event);
@@ -217,8 +221,12 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         let focus_claim_honoured = self.commit_event(event, &frame, &root, &contact_pass);
         if blur_on_up && !focus_claim_honoured {
             self.release_focus_session();
+            self.focus_returns.forget();
         }
         self.resolve_focus_session(&frame, focus_claim_honoured);
+        if focus_claim_honoured {
+            self.commit_focus_target();
+        }
         self.record_key_forward(forward_slot.take());
         drop(forward_slot);
         self.resolve_hover(&frame, root.hover_claimed);
@@ -229,6 +237,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             self.dispatch_declined_key(state, event, carried)
         };
         let mut outcome = self.build_outcome(&frame, &root, carried);
+        outcome.needs_redraw |= returned;
         self.file_drop_follow_up(state, event, &mut outcome);
         (outcome, focus_claim_honoured)
     }
@@ -441,8 +450,44 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         }
         if root.focus_rel {
             self.release_focus_session();
+            self.focus_returns.forget();
         }
         root.focus_req
+    }
+
+    /// Record the deepest traversal stop on the session a claim just committed, with the keyboard
+    /// flag as it stands (a landing Tab step sets it after): the target a scope opening returns to.
+    fn commit_focus_target(&mut self) {
+        let stop = self.focus_stops().into_iter().rfind(|stop| stop.current);
+        let keyboard = self.keyboard_focus;
+        let target = stop.map(|stop| FocusTarget {
+            stop: stop.id,
+            keyboard,
+        });
+        self.focus_returns.commit(target);
+    }
+
+    /// Grant the return a closed focus-return scope owes, consuming it (`crate::focus_scope`):
+    /// never over a live session, and only to a stop the walk the root would use now reaches,
+    /// restoring the keyboard flag it was committed with. Returns whether it landed.
+    pub(super) fn run_focus_return(&mut self, state: &mut State) -> bool {
+        let owed = self.focus_returns.take_pending();
+        let Some(target) = owed.and_then(|entry| entry.target) else {
+            return false;
+        };
+        if self.focus_active {
+            return false;
+        }
+        let stops = self.focus_stops();
+        let Some(stop) = stops.iter().find(|stop| stop.id == target.stop) else {
+            return false;
+        };
+        if !self.grant_focus(state, stop) {
+            return false;
+        }
+        self.set_keyboard_focus(target.keyboard);
+        self.focus_returns.set_keyboard(target.keyboard);
+        true
     }
 
     /// Commit a claimant (or uncaptured) pointer: a `Down` latches a capture and claims focus or
@@ -562,6 +607,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         }
         if root.focus_rel {
             self.release_focus_session();
+            self.focus_returns.forget();
         }
         // Mirrored on any phase, so its follow-ups route down the capture path, even outside.
         if root.captured {
@@ -740,6 +786,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             carried.handled = true;
             carried.needs_redraw = true;
             self.set_keyboard_focus(true);
+            self.focus_returns.set_keyboard(true);
         }
     }
 

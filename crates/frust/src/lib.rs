@@ -951,6 +951,12 @@ pub mod authoring {
         ShortcutId, ShortcutScope,
     };
 
+    /// The focus-return scope key a modal host registers through
+    /// [`PaintCtx::register_focus_scope`] every paint it is open; when it stops, focus returns to
+    /// the control that held it as the scope opened (an Interactive [`OverlayKeys::Modal`]
+    /// surface is a scope already).
+    pub use frust_core::FocusScopeKey;
+
     /// The paint vocabulary [`PaintScene`]'s per-corner and dashed methods name
     /// — `fill_rounded_rect_radii`/`push_clip_rounded_radii` take a
     /// [`CornerRadii`], `stroke_path_dashed` a [`DashPattern`]. Lifted for the

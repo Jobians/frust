@@ -123,6 +123,11 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             flags |= ChangeFlags::PAINT;
         }
 
+        // After the diff, the broadcasts and the orphan release: a popped page routes input again.
+        if self.run_focus_return(state) {
+            flags |= ChangeFlags::PAINT;
+        }
+
         self.pending |= flags;
         // Any change may have changed the semantics tree.
         if !flags.is_empty() {

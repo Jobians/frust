@@ -1035,6 +1035,16 @@ impl<'a> PaintCtx<'a> {
         crate::shortcuts::register(decl);
     }
 
+    /// Hold the focus-return scope `key` open for this frame (see [`crate::focus_scope`]). A
+    /// widget that owns focus while visible, such as a modal host, re-registers every paint while
+    /// it is open; the paint in which it stops registering is its close, after which focus returns
+    /// to the control that held it as the scope opened. An Interactive `OverlayKeys::Modal`
+    /// overlay entry is a scope already, so its owner needs no key.
+    pub fn register_focus_scope(&mut self, key: crate::focus_scope::FocusScopeKey) {
+        self.note_publication();
+        crate::focus_scope::register(key);
+    }
+
     /// Publish this frame's focused-field verbs and menu anchor for the
     /// platform edit menu. A focused field publishes every paint, so hardware
     /// shortcuts stay answerable; no publish means nothing is focused.
