@@ -21,6 +21,7 @@
 //! [`frust::component`], as on every Motion page (see
 //! `crate::pages::motion::text`).
 
+use frust::authoring::{DismissCause, DismissDecision};
 use frust::{
     Component, CrossAxisAlignment, EdgeInsets, Padding, Row, SizedBox, View, ViewSeq, column,
     component, row, stack, text,
@@ -33,8 +34,10 @@ use frust_beui::components::context_menu::{
     context_menu_trigger,
 };
 use frust_beui::components::drawer::{DrawerSide, drawer};
+use frust_beui::components::input::input;
 use frust_beui::components::morphing_modal::{MorphingBackdrop, MorphingPlacement, morphing_modal};
 use frust_beui::components::popover::{PopoverMorph, popover};
+use frust_beui::components::switch::switch;
 use frust_beui::components::tooltip::{TooltipHover, tooltip, tooltip_trigger};
 use frust_beui::overlay::{OverlayAnchor, OverlaySide};
 
@@ -68,6 +71,15 @@ pub struct State {
     drawer_side: DrawerSide,
     sheet_open: bool,
     sheet_snap: usize,
+    /// The draft dialog's page-side field, which holds focus before it opens.
+    composer: String,
+    draft: String,
+    draft_open: bool,
+    veto_on: bool,
+    escape_first: bool,
+    return_focus: bool,
+    /// The last dismiss attempt, as the readout prints it.
+    last_dismiss: String,
 }
 
 impl Default for State {
@@ -93,6 +105,13 @@ impl Default for State {
             drawer_side: DrawerSide::Right,
             sheet_open: false,
             sheet_snap: 0,
+            composer: String::new(),
+            draft: String::new(),
+            draft_open: false,
+            veto_on: true,
+            escape_first: false,
+            return_focus: true,
+            last_dismiss: "last: none yet".to_string(),
         }
     }
 }
@@ -516,7 +535,8 @@ fn center_modals(state: &State) -> impl View<State> {
         "center_morph_modal",
         "The sibling morph with a different source rect \u{2014} its own centre \
          rather than a trigger. The close mark is drawn rather than an icon; \
-         there is no focus trap, no focus restore and no auto-focus on open \
+         there is no focus trap and no auto-focus on open, though focus returns \
+         to the control that held it when the modal closes \
          (the host's barrier is what keeps interaction inside the panel), and \
          reduced motion fades instead of unfolding, which is upstream's own \
          reduced branch.",
@@ -527,6 +547,115 @@ fn center_modals(state: &State) -> impl View<State> {
                 .tone(ButtonTone::Primary)
                 .size(ButtonSize::Sm),
             host,
+        ),
+    )
+}
+
+/// The draft dialog's veto: keep it open while the draft has text, and only
+/// when the page's veto toggle is on.
+fn draft_decision(veto_on: bool, draft: &str) -> DismissDecision {
+    if veto_on && !draft.is_empty() {
+        DismissDecision::Keep
+    } else {
+        DismissDecision::Dismiss
+    }
+}
+
+/// The readout line for one dismiss attempt, e.g. `last: Backdrop, kept`.
+fn dismiss_readout(cause: DismissCause, decision: DismissDecision) -> String {
+    let outcome = match decision {
+        DismissDecision::Keep => "kept",
+        _ => "dismissed",
+    };
+    format!("last: {cause:?}, {outcome}")
+}
+
+/// A labelled toggle: the switch, named for assistive tech, and its text.
+fn toggle(
+    label: &'static str,
+    checked: bool,
+    on_change: impl Fn(&mut State, bool) + 'static,
+) -> impl View<State> {
+    row()
+        .child(switch(checked, on_change).label(label))
+        .child(hgap(8.0))
+        .child(text(label.to_string()).size(14.0))
+        .cross_axis(CrossAxisAlignment::Center)
+}
+
+/// A dialog that holds a draft: the dismiss veto, the Escape-leaves-field
+/// opt-in and focus return, each driven by a toggle read when the dialog is
+/// built.
+fn draft_dialog(state: &State) -> impl View<State> {
+    let content = column()
+        .child(text("Draft").size(16.0))
+        .child(gap(8.0))
+        .child(
+            SizedBox(Some(260.0), None)
+                .child(input(state.draft.clone(), |s: &mut State, v| s.draft = v).label("Draft")),
+        )
+        .child(gap(16.0))
+        .child(trigger("Discard", |s: &mut State| {
+            s.draft.clear();
+            s.draft_open = false;
+        }))
+        .cross_axis(CrossAxisAlignment::Start);
+
+    let host = center_morph_modal(content)
+        .label("Draft dialog")
+        .open(state.draft_open)
+        .on_open_change(|s: &mut State, open| s.draft_open = open)
+        .on_dismiss_request(|s: &mut State, cause| {
+            let decision = draft_decision(s.veto_on, &s.draft);
+            s.last_dismiss = dismiss_readout(cause, decision);
+            decision
+        })
+        .escape_leaves_field_first(state.escape_first)
+        .return_focus(state.return_focus);
+
+    let composer = row()
+        .child(SizedBox(Some(220.0), None).child(
+            input(state.composer.clone(), |s: &mut State, v| s.composer = v).label("Composer"),
+        ))
+        .child(hgap(12.0))
+        .child(
+            button("Open dialog", |s: &mut State| s.draft_open = true)
+                .tone(ButtonTone::Primary)
+                .size(ButtonSize::Sm),
+        )
+        .cross_axis(CrossAxisAlignment::Start);
+
+    demo(
+        "Draft dialog",
+        "Type in Composer, Tab to the button and press Enter, then type a draft. \
+         With the veto on, Escape, a backdrop press and a back press keep the \
+         dialog while the draft has text; Discard always closes it. The toggles \
+         are read when the dialog is built.",
+        (
+            toggle("Veto while draft is non-empty", state.veto_on, |s, on| {
+                s.veto_on = on
+            }),
+            gap(6.0),
+            toggle(
+                "Escape leaves the field first",
+                state.escape_first,
+                |s, on| s.escape_first = on,
+            ),
+            gap(6.0),
+            toggle("Return focus on close", state.return_focus, |s, on| {
+                s.return_focus = on
+            }),
+            gap(12.0),
+            stage(
+                (420.0, 300.0),
+                (0.0, 0.0),
+                column()
+                    .child(composer)
+                    .child(gap(8.0))
+                    .child(caption(state.last_dismiss.clone()))
+                    .cross_axis(CrossAxisAlignment::Start),
+                host,
+            ),
         ),
     )
 }
@@ -641,6 +770,7 @@ impl Component for OverlaysPage {
             .child(context_menus(state))
             .child(morphing_modals(state))
             .child(center_modals(state))
+            .child(draft_dialog(state))
             .child(panels(state))
             .cross_axis(CrossAxisAlignment::Start)
     }
@@ -660,4 +790,34 @@ pub fn page() -> impl View<AppState> {
         .child(SizedBox(None, Some(24.0)))
         .child(component(OverlaysPage))
         .cross_axis(CrossAxisAlignment::Start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_veto_keeps_only_a_non_empty_draft_with_the_toggle_on() {
+        assert_eq!(draft_decision(true, "hi"), DismissDecision::Keep);
+        assert_eq!(draft_decision(true, ""), DismissDecision::Dismiss);
+        assert_eq!(draft_decision(false, "hi"), DismissDecision::Dismiss);
+    }
+
+    #[test]
+    fn the_readout_names_the_cause_and_the_decision() {
+        assert_eq!(
+            dismiss_readout(DismissCause::Backdrop, DismissDecision::Keep),
+            "last: Backdrop, kept"
+        );
+        assert_eq!(
+            dismiss_readout(DismissCause::Escape, DismissDecision::Dismiss),
+            "last: Escape, dismissed"
+        );
+    }
+
+    #[test]
+    fn the_toggles_default_to_veto_on_escape_first_off_return_on() {
+        let state = State::default();
+        assert!(state.veto_on && !state.escape_first && state.return_focus);
+    }
 }
