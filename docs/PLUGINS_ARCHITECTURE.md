@@ -315,13 +315,24 @@ Design-System Contract for the toolkit they all build against). Their shared cha
   card in `Floating` as `Interactive`, so its content is genuinely pressable. Both still latch
   their open state in a widget and time their delays off the paint clock, a hover having no event
   to open on, and the catalogs' own `anchored` hosts are candidates for becoming thin wrappers
-  over that same slot. **One divergence**: `frust-shadcn`'s modal host pops via the simpler
-  `NavigatorController::push_transparent_for_result`, with no staged back-press route, while
-  `frust-material`'s sits on a `BackPolicy::DismissAnimated` + `PushOptions::dismiss_signal` tier
-  — an Android back press stages the *same* reverse-ramp exit every other dismiss gesture takes, a
-  back-dismiss tier `frust-shadcn`'s modal host lacks.
+  over that same slot. The Material and shadcn modal hosts both sit on a
+`BackPolicy::DismissAnimated` + `PushOptions::dismiss_signal` tier, so an Android back press stages
+the *same* reverse-ramp exit every other dismiss gesture takes; on `frust-shadcn` that includes every `show_*` page (`show_dialog`,
+`show_sheet`, `show_drawer`, `show_alert_dialog`, `show_command_dialog`), and a non-dismissable
+host ignores the back press.
+- **`frust-shadcn` and `frust-beui` modal hosts share one dismiss/focus state machine by design**
+  (the Material host has none of it). `ModalView::on_dismiss_request` is the veto (vocabulary in
+  WIDGETS_ARCHITECTURE.md): asked for Escape, a backdrop press (shadcn: when `scrim_dismiss` is on)
+  and Back, never for an explicit close (shadcn's close X, handle, drag; beUI's bottom-sheet drag).
+  A back press arrives at paint, where no state exists, so with a veto it is recorded and decided on
+  the next `Housekeeping` broadcast. `escape_leaves_field_first(true)` makes the Escape that blurs a
+  focused field only blur it; while armed the host declares a Local Escape shortcut labelled
+  "Close" (visible in shortcut hints) so the next Escape still reaches it. `return_focus` is on by
+  default (command palette and command dialog included; `false` opts out): the host registers a
+  focus-return scope each open paint through the closing one, and the invoker regains focus (and
+  the soft keyboard on a phone).
 - **Both plugins' overlay hosts animate their exit, not just their entrance.** Each `modal` host
-  stages every dismiss (scrim tap, Escape, close button, drag, and — material only — back) as a
+  stages every dismiss (scrim tap, Escape, close button, drag, back) as a
   reverse ramp and fires the app's dismissal only once it settles — material's staged pop is
   identity-guarded against the navigator stack and refuses to fire (ramping the surface back open
   instead) if the stack moved during the ramp; `frust-shadcn`'s drawer

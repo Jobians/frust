@@ -3353,6 +3353,70 @@ upstream-parity requirement forcing it into v1.
 
 ---
 
+### `modal-escape-inconsistent-across-design-systems` — one Escape does not mean the same thing in every modal host
+
+**Observed**: with a text field focused inside a modal, the first Escape behaves by design system.
+`frust-beui`, `frust-shadcn` and `frust_material::dialog` close on the Escape that blurs the field
+(beUI and shadcn offer `escape_leaves_field_first(true)` and the `on_dismiss_request` veto to hold
+a draft; the Material dialog has neither). The Material sheet and the glyph sheet leave a focused
+field first (their Escape handler yields while the content holds the live focus link). The
+Cupertino `alert_dialog` pops on any Escape before its content sees it.
+
+**Applies to**: apps that mix design systems or switch between them and expect one Escape rule;
+`frust_material::dialog`, `frust_material::sheet`, `frust_glyph::sheet`,
+`frust_cupertino::alert_dialog`.
+
+**Why accepted**: the veto and the opt-in were scoped to beUI and shadcn by the maintainer
+(2026-10-26); the other catalogs keep their reference behaviour.
+
+**Trigger for removal**: one Escape rule across the design systems.
+
+**Evidence**: `plugins/material/src/sheet.rs:1317-1320` and `plugins/glyph/src/sheet.rs:1130-1134`
+(`!self.content.holds_live_focus()` guard); `plugins/cupertino/src/alert_dialog.rs:594-601`
+(unconditional pop); `plugins/beui/src/overlay/modal.rs` and `plugins/shadcn/src/overlay/modal.rs`
+module docs ("One Escape closes the modal", the veto and `escape_leaves_field_first`).
+
+---
+
+### `modal-dismiss-veto-scope` — what the dismiss veto and the focus return do not cover
+
+**Observed**: `on_dismiss_request` on the `frust-beui` and `frust-shadcn` modal hosts, and the
+default focus return, stop short in five places:
+
+1. **Programmatic closes.** The veto does not hold a dialog open across `Router::go`, which
+   leaves every page but the target, route-less overlays included, whatever the veto answers.
+2. **Explicit closes.** shadcn's close X, handle and drag, and beUI's bottom-sheet drag, never ask
+   the veto.
+3. **The kept-Escape state.** When a veto answers `Keep` to an Escape that blurred a field, the
+   modal stays open with no focus session: later Escapes do not reach the host until the user
+   presses inside the panel, and keys can reach main-tree shortcuts meanwhile.
+4. **Back is decided one frame later.** With a veto installed a back press is recorded at paint
+   and decided on the next `Housekeeping` broadcast (`mark_pending_result_flush` plus a frame
+   request); a host without a veto handles it at once.
+5. **A widget focus scope reads "held inside" from the last paint.** A `PaintCtx::register_focus_scope`
+   host reads it from its own focus path at its last registered paint, so a custom host that a
+   control inside can close must register once more in the paint that closes it, or release focus
+   itself, or the return can be lost. The beUI and shadcn hosts do. An Interactive
+   `OverlayKeys::Modal` entry is not affected.
+
+**Applies to**: `frust_beui::overlay::modal` and `frust_shadcn::overlay::modal` and the components
+built on them; item 5 to any app widget that registers its own focus scope.
+
+**Why accepted**: (1) a router-driven close is a navigation decision the host does not own; (2) an
+explicit control is the user's own close; (3) and (4) follow from the framework routing keys by
+focus session and from a back press arriving at paint, where no app state exists; (5) is the
+price of reading focus from the paint pass rather than from a live event.
+
+**Trigger for removal**: per item: a veto seam on `Router::go`; a host-owned Escape route that
+survives a blur; a state-bearing back callback; a scope that reads focus at the close itself.
+
+**Evidence**: `crates/frust-widgets/src/dismiss.rs` module doc (the veto contract);
+`crates/frust-widgets/src/nav/router.rs` (`Router::go`); `plugins/{beui,shadcn}/src/overlay/modal.rs`
+module docs (dismissal, focus return) and `escape_leaves_field_first`; `crates/frust-core/src/focus_scope.rs`
+module doc and `PaintCtx::register_focus_scope` in `crates/frust-core/src/widget.rs`.
+
+---
+
 ### `overlay-no-auto-focus-on-appear` — the framework has no seam to claim focus (widget or IME) on mount
 
 **Observed**: the framework exposes no auto-focus-on-appear hook a widget can call on mount —
@@ -7296,7 +7360,7 @@ included — so a web build running in a browser on a Mac binds and labels Ctrl 
 
 **Observed**: the baseline `Button`, `Checkbox`, `Radio` and `Slider` are Tab stops and answer the
 keyboard while focused, but none paints a ring or any other keyboard-focus cue, so tabbing across a
-row of them shows nothing moving (a focused `TextInput`'s own border is the only visible stop).
+row of them shows nothing moving (a focused `TextInput`'s own border is the only visible stop); each does publish its focused semantics node to assistive technology, so only the visual cue is missing).
 
 **Applies to**: `frust_widgets`' baseline `Button`, `Checkbox`, `Radio` and `Slider`; design-system
 controls paint their own (`frust_shadcn::button` reads `PaintCtx::is_focused_for_ring`).
