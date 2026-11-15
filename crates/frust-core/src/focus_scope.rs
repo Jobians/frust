@@ -12,10 +12,10 @@
 //! cleared surface, an unmount) keeps it. An opening scope pushes it; a closing one pops it, with
 //! every scope above, and the next rebuild, or the end of the next event pass, grants it back once
 //! if the stop is still in the traversal walk. A session held inside the closing scope as it
-//! closed is ended first; one started outside it after the close is never taken over. Inside is
-//! exact for an overlay scope (the claim's own surface). A widget scope knows it from its host's
-//! focus path at its last registered paint, so a host a control inside can close registers
-//! through that closing paint too. See `docs/CORE_ARCHITECTURE.md`'s traversal notes.
+//! closed is ended first, and so is the invoker's own when it sits on no stop (the target is then
+//! the last stop before it); any other session outside is never taken over. Inside is exact for
+//! an overlay scope (the claim's own surface); a widget scope reads it from its host's focus path
+//! at its last registered paint. See `docs/CORE_ARCHITECTURE.md`'s traversal notes.
 
 use std::cell::Cell;
 
@@ -107,6 +107,8 @@ pub(crate) struct FocusReturn {
     /// The epoch of a session held inside the scope: on an open widget scope, the one its host
     /// held at its last paint; on the owed return, the one still held inside as it closed.
     pub(crate) held: Option<u64>,
+    /// The invoker's session epoch.
+    pub(crate) opened: Option<u64>,
 }
 
 impl FocusReturn {
@@ -135,6 +137,7 @@ pub(crate) struct LiveSession {
 #[derive(Debug, Default)]
 pub(crate) struct FocusReturns {
     last: Option<FocusTarget>,
+    under: Option<ScopeId>,
     /// The live session's epoch and the floated surface its claim was committed through.
     claim: Option<(u64, OverlayKey)>,
     /// The scopes the last paint registered.
@@ -146,9 +149,15 @@ pub(crate) struct FocusReturns {
 }
 
 impl FocusReturns {
-    /// Record the target a claim or grant just committed.
+    /// Record a committed claim's target. `None` (the claimant is no traversal stop) keeps the
+    /// standing target only under the same innermost open scope (`under`).
     pub(crate) fn commit(&mut self, target: Option<FocusTarget>) {
-        self.last = target;
+        let under = self.stack.last().map(|entry| entry.scope);
+        if target.is_some() {
+            (self.last, self.under) = (target, under);
+        } else if self.under != under {
+            self.last = None;
+        }
     }
 
     /// Record the floated `surface` the claim behind session `epoch` was committed through.
@@ -201,6 +210,7 @@ impl FocusReturns {
                         scope,
                         target,
                         held,
+                        opened: live.map(|live| live.epoch),
                     });
                 }
                 None => {}
@@ -313,6 +323,23 @@ mod tests {
         assert_eq!(returns.stack().len(), 1, "a repeated key is one scope");
         returns.settle(Vec::new(), None);
         assert_eq!(returns.take_pending().unwrap().target, None);
+    }
+
+    #[test]
+    fn a_claim_on_no_stop_keeps_the_target_only_among_the_same_open_scopes() {
+        let mut returns = FocusReturns::default();
+        let (outer, inner) = (widget(), widget());
+        returns.commit(target(5));
+        returns.commit(None);
+        returns.settle(vec![outer], Some(&live(3, None, Vec::new())));
+        let entry = returns.stack()[0];
+        assert_eq!(entry.target, target(5), "the stop before the claim");
+        assert_eq!(entry.opened, Some(3), "under the claim's session");
+
+        returns.commit(None);
+        returns.settle(vec![outer, inner], None);
+        assert_eq!(returns.stack()[1].target, None, "not the stop below");
+        assert_eq!(returns.stack()[1].opened, None);
     }
 
     fn live(epoch: u64, surface: Option<OverlayKey>, holders: Vec<FocusScopeKey>) -> LiveSession {

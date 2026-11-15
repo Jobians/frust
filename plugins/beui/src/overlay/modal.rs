@@ -3234,7 +3234,11 @@ mod tests {
                         s.dismissed += 1;
                         s.open = false;
                     });
-                frust::stack().child(field("below")).child(host)
+                let opener = crate::components::button::button("Open", |s: &mut FieldState| {
+                    s.open = true;
+                });
+                let page = frust::column().child(field("below")).child(opener);
+                frust::stack().child(page).child(host)
             };
             self.root.rebuild(&mut logic, &mut self.state);
             self.root
@@ -3323,6 +3327,47 @@ mod tests {
             None,
             "return_focus(false)"
         );
+    }
+
+    /// A beUI button takes focus on its press without being a traversal stop;
+    /// the dialog it opens still returns focus to the field the user left.
+    #[test]
+    fn a_host_opened_by_pressing_a_button_returns_focus_to_the_field_before_it() {
+        for press_inside in [false, true] {
+            let mut h = FieldStack::new(true);
+            h.click(Point::new(10.0, 10.0));
+            h.frame(10);
+            assert_eq!(focused_label(&h.root).as_deref(), Some("below"));
+            let mut y = 12.0;
+            while !h.state.open {
+                y += 6.0;
+                assert!(y < 200.0, "the button is under the field");
+                h.click(Point::new(20.0, y));
+            }
+            h.frame(20);
+            assert_eq!(typed_into(&mut h.root, &mut h.state), None, "it left");
+            h.frame(SETTLED);
+            if press_inside {
+                h.click(centred_rect().center());
+                h.frame(SETTLED + 1);
+                h.escape();
+                assert_eq!(h.state.dismissed, 1);
+            } else {
+                // No Escape reaches a host that never took the session: the
+                // app closes it, with the button's session still live.
+                assert!(h.root.is_focus_active());
+                h.state.open = false;
+            }
+            h.frame(SETTLED + 2);
+            h.frame(SETTLED + EXIT_SPAN);
+            h.frame(SETTLED + EXIT_SPAN * 2);
+            h.pass();
+            assert_eq!(
+                typed_into(&mut h.root, &mut h.state),
+                Some("below"),
+                "press inside: {press_inside}"
+            );
+        }
     }
 
     /// A press the panel takes on the frame before its exit settles is still
