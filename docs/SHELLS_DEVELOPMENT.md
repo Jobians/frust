@@ -435,7 +435,10 @@ A desktop gate for the beUI and shadcn modal hosts' dismiss veto (`on_dismiss_re
 of `examples/beui-demo` (a Stack-mounted `center_morph_modal`) and `examples/shadcn-demo` (a
 `show_dialog` page). Use a window tall enough that the page does not scroll. **Windows: run
 2026-11-15** on Windows 11 Pro 10.0.26200 at `0e5013f6`, input scripted, read from screenshots.
-**macOS: not run yet. Linux: not run** (no desktop session on the Linux host). **Phones: not run**:
+**macOS: run 2026-11-15** on macOS 27.0.1 at `bf47e993`, same method plus VoiceOver read from its
+caption panel; `cargo clippy -p frust-shell-ios --target aarch64-apple-ios-sim --all-targets --locked
+-- -D warnings` and `cargo check -p frust-beui -p frust-shadcn --target aarch64-apple-ios` pass.
+**Linux: not run** (no desktop session on the Linux host). **Phones: not run**:
 neither demo has an Android or iOS host, so the Back cause, the shadcn back press playing the exit
 ramp and the soft keyboard on focus return wait for a demo that runs on phones.
 
@@ -460,6 +463,22 @@ ramp and the soft keyboard on focus return wait for a demo that runs on phones.
   pressing the beUI button, nothing holds focus on close, with step 6's toggle on or off: the
   button takes focus on press but is not a traversal stop, so no return target is recorded. Tab
   does not reach the button, so the keyboard open in the demo's caption cannot be done.
+- **shadcn, macOS: steps pass, VoiceOver hears no focus.** The six steps behave as on Windows
+  (Cmd+B toggles the sidebar behind the kept dialog; after a kept backdrop press Tab leaves the
+  dialog with no ring to be seen; the section refreshes only when the page is revisited). With
+  VoiceOver on nothing is announced as focused: not the Composer, not "Open dialog" reached with
+  Tab, not the focus returned on close; no node reports `AXFocused` and the VoiceOver cursor stays
+  put. Closing with VO-Space on Discard does return focus to "Open dialog" (ring; Return re-opens).
+  On the Controls page Tab from an unfocused page reaches no checkbox, radio or slider; a clicked
+  checkbox takes the ring and Space, and Tab does not move on from it.
+- **beUI, macOS: veto and opt-in pass, focus return fails**, as on Windows: the readout shows
+  "Escape, kept", "Backdrop, kept", "Escape, dismissed" and "Backdrop, dismissed", step 5 passes,
+  and nothing holds focus after any close. After a kept Escape a backdrop press is kept without
+  changing the readout. Tab reaches only text fields, so neither "Open dialog" nor the Controls
+  page's checkbox, radio and slider take keyboard focus. VoiceOver announces a clicked text field
+  ("hi, edit text") but not one reached with Tab. VO-Space opens the dialog and closes it from
+  Discard; focus then returns nowhere and the VoiceOver cursor is left on the closed button's
+  empty rectangle. Each focused field scrolls the page about 66 px, so the page does scroll here.
 
 ## Browser manual gate (web)
 
