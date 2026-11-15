@@ -428,6 +428,39 @@ Gates, against `examples/custom-titlebar` (each gate card flips its bullet):
   focus act; `minimized` stays `false` (`desktop-linux-wayland-minimized-unreported`). Playground
   Window row passes. GNOME not run.
 
+## Modal dismiss and focus return manual test (desktop)
+
+A desktop gate for the beUI and shadcn modal hosts' dismiss veto (`on_dismiss_request`),
+`escape_leaves_field_first` and `return_focus`, on the "Draft dialog" section of the Overlays page
+of `examples/beui-demo` (a Stack-mounted `center_morph_modal`) and `examples/shadcn-demo` (a
+`show_dialog` page). Use a window tall enough that the page does not scroll. **Windows: run
+2026-11-15** on Windows 11 Pro 10.0.26200 at `0e5013f6`, input scripted, read from screenshots.
+**macOS: not run yet. Linux: not run** (no desktop session on the Linux host). **Phones: not run**:
+neither demo has an Android or iOS host, so the Back cause, the shadcn back press playing the exit
+ramp and the soft keyboard on focus return wait for a demo that runs on phones.
+
+1. Type a draft, press Escape: the field blurs and the dialog stays. Click the backdrop: it stays.
+2. With the draft still there and no click inside the panel, press a main-window shortcut or Tab.
+3. Clear the draft, press Escape: the dialog closes and focus is back on the invoker.
+4. Open with the pointer, close with Discard: focus is on the invoker, with no ring.
+5. Veto off, "Escape leaves the field first" on: the first Escape only blurs the field, the second
+   closes.
+6. "Return focus on close" off: nothing holds focus after the close.
+
+- **shadcn, Windows: steps pass.** Veto keeps the dialog on Escape and on the backdrop; an empty
+  draft closes it and focus returns to "Open dialog", with the ring after a keyboard open and
+  without it after a pointer open (Enter re-opens the dialog); step 5 and step 6 behave as written.
+  Step 2: Ctrl+B toggles the sidebar behind the kept dialog. A dialog opened from the keyboard has
+  no focus inside until Tab. The section itself does not refresh: its switches, readout and
+  Composer text never update on screen, so the cause and decision could not be read.
+- **beUI, Windows: veto and opt-in pass, focus return fails.** Escape and the backdrop are kept
+  (readout "Escape, kept"), an empty draft or a veto-off backdrop press closes ("Escape,
+  dismissed", "Backdrop, dismissed"), step 5 passes, and the close X closes without asking the
+  veto. Step 2: Tab moves focus to the Composer behind the kept dialog. After a dialog opened by
+  pressing the beUI button, nothing holds focus on close, with step 6's toggle on or off: the
+  button takes focus on press but is not a traversal stop, so no return target is recorded. Tab
+  does not reach the button, so the keyboard open in the demo's caption cannot be done.
+
 ## Browser manual gate (web)
 
 A gate for `crates/frust-shell-web`, run against `examples/web-gallery` per its own README's
