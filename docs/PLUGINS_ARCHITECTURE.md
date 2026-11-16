@@ -97,7 +97,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for how PLUGINS relates to the other unit
 | `plugins/material-i18n` | Facade-tier bridge (`frust-material-i18n`, depends on `frust-reactive`): `material_strings_for(locale)`, `localized_theme` and `provide_localized_strings` map the active `I18n` locale onto the `MaterialStrings` theme extension; no OS integration. Tables: en plus machine-drafted th/vi/ja/es/de/fr/zh-Hans; zh-Hant and zh TW/HK/MO/US/GB get English with one warning. `provide_localized_strings` reads the parent's theme so a pushed theme reaches readers below it; a caller theme on the same owner must be provided again before it on every build |
 | `plugins/cupertino` | The Cupertino (iOS-styled) design-system plugin (`frust-cupertino`), including its own "Liquid Glass" `GlassScale` recipe |
 | `plugins/shadcn` | The shadcn/ui design-system plugin (`frust-shadcn`), the tier's first external-origin catalog: a port of shadcn/ui v4 (55 components, incl. an app-shell `sidebar`, a `message`/`message_scroller` chat pair, and a `questionnaire` step-sequence form), its own token system (vendored `neutral` base plus six sibling palettes folded onto the baseline `ColorScheme`, a `ShadcnTokens` extension for the roles it has no baseline analogue for), an `overlay` hosting seam for its anchored and modal panel families — every modal component animates its exit, and every anchored panel takes a prop-driven `.open(bool)` for the same (see *Design-System Plugins* below) — and its own bundled Inter + JetBrains Mono variable fonts |
-| `plugins/beui` | The beUI design-system plugin (`frust-beui`), the tier's second external-origin catalog: a port of beUI v2 (81 upstream registry slugs — 42 `components`, 17 `agents`, 22 `blocks`, module-family-prefixed rather than flat re-exported), its own `BeuiTokens` extension over an oklch-transcribed palette, three glass recipes, and catalog motion tokens (`SPRING_*`/`EASE_*`), an `overlay` hosting seam mirroring shadcn's (see *Design-System Plugins* below), a dedicated per-character text-cell substrate (`motion::chars`) and stagger/pointer/scroll-effect drivers making motion the catalog's distinguishing layer, its own bundled Geist + Geist Mono variable fonts (`plugins/beui/fonts`, OFL), and (behind the non-default `gpu-effects` feature) the `gpu_fx` perspective-quad substrate five components opt into (see *Design-System Plugins* below) |
+| `plugins/beui` | The beUI design-system plugin (`frust-beui`), the tier's second external-origin catalog: a port of beUI v2 (81 upstream registry slugs — 42 `components`, 17 `agents`, 22 `blocks`, module-family-prefixed rather than flat re-exported) plus six phone-content parts authored in this repository (`components::{alert, avatar, card, chip, grouped_list, key_value}`), its own `BeuiTokens` and `BeuiMetrics` (per-`Density` sizes; `theme_with_density`/`install_with_density`) extensions over an oklch-transcribed palette, three glass recipes, and catalog motion tokens (`SPRING_*`/`EASE_*`), an `overlay` hosting seam mirroring shadcn's (see *Design-System Plugins* below), a dedicated per-character text-cell substrate (`motion::chars`) and stagger/pointer/scroll-effect drivers making motion the catalog's distinguishing layer, its own bundled Geist + Geist Mono variable fonts (`plugins/beui/fonts`, OFL), and (behind the non-default `gpu-effects` feature) the `gpu_fx` perspective-quad substrate five components opt into (see *Design-System Plugins* below) |
 | `plugins/network-image` | Facade-tier network image view (`network_image(url)` / `NetworkImageView`): an `ImageLoader` runs memory cache, then disk cache, then a single-flight fetch through the `ImageFetcher` seam (default `ReqwestFetcher`, cap-bounded streaming), then an off-thread decode-and-fit; the view renders placeholder, fade-in image or error slot from a `LoadState`. `NetworkImages::install()` publishes the process-wide loader. Optional `webp` feature |
 
 ## Desktop Backend Status
@@ -352,15 +352,19 @@ host ignores the back press.
   advisory one-frame depth guard: it snapshots the navigator's page-stack depth when an exit ramp is
   staged and refuses to fire the pop if that depth moved before the ramp settles — the same
   identity-guard shape `frust-material`'s staged pop already carries; the two hosts carry the
-  same guard under the same name, `StagedPop`.
+  same guard under the same name, `StagedPop`. A `select`/`multi_select` built with
+  `.floating(true)` (default `false`, the inline host) floats its option panel into the root
+  overlay layer instead, so it works inside a modal or a clipping container at the costs listed in
+  `overlay/anchored.rs` (*What floating still costs*).
 - **`frust-beui`'s three catalogs (`components`/`agents`/`blocks`) mirror upstream beUI's own
   registry split** — 42 `components` (incl. `shader_background`'s five WGSL variants), 17 `agents`,
-  22 `blocks`, 81 slugs total; public symbols stay module-prefixed rather than flat re-exported at
+  22 `blocks`, 81 slugs total; `components` also holds the six parts authored here (48 modules in
+  all; `components/mod.rs` names them); public symbols stay module-prefixed rather than flat re-exported at
   the crate root (`ButtonVariant`, not a bare `Variant`) since the three families cover overlapping
   upstream ground. Motion is this catalog's distinguishing layer over the other four: `motion::chars`
   (per-character shaped text cells), `motion::stagger`/`pointer`/`scroll_fx`, and `motion::presence`
   (the kept-mounted exit staging above) back nearly every component, against Glyph/Material/
-  Cupertino's and shadcn's mostly-static layouts. `examples/beui-demo` (desktop gallery, 19 pages) is
+  Cupertino's and shadcn's mostly-static layouts. `examples/beui-demo` (a standalone, phone-capable gallery app, 20 pages) is
   the reference consumer — see [ARCHITECTURE.md](ARCHITECTURE.md)'s Examples table.
 - **`frust-beui`'s non-default `gpu-effects` feature (`= ["frust/gpu"]`) adds `gpu_fx`, a
   perspective-quad GPU substrate reaching `wgpu` only through `frust::gpu`'s re-export — the crate
