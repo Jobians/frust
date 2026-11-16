@@ -47,7 +47,7 @@ pub use compile::paint::{
 };
 pub use compile::{
     CompiledFrame, DepthCounter, EngineDraw, RetainedBracket, RetainedKind, RetainedPlacement,
-    SceneCompiler, SceneTextureFilter, SceneTextureHints,
+    SceneCompiler, SceneTextureFilter, SceneTextureHints, validate_scene,
 };
 pub use diag::{EngineSpan, FrameTimestamps};
 pub use effects::ShaderQuadPass;

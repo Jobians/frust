@@ -854,8 +854,8 @@ proptest! {
                 prop_assert!(frame.fast_rect_draws as usize <= frame.draws().len());
             }
             Err(
-                EngineError::InvalidTransform
-                | EngineError::InvalidGeometry
+                EngineError::InvalidTransform { .. }
+                | EngineError::InvalidGeometry { .. }
                 | EngineError::TargetTooLarge,
             ) => {}
             Err(other) => prop_assert!(
@@ -1796,7 +1796,7 @@ fn the_documented_non_terminating_rounded_rect_is_refused() {
 
     assert!(matches!(
         SceneCompiler::new(VIEWPORT.0, VIEWPORT.1).compile(&scene, root, VIEWPORT),
-        Err(EngineError::InvalidGeometry)
+        Err(EngineError::InvalidGeometry { .. })
     ));
 }
 
@@ -1823,7 +1823,7 @@ fn the_documented_non_terminating_dash_cycle_is_refused() {
 
     assert!(matches!(
         SceneCompiler::new(VIEWPORT.0, VIEWPORT.1).compile(&scene, Affine::IDENTITY, VIEWPORT),
-        Err(EngineError::InvalidGeometry)
+        Err(EngineError::InvalidGeometry { .. })
     ));
 }
 
@@ -2041,7 +2041,7 @@ fn non_finite_geometry_is_refused_field_by_field() {
                         Affine::IDENTITY,
                         VIEWPORT
                     ),
-                    Err(EngineError::InvalidGeometry)
+                    Err(EngineError::InvalidGeometry { .. })
                 ),
                 "a {bad} {name} must be refused as geometry"
             );
@@ -2079,7 +2079,7 @@ fn a_non_finite_shader_quad_destination_refuses_the_frame() {
 
     assert!(matches!(
         SceneCompiler::new(VIEWPORT.0, VIEWPORT.1).compile(&scene, Affine::IDENTITY, VIEWPORT),
-        Err(EngineError::InvalidGeometry)
+        Err(EngineError::InvalidGeometry { .. })
     ));
 }
 
@@ -2187,7 +2187,7 @@ fn a_non_finite_root_transform_is_refused_whole() {
     ] {
         assert!(matches!(
             SceneCompiler::new(VIEWPORT.0, VIEWPORT.1).compile(&scene, root, VIEWPORT),
-            Err(EngineError::InvalidTransform)
+            Err(EngineError::InvalidTransform { .. })
         ));
     }
 }

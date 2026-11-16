@@ -713,7 +713,7 @@ fn non_finite_group_geometry_is_refused_before_any_strip_is_generated() {
 
     for (what, scene) in cases {
         assert!(
-            matches!(refusal(&scene), EngineError::InvalidGeometry),
+            matches!(refusal(&scene), EngineError::InvalidGeometry { .. }),
             "{what} that is not finite must refuse the frame"
         );
     }
