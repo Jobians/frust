@@ -70,7 +70,8 @@ use frust::{FrameTime, Theme};
 
 use crate::agents::code_block::{
     CODE_LINE_HEIGHT, CODE_TEXT_SIZE, CodePalette, CodeSpan, CodeTokenClass, code_palette,
-    code_span, code_style, draw_check, draw_chevron, draw_file_glyph, draw_spinner, spinner_angle,
+    code_span, draw_check, draw_chevron, draw_file_glyph, draw_spinner, scaled_code_style,
+    spinner_angle, text_factor,
 };
 use crate::motion::{Ramp, Stagger};
 use crate::press::{Lane, inside, is_activation_key, presses};
@@ -429,6 +430,9 @@ pub struct FileDiffWidget {
     /// The file's own disclosure.
     reveal: Lane,
     width: f64,
+    /// The OS text scale layout resolved: it sizes the row pitch, the hunk
+    /// header and the gutters.
+    scale: f64,
     focused: DiffTarget,
     hovered: Option<DiffTarget>,
     captured: Option<DiffTarget>,
@@ -489,6 +493,7 @@ impl<State: 'static> View<State> for FileDiffView<State> {
             max_height: self.max_height,
             reveal: Lane::at_rest(FILE_DIFF_REVEAL, if self.open { 1.0 } else { 0.0 }),
             width: 0.0,
+            scale: 1.0,
             focused: DiffTarget::File,
             hovered: None,
             captured: None,
@@ -600,17 +605,28 @@ impl FileDiffWidget {
         ))
     }
 
+    /// One diff row's pitch: [`CODE_LINE_HEIGHT`] grown with the text scale so
+    /// consecutive scaled rows never overlap.
+    fn line_height(&self) -> f64 {
+        CODE_LINE_HEIGHT * self.scale
+    }
+
+    /// A hunk header row's height, grown with the text scale.
+    fn hunk_header_height(&self) -> f64 {
+        FILE_DIFF_HUNK_HEADER_HEIGHT * self.scale
+    }
+
     /// Hunk `index`'s row band height right now.
     fn hunk_body(&self, index: usize) -> f64 {
         self.hunks.get(index).map_or(0.0, |entry| {
-            (entry.reveal.value().clamp(0.0, 1.0) * entry.rows.len() as f64 * CODE_LINE_HEIGHT)
+            (entry.reveal.value().clamp(0.0, 1.0) * entry.rows.len() as f64 * self.line_height())
                 .max(0.0)
         })
     }
 
     /// Hunk `index`'s whole height: its header plus its band.
     fn hunk_height(&self, index: usize) -> f64 {
-        FILE_DIFF_HUNK_HEADER_HEIGHT + self.hunk_body(index)
+        self.hunk_header_height() + self.hunk_body(index)
     }
 
     /// The panel's natural (uncapped) height.
@@ -656,7 +672,7 @@ impl FileDiffWidget {
         }
         Some(Rect::from_origin_size(
             Point::new(panel.x0, y),
-            Size::new(panel.width(), FILE_DIFF_HUNK_HEADER_HEIGHT),
+            Size::new(panel.width(), self.hunk_header_height()),
         ))
     }
 
@@ -745,8 +761,11 @@ impl Widget for FileDiffWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
         self.width = bc.max().width;
         // Explicit: every run here is code in the mono stack, and `TypeScale`
-        // has no monospace role to take it from.
-        let code = code_style(CODE_TEXT_SIZE);
+        // has no monospace role to take it from. The style follows the OS text
+        // scale once, here; the row geometry below follows `self.scale`.
+        let theme = Theme::from_layout_ctx(ctx);
+        self.scale = text_factor(theme);
+        let code = scaled_code_style(CODE_TEXT_SIZE, theme);
         self.file.layout(ctx, &code);
         self.additions.layout(ctx, &code);
         self.deletions.layout(ctx, &code);
@@ -942,7 +961,7 @@ impl Widget for FileDiffWidget {
                 entry.header.paint(
                     Point::new(
                         header_at.x + style::GAP_MD,
-                        header_at.y + (FILE_DIFF_HUNK_HEADER_HEIGHT - measured.height) / 2.0,
+                        header_at.y + (header.height() - measured.height) / 2.0,
                     ),
                     with_alpha(palette.comment, CodePalette::HUNK_HEADER_ALPHA),
                     scene,
@@ -952,7 +971,7 @@ impl Widget for FileDiffWidget {
                         scene,
                         Point::new(
                             header_at.x + header.width() - style::GAP_MD - style::ICON_SIZE / 2.0,
-                            header_at.y + FILE_DIFF_HUNK_HEADER_HEIGHT / 2.0,
+                            header_at.y + header.height() / 2.0,
                         ),
                         style::ICON_SIZE,
                         entry.reveal.value().clamp(0.0, 1.0) * std::f64::consts::PI,
@@ -964,7 +983,10 @@ impl Widget for FileDiffWidget {
                 if body <= 0.5 {
                     continue;
                 }
-                let body_top = header_at.y + FILE_DIFF_HUNK_HEADER_HEIGHT;
+                let body_top = header_at.y + header.height();
+                let line_height = self.line_height();
+                let gutter_width = FILE_DIFF_GUTTER_WIDTH * self.scale;
+                let marker_width = FILE_DIFF_MARKER_WIDTH * self.scale;
                 scene.push_clip(
                     Point::new(header_at.x, body_top),
                     Size::new(header.width(), body),
@@ -983,12 +1005,12 @@ impl Widget for FileDiffWidget {
                         cascade.progress_clamped(elapsed, row_index, count)
                     };
                     let row_top = body_top
-                        + row_index as f64 * CODE_LINE_HEIGHT
+                        + row_index as f64 * line_height
                         + (1.0 - arrived) * FILE_DIFF_ROW_RISE;
                     if row_top > body_top + body {
                         break;
                     }
-                    let row_size = Size::new(header.width(), CODE_LINE_HEIGHT);
+                    let row_size = Size::new(header.width(), line_height);
                     if let Some(wash) = Self::row_wash(row.kind, &palette, danger) {
                         scene.fill_rect(Point::new(header_at.x, row_top), row_size, wash);
                     }
@@ -1005,16 +1027,14 @@ impl Widget for FileDiffWidget {
                             let measured = run.size();
                             run.paint(
                                 Point::new(
-                                    column + FILE_DIFF_GUTTER_WIDTH
-                                        - style::GAP_MD
-                                        - measured.width,
-                                    row_top + (CODE_LINE_HEIGHT - measured.height) / 2.0,
+                                    column + gutter_width - style::GAP_MD - measured.width,
+                                    row_top + (line_height - measured.height) / 2.0,
                                 ),
                                 with_alpha(palette.comment, FILE_DIFF_GUTTER_ALPHA),
                                 scene,
                             );
                         }
-                        column += FILE_DIFF_GUTTER_WIDTH;
+                        column += gutter_width;
                     }
                     let marker_ink = match row.kind {
                         FileDiffLineKind::Added => tokens.success,
@@ -1024,20 +1044,17 @@ impl Widget for FileDiffWidget {
                     let marker_size = row.marker.size();
                     row.marker.paint(
                         Point::new(
-                            column + (FILE_DIFF_MARKER_WIDTH - marker_size.width) / 2.0,
-                            row_top + (CODE_LINE_HEIGHT - marker_size.height) / 2.0,
+                            column + (marker_width - marker_size.width) / 2.0,
+                            row_top + (line_height - marker_size.height) / 2.0,
                         ),
                         marker_ink,
                         scene,
                     );
-                    column += FILE_DIFF_MARKER_WIDTH + style::GAP_SM;
+                    column += marker_width + style::GAP_SM;
                     for (run, class) in &row.spans {
                         let measured = run.size();
                         run.paint(
-                            Point::new(
-                                column,
-                                row_top + (CODE_LINE_HEIGHT - measured.height) / 2.0,
-                            ),
+                            Point::new(column, row_top + (line_height - measured.height) / 2.0),
                             palette.ink(*class),
                             scene,
                         );
@@ -1693,5 +1710,43 @@ mod tests {
             &faces,
             Face::GeistMono,
         );
+    }
+
+    // ---- The OS text scale ---------------------------------------------------
+
+    /// Diff code grows with the text scale; the row pitch, hunk header and
+    /// gutters grow with it so rows never overlap, and at `1.0` every measure
+    /// is today's.
+    #[test]
+    fn diff_text_follows_the_text_scale_without_overlapping_rows() {
+        use crate::agents::code_block::scale_test::{assert_scaled, layout_under, theme_at};
+
+        let mut base = build(&view(true, Vec::new()));
+        let base_size = layout_under(&mut base, None, 460.0);
+        let mut unit = build(&view(true, Vec::new()));
+        let unit_theme = theme_at(1.0);
+        assert_eq!(layout_under(&mut unit, Some(&unit_theme), 460.0), base_size);
+        assert_eq!(base.line_height(), CODE_LINE_HEIGHT);
+        assert_eq!(base.hunk_header_height(), FILE_DIFF_HUNK_HEADER_HEIGHT);
+
+        let mut big = build(&view(true, Vec::new()));
+        let big_theme = theme_at(1.5);
+        layout_under(&mut big, Some(&big_theme), 460.0);
+        fn row(w: &FileDiffWidget) -> &RowRuns {
+            &w.hunks[0].rows[0]
+        }
+        let span = |w: &FileDiffWidget| row(w).spans[0].0.size().height;
+        assert_scaled("diff code", span(&base), span(&big), 1.5);
+        let marker = |w: &FileDiffWidget| row(w).marker.size().height;
+        assert_scaled("marker", marker(&base), marker(&big), 1.5);
+        let header = |w: &FileDiffWidget| w.hunks[0].header.size().height;
+        assert_scaled("hunk header", header(&base), header(&big), 1.5);
+        assert!(
+            big.line_height() >= span(&big),
+            "the row pitch holds a scaled line"
+        );
+        assert!(big.hunk_header_height() >= header(&big));
+        assert_scaled("row pitch", base.line_height(), big.line_height(), 1.5);
+        assert_scaled("hunk band", base.hunk_body(0), big.hunk_body(0), 1.5);
     }
 }

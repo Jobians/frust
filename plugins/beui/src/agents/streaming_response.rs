@@ -75,6 +75,7 @@ use frust::{FrameTime, Theme};
 use kurbo::Point;
 use peniko::{Brush, Color};
 
+use crate::agents::code_block::text_factor;
 use crate::motion::Ramp;
 use crate::press::Lane;
 use crate::style::{self, scale_alpha};
@@ -229,6 +230,9 @@ pub struct StreamingResponseWidget {
     reveal: Lane,
     /// The frame this widget first painted on — the cursor's cycle clock.
     started: Option<FrameTime>,
+    /// The OS text scale layout resolved: it sizes the cursor and the
+    /// reserved first line to match the scaled body.
+    scale: f64,
 }
 
 impl StreamingResponseWidget {
@@ -395,6 +399,7 @@ impl<State: 'static> View<State> for StreamingResponseView {
             color: self.color,
             run: None,
             shaped: None,
+            scale: 1.0,
             settled_glyphs: 0,
             // The first content is not an append: it arrives settled, so a
             // transcript of finished answers plays nothing.
@@ -445,6 +450,7 @@ impl Widget for StreamingResponseWidget {
         let theme = Theme::from_layout_ctx(ctx);
         let ink = self.ink(theme);
         let style = self.body_style(theme, ink);
+        self.scale = text_factor(theme);
         let width = if bc.max().width.is_finite() {
             bc.max().width
         } else {
@@ -469,7 +475,7 @@ impl Widget for StreamingResponseWidget {
         // somewhere to sit before the first token lands.
         bc.constrain(Size::new(
             measured.width,
-            measured.height.max(STREAM_LINE_HEIGHT),
+            measured.height.max(STREAM_LINE_HEIGHT * self.scale),
         ))
     }
 
@@ -497,7 +503,8 @@ impl Widget for StreamingResponseWidget {
             .as_ref()
             .map(|run| run.to_scene_runs(origin))
             .unwrap_or_default();
-        let cursor = cursor_at(&runs, origin, self.size as f64);
+        let body_size = self.size as f64 * self.scale;
+        let cursor = cursor_at(&runs, origin, body_size);
         let (settled, pending) = split_runs(runs, self.settled_glyphs);
 
         for mut run in settled {
@@ -518,7 +525,7 @@ impl Widget for StreamingResponseWidget {
             } else {
                 cursor_alpha(cycle(elapsed, CURSOR_PERIOD))
             };
-            let height = self.size as f64 * CURSOR_HEIGHT_FACTOR;
+            let height = body_size * CURSOR_HEIGHT_FACTOR;
             scene.fill_rounded_rect(
                 cursor,
                 Size::new(CURSOR_WIDTH, height),
@@ -922,5 +929,35 @@ mod tests {
     #[test]
     fn the_body_follows_a_live_theme_family_swap() {
         assert_follows_a_live_family_swap("the response body", probe_view, BOX);
+    }
+
+    // ---- The OS text scale ---------------------------------------------------
+
+    /// The body, its reserved first line and its cursor follow the text scale
+    /// once, and at `1.0` every measure is today's.
+    #[test]
+    fn the_body_and_its_reserved_line_follow_the_text_scale() {
+        use crate::agents::code_block::scale_test::{assert_scaled, layout_under, theme_at};
+
+        let make = |content: &str| {
+            let mut next_id = 0u64;
+            View::<()>::build(
+                &streaming_response(content),
+                &mut BuildCtx::new(&mut next_id),
+            )
+        };
+        let unit_theme = theme_at(1.0);
+        let big_theme = theme_at(1.5);
+        for content in ["", "one line"] {
+            let mut base = make(content);
+            let base_size = layout_under(&mut base, None, 320.0);
+            let mut unit = make(content);
+            assert_eq!(layout_under(&mut unit, Some(&unit_theme), 320.0), base_size);
+            assert_eq!(base_size.height, STREAM_LINE_HEIGHT);
+
+            let mut big = make(content);
+            let big_size = layout_under(&mut big, Some(&big_theme), 320.0);
+            assert_scaled("body line", base_size.height, big_size.height, 1.5);
+        }
     }
 }
