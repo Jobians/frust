@@ -66,7 +66,7 @@ use frust::authoring::{
     any, build_child, rebuild_child, rebuild_children, route_event, route_event_single,
     teardown_child, visit_children,
 };
-use frust::{NavigatorController, PopResult, Theme, icon, text_input};
+use frust::{FocusHandle, NavigatorController, PopResult, Theme, icon, text_input};
 use kurbo::{Point, Size};
 
 use super::{
@@ -88,6 +88,9 @@ type OnText<State> = Rc<dyn Fn(&mut State, String)>;
 
 /// A view-held, typed state callback.
 type OnState<State> = Rc<dyn Fn(&mut State)>;
+
+/// A view-held, typed flag callback (focus or composition changes).
+type OnFlag<State> = Rc<dyn Fn(&mut State, bool)>;
 
 /// The M3 full-screen search-view chrome: a full-area `surfaceContainerHigh`
 /// panel with square corners and no shadow (a panel filling the window has no
@@ -140,6 +143,10 @@ pub struct SearchView<State: 'static> {
     trailing: Vec<AnyView<State>>,
     suggestions: Option<AnyView<State>>,
     on_submit: Option<OnText<State>>,
+    focus_handle: Option<FocusHandle>,
+    autofocus: Option<bool>,
+    on_focus_change: Option<OnFlag<State>>,
+    on_composing_change: Option<OnFlag<State>>,
     on_back: Option<OnState<State>>,
     dismissable: bool,
     on_dismiss: Option<OnState<State>>,
@@ -185,6 +192,10 @@ pub fn search_view<State: 'static, F: Fn(&mut State, String) + 'static>(
         trailing: Vec::new(),
         suggestions: None,
         on_submit: None,
+        focus_handle: None,
+        autofocus: None,
+        on_focus_change: None,
+        on_composing_change: None,
         on_back: None,
         dismissable: true,
         on_dismiss: None,
@@ -239,6 +250,35 @@ impl<State: 'static> SearchView<State> {
     /// Set the Enter handler (`M3ESearchAnchor.viewOnSubmitted`).
     pub fn on_submit<F: Fn(&mut State, String) + 'static>(mut self, on_submit: F) -> Self {
         self.on_submit = Some(Rc::new(on_submit));
+        self
+    }
+
+    /// Take, release and observe the header field's focus from app code;
+    /// forwarded to the baseline field's `focus_handle`.
+    pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
+        self.focus_handle = Some(handle);
+        self
+    }
+
+    /// Focus the header field once when it first paints; forwarded to the
+    /// baseline field's `autofocus`. Unset, a full-screen view autofocuses and
+    /// a docked one does not; an explicit call overrides that in either mode.
+    pub fn autofocus(mut self, autofocus: bool) -> Self {
+        self.autofocus = Some(autofocus);
+        self
+    }
+
+    /// Be told when the header field gains or loses focus; forwarded to the
+    /// baseline field's `on_focus_change`.
+    pub fn on_focus_change<F: Fn(&mut State, bool) + 'static>(mut self, f: F) -> Self {
+        self.on_focus_change = Some(Rc::new(f));
+        self
+    }
+
+    /// Be told when an IME composition starts or ends in the header field;
+    /// forwarded to the baseline field's `on_composing_change`.
+    pub fn on_composing_change<F: Fn(&mut State, bool) + 'static>(mut self, f: F) -> Self {
+        self.on_composing_change = Some(Rc::new(f));
         self
     }
 
@@ -347,6 +387,10 @@ impl<State: 'static> SearchView<State> {
             trailing: self.trailing,
             suggestions: self.suggestions,
             on_submit: self.on_submit,
+            focus_handle: self.focus_handle,
+            autofocus: self.autofocus,
+            on_focus_change: self.on_focus_change,
+            on_composing_change: self.on_composing_change,
             on_back: self.on_back,
             back_label: self.back_label,
             clear_label: self.clear_label,
@@ -366,6 +410,10 @@ struct SearchViewContentView<State: 'static> {
     trailing: Vec<AnyView<State>>,
     suggestions: Option<AnyView<State>>,
     on_submit: Option<OnText<State>>,
+    focus_handle: Option<FocusHandle>,
+    autofocus: Option<bool>,
+    on_focus_change: Option<OnFlag<State>>,
+    on_composing_change: Option<OnFlag<State>>,
     on_back: Option<OnState<State>>,
     back_label: String,
     clear_label: String,
@@ -387,12 +435,25 @@ impl<State: 'static> SearchViewContentView<State> {
         .focus_ring_width(0.0)
         .corner_radius(0.0)
         .padding(hpad + ACTION_SLOT, 0.0)
-        .autofocus(self.mode == SearchViewMode::FullScreen);
+        .autofocus(
+            self.autofocus
+                .unwrap_or(self.mode == SearchViewMode::FullScreen),
+        );
         if let Some(hint) = &self.hint {
             field = field.placeholder(hint.clone());
         }
         if let Some(on_submit) = self.on_submit.clone() {
             field = field.on_submit(move |state: &mut State, text| on_submit(state, text));
+        }
+        if let Some(handle) = self.focus_handle.clone() {
+            field = field.focus_handle(handle);
+        }
+        if let Some(f) = self.on_focus_change.clone() {
+            field = field.on_focus_change(move |state: &mut State, focused| f(state, focused));
+        }
+        if let Some(f) = self.on_composing_change.clone() {
+            field =
+                field.on_composing_change(move |state: &mut State, composing| f(state, composing));
         }
         field
     }
@@ -1519,6 +1580,41 @@ mod tests {
             SearchViewMode::Docked,
             Some(anchor)
         ));
+    }
+
+    #[test]
+    fn setters_reach_the_header_field() {
+        #[derive(Default)]
+        struct Log {
+            focus: Vec<bool>,
+        }
+        let run = |explicit: Option<bool>| {
+            let handle = FocusHandle::new();
+            let mut logic = {
+                let handle = handle.clone();
+                move |_s: &mut Log| {
+                    let mut v = search_view(String::new(), |_: &mut Log, _| {})
+                        .focus_handle(handle.clone())
+                        .on_focus_change(|s: &mut Log, f| s.focus.push(f))
+                        .on_composing_change(|_: &mut Log, _| {});
+                    if let Some(a) = explicit {
+                        v = v.autofocus(a);
+                    }
+                    v.into_content(SearchViewMode::FullScreen, None)
+                }
+            };
+            let mut root: RenderRoot<Log, SearchViewContentView<Log>> = RenderRoot::new();
+            let mut state = Log::default();
+            let mut tcx = TextContext::new();
+            for frame in 0..6u64 {
+                root.rebuild(&mut logic, &mut state);
+                root.layout_with_text(COMPACT, &mut tcx as &mut dyn Any);
+                root.paint(&mut Recorder::default(), ft(frame * 16));
+            }
+            (handle.is_focused(), state.focus)
+        };
+        assert_eq!(run(None), (true, vec![true]));
+        assert_eq!(run(Some(false)), (false, vec![]));
     }
 
     // ---- Semantics ----

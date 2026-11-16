@@ -152,7 +152,9 @@
 //! header field sets the baseline field's `autofocus(true)`, so it takes focus
 //! on its first paint and the soft keyboard rises with the page. The docked
 //! panel does not: its anchoring bar already holds the focus the user gave it,
-//! and the panel leaves that session alone.
+//! and the panel leaves that session alone. An explicit
+//! [`SearchView::autofocus`](view::SearchView::autofocus) call overrides either
+//! default.
 //!
 //! # Symbol surface
 //!

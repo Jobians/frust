@@ -226,6 +226,8 @@ pub enum TextFieldVariant {
 /// A view-held, typed text callback (erased by the wrapped baseline field on
 /// build).
 type OnText<State> = Rc<dyn Fn(&mut State, String)>;
+
+/// A view-held, typed flag callback (focus or composition changes).
 type OnFlag<State> = Rc<dyn Fn(&mut State, bool)>;
 
 /// A declarative M3 text field. See the [module docs](self).
@@ -1115,7 +1117,6 @@ mod tests {
         assert_eq!(first, second);
     }
 
-    /// The window every harness lays out in.
     #[test]
     fn autofocus_and_on_focus_change_reach_the_wrapped_field() {
         #[derive(Default)]
@@ -1149,6 +1150,7 @@ mod tests {
         assert_eq!(state.focus, [true]);
     }
 
+    /// The window every harness lays out in.
     const WINDOW: Size = Size::new(320.0, 160.0);
     /// A point inside the decoration box, clear of both icon slots.
     const IN_FIELD: Point = Point::new(120.0, 28.0);
