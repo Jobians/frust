@@ -124,6 +124,8 @@ pub struct FormsState {
     pub grid_last: RwSignal<Option<GridPoint>>,
     /// The last `offset_from_origin` a long-press move reported.
     pub grid_offset: RwSignal<(f64, f64)>,
+    /// The last `global_position` a long-press move reported, in window coordinates.
+    pub grid_global: RwSignal<(f64, f64)>,
 }
 
 impl FormsState {
@@ -150,6 +152,7 @@ impl FormsState {
             grid_active: RwSignal::new(false),
             grid_last: RwSignal::new(None),
             grid_offset: RwSignal::new((0.0, 0.0)),
+            grid_global: RwSignal::new((0.0, 0.0)),
         }
     }
 }
@@ -368,8 +371,11 @@ pub fn page(state: &PlaygroundState) -> impl View<PlaygroundState> {
     let selected_now = grid_selected.get();
     let selected_count = selected_now.iter().filter(|on| **on).count();
     let (offset_x, offset_y) = grid_offset.get();
+    let grid_global = forms.grid_global;
+    let (global_x, global_y) = grid_global.get();
     let grid_status = format!(
-        "selected: {selected_count}   dragging: {}   last offset: ({offset_x:.0}, {offset_y:.0})",
+        "selected: {selected_count}   dragging: {}   last offset: ({offset_x:.0}, {offset_y:.0})   \
+         window: ({global_x:.0}, {global_y:.0})",
         yes_no(grid_active.get()),
     );
     let scheme = *theme().scheme();
@@ -413,6 +419,7 @@ pub fn page(state: &PlaygroundState) -> impl View<PlaygroundState> {
                         grid_last.set(Some(here));
                         grid_offset
                             .set((details.offset_from_origin.x, details.offset_from_origin.y));
+                        grid_global.set((details.global_position.x, details.global_position.y));
                     },
                 )
                 .on_long_press_end(
@@ -730,6 +737,11 @@ mod tests {
         assert!(
             (dx - (end.x - start.x)).abs() < 0.5 && (dy - (end.y - start.y)).abs() < 0.5,
             "the last offset is the distance from the press: ({dx}, {dy})"
+        );
+        let (gx, gy) = forms.grid_global.get_untracked();
+        assert!(
+            (gx - end.x).abs() < 0.5 && (gy - end.y).abs() < 0.5,
+            "the last window position is where the pointer ended: ({gx}, {gy})"
         );
         assert_eq!(
             h.bounds("GestureDetectorWidget", 0).y0,
