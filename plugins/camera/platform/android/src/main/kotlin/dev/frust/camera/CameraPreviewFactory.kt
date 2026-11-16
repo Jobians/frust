@@ -635,6 +635,13 @@ internal class CameraPreviewView(context: Context) : FrameLayout(context), Previ
             // Assigning is what schedules the layout pass; the compare above is
             // what keeps a steady preview free of one.
             surfaceView.layoutParams = lp
+            // A request made during a layout pass is dropped once the inner
+            // view's own `layout()` clears `PFLAG_FORCE_LAYOUT`, and the
+            // compare above then never repeats it. `onSizeChanged` posts its
+            // own call, but a `TransformationInfo` that CameraX delivers
+            // inline from `maybeSyncTargetRotation` still lands here inside
+            // the pass, so ask again once it is over.
+            if (isInLayout) post { surfaceView.requestLayout() }
         }
     }
 
