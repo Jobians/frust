@@ -25,12 +25,14 @@ pub enum EngineError {
     /// A transform maps geometry off the finite device grid.
     ///
     /// `command` is the index of the offending command in the scene's command
-    /// order, or `None` when the root transform itself is the culprit; `kind`
-    /// is that command's variant name (for example `"RoundedRect"`), or
-    /// `"root"` for the root transform.
+    /// order, or `None` when the refusal was raised where the index is not
+    /// known: the root transform (kind `"root"`) or a filter being recorded
+    /// (kind `"PushLayer"`); `kind` is otherwise that command's variant name
+    /// (for example `"RoundedRect"`).
     #[error("non-finite transform refused ({})", describe_site(*command, kind))]
     InvalidTransform {
-        /// Index of the offending command, `None` for the root transform.
+        /// Index of the offending command, `None` when it is not known (the
+        /// root transform, or filter recording).
         command: Option<usize>,
         /// The command's variant name, or `"root"`.
         kind: &'static str,
@@ -47,13 +49,14 @@ pub enum EngineError {
     ///
     /// `command` is the index of the offending command in the scene's command
     /// order and `kind` its variant name (for example `"RoundedRect"`), so a
-    /// caller can find the draw that blanked the frame. A filter refused while
-    /// it is being recorded (before it is part of any scene) reports index 0
-    /// and kind `"PushLayer"`.
-    #[error("non-finite geometry refused (command {command}, {kind})")]
+    /// caller can find the draw that blanked the frame. `command` is `None`
+    /// when the refusal was raised where the index is not known: a filter
+    /// refused while it is being recorded (before it is part of any scene)
+    /// reports `None` and kind `"PushLayer"`.
+    #[error("non-finite geometry refused ({})", describe_site(*command, kind))]
     InvalidGeometry {
-        /// Index of the offending command.
-        command: usize,
+        /// Index of the offending command, `None` when it is not known.
+        command: Option<usize>,
         /// The command's variant name.
         kind: &'static str,
     },

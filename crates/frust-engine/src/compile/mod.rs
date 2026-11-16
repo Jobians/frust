@@ -1356,72 +1356,7 @@ impl SceneCompiler {
         // without `perf-trace`.
         let mut clock = PhaseClock::start();
         let (width, height) = size;
-        check_tile_addressable(width, height)?;
-        check_finite(root)?;
-
-        // The whole scene is refused up front rather than mid-walk, so a
-        // rejected frame never leaves half its draws recorded.
-        let mut backdrops = 0_usize;
-        // The open retained brackets, and whether the outermost one presents
-        // its body at a scale other than 1: the one correction the walk
-        // composes ahead of a command that this loop does not.
-        let mut bracket_depth = 0_usize;
-        let mut bracket_rescales = false;
-        for (index, command) in scene.commands().iter().enumerate() {
-            check_command_transform(index, command, root)?;
-            if let Command::DrawRetained { key, .. } = command
-                && !self.retain
-            {
-                // This compiler retains nothing, so no ledger can have
-                // declared a key resident and a `DrawRetained` here is a
-                // recorder error. Refused with the whole frame, before any
-                // strip is generated; the caller logs the reason and skips
-                // the frame. With retention on, whether the key is resident is
-                // the renderer's store's to answer, after the walk.
-                return Err(EngineError::RetainedKeyMissing { key: *key });
-            }
-            check_geometry(index, command)?;
-            match command {
-                Command::PushRetained { scale, .. } => {
-                    if bracket_depth == 0 {
-                        bracket_rescales = *scale != 1.0;
-                    }
-                    bracket_depth = bracket_depth.saturating_add(1);
-                }
-                Command::PopRetained => bracket_depth = bracket_depth.saturating_sub(1),
-                Command::BackdropBlur {
-                    rect,
-                    radius,
-                    transform,
-                } if (bracket_depth > 0 && bracket_rescales)
-                    || backdrop_reaches_target(*rect, *radius, root * *transform, size) =>
-                {
-                    backdrops = backdrops.saturating_add(1);
-                }
-                _ => {}
-            }
-        }
-        // Counted over the backdrops whose blur region reaches the target, the
-        // ones that cost a surface cut, a region copy and a blur sequence: a
-        // backdrop scrolled or translated clear of the frame (a scroll view's
-        // warm paint margin, say) draws nothing and does not count. The test
-        // is made here, ahead of the walk, from the rectangle's device
-        // transform and the target alone, so it ignores any clip's coverage:
-        // it can count a backdrop the walk later drops, never miss one it
-        // draws. Inside a retained bracket whose outermost presentation scale
-        // is not exactly 1 the walk composes a correction that can pull an
-        // off-target rectangle onto the target, so every backdrop there is
-        // counted without the target test; a bracket at scale 1 corrects
-        // nothing and is tested like any other backdrop. For an ordinary
-        // frame this is the walk's own test. Refused whole before a strip is
-        // generated, whatever cap the app chose.
-        let cap = clamp_backdrop_cap(backdrop_cap);
-        if backdrops > cap {
-            return Err(EngineError::TooManyBackdrops {
-                recorded: backdrops,
-                max: cap,
-            });
-        }
+        check_scene(scene, root, size, self.retain, backdrop_cap)?;
 
         let validate = clock.lap();
 
@@ -3220,6 +3155,93 @@ fn retained_entry(on_grid: bool, scale: f64, transform: Affine) -> (f64, Affine)
     }
 }
 
+/// The up-front walk [`SceneCompiler::compile`] and [`validate_scene`] share:
+/// every refusal that depends on the scene, the root and the target alone.
+///
+/// In order: the target size, the root transform, then per command its
+/// transform, the retained-key refusal, its own geometry and the backdrop
+/// count, and last the backdrop count against `backdrop_cap` (clamped).
+/// `retain` is the compiler's retention setting: with it off a
+/// [`Command::DrawRetained`] is refused as a missing key, and with it on the
+/// walk leaves residency to the renderer's store. Generates no strips and
+/// touches no GPU.
+fn check_scene(
+    scene: &Scene,
+    root: Affine,
+    size: (u16, u16),
+    retain: bool,
+    backdrop_cap: usize,
+) -> Result<(), EngineError> {
+    let (width, height) = size;
+    check_tile_addressable(width, height)?;
+    check_finite(root)?;
+
+    // The whole scene is refused up front rather than mid-walk, so a
+    // rejected frame never leaves half its draws recorded.
+    let mut backdrops = 0_usize;
+    // The open retained brackets, and whether the outermost one presents
+    // its body at a scale other than 1: the one correction the walk
+    // composes ahead of a command that this loop does not.
+    let mut bracket_depth = 0_usize;
+    let mut bracket_rescales = false;
+    for (index, command) in scene.commands().iter().enumerate() {
+        check_command_transform(index, command, root)?;
+        if let Command::DrawRetained { key, .. } = command
+            && !retain
+        {
+            // This compiler retains nothing, so no ledger can have
+            // declared a key resident and a `DrawRetained` here is a
+            // recorder error. Refused with the whole frame, before any
+            // strip is generated; the caller logs the reason and skips
+            // the frame. With retention on, whether the key is resident is
+            // the renderer's store's to answer, after the walk.
+            return Err(EngineError::RetainedKeyMissing { key: *key });
+        }
+        check_geometry(index, command)?;
+        match command {
+            Command::PushRetained { scale, .. } => {
+                if bracket_depth == 0 {
+                    bracket_rescales = *scale != 1.0;
+                }
+                bracket_depth = bracket_depth.saturating_add(1);
+            }
+            Command::PopRetained => bracket_depth = bracket_depth.saturating_sub(1),
+            Command::BackdropBlur {
+                rect,
+                radius,
+                transform,
+            } if (bracket_depth > 0 && bracket_rescales)
+                || backdrop_reaches_target(*rect, *radius, root * *transform, size) =>
+            {
+                backdrops = backdrops.saturating_add(1);
+            }
+            _ => {}
+        }
+    }
+    // Counted over the backdrops whose blur region reaches the target, the
+    // ones that cost a surface cut, a region copy and a blur sequence: a
+    // backdrop scrolled or translated clear of the frame (a scroll view's
+    // warm paint margin, say) draws nothing and does not count. The test
+    // is made here, ahead of the walk, from the rectangle's device
+    // transform and the target alone, so it ignores any clip's coverage:
+    // it can count a backdrop the walk later drops, never miss one it
+    // draws. Inside a retained bracket whose outermost presentation scale
+    // is not exactly 1 the walk composes a correction that can pull an
+    // off-target rectangle onto the target, so every backdrop there is
+    // counted without the target test; a bracket at scale 1 corrects
+    // nothing and is tested like any other backdrop. For an ordinary
+    // frame this is the walk's own test. Refused whole before a strip is
+    // generated, whatever cap the app chose.
+    let cap = clamp_backdrop_cap(backdrop_cap);
+    if backdrops > cap {
+        return Err(EngineError::TooManyBackdrops {
+            recorded: backdrops,
+            max: cap,
+        });
+    }
+    Ok(())
+}
+
 /// Refuse a viewport whose tile-snapped extent would not fit in `u16`.
 ///
 /// The recorder snaps the scene size up to whole tiles, and that rounding is
@@ -3237,6 +3259,11 @@ fn check_tile_addressable(width: u16, height: u16) -> Result<(), EngineError> {
     }
 }
 
+/// Whether every coefficient of `transform` is finite.
+fn transform_is_finite(transform: Affine) -> bool {
+    transform.as_coeffs().iter().all(|c| c.is_finite())
+}
+
 /// Refuse a transform that maps geometry off the finite device grid.
 ///
 /// A non-finite coefficient (`NaN` from a degenerate inverse, an infinity from
@@ -3244,11 +3271,9 @@ fn check_tile_addressable(width: u16, height: u16) -> Result<(), EngineError> {
 /// pixel range the strip pipeline addresses, so the frame is refused rather
 /// than rasterized into whatever the downstream float-to-integer conversions
 /// happen to saturate to.
-/// Whether every coefficient of `transform` is finite.
-fn transform_is_finite(transform: Affine) -> bool {
-    transform.as_coeffs().iter().all(|c| c.is_finite())
-}
-
+///
+/// `command` is the index of the command the transform belongs to, `None` for
+/// the root; `kind` is that command's variant name, or `"root"`.
 fn check_finite_at(
     transform: Affine,
     command: Option<usize>,
@@ -3308,30 +3333,39 @@ fn command_kind(command: &Command) -> &'static str {
     }
 }
 
-/// Run the up-front refusals [`SceneCompiler::compile`] runs on a scene, and
-/// nothing else.
+/// Run the scene-only up-front refusals [`SceneCompiler::compile`] runs, with
+/// no strips and no GPU, so a headless caller can ask whether the engine would
+/// refuse a frame.
 ///
-/// Checks the target size, the root transform, and for every command its
-/// transform and its own geometry, in the order `compile` does; it generates
-/// no strips, allocates nothing proportional to coverage and touches no GPU,
-/// so a headless caller can run it on every frame it records. `compile` calls
-/// the same checks, so the two cannot disagree on what they refuse.
+/// `compile` calls the same walk, so the two agree, in the same order, on
+/// exactly these checks:
+///
+/// - the target `size`: [`EngineError::TargetTooLarge`] when its tile-snapped
+///   extent does not fit `u16`;
+/// - the `root` transform and each command's transform composed under it:
+///   [`EngineError::InvalidTransform`] when non-finite;
+/// - each command's own geometry: [`EngineError::InvalidGeometry`] when
+///   non-finite;
+/// - the backdrop count: [`EngineError::TooManyBackdrops`] when more
+///   `Command::BackdropBlur`s reach the target than
+///   [`max_backdrops_per_frame`] allows, judged as the renderer judges it.
+///
+/// It does not check what only a renderer or a later stage of `compile` can
+/// know. A [`Command::DrawRetained`] is never refused here, because a
+/// headless caller has no retained store, so [`EngineError::RetainedKeyMissing`]
+/// (the compiler's retention setting, and the store's residency and placement
+/// answer) is not covered. Also not covered, because each is raised later in
+/// `compile` or by the renderer: [`EngineError::PaintCapacity`] and
+/// [`EngineError::AlphaCapacity`], the filter-data refusals raised while a
+/// filter layer is recorded, [`EngineError::SchedulerEscalation`], the
+/// intermediate-texture and atlas errors, and GPU failures.
 ///
 /// # Errors
 ///
-/// [`EngineError::TargetTooLarge`] for a size whose tile-snapped extent does
-/// not fit `u16`; [`EngineError::InvalidTransform`] for a non-finite root or
-/// command transform; [`EngineError::InvalidGeometry`] for non-finite command
-/// geometry, each naming the offending command and its variant.
+/// The first refusal found, as listed above, naming the offending command and
+/// its variant where one applies.
 pub fn validate_scene(scene: &Scene, root: Affine, size: (u16, u16)) -> Result<(), EngineError> {
-    let (width, height) = size;
-    check_tile_addressable(width, height)?;
-    check_finite(root)?;
-    for (index, command) in scene.commands().iter().enumerate() {
-        check_command_transform(index, command, root)?;
-        check_geometry(index, command)?;
-    }
-    Ok(())
+    check_scene(scene, root, size, true, max_backdrops_per_frame())
 }
 
 /// Refuse a command whose own geometry is non-finite.
@@ -3434,7 +3468,7 @@ fn check_geometry(index: usize, command: &Command) -> Result<(), EngineError> {
         Ok(())
     } else {
         Err(EngineError::InvalidGeometry {
-            command: index,
+            command: Some(index),
             kind: command_kind(command),
         })
     }

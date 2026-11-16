@@ -156,10 +156,14 @@ pub struct PumpOutcome {
 /// Testers on one thread share that clock, so a pump on either advances it for both; the last
 /// Tester dropped uninstalls it, and the next starts again from zero.
 ///
-/// Every frame is also recorded into a scene and checked with the engine's own scene validation,
-/// the check the renderer applies before drawing: a frame it would refuse (non-finite geometry,
-/// say, which is a blank screen on a device) panics with the engine's error, or is collected in
-/// [`refused_frames`](Self::refused_frames) under [`TesterOptions::allow_refused_frames`].
+/// Every frame is also recorded into a scene and checked with the engine's up-front scene
+/// validation ([`validate_scene`]: target size, transforms, command geometry and the per-frame
+/// backdrop cap), at the physical extent and scale root a shell hands the renderer. A frame it
+/// would refuse (non-finite geometry or too many glass surfaces on screen, say, which is a blank
+/// screen on a device) panics with the engine's error, or is collected in
+/// [`refused_frames`](Self::refused_frames) under [`TesterOptions::allow_refused_frames`]. This
+/// is not everything the renderer can refuse: refusals raised later in compilation or by the GPU
+/// path are out of its reach.
 pub struct Tester<S: 'static, V: View<S>> {
     root: RenderRoot<S, V>,
     state: S,
@@ -380,6 +384,9 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
     }
 
     /// Rebuild, lay out and record one paint at the current clock, without advancing it.
+    ///
+    /// The recorded frame is validated like every pumped one: it panics, or is collected under
+    /// [`TesterOptions::allow_refused_frames`], when the engine would refuse it.
     #[track_caller]
     pub fn scene(&mut self) -> Scene {
         self.frame_recorded().1
@@ -458,11 +465,15 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
         let (outcome, scene) = self.paint_frame();
         let ordinal = self.frames;
         self.frames += 1;
+        // What a shell hands the renderer: it pushes `Affine::scale(scale)` over the logical
+        // paint and the renderer compiles at the identity root against the physical surface, so
+        // the scale transform is the root and the extent is the logical size times the scale.
+        let scale = self.metrics.scale;
         let size = (
-            surface_extent(self.metrics.size.width),
-            surface_extent(self.metrics.size.height),
+            surface_extent(self.metrics.size.width * scale),
+            surface_extent(self.metrics.size.height * scale),
         );
-        if let Err(error) = validate_scene(&scene, Affine::IDENTITY, size) {
+        if let Err(error) = validate_scene(&scene, Affine::scale(scale), size) {
             if !self.allow_refused_frames {
                 panic!("Tester: the engine would refuse frame {ordinal} \u{2014} {error}");
             }
