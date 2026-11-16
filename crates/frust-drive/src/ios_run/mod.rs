@@ -409,11 +409,15 @@ pub fn run_physical(
 
     println!("Launching {}…", prepared.bundle_id);
     let mut on_launch_line = |line: &str| println!("{line}");
+    // The device process writes to both streams under `--console`; print its
+    // stderr live (to ours) instead of holding it until the launch exits.
+    let mut on_launch_stderr_line = |line: &str| eprintln!("{line}");
     let launch_out = devicectl::launch(
         runner,
         &prepared.udid,
         &prepared.bundle_id,
         &mut on_launch_line,
+        &mut on_launch_stderr_line,
     )?;
     if !launch_out.success {
         bail!(
