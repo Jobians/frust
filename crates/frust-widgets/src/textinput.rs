@@ -46,6 +46,12 @@
 //! edit the widget fires `on_change`, resets the caret to visible, and
 //! republishes the IME surface.
 //!
+//! `on_change` includes preedit text: a half-composed word reaches it as it is
+//! typed. While the field is composing, Enter confirms the IME's candidate, so
+//! `on_submit` never fires (and no newline is inserted) until the composition
+//! ends. Use [`on_composing_change`](TextInputView::on_composing_change) to act
+//! on committed text only: run the work when it reports `false`.
+//!
 //! An enabled field (read-only included) is also a Tab stop: root traversal can
 //! focus it, and it declines Tab so traversal can move on.
 //!
@@ -707,6 +713,7 @@ pub struct TextInputView<State: 'static> {
     on_change: OnText<State>,
     on_submit: Option<OnText<State>>,
     on_caret_change: Option<crate::authoring::TypedArgCallback<State, CaretInfo>>,
+    on_composing_change: Option<crate::authoring::TypedArgCallback<State, bool>>,
 }
 
 /// Create a controlled text field showing `value` that fires
@@ -714,7 +721,9 @@ pub struct TextInputView<State: 'static> {
 ///
 /// The field is a controlled component: it reports the requested text through
 /// `on_change` and adopts the app-confirmed `value` on the next rebuild — it is
-/// never its own source of truth. Add a submit handler with
+/// never its own source of truth. `on_change` includes IME preedit text; use
+/// [`TextInputView::on_composing_change`] to act on committed text only.
+/// Add a submit handler with
 /// [`TextInputView::on_submit`] and a placeholder with
 /// [`TextInputView::placeholder`].
 pub fn text_input<State: 'static, F: Fn(&mut State, String) + 'static>(
@@ -742,6 +751,7 @@ pub fn text_input<State: 'static, F: Fn(&mut State, String) + 'static>(
         on_change: Rc::new(on_change),
         on_submit: None,
         on_caret_change: None,
+        on_composing_change: None,
     }
 }
 
@@ -775,7 +785,9 @@ impl<State: 'static> TextInputView<State> {
     }
 
     /// Set the submit handler fired on Enter (with the current text); focus is
-    /// kept.
+    /// kept. It never fires while an IME composition is live: that Enter
+    /// confirms the candidate instead. See
+    /// [`on_composing_change`](Self::on_composing_change).
     pub fn on_submit<F: Fn(&mut State, String) + 'static>(mut self, on_submit: F) -> Self {
         self.on_submit = Some(Rc::new(on_submit));
         self
@@ -800,6 +812,26 @@ impl<State: 'static> TextInputView<State> {
     /// those stay silent.
     pub fn on_caret_change<F: Fn(&mut State, CaretInfo) + 'static>(mut self, f: F) -> Self {
         self.on_caret_change = Some(Rc::new(f));
+        self
+    }
+
+    /// Be told when an IME composition starts and ends.
+    ///
+    /// `on_composing_change(state, composing)` fires on every transition of
+    /// the field's composing state, never twice in a row with the same value.
+    /// `true` fires **before** the [`on_change`](text_input) of the first
+    /// preedit update; `false` fires **after** the `on_change` of the commit
+    /// or clear that ended it, so a handler that runs on `false` reads the
+    /// final text. It also fires `false` when the composition ends with no
+    /// text change (a commit equal to the preedit, focus loss, a programmatic
+    /// value replace). `on_change` includes preedit text, so use this to act
+    /// on committed text only (a search-as-you-type field queries on `false`).
+    ///
+    /// A composition that ends without an event the field handles (a
+    /// controlled-value replace, a blur routed past the field) is reported
+    /// with the next event the field handles.
+    pub fn on_composing_change<F: Fn(&mut State, bool) + 'static>(mut self, f: F) -> Self {
+        self.on_composing_change = Some(Rc::new(f));
         self
     }
 
@@ -1243,6 +1275,9 @@ pub struct TextInputWidget {
     on_change: crate::authoring::ErasedArgCallback<String>,
     on_submit: Option<crate::authoring::ErasedArgCallback<String>>,
     on_caret_change: Option<crate::authoring::ErasedArgCallback<CaretInfo>>,
+    on_composing_change: Option<crate::authoring::ErasedArgCallback<bool>>,
+    /// The composing state last handed to `on_composing_change`.
+    composing_reported: bool,
     /// The last [`CaretInfo`] handed to `on_caret_change` in this focus
     /// session; `None` until the first report and again once focus is lost.
     caret_reported: Option<CaretInfo>,
@@ -1596,6 +1631,8 @@ impl TextInputWidget {
         self.sync_mask();
         self.reset_blink();
         let after = self.editor.text().to_string();
+        // `true` goes out ahead of the first preedit's `on_change`.
+        self.report_composing(ctx, true);
         if after != before {
             (self.on_change)(ctx, after);
             // Hide rule: a toolbar offers verbs for a *selection*, and an edit
@@ -1605,6 +1642,8 @@ impl TextInputWidget {
             // lets a long-press select and open in the same pass.
             self.hide_toolbar(ctx);
         }
+        // `false` goes out behind the `on_change` of the edit that ended it.
+        self.report_composing(ctx, false);
         self.publish(ctx);
         ctx.request_redraw();
         // A rebuild deferred by a preedit fires on the next layout: ask for
@@ -1983,6 +2022,12 @@ impl TextInputWidget {
                     NamedKey::Home => self.apply_edit(ctx, EditOp::Home { select }),
                     NamedKey::End => self.apply_edit(ctx, EditOp::End { select }),
                     NamedKey::Enter => {
+                        // While composing, Enter belongs to the input method:
+                        // it confirms a candidate, and the IME's own commit
+                        // follows. Neither submit nor newline.
+                        if self.editor.is_composing() {
+                            return EventResult::Handled;
+                        }
                         // Single-line always submits (Enter is never a newline).
                         // Multi-line: the resolved `submit_on_enter`, inverted by
                         // Shift, decides submit vs. insert-newline.
@@ -2218,6 +2263,21 @@ impl TextInputWidget {
                 // literal '\n'. A newline-inserting multi-line field instead lands
                 // the literal newline, matching its `NamedKey::Enter` behavior.
                 if s == "\n" || s == "\r" || s == "\r\n" {
+                    if self.editor.is_composing() {
+                        // The newline confirms the composition: end it as a
+                        // normal commit of the preedit, and submit nothing.
+                        let before = self.editor.text().to_string();
+                        if self.editor.has_preedit() {
+                            self.editor.apply(EditOp::FinishCompose, &mut self.text_ctx);
+                        } else {
+                            let mut state = self.editor.editing_state_bytes();
+                            state.composing = None;
+                            self.editor
+                                .apply(EditOp::ApplyEditingState(state), &mut self.text_ctx);
+                        }
+                        self.finish_edit(ctx, before);
+                        return EventResult::Handled;
+                    }
                     if self.max_visible_lines.is_some() && !self.submit_on_enter {
                         self.apply_edit(ctx, EditOp::InsertNewline);
                         return EventResult::Handled;
@@ -2369,6 +2429,11 @@ impl<State: 'static> View<State> for TextInputView<State> {
                 .as_ref()
                 .map(crate::authoring::erase_callback_arg::<State, CaretInfo>),
             caret_reported: None,
+            on_composing_change: self
+                .on_composing_change
+                .as_ref()
+                .map(crate::authoring::erase_callback_arg::<State, bool>),
+            composing_reported: false,
         };
         // Seeds the masked mirror when built obscured (a no-op otherwise).
         widget.rebuild_mask_editor();
@@ -2391,6 +2456,10 @@ impl<State: 'static> View<State> for TextInputView<State> {
             .on_caret_change
             .as_ref()
             .map(crate::authoring::erase_callback_arg::<State, CaretInfo>);
+        element.on_composing_change = self
+            .on_composing_change
+            .as_ref()
+            .map(crate::authoring::erase_callback_arg::<State, bool>);
 
         let mut flags = ChangeFlags::NONE;
         if prev.placeholder != self.placeholder {
@@ -2898,6 +2967,7 @@ impl Widget for TextInputWidget {
 
     fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
         let result = self.dispatch_event(ctx, event);
+        self.report_composing(ctx, false);
         self.report_caret(ctx);
         result
     }
@@ -2935,6 +3005,24 @@ impl TextInputWidget {
             offset: es.extent,
             selection: (es.base != es.extent)
                 .then(|| es.base.min(es.extent)..es.base.max(es.extent)),
+        }
+    }
+
+    /// Hand `on_composing_change` the composing state when it differs from the
+    /// last report. A blurred field is never composing. With `rising_only`
+    /// only a start is reported, so `finish_edit` can send `true` before
+    /// `on_change` and `false` after it.
+    fn report_composing(&mut self, ctx: &mut EventCtx, rising_only: bool) {
+        if self.on_composing_change.is_none() {
+            return;
+        }
+        let now = self.focused && self.editor.is_composing();
+        if now == self.composing_reported || (rising_only && !now) {
+            return;
+        }
+        self.composing_reported = now;
+        if let Some(cb) = &mut self.on_composing_change {
+            cb(ctx, now);
         }
     }
 
@@ -3394,6 +3482,7 @@ mod tests {
         reject: bool,
         carets: Vec<CaretInfo>,
         order: Vec<&'static str>,
+        composing_log: Vec<String>,
     }
 
     fn build(state: &mut AppState) -> TextInputView<AppState> {
@@ -3979,6 +4068,168 @@ mod tests {
         );
         assert_eq!(state.submits, 2);
         assert!(!widget(&root).editor.text().contains('\r'));
+    }
+
+    /// A field that logs `on_change` and `on_composing_change` into one list.
+    fn composing_harness(state: &mut AppState) -> RenderRoot<AppState, TextInputView<AppState>> {
+        let mut root = RenderRoot::new();
+        let mut build = |s: &mut AppState| {
+            text_input(s.value.clone(), |s: &mut AppState, v: String| {
+                s.composing_log.push(format!("change:{v}"));
+                s.value = v;
+            })
+            .on_submit(|s: &mut AppState, v: String| {
+                s.submits += 1;
+                s.last_submit = v;
+            })
+            .on_composing_change(|s: &mut AppState, c: bool| {
+                s.composing_log.push(format!("composing:{c}"));
+            })
+        };
+        root.rebuild(&mut build, state);
+        root.layout(Size::new(300.0, 200.0));
+        root
+    }
+
+    fn commit(
+        root: &mut RenderRoot<AppState, TextInputView<AppState>>,
+        state: &mut AppState,
+        text: &str,
+    ) {
+        root.event(state, &InputEvent::Ime(ImeEvent::Commit(text.to_string())));
+    }
+
+    #[test]
+    fn enter_during_a_preedit_does_not_submit_and_leaves_the_text() {
+        let mut state = AppState::default();
+        let mut root = harness(&mut state);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        compose(&mut root, &mut state, "ni");
+        let outcome = root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
+        assert!(outcome.handled);
+        assert_eq!(state.submits, 0);
+        assert_eq!(widget(&root).editor.text(), "ni");
+        assert!(widget(&root).editor.has_preedit(), "composition untouched");
+    }
+
+    #[test]
+    fn enter_after_a_commit_submits_the_committed_text() {
+        let mut state = AppState::default();
+        let mut root = harness(&mut state);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        compose(&mut root, &mut state, "ni");
+        commit(&mut root, &mut state, "\u{4f60}");
+        root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
+        assert_eq!(state.submits, 1);
+        assert_eq!(state.last_submit, "\u{4f60}");
+    }
+
+    #[test]
+    fn newline_commit_during_a_preedit_commits_it_without_submitting() {
+        let mut state = AppState::default();
+        let mut root = harness(&mut state);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        compose(&mut root, &mut state, "ni");
+        commit(&mut root, &mut state, "\n");
+        assert_eq!(state.submits, 0);
+        assert_eq!(widget(&root).editor.text(), "ni");
+        assert!(!widget(&root).editor.is_composing(), "composition ended");
+    }
+
+    #[test]
+    fn multiline_enter_during_a_preedit_inserts_no_newline() {
+        let mut state = AppState::default();
+        let mut root = RenderRoot::new();
+        let mut build = |s: &mut AppState| {
+            text_input(s.value.clone(), |s: &mut AppState, v: String| s.value = v).multiline(3)
+        };
+        root.rebuild(&mut build, &mut state);
+        root.layout(Size::new(300.0, 200.0));
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        compose(&mut root, &mut state, "ni");
+        root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
+        assert_eq!(widget(&root).editor.text(), "ni");
+    }
+
+    #[test]
+    fn composing_callbacks_wrap_the_changes_of_a_composition() {
+        let mut state = AppState::default();
+        let mut root = composing_harness(&mut state);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        compose(&mut root, &mut state, "n");
+        compose(&mut root, &mut state, "ni");
+        commit(&mut root, &mut state, "\u{4f60}");
+        assert_eq!(
+            state.composing_log,
+            [
+                "composing:true",
+                "change:n",
+                "change:ni",
+                "change:\u{4f60}",
+                "composing:false"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_commit_equal_to_the_preedit_still_reports_false() {
+        let mut state = AppState::default();
+        let mut root = composing_harness(&mut state);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        compose(&mut root, &mut state, "ni");
+        commit(&mut root, &mut state, "ni");
+        assert_eq!(
+            state.composing_log,
+            ["composing:true", "change:ni", "composing:false"]
+        );
+    }
+
+    #[test]
+    fn a_direct_commit_reports_no_composition() {
+        let mut state = AppState::default();
+        let mut root = composing_harness(&mut state);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        commit(&mut root, &mut state, "ab");
+        assert_eq!(state.composing_log, ["change:ab"]);
+    }
+
+    #[test]
+    fn a_platform_composing_range_guards_enter_and_reports() {
+        let mut state = AppState::default();
+        let mut root = composing_harness(&mut state);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        let sync = |composing_base: i32, composing_extent: i32| {
+            InputEvent::Ime(ImeEvent::ApplyEditingState(EditingState {
+                text: "hello".to_string(),
+                selection_base: 5,
+                selection_extent: 5,
+                composing_base,
+                composing_extent,
+            }))
+        };
+        root.event(&mut state, &sync(2, 5));
+        root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
+        assert_eq!(state.submits, 0, "a platform range guards Enter too");
+        root.event(&mut state, &sync(-1, -1));
+        assert_eq!(
+            state.composing_log,
+            ["composing:true", "change:hello", "composing:false"]
+        );
+        root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
+        assert_eq!(state.submits, 1);
+    }
+
+    #[test]
+    fn focus_loss_mid_composition_reports_false() {
+        let mut state = AppState::default();
+        let mut root = composing_harness(&mut state);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        compose(&mut root, &mut state, "ni");
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 150.0));
+        assert_eq!(
+            state.composing_log,
+            ["composing:true", "change:ni", "composing:false"]
+        );
     }
 
     #[test]
