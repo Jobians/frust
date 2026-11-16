@@ -230,6 +230,32 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
         self.up(gesture);
     }
 
+    /// Press at `at`, hold past the default long-press threshold until it has fired, drag to
+    /// `to` and release.
+    ///
+    /// The moves after the fire are spread in steps of at most [`TOUCH_SLOP`], 16 ms apart, and
+    /// the last lands exactly on `to`. A press moved before the threshold is an ordinary drag,
+    /// so this holds still until the long-press fires (see [`long_press`](Self::long_press)).
+    pub fn long_press_then_drag(&mut self, from: impl Into<Target>, to: impl Into<Point>) {
+        let mut gesture = self.press(from);
+        let threshold = Duration::from_millis(LONG_PRESS_MS) + FRAME;
+        let start = self.frame_time();
+        while self.frame_time().saturating_sub(start) < threshold {
+            self.pump(FRAME);
+        }
+        self.pump(FRAME);
+        let origin = gesture.position;
+        let delta = to.into() - origin;
+        let steps = (delta.hypot() / TOUCH_SLOP).ceil().max(1.0) as usize;
+        for step in 1..=steps {
+            self.pump(FRAME);
+            let at = origin + delta * (step as f64 / steps as f64);
+            self.move_to(&mut gesture, at);
+        }
+        self.pump(FRAME);
+        self.up(gesture);
+    }
+
     /// Press at `at`, drag by `delta` and release (Flutter's `drag`).
     ///
     /// Events carry no clock, so a recognizer's slop and a release velocity need paints between
@@ -291,7 +317,8 @@ mod tests {
     use crate::testing::{Tester, find};
     use crate::{
         DoubleTapDetails, DragEndDetails, DragStartBehavior, DragStartDetails, DragUpdateDetails,
-        GestureDetectorView, NavigatorController, PanZoomTransform, TapDownDetails, TapUpDetails,
+        GestureDetectorView, LongPressEndDetails, LongPressMoveDetails, NavigatorController,
+        PanZoomTransform, ScrollController, TapDownDetails, TapUpDetails, scroll_view,
     };
 
     const SIZE: Size = Size::new(200.0, 200.0);
@@ -790,5 +817,91 @@ mod tests {
         tester.pump_and_settle();
         assert!(tester.find(&find::text("details")).is_empty());
         assert_eq!(tester.find(&find::label(Role::Button, "Open")).len(), 1);
+    }
+
+    #[derive(Default)]
+    struct Scrolled {
+        events: Vec<String>,
+    }
+
+    /// A detector inside a vertical scroll view of content taller than the
+    /// viewport, with the follow-up callbacks set when `follow` is.
+    fn scrolled_detector(
+        controller: ScrollController,
+        follow: bool,
+    ) -> impl FnMut(&mut Scrolled) -> crate::ScrollView<Scrolled> {
+        move |_: &mut Scrolled| {
+            let mut detector = crate::GestureDetector(pad(200.0))
+                .on_long_press(|s: &mut Scrolled| s.events.push("long".into()));
+            if follow {
+                detector = detector
+                    .on_long_press_move_update(|s: &mut Scrolled, d: LongPressMoveDetails| {
+                        s.events
+                            .push(format!("move {}", d.offset_from_origin.y as i32))
+                    })
+                    .on_long_press_end(|s: &mut Scrolled, _: LongPressEndDetails| {
+                        s.events.push("end".into())
+                    })
+                    .on_long_press_cancel(|s: &mut Scrolled| s.events.push("cancel".into()));
+            }
+            scroll_view(
+                crate::column()
+                    .child(detector)
+                    .child(pad(200.0))
+                    .child(pad(200.0))
+                    .child(pad(200.0)),
+            )
+            .controller(controller.clone())
+        }
+    }
+
+    #[test]
+    fn a_long_press_drag_reaches_the_detector_and_does_not_scroll() {
+        let controller = ScrollController::new();
+        let mut tester = Tester::new(
+            Scrolled::default(),
+            scrolled_detector(controller.clone(), true),
+            SIZE,
+        );
+        tester.long_press_then_drag((100.0, 20.0), Point::new(100.0, 220.0));
+        let events = &tester.state().events;
+        assert_eq!(events.first().map(String::as_str), Some("long"));
+        assert_eq!(events.last().map(String::as_str), Some("end"));
+        let moves: Vec<_> = events.iter().filter(|e| e.starts_with("move")).collect();
+        assert!(moves.len() >= 10, "moves arrive: {events:?}");
+        assert_eq!(moves.last().map(|m| m.as_str()), Some("move 200"));
+        assert!(!events.iter().any(|e| e == "cancel"), "{events:?}");
+        assert_eq!(controller.offset(), 0.0, "the scroll view stayed put");
+    }
+
+    #[test]
+    fn a_drag_before_the_threshold_scrolls_and_fires_no_long_press_callbacks() {
+        let controller = ScrollController::new();
+        let mut tester = Tester::new(
+            Scrolled::default(),
+            scrolled_detector(controller.clone(), true),
+            SIZE,
+        );
+        tester.drag((100.0, 150.0), Vec2::new(0.0, -100.0));
+        tester.pump(FRAME);
+        assert!(controller.offset() > 0.0, "the scroll view scrolled");
+        assert!(
+            tester.state().events.is_empty(),
+            "{:?}",
+            tester.state().events
+        );
+    }
+
+    #[test]
+    fn a_long_press_drag_with_only_on_long_press_still_scrolls() {
+        let controller = ScrollController::new();
+        let mut tester = Tester::new(
+            Scrolled::default(),
+            scrolled_detector(controller.clone(), false),
+            SIZE,
+        );
+        tester.long_press_then_drag((100.0, 150.0), Point::new(100.0, 20.0));
+        assert_eq!(tester.state().events, ["long"]);
+        assert!(controller.offset() > 0.0, "the scroll view took the drag");
     }
 }
