@@ -147,7 +147,7 @@ fn tap_on<S: 'static, V: View<S>>(tester: &mut Tester<S, V>, type_suffix: &str) 
 }
 
 #[test]
-fn an_autofocus_field_is_focused_after_the_first_pump_with_no_input() {
+fn an_autofocus_field_is_focused_within_a_few_frames_with_no_input() {
     let (model, handle) = (model(Tap::Count), FocusHandle::new());
     model.borrow_mut().autofocus = true;
     let mut tester = page(&model, &handle);

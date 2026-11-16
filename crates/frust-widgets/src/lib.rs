@@ -108,9 +108,9 @@ pub use flex::{
     Axis, Column, CrossAxisAlignment, FlexChild, FlexView, FlexWidget, MainAxisAlignment, Row,
     column, flexible, inflexible, keyed, row,
 };
+pub use frust_core::FocusHandle;
 /// Whether a floated surface claims keys as a modal, re-exported for
 /// [`OverlaySlot::set_keys`] and [`OverlayPortalView::keys`].
-pub use frust_core::FocusHandle;
 pub use frust_core::OverlayKeys;
 /// The axis a [`CustomScrollView`] scrolls along, re-exported so its
 /// [`axis`](CustomScrollView::axis) builder needs no direct `frust-core` import.
