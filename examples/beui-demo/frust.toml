@@ -1,0 +1,43 @@
+[app]
+name = "beuidemo"
+org = "it.f0x"
+description = "beUI design-system gallery: every motion, agent and block component, plus theming"
+# Applied to the Android label and the iOS display name at build time.
+display-name = "beUI Gallery"
+
+# No `[desktop]`/`[macos]`/`[windows]`/`[linux]`: only `android/` and `ios/` are scaffolded, so a
+# `frust build macos|windows|linux` here assembles from generated fallbacks. `cargo run` needs none of it.
+
+# [flavors.dev]
+# app-id-suffix = ".dev"
+# app-name-suffix = " Dev"
+
+# Android release signing reads gitignored `android/key.properties` (keys below; create the keystore with the
+# keytool line), falling back per value to `ANDROID_*` env vars. Parsed by Frust; set only to change the defaults.
+# A manual `./gradlew assembleRelease` bypasses Frust's signing gate and may debug-sign with only a warning.
+#   storePassword=<keystore password>
+#   keyPassword=<key password>
+#   keyAlias=<key alias>
+#   storeFile=<path to .jks, relative to the android/ dir>
+#   keytool -genkey -v -keystore ~/upload-keystore.jks -keyalg RSA \
+#     -storetype JKS -keysize 2048 -validity 10000 -alias upload
+# [signing]
+# # Properties file path, relative to `android/`. Default: "key.properties".
+# key-properties = "app/keystores/key.properties"
+# # Key prefix for a file holding several key sets. Default: none.
+# prefix = "prod"
+# # Waives the gate when signing happens outside Frust; release builds then warn.
+# external = false
+#
+# Renames the environment variable behind a value (names only, never values).
+# [signing.env]
+# store-file = "CI_STORE_FILE"
+# store-password = "CI_STORE_PASSWORD"
+# key-alias = "CI_KEY_ALIAS"
+# key-password = "CI_KEY_PASSWORD"
+
+# Override the derived identifiers (default `<org>.<name>`, here `it.f0x.beuidemo`).
+# [android]
+# identifier = "it.f0x.beuidemo"
+# [ios]
+# identifier = "it.f0x.beuidemo"

@@ -1,0 +1,4 @@
+# Puts a bare `cargo build`/`cargo run` output under `build/rust`; `CARGO_TARGET_DIR` or
+# `--target-dir` override it. The Android `rustflags` come from the repo root's `.cargo/config.toml`.
+[build]
+target-dir = "build/rust"

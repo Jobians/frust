@@ -1,16 +1,104 @@
-# Root-workspace member: desktop-only, no Android/iOS/git+rev, covered by workspace gates.
-# Single-crate (no lib.rs/android/ios/cdylib), desktop-only (referenced in main.rs:2, nav.rs:9).
+# Standalone package, excluded from the root workspace: the device projects resolve a
+# project-local `target/` (the iOS build phase links `target/<triple>/<profile>/libbeuidemo.a`).
+[workspace]
+
 [package]
-name = "beui-demo"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
+name = "beuidemo"
+version = "0.1.0"
+edition = "2024"
 publish = false
 
+# `cdylib`: Android JNI library; `staticlib`: iOS Xcode link target; `rlib`:
+# the desktop `main.rs` preview binary.
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
 [dependencies]
-frust = { workspace = true, features = ["complex-scripts"] }
+# The facade package is named `frust-ui` (lib name `frust`): https://github.com/lloydmeta/frunk/issues/258
+frust = { package = "frust-ui", path = "../../crates/frust", features = ["complex-scripts"] }
+# The beUI catalog is a plugin crate beside the facade, never inside it (docs/ARCHITECTURE.md).
 frust-beui = { path = "../../plugins/beui" }
+
+# Present so the release-only `lean` feature can cap the log level. Never make
+# the cap unconditional: `profile` builds must keep `frust-perf` output.
+log = "0.4"
 
 [features]
 # Off by default; enables frust-beui/gpu-effects (accessed via frust/gpu facade).
 gpu-effects = ["frust-beui/gpu-effects"]
+# Release-only log cap; the CLI passes `--features lean` for `--release`.
+lean = ["log/release_max_level_warn"]
+
+# Store-distribution release profile. Kept in sync with Frust's root
+# `Cargo.toml` and `examples/huddle/Cargo.toml`.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# BEGIN release cold-set opt-level overrides (generated: keep hand-synced)
+# Shrinks crates cold on the per-frame path; byte-synced with Frust's root
+# `Cargo.toml` (tripwire: `crates/frust-cli/tests/profile_sync.rs`).
+
+[profile.release.package.naga]
+opt-level = "z"
+
+[profile.release.package.codespan-reporting]
+opt-level = "z"
+
+[profile.release.package.ash]
+opt-level = "z"
+
+[profile.release.package.gpu-allocator]
+opt-level = "z"
+
+[profile.release.package.serde_json]
+opt-level = "z"
+
+[profile.release.package.fontique]
+opt-level = "z"
+
+[profile.release.package.mio]
+opt-level = "z"
+
+[profile.release.package.image]
+opt-level = "z"
+
+[profile.release.package.png]
+opt-level = "z"
+# END release cold-set opt-level overrides
+
+# `--profile`: release performance with symbols kept, for on-device measurement.
+[profile.profile]
+inherits = "release"
+debug = true
+strip = "none"
+
+# Shader-compile crates at `opt-level = 2`: unoptimized wgpu/naga translation is
+# slow enough that iOS kills a debug launch. Kept in sync with Frust's root.
+[profile.dev.package.wgpu]
+opt-level = 2
+
+[profile.dev.package.wgpu-core]
+opt-level = 2
+
+[profile.dev.package.wgpu-hal]
+opt-level = 2
+
+[profile.dev.package.naga]
+opt-level = 2
+
+[profile.dev.package.vello_common]
+opt-level = 2
+
+[profile.dev.package.glifo]
+opt-level = 2
+
+[profile.dev.package.fearless_simd]
+opt-level = 2
+
+# Debug dependencies at `opt-level = 1` (the named overrides above win).
+# Kept in sync with Frust's root `Cargo.toml` and `examples/huddle/Cargo.toml`.
+[profile.dev.package."*"]
+opt-level = 1
