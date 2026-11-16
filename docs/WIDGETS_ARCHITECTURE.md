@@ -48,9 +48,8 @@ path). `frust-theme` is `frust-widgets`' primary consumer. The one reverse edge,
 Every container and interactive widget is built through the crate's own public authoring toolkit, not
 `frust-core` primitives directly. The crate graph enforces this: the three built-in design systems
 (`frust-glyph`/`frust-material`/`frust-cupertino`, PLUGINS unit) depend only on the `frust` facade
-(`default-features = false`) plus `kurbo`/`peniko`, so they cannot reach a `frust-core` primitive
-`frust` doesn't re-export: the seam any third-party design system builds against (see *External
-Design-System Contract*).
+(`default-features = false`) plus `kurbo`/`peniko`, so they cannot reach a `frust-core` primitive `frust` doesn't
+re-export: the seam any third-party design system builds against (see *External Design-System Contract*).
 
 ## Data Flow
 
@@ -298,8 +297,11 @@ built-in one does. `examples/design-system-sample` is the reference proof for a 
 crate (outside this workspace) — a themed catalog plus installer built on `frust`'s public API alone
 (see ARCHITECTURE.md's Examples table); its one finding, that `Widget::semantics` cannot be exercised
 from out of tree, is registered in LIMITATIONS.md. `plugins/shadcn` (55 components) and `plugins/beui`
-(81 motion-first parts) are production-scale external-origin ports on the same seam — see
-PLUGINS_ARCHITECTURE.md's Design-System Plugins.
+(81 motion-first upstream ports plus six phone-content parts authored here) are production-scale
+external-origin ports on the same seam — see PLUGINS_ARCHITECTURE.md's Design-System Plugins. beUI
+takes its sizes from a `BeuiMetrics` theme extension selected by a `Density`: `Touch` gives a 44 pt
+(Apple) / 48 dp (elsewhere) minimum target on the parts that read the metrics, the rest keep the
+comfortable sizes, and beUI text follows the OS text scale.
 
 Three more seams are part of the same public authoring surface: opt-in hover claiming
 (`EventCtx::claim_hover`/`PaintCtx::is_hovered`) for state-layer-style interaction chrome, cursor
@@ -409,10 +411,9 @@ owners (viewport geometry, child origins, list windowing) around one `ScrollSurf
 `ScrollSurface` trait in `scroll_core.rs` (crate-internal, not facade API). The core is the single
 copy of the drag accumulator and edge pull, the takeover with claim and veto, fling/settle/ballistic,
 controller attach/drain/jump/animate/publish, and the `on_scroll` owed-notification rule. Each owner
-supplies only its position arithmetic (`pixels`, `displacement`, `set_allowed_position`,
-`decay_displacement`, `settle_to_edge`, base offset): `ScrollWidget` keeps an out-of-range offset,
-`ListViewWidget` a clamped offset plus `overscroll`. A new surface implements `ScrollSurface` and
-copies none of the machinery.
+supplies only its position arithmetic (`pixels`, `displacement`, `set_allowed_position`, `decay_displacement`,
+`settle_to_edge`, base offset): `ScrollWidget` keeps an out-of-range offset, `ListViewWidget` a clamped offset
+plus `overscroll`. A new surface implements `ScrollSurface` and copies none of the machinery.
 
 The feel is a pluggable strategy (`crate::physics`, mirroring Flutter): a `ScrollPhysics` trait (drag
 mapping, boundary rejection, ballistic simulation, fling thresholds, spring; composed with
@@ -441,10 +442,9 @@ simulation that ends fully pinned outward stops early, handing the residual pull
 deferring when the inner can consume the direction. A claim registers only with real scroll capacity
 (a deliberate deviation from Flutter's `BouncingScrollPhysics`). The report is a `Down`-time
 snapshot and the defer decision is sticky for the gesture. All surfaces also run a live
-**multi-contact veto**, a per-gesture cell replaced on every primary `Down` and consulted on every
-`Move` takeover check, so a nested `pinch_detector`/`pan_zoom` reporting a second contact still
-suppresses the takeover. Claims are axis-aware: a viewport registers only into a same-axis host and
-drops other-axis claims.
+**multi-contact veto**, a per-gesture cell replaced on every primary `Down` and consulted on every `Move`
+takeover check, so a nested `pinch_detector`/`pan_zoom` reporting a second contact still suppresses the
+takeover. Claims are axis-aware: a viewport registers only into a same-axis host and drops other-axis claims.
 
 **Programmatic scroll (`scroll_controller.rs`).** `ScrollController` is a cloneable, reactive-free
 handle that `ScrollView`/`ListView`/`CustomScrollView::controller` attaches. One surface holds a
