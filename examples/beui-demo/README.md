@@ -1,8 +1,8 @@
 # beui-demo
 
-The `frust-beui` design-system plugin's gallery: nineteen pages that show
+The `frust-beui` design-system plugin's gallery: twenty pages that show
 every ported component interactively — a home page with the upstream
-attribution, nine Motion pages (text effects, buttons, controls, selection,
+attribution, a Content page for the phone-shaped parts, nine Motion pages (text effects, buttons, controls, selection,
 overlays, navigation, surfaces, data, and the WGSL shader backgrounds), three
 Agents pages (chat primitives, agent-output panels, the assembled chat app
 over a mock streaming driver), four Blocks pages (command surfaces, morphing
@@ -56,11 +56,21 @@ rather than inventing a group-header widget here. `nav.rs`'s module docs carry
 the same note; the upgrade to a genuinely grouped rail is future work for
 whichever task next touches `animated_sidebar` itself.
 
-Nineteen pages, in nav order:
+Twenty pages, in nav order:
 
 - **Home** — title, upstream attribution (MIT, rev
   `10c283e433a8f4f0ac0736684d4426ab612b9f55`), and a category-overview card
   per section, each linking straight into that section's first page.
+- **Content** — the parts a phone screen is built from, in one column at most
+  480 logical px wide and centred on a wider window: a hero card over a 2×2
+  grid of stat tiles, a grouped list (avatar rows, a pressable counter row, a
+  destructive row), chips and every status-badge tone, avatars in three sizes,
+  every alert tone (a banner and a dismissible one among them), key-value rows
+  and a three-step timeline, every button tone and size, a text field, a
+  floating select and a toast trigger. Two chips at the top switch the
+  density between Comfortable and Touch (`frust_beui::theme_with_density`,
+  pushed through `frust::set_app_theme` with the current brightness kept);
+  the light/dark toggle keeps the chosen density.
 - **Motion** (9 pages: `text`, `buttons`, `controls`, `selection`, `overlays`,
   `navigation`, `surfaces`, `data`, `shader`) — the 41 motion components with
   every registry variant, plus the five `shader_background` variants on the
@@ -91,8 +101,9 @@ Theming) alongside the active page's title.
 ## Theming today vs. TODO
 
 - **Wired today:** `frust_beui::install()` seeds the beUI theme as the app
-  default; both `theme_toggle` instances (top bar, Theming page) flip
-  brightness live through `frust::set_app_theme`; every swatch, button, and
+  default; every `theme_toggle` instance (top bar, Theming and Content pages)
+  flips brightness live through `frust::set_app_theme`, keeping the density
+  the Content page's chips chose; every swatch, button, and
   text run on Home/Theming resolves through beUI's own tokens
   (`frust_beui::palette`/`sans_family`/`mono_family`) rather than a literal
   color authored in this crate.

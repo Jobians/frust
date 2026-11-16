@@ -57,10 +57,11 @@ impl Default for AppState {
 }
 
 /// Resolve the active page's content view.
-// erasure: keep 19-arm page match, one concrete view type per page
+// erasure: keep 20-arm page match, one concrete view type per page
 fn page_body(page: Page, state: &mut AppState) -> AnyView<AppState> {
     match page {
         Page::Home => any(pages::home::page(&mut state.home)),
+        Page::Content => any(pages::content::page()),
         Page::Theming => any(pages::theming::page(&mut state.theming)),
         Page::MotionText => any(pages::motion::text::page()),
         Page::MotionButtons => any(pages::motion::buttons::page()),

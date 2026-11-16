@@ -9,7 +9,7 @@
 //!
 //! # How the palette's keybinding is routed
 //!
-//! The gallery shell installs **no key handling at all**: `main.rs` builds a
+//! The gallery shell installs **no key handling at all**: `lib.rs` builds a
 //! sidebar, a page switcher and a `DesktopConfig` whose only menu item is the
 //! Quit role, and `nav.rs` builds a top bar of buttons — neither reads a key,
 //! and there is no accelerator to hang one on. Underneath, frust delivers
@@ -34,7 +34,7 @@
 //! so nothing extra has to be wired for it to arrive.
 //!
 //! A binding that fires *without* the page being focused would need either a
-//! shell-level key seam or a `MenuItemSpec` accelerator declared in `main.rs`
+//! shell-level key seam or a `MenuItemSpec` accelerator declared in `lib.rs`
 //! — both outside this page.
 //!
 //! # Why two blocks sit in a fixed-height stage

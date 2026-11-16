@@ -23,6 +23,12 @@ frust-beui = { path = "../../plugins/beui" }
 # the cap unconditional: `profile` builds must keep `frust-perf` output.
 log = "0.4"
 
+# Test builds only: the facade's headless `frust::testing` driver, and the theme-override
+# slot the Content page's tests poll the way a shell does (as `examples/glyph-catalog` does).
+[dev-dependencies]
+frust = { package = "frust-ui", path = "../../crates/frust", features = ["complex-scripts", "test-support"] }
+frust-shell-common = { path = "../../crates/frust-shell-common" }
+
 [features]
 # Off by default; enables frust-beui/gpu-effects (accessed via frust/gpu facade).
 gpu-effects = ["frust-beui/gpu-effects"]

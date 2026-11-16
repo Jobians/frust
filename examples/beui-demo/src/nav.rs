@@ -5,9 +5,10 @@
 //!
 //! `examples/shadcn-demo`'s rail is built from `frust_shadcn`'s own
 //! `sidebar_group`/`sidebar_group_label` family — a shape this crate cannot
-//! reach for, since `beui-demo` depends on `frust_beui` alone (see
-//! `Cargo.toml`'s header). `frust_beui::components::animated_sidebar` ports
-//! upstream's **panel and menu**, not its group-header slot (see that
+//! reach for, since `beui-demo` depends on `frust_beui` alone (see the
+//! `[dependencies]` table in `Cargo.toml`).
+//! `frust_beui::components::animated_sidebar` ports upstream's **panel and
+//! menu**, not its group-header slot (see that
 //! module's own doc comment on what the port covers), so there is no beUI
 //! primitive for a labelled section today.
 //!
@@ -19,10 +20,10 @@
 //! here. A real grouped rail is future work for whichever task next touches
 //! `frust_beui::components::animated_sidebar` itself.
 //!
-//! [`Page::GpuEffects`] joins `Home` and `Theming` as a third page standing
-//! outside every section — it is always in the rail, whether or not the
-//! crate was built with the `gpu-effects` feature; the page itself explains
-//! what is on when the feature is off.
+//! [`Page::Content`] and [`Page::GpuEffects`] join `Home` and `Theming` as
+//! pages standing outside every section. GPU Effects is always in the rail,
+//! whether or not the crate was built with the `gpu-effects` feature; the page
+//! itself explains what is on when the feature is off.
 
 use frust::{
     CrossAxisAlignment, EdgeInsets, IconSource, Padding, SizedBox, View, column, icon, icons, row,
@@ -41,6 +42,7 @@ use crate::AppState;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Page {
     Home,
+    Content,
     MotionText,
     MotionButtons,
     MotionControls,
@@ -64,8 +66,9 @@ pub enum Page {
 impl Page {
     /// Every page, in nav order — the rail's item list, and the array the
     /// rail's `on_select` index looks back into.
-    pub const ALL: [Page; 19] = [
+    pub const ALL: [Page; 20] = [
         Page::Home,
+        Page::Content,
         Page::MotionText,
         Page::MotionButtons,
         Page::MotionControls,
@@ -86,11 +89,11 @@ impl Page {
         Page::GpuEffects,
     ];
 
-    /// The section this page belongs to, or `None` for the three pages that
+    /// The section this page belongs to, or `None` for the four pages that
     /// stand outside every section.
     fn section(self) -> Option<&'static str> {
         match self {
-            Page::Home | Page::Theming | Page::GpuEffects => None,
+            Page::Home | Page::Content | Page::Theming | Page::GpuEffects => None,
             Page::MotionText
             | Page::MotionButtons
             | Page::MotionControls
@@ -111,6 +114,7 @@ impl Page {
     fn label(self) -> &'static str {
         match self {
             Page::Home => "Home",
+            Page::Content => "Content",
             Page::MotionText => "Text",
             Page::MotionButtons => "Buttons",
             Page::MotionControls => "Controls",
@@ -133,7 +137,7 @@ impl Page {
     }
 
     /// The rail's label and the top bar's title: `"<section> \u{b7}
-    /// <label>"` for a grouped page, just `label()` for the two standalone
+    /// <label>"` for a grouped page, just `label()` for the standalone
     /// ones.
     pub fn title(self) -> String {
         match self.section() {
@@ -146,6 +150,7 @@ impl Page {
     fn icon(self) -> IconSource {
         match self {
             Page::Home => icons::HOME,
+            Page::Content => icons::PERSON,
             Page::MotionText => icons::FORMAT_SIZE,
             Page::MotionButtons => icons::TAG,
             Page::MotionControls => icons::SETTINGS,

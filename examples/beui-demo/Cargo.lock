@@ -483,6 +483,7 @@ name = "beuidemo"
 version = "0.1.0"
 dependencies = [
  "frust-beui",
+ "frust-shell-common",
  "frust-ui",
  "log",
 ]
