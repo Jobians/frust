@@ -341,7 +341,7 @@ impl LayerFilter {
                 // here without asking.
                 if !served_sigmas(sigma, transform) {
                     return Err(EngineError::InvalidGeometry {
-                        command: 0,
+                        command: None,
                         kind: "PushLayer",
                     });
                 }
@@ -360,7 +360,7 @@ impl LayerFilter {
             } => {
                 if !served_sigmas(sigma, transform) || !dx.is_finite() || !dy.is_finite() {
                     return Err(EngineError::InvalidGeometry {
-                        command: 0,
+                        command: None,
                         kind: "PushLayer",
                     });
                 }

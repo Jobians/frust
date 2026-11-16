@@ -356,7 +356,7 @@ fn a_non_finite_font_size_refuses_the_frame() {
     assert!(matches!(
         compiler().compile(&scene, Affine::IDENTITY, VIEWPORT),
         Err(EngineError::InvalidGeometry {
-            command: 0,
+            command: Some(0),
             kind: "GlyphRun",
         })
     ));
