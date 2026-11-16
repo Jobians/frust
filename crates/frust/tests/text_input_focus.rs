@@ -375,3 +375,56 @@ fn a_field_pressed_inside_keep_focus_neither_takes_nor_reports_focus() {
         "the kept field reported nothing"
     );
 }
+
+/// One field inside `keep_focus`, logging the caret offsets it reports.
+struct KeptHolderPage {
+    carets: Rc<RefCell<Vec<usize>>>,
+}
+
+impl Component for KeptHolderPage {
+    type State = ();
+
+    fn init(&self) {}
+
+    fn build(&self, _: &mut ()) -> impl View<()> {
+        let carets = self.carets.clone();
+        keep_focus(
+            text_input("hello wide world".to_string(), |_: &mut (), _: String| {})
+                .on_caret_change(move |_: &mut (), caret| carets.borrow_mut().push(caret.offset)),
+        )
+    }
+}
+
+#[test]
+fn a_focused_field_inside_keep_focus_still_moves_its_caret_on_a_press() {
+    let carets = Rc::new(RefCell::new(Vec::new()));
+    let c = carets.clone();
+    let mut tester = Tester::new(
+        (),
+        move |_: &mut ()| component(KeptHolderPage { carets: c.clone() }),
+        Size::new(400.0, 300.0),
+    );
+    settle(&mut tester);
+    let bounds = tester
+        .inspect()
+        .into_iter()
+        .find(|node| node.type_name.ends_with("TextInputWidget"))
+        .expect("the field is mounted")
+        .bounds;
+    let y = bounds.center().y;
+
+    tester.tap(Point::new(bounds.x0 + 14.0, y));
+    settle(&mut tester);
+    let field = tester.focus_info().expect("the first tap focused it").node;
+    let after_first = *carets.borrow().last().expect("focus reported a caret");
+
+    tester.tap(Point::new(bounds.x0 + 90.0, y));
+    settle(&mut tester);
+
+    assert_eq!(tester.focus_info().map(|info| info.node), Some(field));
+    let after_second = *carets.borrow().last().unwrap();
+    assert!(
+        after_second > after_first,
+        "the second press moved the caret: {after_first} then {after_second}"
+    );
+}
