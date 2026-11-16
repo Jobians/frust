@@ -36,20 +36,36 @@
 //!
 //! * [`select_trigger`] — the closed control, capturing its own window rect into
 //!   an [`OverlayAnchor`] and reporting an open toggle.
-//! * [`select`] — the panel, mounted as the top child of a full-area
-//!   [`frust::Stack`] (or a transparent navigator page) and anchored to that
-//!   same rect through [`crate::overlay::anchored`](mod@crate::overlay::anchored).
+//! * [`select`] — the panel, anchored to that same rect through
+//!   [`crate::overlay::anchored`](mod@crate::overlay::anchored)'s **floating** host: the panel is
+//!   painted in the render root's overlay layer, above the whole main tree,
+//!   so the view can be mounted anywhere under the trigger's ancestors and
+//!   takes no room where it is mounted.
 //!
 //! The label registry collapses into the option list the app hands both halves;
 //! nothing registers anything at runtime.
 //!
+//! # Inside a modal
+//!
+//! Floating is what makes the pair usable inside a modal such as
+//! [`crate::components::center_morph_modal`]: mounted beside the trigger in
+//! the modal's content, the closed panel leaves the modal its own size, the
+//! open one paints above the modal surface (outside its clip) and anywhere in
+//! the window, and its rows take presses wherever it lands. The first Escape
+//! and an outside press close only the panel: the focused trigger answers
+//! Escape itself while its panel is open, and an outside press is consumed by
+//! the floated panel's light dismiss, so neither reaches the modal host — whose
+//! dismiss veto is therefore not asked either.
+//!
 //! # Dismissal is the seam's, not this component's
 //!
-//! An outside press and Escape both dismiss through
+//! An outside press and Escape on the panel both dismiss through
 //! [`crate::overlay::anchored`](mod@crate::overlay::anchored)'s host — once, and reported as
-//! `on_open_change(state, false)`. This module owns no dismissal logic of its
-//! own, which is why a press landing on the panel's own background is swallowed
-//! by the host rather than by the list.
+//! `on_open_change(state, false)` — which is why a press landing on the panel's
+//! own background is swallowed by the host rather than by the list. The one
+//! dismissal this module owns is Escape on the focused trigger, reported
+//! through the trigger's own `on_open_change`: the panel's host never holds
+//! focus while the trigger does.
 //!
 //! # v1 boundaries, adopted from the sibling catalog
 //!
@@ -95,6 +111,14 @@
 //! - **No scroll.** A list longer than [`SELECT_MAX_HEIGHT`] is clipped rather
 //!   than scrolled: a scrollable panel would have to mount inside a
 //!   [`frust::scroll_view`], which the overlay seam forbids under a host.
+//! - **No row hover wash.** A floated panel receives its pointer as an overlay
+//!   broadcast, which records no hover, so a row under the mouse is not
+//!   washed; the selected row's wash and check are unaffected. Presses, and
+//!   touch, are unaffected.
+//! - **The list's accessibility nodes sit at the panel host's position.** The
+//!   root walks no floated pod for semantics, so the host publishes the
+//!   listbox under its own position with the panel's size; mounted right after
+//!   its trigger, that is within [`PANEL_GAP`] of the panel itself.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -102,9 +126,9 @@ use std::time::Duration;
 
 use frust::authoring::{
     Action, Affine, BezPath, BoxConstraints, Brush, BuildCtx, ChangeFlags, Color, CornerRadii,
-    CursorIcon, ErasedArgCallback, EventCtx, EventResult, InputEvent, LayoutCtx, PaintCtx,
-    PaintScene, Point, PointerPhase, Rect, Role, RoundedRect, SemanticsCtx, Shape, Size, View,
-    Widget, erase_callback_arg,
+    CursorIcon, ErasedArgCallback, EventCtx, EventResult, InputEvent, Key, KeyEvent, LayoutCtx,
+    Modifiers, NamedKey, PaintCtx, PaintScene, Point, PointerPhase, Rect, Role, RoundedRect,
+    SemanticsCtx, Shape, Size, View, Widget, erase_callback_arg,
 };
 use frust::{FrameTime, Theme};
 
@@ -421,6 +445,15 @@ pub(crate) fn stroke_frame(
 }
 
 // ---- The trigger -----------------------------------------------------------
+
+/// Whether `key` is a bare Escape — the key a focused trigger closes its open
+/// panel on.
+///
+/// Crate-internal rather than private: the multi-select trigger closes its
+/// panel on the same key.
+pub(crate) fn is_bare_escape(key: &KeyEvent) -> bool {
+    key.key == Key::Named(NamedKey::Escape) && key.modifiers == Modifiers::default()
+}
 
 /// A view-held, typed open-change callback (erased on build).
 type OnOpenChange<State> = Rc<dyn Fn(&mut State, bool)>;
@@ -751,7 +784,17 @@ impl Widget for SelectTriggerWidget {
     fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
         match event {
             InputEvent::Key(key) => {
-                if self.disabled || !is_activation_key(key) {
+                if self.disabled {
+                    return EventResult::Ignored;
+                }
+                // The focused trigger owns Escape while its panel is open: it
+                // closes the panel and stops there, so the key never reaches
+                // an enclosing modal host (see the module docs).
+                if self.open && is_bare_escape(key) {
+                    (self.on_open_change)(ctx, false);
+                    return EventResult::Handled;
+                }
+                if !is_activation_key(key) {
                     return EventResult::Ignored;
                 }
                 (self.on_open_change)(ctx, !self.open);
@@ -853,10 +896,13 @@ pub struct SelectView<State: 'static> {
 /// Build a select panel over `options`, showing `options[selected]` as checked
 /// and reporting a commit through `on_select(state, option_index)`.
 ///
-/// Mount it as the top child of a full-area [`frust::Stack`] (or a transparent
-/// navigator page) and hand it the app's open flag through [`SelectView::open`],
-/// so a close plays the panel's exit — see [`crate::overlay::anchored`](mod@crate::overlay::anchored) for the
-/// mounting contract.
+/// The panel floats in the render root's overlay layer, so it can be mounted
+/// anywhere under the trigger's ancestors — beside the trigger in a form
+/// column, inside a modal's content, or as the top child of a full-area
+/// [`frust::Stack`] as before — and takes no room of its own there. Hand it
+/// the app's open flag through [`SelectView::open`], so a close plays the
+/// panel's exit — see [`crate::overlay::anchored`](mod@crate::overlay::anchored)'s
+/// *Floating in the root overlay layer* for what floating does and costs.
 pub fn select<State: 'static, F: Fn(&mut State, usize) + 'static>(
     options: Vec<SelectOption>,
     selected: Option<usize>,
@@ -877,7 +923,7 @@ pub fn select<State: 'static, F: Fn(&mut State, usize) + 'static>(
         .align(OverlayAlign::Start)
         .offset(PANEL_GAP);
     SelectView {
-        inner: anchored(content).placement(placement),
+        inner: anchored(content).placement(placement).floating(),
         config,
         placement,
         variant: SelectVariant::Default,
@@ -1474,7 +1520,7 @@ impl Widget for SelectPanelWidget {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use frust::authoring::text::TextContext;
     use frust::authoring::{Key, KeyEvent, Modifiers, NamedKey, PointerButton, PointerEvent};
@@ -2154,5 +2200,479 @@ mod tests {
     #[test]
     fn select_text_follows_a_live_theme_family_swap() {
         assert_follows_a_live_family_swap("the select's text", probe_view, PROBE_WINDOW);
+    }
+
+    // ---- Inside a centre-morph modal --------------------------------------
+
+    /// A select mounted inside a centre-morph modal at an 800x600 window,
+    /// driven headlessly. Shared with `multi_select`'s tests, which mount
+    /// their own pair through the same modal, driver and recorder.
+    pub(crate) mod in_a_modal {
+        use super::*;
+        use crate::components::center_morph_modal::{
+            CENTER_MORPH_MAX_WIDTH, CENTER_MORPH_RADIUS, center_morph_modal,
+        };
+        use crate::components::popover::tests::{escape, light};
+        use frust::SizedBox;
+        use frust::authoring::{AnyView, DismissCause, DismissDecision, any};
+        use frust_core::RenderRoot;
+
+        pub(crate) const WINDOW: Size = Size::new(800.0, 600.0);
+        /// The width of the modal's form column.
+        pub(crate) const COLUMN_WIDTH: f64 = 320.0;
+        /// A spacer row above and below the trigger.
+        pub(crate) const SPACER: f64 = 48.0;
+        /// One frame, in milliseconds.
+        const FRAME_MS: f64 = 16.0;
+
+        /// The app: the modal's flag, the list's flag and value(s), and what
+        /// the modal host reported.
+        #[derive(Default)]
+        pub(crate) struct ModalApp {
+            pub(crate) modal_open: bool,
+            pub(crate) list_open: bool,
+            pub(crate) value: Option<usize>,
+            pub(crate) selected: Vec<usize>,
+            pub(crate) modal_closes: u32,
+            pub(crate) veto_asked: Vec<DismissCause>,
+            pub(crate) anchor: OverlayAnchor,
+        }
+
+        /// `trigger` between two spacer rows, in a fixed-width column.
+        pub(crate) fn form_column<V: View<ModalApp>>(
+            trigger: V,
+            trigger_height: Option<f64>,
+        ) -> frust::FlexView<ModalApp> {
+            frust::column()
+                .child(SizedBox(Some(COLUMN_WIDTH), Some(SPACER)))
+                .child(SizedBox(Some(COLUMN_WIDTH), trigger_height).child(trigger))
+                .child(SizedBox(Some(COLUMN_WIDTH), Some(SPACER)))
+        }
+
+        /// `content` as the body of a centre-morph modal carrying the app's
+        /// flag, counting its closes and recording every veto it asks.
+        pub(crate) fn in_modal<V: View<ModalApp>>(s: &ModalApp, content: V) -> AnyView<ModalApp> {
+            any(frust::stack().child(
+                center_morph_modal(content)
+                    .open(s.modal_open)
+                    .label("Pick a fruit")
+                    .on_open_change(|s: &mut ModalApp, open| {
+                        s.modal_open = open;
+                        if !open {
+                            s.modal_closes += 1;
+                        }
+                    })
+                    .on_dismiss_request(|s: &mut ModalApp, cause| {
+                        s.veto_asked.push(cause);
+                        DismissDecision::Dismiss
+                    }),
+            ))
+        }
+
+        /// The select pair in the modal: the trigger in the form column, the
+        /// panel stacked over that column — the full-area mount the overlay
+        /// seam used to require, placed in the modal's content.
+        fn select_in_modal(s: &mut ModalApp) -> AnyView<ModalApp> {
+            let label = s.value.map(|i| options()[i].label().to_string());
+            let trigger = select_trigger(&s.anchor, label)
+                .open(s.list_open)
+                .on_open_change(|s: &mut ModalApp, open| s.list_open = open);
+            let panel = select(options(), s.value, |s: &mut ModalApp, index| {
+                s.value = Some(index);
+                s.list_open = false;
+            })
+            .anchor(&s.anchor)
+            .open(s.list_open)
+            .on_open_change(|s: &mut ModalApp, open| s.list_open = open);
+            let column = form_column(trigger, Some(TRIGGER_HEIGHT));
+            in_modal(s, frust::stack().child(column).child(panel))
+        }
+
+        /// The same pair with the panel mounted as a plain column sibling
+        /// right after the trigger — the mount floating newly allows.
+        fn select_beside_its_trigger(s: &mut ModalApp) -> AnyView<ModalApp> {
+            let trigger = select_trigger(&s.anchor, None)
+                .open(s.list_open)
+                .on_open_change(|s: &mut ModalApp, open| s.list_open = open);
+            let panel = select(options(), s.value, |s: &mut ModalApp, index| {
+                s.value = Some(index);
+                s.list_open = false;
+            })
+            .anchor(&s.anchor)
+            .open(s.list_open)
+            .on_open_change(|s: &mut ModalApp, open| s.list_open = open);
+            in_modal(
+                s,
+                frust::column()
+                    .child(SizedBox(Some(COLUMN_WIDTH), Some(SPACER)))
+                    .child(SizedBox(Some(COLUMN_WIDTH), Some(TRIGGER_HEIGHT)).child(trigger))
+                    .child(panel)
+                    .child(SizedBox(Some(COLUMN_WIDTH), Some(SPACER))),
+            )
+        }
+
+        /// One filled shape as painted: its rect, radius, colour, and the
+        /// intersection of every clip active when it was drawn.
+        #[derive(Clone, Copy, Debug)]
+        pub(crate) struct Fill {
+            pub(crate) rect: Rect,
+            pub(crate) radius: f64,
+            pub(crate) color: Color,
+            pub(crate) clip: Option<Rect>,
+        }
+
+        /// Records fills in paint order with the clip they were drawn under.
+        #[derive(Default)]
+        pub(crate) struct OrderRecorder {
+            fills: Vec<Fill>,
+            clips: Vec<Rect>,
+        }
+
+        impl OrderRecorder {
+            fn clip(&self) -> Option<Rect> {
+                self.clips.iter().copied().reduce(|a, b| a.intersect(b))
+            }
+        }
+
+        impl PaintScene for OrderRecorder {
+            fn fill_rect(&mut self, _o: Point, _s: Size, _c: Color) {}
+            fn draw_text(&mut self, _o: Point, _t: &str) {}
+            fn fill_rounded_rect(&mut self, o: Point, s: Size, radius: f64, color: Color) {
+                let clip = self.clip();
+                self.fills.push(Fill {
+                    rect: Rect::from_origin_size(o, s),
+                    radius,
+                    color,
+                    clip,
+                });
+            }
+            fn push_clip(&mut self, o: Point, s: Size) {
+                self.clips.push(Rect::from_origin_size(o, s));
+            }
+            fn push_clip_rounded(&mut self, o: Point, s: Size, _r: f64) {
+                self.clips.push(Rect::from_origin_size(o, s));
+            }
+            fn pop_clip(&mut self) {
+                self.clips.pop();
+            }
+        }
+
+        /// A headless driver that paints only while a frame is owed: an
+        /// event's `needs_redraw` or a paint's `needs_frame` owes one, and a
+        /// pump with nothing owed paints nothing — the desktop shell's loop,
+        /// so a missing frame request leaves a stale frame here too, where a
+        /// driver painting on every pump would hide it.
+        pub(crate) struct Driver {
+            root: RenderRoot<ModalApp, AnyView<ModalApp>>,
+            pub(crate) state: ModalApp,
+            view: fn(&mut ModalApp) -> AnyView<ModalApp>,
+            tcx: TextContext,
+            now: f64,
+            owed: bool,
+            last: OrderRecorder,
+        }
+
+        impl Driver {
+            /// Mount `view` with the modal open and settle it.
+            pub(crate) fn new(view: fn(&mut ModalApp) -> AnyView<ModalApp>) -> Self {
+                let mut root = RenderRoot::new();
+                root.set_theme(Box::new(light()));
+                let mut driver = Driver {
+                    root,
+                    state: ModalApp {
+                        modal_open: true,
+                        ..ModalApp::default()
+                    },
+                    view,
+                    tcx: TextContext::new(),
+                    now: 0.0,
+                    owed: true,
+                    last: OrderRecorder::default(),
+                };
+                driver.settle();
+                driver
+            }
+
+            /// One frame, if one is owed: rebuild, lay out, paint.
+            fn pump(&mut self) -> bool {
+                self.now += FRAME_MS;
+                if !self.owed {
+                    return false;
+                }
+                let mut logic = self.view;
+                self.root.rebuild(&mut logic, &mut self.state);
+                self.root
+                    .layout_with_text(WINDOW, &mut self.tcx as &mut dyn Any);
+                let mut rec = OrderRecorder::default();
+                let outcome = self.root.paint(&mut rec, ft_ms(self.now));
+                self.owed = outcome.needs_frame;
+                self.last = rec;
+                true
+            }
+
+            /// Pump until no frame is owed.
+            pub(crate) fn settle(&mut self) {
+                for _ in 0..400 {
+                    if !self.pump() {
+                        return;
+                    }
+                }
+                panic!("the tree never stopped asking for frames");
+            }
+
+            /// Deliver one event; a frame is owed only if it asks for one.
+            pub(crate) fn send(&mut self, event: InputEvent) {
+                let outcome = self.root.event(&mut self.state, &event);
+                self.owed |= outcome.needs_redraw;
+            }
+
+            /// A primary press and release at `at`, then settle.
+            pub(crate) fn tap(&mut self, at: Point) {
+                self.send(pointer(PointerPhase::Down, at.x, at.y));
+                self.send(pointer(PointerPhase::Up, at.x, at.y));
+                self.settle();
+            }
+
+            /// One bare Escape, then settle.
+            pub(crate) fn escape(&mut self) {
+                self.send(escape());
+                self.settle();
+            }
+
+            /// The modal panel's laid-out bounds, from the retained tree.
+            pub(crate) fn modal_panel(&self) -> Rect {
+                self.root
+                    .inspect()
+                    .into_iter()
+                    .find(|n| n.type_name.ends_with("CenterPanelWidget"))
+                    .map(|n| n.bounds)
+                    .expect("the modal panel is mounted")
+            }
+
+            /// The modal surface as last painted, and its paint index.
+            pub(crate) fn modal_surface(&self) -> Option<(usize, Fill)> {
+                let want = light().scheme().surface_container_high;
+                self.last
+                    .fills
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .find(|(_, f)| f.color == want && f.radius == CENTER_MORPH_RADIUS)
+            }
+
+            /// The option panel's surface as last painted, and its paint
+            /// index — the trigger shares its fill and radius, so it is told
+            /// apart by its own rect.
+            pub(crate) fn option_panel(&self) -> Option<(usize, Fill)> {
+                let want = panel_colors(Some(&light())).surface;
+                let trigger = self.state.anchor.rect();
+                self.last
+                    .fills
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .find(|(_, f)| f.color == want && f.radius == PANEL_RADIUS && f.rect != trigger)
+            }
+
+            /// The trigger's window rect, as its last paint captured it.
+            pub(crate) fn trigger(&self) -> Rect {
+                self.state.anchor.rect()
+            }
+
+            /// Assert the open panel floats above the modal: after the modal
+            /// surface in paint order, under no clip, wholly inside the window
+            /// and past the modal's own bottom edge.
+            pub(crate) fn assert_floats_above_the_modal(&self) {
+                let (modal_at, modal) = self.modal_surface().expect("the modal surface");
+                let (panel_at, panel) = self.option_panel().expect("the open option panel");
+                assert!(panel_at > modal_at, "painted above the modal surface");
+                assert_eq!(panel.clip, None, "clipped by nothing, the modal included");
+                let window = Rect::from_origin_size(Point::ORIGIN, WINDOW);
+                assert_eq!(window.union(panel.rect), window, "inside the window");
+                assert!(
+                    panel.rect.y1 > modal.rect.y1,
+                    "hangs past the modal's own edge: {panel:?} vs {modal:?}"
+                );
+            }
+        }
+
+        /// The modal hugs a column of two spacers around a `trigger`-tall row.
+        pub(crate) fn hugged(trigger: f64) -> Size {
+            Size::new(CENTER_MORPH_MAX_WIDTH, SPACER * 2.0 + trigger)
+        }
+
+        /// Row `index`'s centre on a select panel painted at `panel`.
+        fn row_centre(panel: Rect, index: usize) -> Point {
+            Point::new(
+                panel.center().x,
+                panel.y0 + PANEL_PADDING + ITEM_HEIGHT * (index as f64 + 0.5),
+            )
+        }
+
+        /// What the reproduction recorded before the panel floated: the modal
+        /// grew to `416x568` with the select closed (the stacked host claimed
+        /// its whole maximum height), the panel painted under the modal's own
+        /// clip, and the first Escape closed the modal (asking its veto) with
+        /// the panel left open. Each assertion below is one of those, fixed.
+        #[test]
+        fn a_closed_select_leaves_the_modal_its_own_size() {
+            for view in [select_in_modal, select_beside_its_trigger] {
+                let mut d = Driver::new(view);
+                let closed = d.modal_panel();
+                assert_eq!(closed.size(), hugged(TRIGGER_HEIGHT));
+                assert!(d.option_panel().is_none(), "a closed panel paints nothing");
+
+                d.tap(d.trigger().center());
+                assert!(d.state.list_open, "the trigger opened it");
+                assert_eq!(d.modal_panel(), closed, "and opening it moved nothing");
+            }
+        }
+
+        #[test]
+        fn the_open_panel_floats_above_the_modal_against_its_trigger() {
+            for view in [select_in_modal, select_beside_its_trigger] {
+                let mut d = Driver::new(view);
+                d.tap(d.trigger().center());
+                d.assert_floats_above_the_modal();
+                let (_, panel) = d.option_panel().expect("the open option panel");
+                let trigger = d.trigger();
+                assert_eq!(
+                    panel.rect.x0, trigger.x0,
+                    "flush with the trigger's leading edge"
+                );
+                assert_eq!(panel.rect.y0, trigger.y1 + PANEL_GAP, "the gap below it");
+                assert_eq!(panel.rect.width(), trigger.width(), "never narrower");
+            }
+        }
+
+        #[test]
+        fn an_option_press_inside_the_modal_selects_it() {
+            let mut d = Driver::new(select_in_modal);
+            d.tap(d.trigger().center());
+            let (_, panel) = d.option_panel().expect("the open option panel");
+            d.tap(row_centre(panel.rect, 1));
+            assert_eq!(d.state.value, Some(1));
+            assert!(!d.state.list_open, "the commit closed the list");
+            assert!(d.state.modal_open, "and only the list");
+            assert!(d.option_panel().is_none(), "its exit ran to the end");
+            assert!(d.state.veto_asked.is_empty());
+        }
+
+        #[test]
+        fn the_first_escape_closes_only_the_panel_and_never_asks_the_veto() {
+            let mut d = Driver::new(select_in_modal);
+            d.tap(d.trigger().center());
+            d.escape();
+            assert!(!d.state.list_open, "the first Escape closed the list");
+            assert!(d.state.modal_open, "the modal stays open");
+            assert_eq!(d.state.modal_closes, 0);
+            assert!(d.state.veto_asked.is_empty(), "the veto was not asked");
+            assert!(
+                d.option_panel().is_none(),
+                "the panel's exit ran to the end"
+            );
+
+            // The next Escape is the modal's own, veto included.
+            d.escape();
+            assert!(!d.state.modal_open);
+            assert_eq!(d.state.veto_asked, vec![DismissCause::Escape]);
+        }
+
+        /// A press on the panel's own background takes focus for the panel, so
+        /// Escape then reaches the panel's host rather than the trigger.
+        #[test]
+        fn escape_after_a_press_on_the_panel_closes_only_the_panel() {
+            let mut d = Driver::new(select_in_modal);
+            d.tap(d.trigger().center());
+            let (_, panel) = d.option_panel().expect("the open option panel");
+            d.tap(Point::new(panel.rect.x0 + 1.0, panel.rect.y0 + 1.0));
+            assert!(
+                d.state.list_open,
+                "a press on the background is the panel's"
+            );
+            d.escape();
+            assert!(!d.state.list_open);
+            assert!(d.state.modal_open);
+            assert!(d.state.veto_asked.is_empty());
+        }
+
+        #[test]
+        fn an_outside_press_closes_only_the_panel() {
+            let mut d = Driver::new(select_in_modal);
+            let modal = d.modal_panel();
+            // On the backdrop, and on the modal surface away from the panel.
+            for at in [
+                Point::new(4.0, 4.0),
+                Point::new(modal.x0 + 24.0, modal.y0 + 24.0),
+            ] {
+                d.tap(d.trigger().center());
+                assert!(d.state.list_open);
+                d.tap(at);
+                assert!(!d.state.list_open, "the press at {at:?} closed the list");
+                assert!(d.state.modal_open, "and only the list");
+                assert!(d.state.veto_asked.is_empty());
+                assert!(d.option_panel().is_none());
+            }
+            assert_eq!(d.state.modal_closes, 0);
+        }
+
+        /// The layout-skip audit cannot see a floated pod (the root's
+        /// inspector walks only the main tree), so the trigger-width floor it
+        /// audits for the inline panel is asserted on the painted panel here,
+        /// under the same frame-gated loop.
+        #[test]
+        fn a_floated_panel_follows_a_trigger_that_resizes() {
+            struct Resizing {
+                width: f64,
+                anchor: OverlayAnchor,
+            }
+            fn view(s: &mut Resizing) -> AnyView<Resizing> {
+                any(frust::stack()
+                    .child(
+                        SizedBox(Some(s.width), Some(TRIGGER_HEIGHT))
+                            .child(select_trigger(&s.anchor, Some("Apple".to_string()))),
+                    )
+                    .child(
+                        select(options(), Some(0), |_: &mut Resizing, _| {})
+                            .anchor(&s.anchor)
+                            .open(true),
+                    ))
+            }
+            let mut root: RenderRoot<Resizing, AnyView<Resizing>> = RenderRoot::new();
+            root.set_theme(Box::new(light()));
+            let mut state = Resizing {
+                width: 150.0,
+                anchor: OverlayAnchor::new(),
+            };
+            let mut tcx = TextContext::new();
+            let mut now = 0.0;
+            let want = panel_colors(Some(&light())).surface;
+            for width in [150.0, 340.0, 200.0, 380.0] {
+                state.width = width;
+                // One frame for the rebuild, then only the frames it asks for.
+                let mut owed = true;
+                let mut last = OrderRecorder::default();
+                for _ in 0..400 {
+                    if !owed {
+                        break;
+                    }
+                    now += FRAME_MS;
+                    let mut logic = view;
+                    root.rebuild(&mut logic, &mut state);
+                    root.layout_with_text(WINDOW, &mut tcx as &mut dyn Any);
+                    last = OrderRecorder::default();
+                    owed = root.paint(&mut last, ft_ms(now)).needs_frame;
+                }
+                assert!(!owed, "the tree settled at {width}");
+                let trigger = state.anchor.rect();
+                let panel = last
+                    .fills
+                    .iter()
+                    .find(|f| f.color == want && f.radius == PANEL_RADIUS && f.rect != trigger)
+                    .expect("the open panel");
+                assert_eq!(trigger.width(), width);
+                assert_eq!(panel.rect.width(), width, "the panel follows its trigger");
+            }
+        }
     }
 }
