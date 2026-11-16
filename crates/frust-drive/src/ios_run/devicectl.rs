@@ -27,15 +27,18 @@ pub fn install(runner: &dyn ProcessRunner, udid: &str, app_path: &str) -> Result
 
 /// `xcrun devicectl device process launch --device <udid> --console
 /// --terminate-existing <bundle_id>`. Blocks and streams the app's console
-/// output through `on_line` until the app exits or the command is
-/// interrupted — mirrors `simctl::launch`'s streamed UX.
+/// output until the app exits or the command is interrupted: stdout lines
+/// through `on_line`, stderr lines through `on_stderr_line` as they arrive
+/// (`--console` writes to both streams). The collected stderr is still
+/// returned in `Output::stderr`.
 pub fn launch(
     runner: &dyn ProcessRunner,
     udid: &str,
     bundle_id: &str,
     on_line: &mut dyn FnMut(&str),
+    on_stderr_line: &mut dyn FnMut(&str),
 ) -> Result<Output> {
-    runner.run_streaming(
+    runner.run_streaming_with_stderr(
         "xcrun",
         &[
             "devicectl",
@@ -51,6 +54,7 @@ pub fn launch(
         None,
         &[],
         on_line,
+        on_stderr_line,
     )
 }
 
@@ -86,17 +90,24 @@ mod tests {
     fn launch_puts_console_and_terminate_existing_flags_before_bundle_id() {
         let runner = FakeProcessRunner::new().with(
             "xcrun devicectl device process launch --device 00008110-000A2D3A3C68801E --console --terminate-existing dev.f0x.myapp",
-            ok("hello from app\n"),
+            Output {
+                success: true,
+                stdout: "hello from app\n".to_string(),
+                stderr: "warning from app\n".to_string(),
+            },
         );
         let mut lines = Vec::new();
+        let mut err_lines = Vec::new();
         let out = launch(
             &runner,
             "00008110-000A2D3A3C68801E",
             "dev.f0x.myapp",
             &mut |line| lines.push(line.to_string()),
+            &mut |line| err_lines.push(line.to_string()),
         )
         .unwrap();
         assert!(out.success);
         assert_eq!(lines, vec!["hello from app"]);
+        assert_eq!(err_lines, vec!["warning from app"]);
     }
 }

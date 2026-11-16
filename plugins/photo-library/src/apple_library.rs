@@ -431,6 +431,8 @@ fn asset_of(asset: &PHAsset, details: bool) -> Asset {
                 .filter(|id| !id.is_empty()),
             file_name,
             content_type,
+            // The platform has no documented size accessor on the asset resource.
+            size_bytes: None,
         }
     }
 }

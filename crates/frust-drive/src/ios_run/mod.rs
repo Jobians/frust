@@ -409,19 +409,23 @@ pub fn run_physical(
 
     println!("Launching {}…", prepared.bundle_id);
     let mut on_launch_line = |line: &str| println!("{line}");
+    // The device process writes to both streams under `--console`; print its
+    // stderr live (to ours) instead of holding it until the launch exits.
+    let mut on_launch_stderr_line = |line: &str| eprintln!("{line}");
     let launch_out = devicectl::launch(
         runner,
         &prepared.udid,
         &prepared.bundle_id,
         &mut on_launch_line,
+        &mut on_launch_stderr_line,
     )?;
     if !launch_out.success {
         bail!(
             "{}",
-            with_developer_mode_hint(format!(
-                "`xcrun devicectl device process launch` failed: {}",
-                launch_out.stderr.trim()
-            ))
+            with_developer_mode_hint(
+                "`xcrun devicectl device process launch` failed (the device output is above)"
+                    .to_string()
+            )
         );
     }
 
@@ -1203,7 +1207,9 @@ mod tests {
             message.contains("devicectl device process launch"),
             "{message}"
         );
-        assert!(message.contains("Developer Mode disabled"), "{message}");
+        // The device stderr was already printed live; the error must not repeat it.
+        assert!(!message.contains("Developer Mode disabled"), "{message}");
+        assert!(message.contains("device output is above"), "{message}");
         assert!(message.contains("Developer Mode enabled"), "{message}");
         let _ = fs::remove_dir_all(&dir);
     }

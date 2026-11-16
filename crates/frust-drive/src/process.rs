@@ -81,6 +81,37 @@ pub trait ProcessRunner {
         self.run_streaming(cmd, args, cwd, env, on_line)
     }
 
+    /// Like [`run_streaming`](ProcessRunner::run_streaming), but also hands
+    /// every stderr line to `on_stderr_line` as it arrives, rather than only
+    /// returning stderr in [`Output::stderr`] once the child exits. Use it
+    /// for a child whose console output lands on both streams
+    /// (`devicectl device process launch --console`). `Output::stderr` still
+    /// holds the full stderr text afterwards: the lines
+    /// joined with newlines, with no trailing newline. Every stderr line is
+    /// retained for the life of the process, so a very chatty child grows
+    /// memory until it exits. Both callbacks run on the
+    /// calling thread; the relative order of stdout and stderr lines is not
+    /// guaranteed, only the order within each stream.
+    ///
+    /// **The default implementation never calls `on_stderr_line`** and
+    /// forwards to [`run_streaming`](ProcessRunner::run_streaming), which
+    /// keeps the crate's small in-test runner doubles source-compatible. Any
+    /// implementation that spawns a real process must override it, and a
+    /// wrapper runner that delegates to an inner runner must forward this
+    /// method too, because the default drops the stderr callback.
+    fn run_streaming_with_stderr(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: Option<&Path>,
+        env: &[(&str, &str)],
+        on_line: &mut dyn FnMut(&str),
+        on_stderr_line: &mut dyn FnMut(&str),
+    ) -> Result<Output> {
+        let _ = on_stderr_line;
+        self.run_streaming(cmd, args, cwd, env, on_line)
+    }
+
     /// Like [`run_streaming`](ProcessRunner::run_streaming), but
     /// **non-blocking**: spawns the process and returns immediately with a
     /// [`StreamHandle`] a caller drains/cancels at its own pace instead of
@@ -564,6 +595,100 @@ const TASKKILL_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs
 #[cfg(windows)]
 const TASKKILL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// A child killed by a termination signal is usually not a tool that failed
+/// — it is this process's own Ctrl-C/SIGTERM arriving group-wide and killing
+/// both of us. Returning a plain `success: false` hands the caller an
+/// ordinary build failure to `bail!` on, which races `interrupt`'s handler
+/// thread for the process's exit status (exit 1 versus its scrub-then-130).
+/// Deferring here — at the one seam every synchronous pipeline funnels its
+/// external tools through — makes the signal win, for every caller. Costs
+/// nothing on ordinary paths: only a signal-killed child carries a `signal()`.
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn defer_to_signal_if_terminated(status: &std::process::ExitStatus) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status
+            .signal()
+            .is_some_and(|signal| TERMINATION_SIGNALS.contains(&signal))
+        {
+            crate::interrupt::defer_to_pending_signal(crate::interrupt::SIGNAL_DEFER_TIMEOUT);
+        }
+    }
+}
+
+/// The both-streams-live half of [`RealProcessRunner::stream`]: stdout and
+/// stderr are each read on their own thread and forwarded over a channel, so
+/// the calling thread can run both callbacks (neither needs to be `Send`) as
+/// lines arrive. Returns once both pipes hit EOF and the child is reaped;
+/// `Output::stderr` carries every stderr line.
+fn finish_stream_with_stderr(
+    child: &mut std::process::Child,
+    cmd: &str,
+    on_line: &mut dyn FnMut(&str),
+    on_stderr_line: &mut dyn FnMut(&str),
+) -> Result<Output> {
+    use std::io::{BufRead, BufReader, Read};
+
+    fn pump<R: Read + Send + 'static>(
+        pipe: R,
+        is_stderr: bool,
+        tx: std::sync::mpsc::Sender<(bool, String)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(pipe);
+            let mut raw = Vec::new();
+            loop {
+                raw.clear();
+                match reader.read_until(b'\n', &mut raw) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send((is_stderr, decode_stream_line(&raw))).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut pumps = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        pumps.push(pump(stdout, false, tx.clone()));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        pumps.push(pump(stderr, true, tx.clone()));
+    }
+    drop(tx);
+
+    let mut stdout_lines = Vec::new();
+    let mut stderr_lines = Vec::new();
+    for (is_stderr, line) in rx {
+        if is_stderr {
+            on_stderr_line(&line);
+            stderr_lines.push(line);
+        } else {
+            on_line(&line);
+            stdout_lines.push(line);
+        }
+    }
+    for pump in pumps {
+        let _ = pump.join();
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting on `{cmd}`"))?;
+    defer_to_signal_if_terminated(&status);
+
+    Ok(Output {
+        success: status.success(),
+        stdout: stdout_lines.join("\n"),
+        stderr: stderr_lines.join("\n"),
+    })
+}
+
 /// Shells out for real via [`std::process::Command`].
 pub struct RealProcessRunner;
 
@@ -572,6 +697,8 @@ impl RealProcessRunner {
     /// [`ProcessRunner::run_streaming`] and
     /// [`ProcessRunner::run_streaming_scrubbed`] use — the plain variant is
     /// exactly this with an empty `remove_env`, so the two can never drift.
+    /// `on_stderr_line`, when set, switches to the both-streams-live path.
+    #[allow(clippy::too_many_arguments)]
     fn stream(
         &self,
         cmd: &str,
@@ -580,6 +707,7 @@ impl RealProcessRunner {
         env: &[(&str, &str)],
         remove_env: &[&str],
         on_line: &mut dyn FnMut(&str),
+        on_stderr_line: Option<&mut dyn FnMut(&str)>,
     ) -> Result<Output> {
         use std::io::{BufRead, BufReader, Read};
 
@@ -604,6 +732,10 @@ impl RealProcessRunner {
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn `{cmd}`"))?;
+
+        if let Some(on_stderr_line) = on_stderr_line {
+            return finish_stream_with_stderr(&mut child, cmd, on_line, on_stderr_line);
+        }
 
         // Drain stderr on a background thread so a child that fills its
         // stderr pipe while we're blocked reading stdout can't deadlock us.
@@ -641,30 +773,7 @@ impl RealProcessRunner {
         let status = child
             .wait()
             .with_context(|| format!("waiting on `{cmd}`"))?;
-
-        // A child killed by a termination signal is usually not a tool that
-        // failed — it is this process's own Ctrl-C/SIGTERM arriving group-wide
-        // and killing both of us. Returning a plain `success: false` here
-        // hands the caller an ordinary build failure to `bail!` on, which
-        // races `interrupt`'s handler thread for the process's exit status
-        // (exit 1 versus its scrub-then-130) and used to win about as often as
-        // it lost. Deferring here — at the one seam every synchronous pipeline
-        // funnels its external tools through, rather than in each pipeline's
-        // own failure branch — makes the signal win, for every caller.
-        //
-        // Costs nothing on the ordinary paths: an exit status carries a
-        // `signal()` only for a signal-killed child, so a tool that merely
-        // exited non-zero (the normal build-failure case) never calls in.
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if status
-                .signal()
-                .is_some_and(|signal| TERMINATION_SIGNALS.contains(&signal))
-            {
-                crate::interrupt::defer_to_pending_signal(crate::interrupt::SIGNAL_DEFER_TIMEOUT);
-            }
-        }
+        defer_to_signal_if_terminated(&status);
 
         Ok(Output {
             success: status.success(),
@@ -695,7 +804,7 @@ impl ProcessRunner for RealProcessRunner {
         env: &[(&str, &str)],
         on_line: &mut dyn FnMut(&str),
     ) -> Result<Output> {
-        self.stream(cmd, args, cwd, env, &[], on_line)
+        self.stream(cmd, args, cwd, env, &[], on_line, None)
     }
 
     fn run_streaming_scrubbed(
@@ -707,7 +816,19 @@ impl ProcessRunner for RealProcessRunner {
         remove_env: &[&str],
         on_line: &mut dyn FnMut(&str),
     ) -> Result<Output> {
-        self.stream(cmd, args, cwd, env, remove_env, on_line)
+        self.stream(cmd, args, cwd, env, remove_env, on_line, None)
+    }
+
+    fn run_streaming_with_stderr(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: Option<&Path>,
+        env: &[(&str, &str)],
+        on_line: &mut dyn FnMut(&str),
+        on_stderr_line: &mut dyn FnMut(&str),
+    ) -> Result<Output> {
+        self.stream(cmd, args, cwd, env, &[], on_line, Some(on_stderr_line))
     }
 
     fn spawn_streaming(
@@ -1159,6 +1280,25 @@ impl ProcessRunner for FakeProcessRunner {
         Ok(out)
     }
 
+    /// As [`run_streaming`](Self::run_streaming), additionally replaying the
+    /// registered output's `stderr` one line at a time through
+    /// `on_stderr_line` (after stdout).
+    fn run_streaming_with_stderr(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: Option<&Path>,
+        env: &[(&str, &str)],
+        on_line: &mut dyn FnMut(&str),
+        on_stderr_line: &mut dyn FnMut(&str),
+    ) -> Result<Output> {
+        let out = self.run_streaming(cmd, args, cwd, env, on_line)?;
+        for line in out.stderr.lines() {
+            on_stderr_line(line);
+        }
+        Ok(out)
+    }
+
     /// Fakes `spawn_streaming` from a registered [`with_stream`](FakeProcessRunner::with_stream)/
     /// [`with_stream_delayed`](FakeProcessRunner::with_stream_delayed)/
     /// [`with_hanging_stream`](FakeProcessRunner::with_hanging_stream) script,
@@ -1300,6 +1440,92 @@ mod tests {
         assert!(out.success);
         assert_eq!(seen, vec!["before\u{FFFD}after"]);
         assert_eq!(out.stdout, "before\u{FFFD}after");
+    }
+
+    #[cfg(unix)]
+    const STDERR_SCRIPT: &str = "echo out; echo err 1>&2; sleep 0.2; echo err2 1>&2";
+
+    #[cfg(unix)]
+    #[test]
+    fn run_streaming_with_stderr_delivers_stderr_before_the_child_exits() {
+        let runner = RealProcessRunner;
+        // The child prints a first stderr line, then waits for a marker file
+        // that only the stderr callback creates, then prints a second line.
+        // The second line only appears once the callback has seen the first
+        // while the child is still running; a bounded wait keeps a broken
+        // implementation from hanging the test.
+        let marker =
+            std::env::temp_dir().join(format!("frust-drive-stderr-marker-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "echo out; echo err 1>&2; i=0; \
+             while [ ! -f '{m}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; \
+             if [ -f '{m}' ]; then echo err2 1>&2; else echo timed-out 1>&2; fi",
+            m = marker.display()
+        );
+        let mut out_lines = Vec::new();
+        let mut err_lines: Vec<String> = Vec::new();
+        let out = runner
+            .run_streaming_with_stderr(
+                "/bin/sh",
+                &["-c", &script],
+                None,
+                &[],
+                &mut |line| out_lines.push(line.to_string()),
+                &mut |line| {
+                    if err_lines.is_empty() {
+                        std::fs::write(&marker, "seen").unwrap();
+                    }
+                    err_lines.push(line.to_string());
+                },
+            )
+            .unwrap();
+        let _ = std::fs::remove_file(&marker);
+        assert!(out.success);
+        assert_eq!(out_lines, vec!["out"]);
+        assert_eq!(err_lines, vec!["err", "err2"]);
+        assert_eq!(out.stdout, "out");
+        assert_eq!(out.stderr, "err\nerr2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_streaming_still_forwards_only_stdout_to_the_callback() {
+        let runner = RealProcessRunner;
+        let mut seen = Vec::new();
+        let out = runner
+            .run_streaming("/bin/sh", &["-c", STDERR_SCRIPT], None, &[], &mut |line| {
+                seen.push(line.to_string())
+            })
+            .unwrap();
+        assert_eq!(seen, vec!["out"]);
+        assert_eq!(out.stderr.trim(), "err\nerr2");
+    }
+
+    #[test]
+    fn fake_run_streaming_with_stderr_replays_both_streams() {
+        let runner = FakeProcessRunner::new().with(
+            "tool go",
+            Output {
+                success: true,
+                stdout: "a\nb\n".to_string(),
+                stderr: "x\ny\n".to_string(),
+            },
+        );
+        let (mut out_lines, mut err_lines) = (Vec::new(), Vec::new());
+        let out = runner
+            .run_streaming_with_stderr(
+                "tool",
+                &["go"],
+                None,
+                &[],
+                &mut |l| out_lines.push(l.to_string()),
+                &mut |l| err_lines.push(l.to_string()),
+            )
+            .unwrap();
+        assert_eq!(out_lines, vec!["a", "b"]);
+        assert_eq!(err_lines, vec!["x", "y"]);
+        assert_eq!(out.stderr, "x\ny\n");
     }
 
     #[test]

@@ -47,7 +47,8 @@ Add Plugin `library` option) the crate also lists the user's photos: `PhotoLibra
   `thumbnail`.
 - Every `Asset` carries `modified_unix_ms`, `is_favorite` and `burst_id`. `is_favorite` is `None` below
   Android API 30 and `burst_id` is always `None` on Android (`photo-library-android-asset-fields`).
-  `AssetQuery::with_details()` also fills `file_name` (untrusted, display only) and `content_type`, which is
+  `AssetQuery::with_details()` also fills `file_name` (untrusted, display only), `size_bytes` (the
+  original's size; Android fills it, iOS returns `None`) and `content_type`, which is
   platform-shaped: a MIME type on Android, a uniform type identifier on iOS
   (`photo-library-content-type-platform-shaped`). `Asset::mime_type()` gives a MIME type on both phones: it maps the
   iOS identifiers in a fixed table and returns `None` for an identifier it does not know rather than guessing. They are off by default because on iOS each row then costs
@@ -143,7 +144,7 @@ fn sync(saved: Option<Vec<u8>>) -> Result<Vec<u8>, PhotoError> {
 `PhotoLibrary::assets_by_id(&[AssetId], details)` returns the `Asset` rows for given ids, so a delta
 needs no re-listing. The answer has one entry per input id, in input order: `None` where the id does
 not exist, was deleted, is outside a limited selection or is not a library id, and a duplicate id gives
-a duplicate entry. `details: true` fills `file_name` and `content_type` as `AssetQuery::with_details`
+a duplicate entry. `details: true` fills `file_name`, `content_type` and `size_bytes` as `AssetQuery::with_details`
 does. An empty slice returns an empty `Vec` without a platform call; otherwise the call blocks, refuses
 the UI thread and needs the same access as `assets`. Android takes a whole delta in one call (it
 queries at most 500 ids at a time on its own); iOS does the same; desktop and web answer `Unsupported`.

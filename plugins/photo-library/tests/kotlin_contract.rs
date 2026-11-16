@@ -810,6 +810,7 @@ fn browse_result_fields_match_their_rust_reads() {
                 ("favorites", "IntArray", "int_array_field"),
                 ("names", "Array<String?>", "string_array_field"),
                 ("types", "Array<String?>", "string_array_field"),
+                ("sizes", "LongArray", "long_array_field"),
             ],
         ),
         (

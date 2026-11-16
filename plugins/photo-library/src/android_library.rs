@@ -180,6 +180,7 @@ fn asset_columns(
         favorites: int_array_field(env, &result, jni_str!("favorites"))?,
         names: string_array_field(env, &result, jni_str!("names"))?,
         types: string_array_field(env, &result, jni_str!("types"))?,
+        sizes: long_array_field(env, &result, jni_str!("sizes"))?,
     })
 }
 
@@ -333,6 +334,8 @@ struct AssetColumns {
     names: Vec<Option<String>>,
     /// Only meaningful when the query asked for details.
     types: Vec<Option<String>>,
+    /// `SIZE` in bytes, or `-1` when unknown. Only meaningful when the query asked for details.
+    sizes: Vec<jlong>,
 }
 
 /// Zip [`AssetColumns`] into a page.
@@ -356,7 +359,8 @@ fn assets_from(
     {
         return Err(mismatched_arrays());
     }
-    if details && (columns.names.len() != n || columns.types.len() != n) {
+    if details && (columns.names.len() != n || columns.types.len() != n || columns.sizes.len() != n)
+    {
         return Err(mismatched_arrays());
     }
     let mut names = columns.names;
@@ -381,6 +385,13 @@ fn assets_from(
             burst_id: None,
             file_name: if details { names[index].take() } else { None },
             content_type: if details { types[index].take() } else { None },
+            size_bytes: if details {
+                u64::try_from(columns.sizes[index])
+                    .ok()
+                    .filter(|&size| size > 0)
+            } else {
+                None
+            },
         });
     }
     Ok(AssetPage {
@@ -630,6 +641,7 @@ mod tests {
             favorites: vec![1; n],
             names: vec![Some("a.jpg".into()); n],
             types: vec![Some("image/jpeg".into()); n],
+            sizes: vec![2_048; n],
         }
     }
 
@@ -652,6 +664,16 @@ mod tests {
         assert_eq!(asset.burst_id, None);
         assert_eq!(asset.file_name.as_deref(), Some("a.jpg"));
         assert_eq!(asset.content_type.as_deref(), Some("image/jpeg"));
+        assert_eq!(asset.size_bytes, Some(2_048));
+    }
+
+    #[test]
+    fn an_unknown_or_zero_size_is_none() {
+        let mut c = columns(2);
+        c.sizes = vec![-1, 0];
+        let page = assets_from(c, 2, true).unwrap();
+        assert_eq!(page.items[0].size_bytes, None);
+        assert_eq!(page.items[1].size_bytes, None);
     }
 
     #[test]
@@ -668,6 +690,7 @@ mod tests {
         let page = assets_from(columns(1), 1, false).unwrap();
         assert_eq!(page.items[0].file_name, None);
         assert_eq!(page.items[0].content_type, None);
+        assert_eq!(page.items[0].size_bytes, None);
     }
 
     #[test]
@@ -678,6 +701,7 @@ mod tests {
         let mut c = columns(2);
         c.names.clear();
         c.types.clear();
+        c.sizes.clear();
         assert!(assets_from(c, 2, false).is_ok());
     }
 }
