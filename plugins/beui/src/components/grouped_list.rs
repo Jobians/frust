@@ -33,10 +33,10 @@ use frust::authoring::{
     rebuild_child, rebuild_children, route_event, route_event_single, teardown_child,
 };
 
-use crate::press::{inside, presses};
-use crate::style::{ACTIVE_CURSOR, SPACING_UNIT, with_alpha};
+use crate::press::{draw_focus_ring, inside, is_activation_key, presses};
+use crate::style::{ACTIVE_CURSOR, FOCUS_RING_WIDTH, SPACING_UNIT, with_alpha};
 use crate::text::{SHAPING_INK, ThemeTextType, themed_style};
-use crate::tokens::{BeuiMetrics, color_scheme_light};
+use crate::tokens::{BeuiMetrics, BeuiTokens, color_scheme_light};
 
 /// The pressed wash laid over a row, as a share of the ink colour.
 const PRESS_WASH_ALPHA: f32 = 0.1;
@@ -48,6 +48,9 @@ const CHEVRON_STROKE: f64 = 2.0;
 /// The gap between a row's parts, and its vertical padding.
 const PART_GAP: f64 = 3.0 * SPACING_UNIT;
 const ROW_PAD_Y: f64 = 2.0 * SPACING_UNIT;
+/// How far the focus ring's outer edge sits inside a row's bounds. The group clips its
+/// rows, so the ring cannot sit outside them the way a free-standing control's does.
+const RING_INSET: f64 = 2.0;
 
 /// A cached one-line text run whose ink is applied at paint time and which cuts
 /// itself to a width with an ellipsis. Private copy: `LabelRun` has no bound.
@@ -326,6 +329,14 @@ pub struct ListRowWidget {
 }
 
 impl ListRowWidget {
+    /// Whether the leading or trailing child holds focus, so the row is only on the path.
+    fn child_holds_focus(&self) -> bool {
+        [&self.leading, &self.trailing]
+            .into_iter()
+            .flatten()
+            .any(ChildPod::holds_live_focus)
+    }
+
     /// Where this row's title starts, in row-local x, from the last layout.
     pub fn title_inset(&self) -> f64 {
         self.title_inset
@@ -439,6 +450,8 @@ impl Widget for ListRowWidget {
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
         let theme = Theme::from_paint_ctx(ctx);
         let colors = ListColors::resolve(theme);
+        let radius = BeuiMetrics::resolve(theme).radius_list;
+        let ring = BeuiTokens::resolve_ring(None, theme);
         let origin = ctx.origin();
         if self.pressed {
             scene.fill_rect(origin, self.size, with_alpha(colors.ink, PRESS_WASH_ALPHA));
@@ -474,6 +487,18 @@ impl Widget for ListRowWidget {
                 &Brush::Solid(colors.secondary),
             );
         }
+        if self.on_press.is_some() && ctx.is_focused_for_ring() && !self.child_holds_focus() {
+            // A negative offset draws the ring inward; the radius follows the group's
+            // corner so the first and last row's ring stays inside the rounded clip.
+            draw_focus_ring(
+                scene,
+                origin,
+                self.size,
+                radius.max(RING_INSET + FOCUS_RING_WIDTH),
+                -(RING_INSET + FOCUS_RING_WIDTH),
+                ring,
+            );
+        }
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
@@ -487,8 +512,23 @@ impl Widget for ListRowWidget {
                 }
             }
         }
-        let (Some(_), InputEvent::Pointer(p)) = (&self.on_press, event) else {
+        if self.on_press.is_none() {
             return EventResult::Ignored;
+        }
+        let p = match event {
+            InputEvent::Pointer(p) => p,
+            InputEvent::Key(key) => {
+                // Only when the row itself holds focus: a focused leading or trailing
+                // child already had the key above and keeps it.
+                if !is_activation_key(key) || self.child_holds_focus() {
+                    return EventResult::Ignored;
+                }
+                if let Some(on_press) = &mut self.on_press {
+                    on_press(ctx);
+                }
+                return EventResult::Handled;
+            }
+            _ => return EventResult::Ignored,
         };
         let size = ctx.size();
         match p.phase {
@@ -499,6 +539,7 @@ impl Widget for ListRowWidget {
                 self.pressed = true;
                 self.captured = true;
                 ctx.capture_pointer();
+                ctx.request_focus();
                 ctx.request_redraw();
                 EventResult::Handled
             }
@@ -540,14 +581,19 @@ impl Widget for ListRowWidget {
         }
     }
 
+    fn is_focusable(&self) -> bool {
+        self.on_press.is_some()
+    }
+
     fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let focused = self.on_press.is_some() && ctx.has_focus() && !self.child_holds_focus();
         let role = if self.on_press.is_some() {
             Role::Button
         } else {
             Role::ListItem
         };
         let pressable = self.on_press.is_some();
-        ctx.push_container(
+        let id = ctx.push_container(
             role,
             |node| {
                 node.set_label(self.title.content.as_str());
@@ -567,6 +613,9 @@ impl Widget for ListRowWidget {
                 }
             },
         );
+        if focused {
+            ctx.set_focused(id);
+        }
     }
 
     fn visit_children(&self, visitor: &mut dyn FnMut(&ChildPod)) {
@@ -838,8 +887,11 @@ impl<State: 'static> View<State> for SectionHeaderView {
 mod tests {
     use super::*;
     use crate::tokens::{Density, theme, theme_with_density};
+    use frust::FrameTime;
     use frust::authoring::scene::GlyphRun;
-    use frust::authoring::{PointerButton, PointerEvent, SemanticsUpdate};
+    use frust::authoring::{
+        Key, KeyEvent, Modifiers, NamedKey, PointerButton, PointerEvent, SemanticsUpdate,
+    };
     use std::any::Any;
 
     #[derive(Default)]
@@ -854,6 +906,8 @@ mod tests {
         clips: usize,
         glyphs: usize,
         strokes: usize,
+        /// `(origin, path bounds, width)` of every stroke.
+        stroke_boxes: Vec<(Point, kurbo::Rect, f64)>,
     }
 
     impl PaintScene for Recorder {
@@ -867,8 +921,10 @@ mod tests {
         fn draw_glyph_run(&mut self, _run: GlyphRun) {
             self.glyphs += 1;
         }
-        fn stroke_path(&mut self, _o: Point, _p: &BezPath, _w: f64, _b: &Brush) {
+        fn stroke_path(&mut self, o: Point, p: &BezPath, w: f64, _b: &Brush) {
             self.strokes += 1;
+            self.stroke_boxes
+                .push((o, kurbo::Shape::bounding_box(p), w));
         }
     }
 
@@ -1115,5 +1171,210 @@ mod tests {
         let flags = View::<App>::rebuild(&after, &before, &mut w, &mut BuildCtx::new(&mut next_id));
         assert_eq!(w.row_count(), 3);
         assert!(flags.contains(ChangeFlags::LAYOUT));
+    }
+
+    // ---- Keyboard: a pressable row is a Tab stop ----
+
+    /// Rows 1 and 3 pressable, row 2 plain; row 3 also carries a trailing button.
+    fn mixed_group(_: &mut App) -> GroupedListView<App> {
+        grouped_list([
+            list_row::<App>("Profile").on_press(|s| s.pressed.push("profile")),
+            list_row::<App>("Billing"),
+            list_row::<App>("Privacy")
+                .on_press(|s| s.pressed.push("privacy"))
+                .trailing(frust::button::<App, _>("Reset", |s| {
+                    s.pressed.push("button")
+                })),
+        ])
+    }
+
+    /// A real root: focus traversal, the focus ring policy and semantics are the root's.
+    struct Keyboard {
+        root: frust_core::RenderRoot<App, GroupedListView<App>>,
+        state: App,
+        size: Size,
+    }
+
+    impl Keyboard {
+        fn new() -> Self {
+            let mut root = frust_core::RenderRoot::new();
+            root.set_theme(Box::new(theme()));
+            let mut state = App::default();
+            let mut tcx = TextContext::new();
+            root.rebuild(&mut mixed_group, &mut state);
+            let size = root.layout_with_text(Size::new(400.0, 800.0), &mut tcx as &mut dyn Any);
+            Self { root, state, size }
+        }
+
+        fn key(&mut self, key: Key, shift: bool) {
+            self.root.event(
+                &mut self.state,
+                &InputEvent::Key(KeyEvent {
+                    key,
+                    modifiers: Modifiers {
+                        shift,
+                        ..Modifiers::default()
+                    },
+                    repeat: false,
+                }),
+            );
+        }
+
+        fn tab(&mut self) {
+            self.key(Key::Named(NamedKey::Tab), false);
+        }
+
+        fn shift_tab(&mut self) {
+            self.key(Key::Named(NamedKey::Tab), true);
+        }
+
+        fn enter(&mut self) {
+            self.key(Key::Named(NamedKey::Enter), false);
+        }
+
+        fn space(&mut self) {
+            self.key(Key::Character(" ".into()), false);
+        }
+
+        /// The label of the node the semantics report as focused.
+        fn focused_label(&self) -> Option<String> {
+            let update = self.root.semantics();
+            let focus = update.focus?;
+            update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == focus)
+                .and_then(|(_, n)| n.label().map(str::to_owned))
+        }
+
+        fn paint(&mut self) -> Recorder {
+            let mut rec = Recorder::default();
+            self.root.paint(&mut rec, FrameTime::ZERO);
+            rec
+        }
+
+        fn row_bounds(&self) -> Vec<kurbo::Rect> {
+            self.root
+                .inspect()
+                .into_iter()
+                .filter(|n| n.type_name.ends_with("ListRowWidget"))
+                .map(|n| n.bounds)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn tab_visits_the_pressable_rows_in_order_and_shift_tab_returns() {
+        let mut kb = Keyboard::new();
+        assert_eq!(kb.focused_label(), None);
+        kb.tab();
+        assert_eq!(kb.focused_label().as_deref(), Some("Profile"));
+        kb.tab();
+        assert_eq!(
+            kb.focused_label().as_deref(),
+            Some("Privacy"),
+            "the plain row is skipped"
+        );
+        kb.shift_tab();
+        assert_eq!(kb.focused_label().as_deref(), Some("Profile"));
+    }
+
+    #[test]
+    fn enter_and_space_fire_only_the_focused_rows_handler() {
+        let mut kb = Keyboard::new();
+        kb.tab();
+        kb.enter();
+        assert_eq!(kb.state.pressed, vec!["profile"]);
+        kb.space();
+        assert_eq!(kb.state.pressed, vec!["profile", "profile"]);
+        kb.tab();
+        kb.enter();
+        assert_eq!(kb.state.pressed, vec!["profile", "profile", "privacy"]);
+        kb.space();
+        assert_eq!(kb.state.pressed.last(), Some(&"privacy"));
+        assert_eq!(kb.state.pressed.len(), 4);
+    }
+
+    #[test]
+    fn a_pointer_press_focuses_the_row() {
+        let mut kb = Keyboard::new();
+        let y = kb.row_bounds()[2].center().y;
+        for phase in [PointerPhase::Down, PointerPhase::Up] {
+            kb.root.event(&mut kb.state, &pointer(phase, 20.0, y));
+        }
+        assert_eq!(kb.state.pressed, vec!["privacy"]);
+        assert_eq!(kb.focused_label().as_deref(), Some("Privacy"));
+    }
+
+    #[test]
+    fn the_ring_is_painted_only_for_the_focused_row_and_inside_the_group() {
+        let mut kb = Keyboard::new();
+        assert!(kb.paint().stroke_boxes.is_empty(), "no focus, no ring");
+        let rows = kb.row_bounds();
+        for (stop, row) in [(0, 0), (1, 2)] {
+            kb.tab();
+            let rec = kb.paint();
+            let rings: Vec<_> = rec
+                .stroke_boxes
+                .iter()
+                .filter(|b| b.2 == FOCUS_RING_WIDTH)
+                .collect();
+            assert_eq!(
+                rings.len(),
+                1,
+                "stop {stop}: one ring, got {:?}",
+                rec.stroke_boxes
+            );
+            let (origin, bounds, width) = *rings[0];
+            let outer = (bounds + origin.to_vec2()).inflate(width / 2.0, width / 2.0);
+            let group = kurbo::Rect::from_origin_size(Point::ORIGIN, kb.size);
+            assert!(
+                outer.x0 >= rows[row].x0
+                    && outer.x1 <= rows[row].x1
+                    && outer.y0 >= rows[row].y0
+                    && outer.y1 <= rows[row].y1,
+                "ring {outer:?} leaves its row {:?}",
+                rows[row]
+            );
+            assert!(outer.x0 >= group.x0 && outer.x1 <= group.x1);
+            assert!(outer.y0 >= group.y0 && outer.y1 <= group.y1);
+        }
+    }
+
+    #[test]
+    fn a_plain_row_is_not_a_stop() {
+        let mut kb = Keyboard::new();
+        kb.tab();
+        kb.tab();
+        kb.tab(); // the trailing button
+        kb.tab(); // wraps to the first row
+        assert_eq!(kb.focused_label().as_deref(), Some("Profile"));
+        assert!(
+            !kb.root
+                .semantics()
+                .nodes
+                .iter()
+                .any(|(id, n)| n.label() == Some("Billing")
+                    && Some(*id) == kb.root.semantics().focus),
+            "the plain row never takes focus"
+        );
+    }
+
+    #[test]
+    fn a_focused_trailing_button_keeps_enter_and_the_row_does_not_fire() {
+        let mut kb = Keyboard::new();
+        kb.tab();
+        kb.tab();
+        kb.tab();
+        assert_eq!(kb.focused_label().as_deref(), Some("Reset"));
+        kb.enter();
+        assert_eq!(kb.state.pressed, vec!["button"]);
+        // The ring belongs to the button's own focus, not the row's.
+        let rec = kb.paint();
+        assert!(
+            !rec.stroke_boxes
+                .iter()
+                .any(|b| b.2 == FOCUS_RING_WIDTH && b.1.width() > 300.0)
+        );
     }
 }
