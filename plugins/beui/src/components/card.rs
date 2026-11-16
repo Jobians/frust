@@ -450,6 +450,14 @@ impl CardWidget {
             .collect()
     }
 
+    /// Whether a child holds focus, so the card is only on the path.
+    fn child_holds_focus(&self) -> bool {
+        [&self.child, &self.extra]
+            .into_iter()
+            .flatten()
+            .any(ChildPod::holds_live_focus)
+    }
+
     /// The card's own handling, after its children declined the event.
     fn own_event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
         if self.on_press.is_none() {
@@ -678,7 +686,8 @@ impl Widget for CardWidget {
         if let Some(extra) = &mut self.extra {
             extra.paint_child(ctx, scene);
         }
-        if self.pressable() && ctx.is_focused_for_ring() {
+        // The ring marks the card's own focus, never a focused child's.
+        if self.pressable() && ctx.is_focused_for_ring() && !self.child_holds_focus() {
             draw_focus_ring(scene, origin, size, radius, RING_OFFSET, ring);
         }
     }
@@ -706,6 +715,11 @@ impl Widget for CardWidget {
             if routed == EventResult::Handled || child_holds || event.is_broadcast() {
                 return routed;
             }
+        } else if event.is_broadcast() {
+            // The card's own press does not hide a broadcast from its children.
+            for pod in self.pods_mut() {
+                pod.event_child(ctx, event);
+            }
         }
         self.own_event(ctx, event)
     }
@@ -722,7 +736,8 @@ impl Widget for CardWidget {
         };
         if self.pressable() {
             let name = self.name();
-            ctx.push_container(
+            let focused = ctx.has_focus() && !self.child_holds_focus();
+            let id = ctx.push_container(
                 Role::Button,
                 |node| {
                     node.set_label(name);
@@ -730,6 +745,9 @@ impl Widget for CardWidget {
                 },
                 visit,
             );
+            if focused {
+                ctx.set_focused(id);
+            }
         } else {
             visit(ctx);
         }
@@ -1346,6 +1364,15 @@ mod tests {
             found.into_iter().map(|r| r.center()).collect()
         }
 
+        fn card_bounds(&self) -> kurbo::Rect {
+            self.root
+                .inspect()
+                .into_iter()
+                .find(|n| n.type_name.ends_with("::CardWidget"))
+                .expect("a card")
+                .bounds
+        }
+
         fn card(&self) -> &CardWidget {
             let id = self.root.root_id().expect("root built");
             let w = self.root.tree().pod(id).expect("root pod").widget();
@@ -1457,6 +1484,74 @@ mod tests {
             vec!["button", "button", "card", "card"],
             "Enter on the focused card fires the card"
         );
+    }
+
+    /// Records every stroke's path bounds and width.
+    #[derive(Default)]
+    struct Strokes(Vec<(kurbo::Rect, f64)>);
+
+    impl PaintScene for Strokes {
+        fn fill_rect(&mut self, _o: Point, _s: Size, _c: Color) {}
+        fn draw_text(&mut self, _o: Point, _t: &str) {}
+        fn stroke_path(
+            &mut self,
+            _o: Point,
+            p: &kurbo::BezPath,
+            w: f64,
+            _b: &frust::authoring::Brush,
+        ) {
+            self.0.push((kurbo::Shape::bounding_box(p), w));
+        }
+    }
+
+    #[test]
+    fn the_ring_and_the_reported_focus_are_the_cards_only_while_no_child_holds_focus() {
+        // Under a parent, as in an app: a pod carries the card's focus to its semantics.
+        fn view(_: &mut App) -> impl View<App> + use<> {
+            frust::column().children((card::<App, _>(frust::button::<App, _>(
+                "Go",
+                |s: &mut App| {
+                    s.log.push("button");
+                },
+            ))
+            .label("Open item")
+            .on_press(|s: &mut App| s.log.push("card")),))
+        }
+        let mut rig = Rig::mount(view, App::default());
+        let card_width = rig.card_bounds().width();
+        // Two keyboard stops: the card and its button. At each, who Enter fires says
+        // which one holds focus; the card's ring and reported focus must agree.
+        let mut fired = Vec::new();
+        for _ in 0..2 {
+            rig.key(Key::Named(NamedKey::Tab));
+            rig.frame();
+            let mut strokes = Strokes::default();
+            rig.root.paint(&mut strokes, FrameTime::from_nanos(0));
+            let card_ring = strokes
+                .0
+                .iter()
+                .any(|(b, w)| *w == crate::style::FOCUS_RING_WIDTH && b.width() >= card_width);
+            let update = rig.root.semantics();
+            let card_reported = update.focus.is_some_and(|focus| {
+                update
+                    .nodes
+                    .iter()
+                    .any(|(id, n)| *id == focus && n.label() == Some("Open item"))
+            });
+            rig.state.log.clear();
+            rig.key(Key::Named(NamedKey::Enter));
+            let who = rig
+                .state
+                .log
+                .first()
+                .copied()
+                .expect("Enter fired a handler");
+            assert_eq!(card_ring, who == "card", "{who} focused: ring {card_ring}");
+            assert_eq!(card_reported, who == "card", "{who} focused: semantics");
+            fired.push(who);
+        }
+        fired.sort_unstable();
+        assert_eq!(fired, vec!["button", "card"], "both stops were visited");
     }
 
     #[test]
