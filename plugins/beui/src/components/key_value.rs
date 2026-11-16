@@ -1,90 +1,436 @@
 //! Key-value rows and stage timelines: [`key_value_row`] and [`timeline`].
 //!
-//! The finished part is the read-only detail layout of a phone screen: a row pairing
-//! a key with its value, and a vertical timeline of [`TimelineStep`]s each in a
-//! [`StepState`]. This module is the scaffold: each entry point is a minimal working
-//! view (text only, no styling yet) with the public names the finished part keeps.
+//! The read-only detail layout of a phone screen: a row pairing a key with its
+//! value, and a vertical timeline of [`TimelineStep`]s each in a [`StepState`].
+//!
+//! - [`key_value_row`] puts the key, in the secondary text colour, on the leading
+//!   side and the value on the trailing side. It stacks the value under the key when
+//!   [`stacked`](KeyValueRowView::stacked) is set or when the width cannot fit both
+//!   on one line. [`trailing`](KeyValueRowView::trailing) adds a view at the far
+//!   trailing edge and [`mono`](KeyValueRowView::mono) sets the value in the theme's
+//!   monospace family, for ids.
+//! - [`timeline`] draws one marker per step (a filled success disc with a check for
+//!   `Done`, an accent ring around a dot for `Current`, a muted disc for `Pending`), a
+//!   connector between neighbouring markers, the step label and an optional detail
+//!   line. Marker and connector geometry follow the scaled label line height, so the
+//!   OS text size and the density carry through.
+//!
+//! Semantics: a row publishes its key as the label and its value as the value; each
+//! timeline step publishes its label and its state in words ("Done", "Current",
+//! "Pending") as the value.
 
 use frust::Theme;
 use frust::authoring::text::TextStyle;
 use frust::authoring::{
-    BoxConstraints, BuildCtx, ChangeFlags, ChildPod, LayoutCtx, PaintCtx, PaintScene, View, Widget,
+    AnyView, BezPath, BoxConstraints, Brush, BuildCtx, ChangeFlags, ChildPod, EventCtx,
+    EventResult, InputEvent, LayoutCtx, PaintCtx, PaintScene, Role, SemanticsCtx, View, Widget,
+    any, build_child, rebuild_child, teardown_child,
 };
 use kurbo::{Point, Size, Vec2};
 use peniko::Color;
 
-use crate::text::{LabelRun, ThemeTextType};
+use crate::text::{LabelRun, ThemeTextType, scaled_style};
+use crate::tokens::{BEUI_LIGHT, BeuiMetrics, BeuiTokens, mono_family};
 
-/// The retained widget behind the key-value and timeline entry points: stacked text lines with an optional
-/// child beneath them.
+/// Connector stroke width, in logical px.
+const CONNECTOR_WIDTH: f64 = 2.0;
+/// Ring stroke width of a `Current` marker, in logical px.
+const RING_WIDTH: f64 = 2.0;
+/// Marker diameter as a fraction of the label's line height.
+const MARKER_SCALE: f64 = 0.7;
+
+/// The words a step's state publishes.
+fn state_words(state: StepState) -> &'static str {
+    match state {
+        StepState::Done => "Done",
+        StepState::Current => "Current",
+        StepState::Pending => "Pending",
+    }
+}
+
+/// One step as the widget holds it.
+struct StepRow {
+    state: StepState,
+    label: LabelRun,
+    detail: Option<LabelRun>,
+    /// Top of the step's row, set by layout.
+    top: f64,
+}
+
+/// What the widget draws.
+enum Body {
+    Row {
+        key: Box<LabelRun>,
+        value: Box<LabelRun>,
+        mono: bool,
+        stacked: bool,
+        /// Whether the last layout fell back to the stacked arrangement.
+        narrow: bool,
+        trailing: Option<Box<ChildPod>>,
+    },
+    Timeline {
+        steps: Vec<StepRow>,
+        /// Marker diameter and the marker column width, set by layout.
+        marker: f64,
+        column: f64,
+    },
+}
+
+/// The retained widget behind the key-value and timeline entry points.
 pub struct KeyValueWidget {
-    lines: Vec<LabelRun>,
-    child: Option<ChildPod>,
+    body: Body,
 }
 
 impl KeyValueWidget {
-    fn new(lines: Vec<String>, child: Option<ChildPod>) -> Self {
+    fn row(key: &str, value: &str, mono: bool, stacked: bool, trailing: Option<ChildPod>) -> Self {
         Self {
-            lines: lines.into_iter().map(LabelRun::new).collect(),
-            child,
+            body: Body::Row {
+                key: Box::new(LabelRun::new(key)),
+                value: Box::new(LabelRun::new(value)),
+                mono,
+                stacked,
+                narrow: false,
+                trailing: trailing.map(Box::new),
+            },
         }
     }
 
-    /// The text lines this widget carries, top to bottom.
+    fn timeline(steps: &[TimelineStep]) -> Self {
+        Self {
+            body: Body::Timeline {
+                steps: steps.iter().map(step_row).collect(),
+                marker: 0.0,
+                column: 0.0,
+            },
+        }
+    }
+
+    /// The text lines this widget carries, top to bottom: a row's key and value, or
+    /// each step's label (a detail line follows its label).
     pub fn lines(&self) -> Vec<&str> {
-        self.lines.iter().map(LabelRun::content).collect()
+        match &self.body {
+            Body::Row { key, value, .. } => vec![key.content(), value.content()],
+            Body::Timeline { steps, .. } => steps
+                .iter()
+                .flat_map(|s| {
+                    std::iter::once(s.label.content())
+                        .chain(s.detail.as_ref().map(LabelRun::content))
+                })
+                .collect(),
+        }
     }
 
-    fn set_lines(&mut self, lines: Vec<String>) -> ChangeFlags {
-        let mut flags = ChangeFlags::NONE;
-        if self.lines.len() != lines.len() {
-            self.lines = lines.into_iter().map(LabelRun::new).collect();
-            return ChangeFlags::LAYOUT | ChangeFlags::PAINT;
+    /// Whether the last layout put a row's value under its key.
+    pub fn is_stacked(&self) -> bool {
+        matches!(&self.body, Body::Row { narrow: true, .. })
+    }
+}
+
+fn step_row(step: &TimelineStep) -> StepRow {
+    StepRow {
+        state: step.state,
+        label: LabelRun::new(step.label.clone()),
+        detail: step.detail.clone().map(LabelRun::new),
+        top: 0.0,
+    }
+}
+
+/// The colours a key-value row and timeline paint with.
+struct Hues {
+    ink: Color,
+    secondary: Color,
+    accent: Color,
+    on_accent: Color,
+    done: Color,
+    muted: Color,
+}
+
+impl Hues {
+    fn resolve(theme: Option<&Theme>) -> Self {
+        let scheme = theme.map(Theme::scheme);
+        let tokens = BeuiTokens::resolve(theme);
+        Self {
+            ink: scheme.map_or(BEUI_LIGHT.foreground, |s| s.on_surface),
+            secondary: scheme.map_or(BEUI_LIGHT.muted_foreground, |s| s.on_surface_variant),
+            accent: scheme.map_or(BEUI_LIGHT.primary, |s| s.primary),
+            on_accent: scheme.map_or(BEUI_LIGHT.primary_foreground, |s| s.on_primary),
+            done: tokens.success,
+            muted: scheme.map_or(BEUI_LIGHT.border, |s| s.outline_variant),
         }
-        for (run, text) in self.lines.iter_mut().zip(lines) {
-            if run.set_content(text) {
-                flags |= ChangeFlags::LAYOUT | ChangeFlags::PAINT;
-            }
-        }
-        flags
     }
 }
 
 impl Widget for KeyValueWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        let style = TextStyle::new(14.0, Color::BLACK);
-        let mut width = 0.0_f64;
-        let mut height = 0.0_f64;
-        for run in &mut self.lines {
-            let size = run.layout_themed(ctx, &style, ThemeTextType::BodyMedium);
-            width = width.max(size.width);
-            height += size.height;
+        let theme = Theme::from_layout_ctx(ctx);
+        let metrics = BeuiMetrics::resolve(theme);
+        let sans = |size: f64| TextStyle::new(size as f32, Color::BLACK);
+        match &mut self.body {
+            Body::Row {
+                key,
+                value,
+                mono,
+                stacked,
+                narrow,
+                trailing,
+            } => {
+                let key_size =
+                    key.layout_themed(ctx, &sans(metrics.text_sm), ThemeTextType::BodyMedium);
+                let value_size = if *mono {
+                    // `TypeScale` has no monospace slot, so the family is named here.
+                    let style = scaled_style(
+                        sans(metrics.text_base).with_family(mono_family()),
+                        Theme::from_layout_ctx(ctx),
+                    );
+                    value.layout(ctx, &style)
+                } else {
+                    value.layout_themed(ctx, &sans(metrics.text_base), ThemeTextType::BodyMedium)
+                };
+                let trailing_size = trailing
+                    .as_mut()
+                    .map_or(Size::ZERO, |t| t.layout_child(ctx, &bc.loosen()));
+                let gap = metrics.gap_md;
+                let trail_w = if trailing_size.width > 0.0 {
+                    trailing_size.width + gap
+                } else {
+                    0.0
+                };
+                let inline_w = key_size.width + gap + value_size.width + trail_w;
+                *narrow = *stacked || inline_w > bc.max().width;
+                let (content_w, content_h) = if *narrow {
+                    (
+                        key_size.width.max(value_size.width) + trail_w,
+                        key_size.height + value_size.height,
+                    )
+                } else {
+                    (inline_w, key_size.height.max(value_size.height))
+                };
+                let height = content_h.max(trailing_size.height);
+                let width = if bc.max().width.is_finite() {
+                    bc.max().width
+                } else {
+                    content_w
+                };
+                let size = bc.constrain(Size::new(width, height));
+                if let Some(t) = trailing {
+                    t.set_origin(Point::new(
+                        size.width - trailing_size.width,
+                        (size.height - trailing_size.height) / 2.0,
+                    ));
+                }
+                size
+            }
+            Body::Timeline {
+                steps,
+                marker,
+                column,
+            } => {
+                let label_style = sans(metrics.text_base);
+                let detail_style = sans(metrics.text_sm);
+                let mut y = 0.0;
+                let mut width = 0.0_f64;
+                let mut line = 0.0_f64;
+                // Shape every label first: the marker column follows the label line height.
+                let mut sizes = Vec::with_capacity(steps.len());
+                for step in steps.iter_mut() {
+                    let label =
+                        step.label
+                            .layout_themed(ctx, &label_style, ThemeTextType::BodyMedium);
+                    let detail = step
+                        .detail
+                        .as_mut()
+                        .map(|d| d.layout_themed(ctx, &detail_style, ThemeTextType::BodyMedium));
+                    line = line.max(label.height);
+                    sizes.push((label, detail));
+                }
+                *column = line;
+                *marker = (line * MARKER_SCALE).round().max(4.0);
+                let gap = metrics.gap_md;
+                for (step, (label, detail)) in steps.iter_mut().zip(sizes) {
+                    step.top = y;
+                    let text_w = label.width.max(detail.map_or(0.0, |d| d.width));
+                    width = width.max(*column + gap + text_w);
+                    y += label.height + detail.map_or(0.0, |d| d.height) + gap;
+                }
+                // The trailing gap belongs between steps only.
+                let height = if steps.is_empty() { 0.0 } else { y - gap };
+                bc.constrain(Size::new(width, height))
+            }
         }
-        if let Some(child) = &mut self.child {
-            let size = child.layout_child(ctx, &bc.loosen());
-            child.set_origin(Point::new(0.0, height));
-            width = width.max(size.width);
-            height += size.height;
-        }
-        bc.constrain(Size::new(width, height))
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
-        let ink = Theme::from_paint_ctx(ctx).map_or(Color::BLACK, |t| t.scheme().on_surface);
-        let mut y = 0.0;
-        for run in &self.lines {
-            run.paint(ctx.origin() + Vec2::new(0.0, y), ink, scene);
-            y += run.size().height;
+        let theme = Theme::from_paint_ctx(ctx);
+        let metrics = BeuiMetrics::resolve(theme);
+        let hues = Hues::resolve(theme);
+        let origin = ctx.origin();
+        let size = ctx.size();
+        match &mut self.body {
+            Body::Row {
+                key,
+                value,
+                narrow,
+                trailing,
+                ..
+            } => {
+                let trail_w = trailing.as_ref().map_or(0.0, |t| {
+                    let w = t.size().width;
+                    if w > 0.0 { w + metrics.gap_md } else { 0.0 }
+                });
+                key.paint(origin, hues.secondary, scene);
+                let value_size = value.size();
+                let at = if *narrow {
+                    Point::new(origin.x, origin.y + key.size().height)
+                } else {
+                    Point::new(
+                        origin.x + size.width - trail_w - value_size.width,
+                        origin.y + (size.height - value_size.height) / 2.0,
+                    )
+                };
+                value.paint(at, hues.ink, scene);
+                if let Some(t) = trailing {
+                    t.paint_child(ctx, scene);
+                }
+            }
+            Body::Timeline {
+                steps,
+                marker,
+                column,
+            } => {
+                let gap = metrics.gap_md;
+                let count = steps.len();
+                for (i, step) in steps.iter().enumerate() {
+                    let top = origin.y + step.top;
+                    let label_h = step.label.size().height;
+                    step.label
+                        .paint(Point::new(origin.x + *column + gap, top), hues.ink, scene);
+                    if let Some(detail) = &step.detail {
+                        detail.paint(
+                            Point::new(origin.x + *column + gap, top + label_h),
+                            hues.secondary,
+                            scene,
+                        );
+                    }
+                    let centre = Point::new(origin.x + *column / 2.0, top + label_h / 2.0);
+                    paint_marker(scene, centre, *marker, step.state, &hues);
+                    if i + 1 < count {
+                        // From just under this marker to just above the next one.
+                        let pad = (*marker * 0.25).max(2.0);
+                        let from = centre.y + *marker / 2.0 + pad;
+                        let next =
+                            origin.y + steps[i + 1].top + steps[i + 1].label.size().height / 2.0
+                                - *marker / 2.0
+                                - pad;
+                        if next > from {
+                            scene.fill_rect(
+                                Point::new(centre.x - CONNECTOR_WIDTH / 2.0, from),
+                                Size::new(CONNECTOR_WIDTH, next - from),
+                                if step.state == StepState::Done {
+                                    hues.done
+                                } else {
+                                    hues.muted
+                                },
+                            );
+                        }
+                    }
+                }
+            }
         }
-        if let Some(child) = &mut self.child {
-            child.paint_child(ctx, scene);
+    }
+
+    fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
+        match &mut self.body {
+            Body::Row {
+                trailing: Some(t), ..
+            } => t.event_child(ctx, event),
+            _ => EventResult::Ignored,
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        match &self.body {
+            Body::Row {
+                key,
+                value,
+                trailing,
+                ..
+            } => {
+                ctx.push_container(
+                    Role::Group,
+                    |node| {
+                        node.set_label(key.content());
+                        node.set_value(value.content());
+                    },
+                    |ctx| {
+                        if let Some(t) = trailing {
+                            t.semantics_child(ctx);
+                        }
+                    },
+                );
+            }
+            Body::Timeline { steps, .. } => {
+                ctx.push_container(
+                    Role::List,
+                    |_| {},
+                    |ctx| {
+                        for step in steps {
+                            ctx.push_node(Role::ListItem, |node| {
+                                node.set_label(step.label.content());
+                                node.set_value(state_words(step.state));
+                            });
+                        }
+                    },
+                );
+            }
         }
     }
 
     fn visit_children(&self, visitor: &mut dyn FnMut(&ChildPod)) {
-        if let Some(child) = &self.child {
-            visitor(child);
+        if let Body::Row {
+            trailing: Some(t), ..
+        } = &self.body
+        {
+            visitor(t);
         }
+    }
+}
+
+/// Draw one marker of diameter `d` centred on `centre`.
+fn paint_marker(scene: &mut dyn PaintScene, centre: Point, d: f64, state: StepState, hues: &Hues) {
+    let disc = |scene: &mut dyn PaintScene, d: f64, color: Color| {
+        scene.fill_rounded_rect(
+            Point::new(centre.x - d / 2.0, centre.y - d / 2.0),
+            Size::new(d, d),
+            d / 2.0,
+            color,
+        );
+    };
+    match state {
+        StepState::Done => {
+            disc(scene, d, hues.done);
+            let mut tick = BezPath::new();
+            tick.move_to(Point::new(centre.x - d * 0.22, centre.y + d * 0.02));
+            tick.line_to(Point::new(centre.x - d * 0.06, centre.y + d * 0.18));
+            tick.line_to(Point::new(centre.x + d * 0.24, centre.y - d * 0.16));
+            scene.stroke_path(
+                Point::ORIGIN,
+                &tick,
+                (d / 8.0).max(1.0),
+                &Brush::Solid(hues.on_accent),
+            );
+        }
+        StepState::Current => {
+            let r = (d - RING_WIDTH) / 2.0;
+            let ring = kurbo::Arc::new(centre, Vec2::new(r, r), 0.0, std::f64::consts::TAU, 0.0);
+            scene.stroke_path(
+                Point::ORIGIN,
+                &kurbo::Shape::to_path(&ring, 0.1),
+                RING_WIDTH,
+                &Brush::Solid(hues.accent),
+            );
+            disc(scene, d * 0.4, hues.accent);
+        }
+        StepState::Pending => disc(scene, d, hues.muted),
     }
 }
 
@@ -108,6 +454,7 @@ pub struct TimelineStep {
     pub label: String,
     /// Where the stage stands.
     pub state: StepState,
+    detail: Option<String>,
 }
 
 impl TimelineStep {
@@ -116,44 +463,132 @@ impl TimelineStep {
         Self {
             label: label.into(),
             state,
+            detail: None,
         }
+    }
+
+    /// Add a detail line under the label.
+    #[must_use]
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// The detail line, if any.
+    pub fn detail_text(&self) -> Option<&str> {
+        self.detail.as_deref()
     }
 }
 
 /// A key and its value on one row. See the [module docs](self).
-pub struct KeyValueRowView {
+pub struct KeyValueRowView<State: 'static = ()> {
     key: String,
     value: String,
+    stacked: bool,
+    mono: bool,
+    trailing: Option<AnyView<State>>,
 }
 
 /// A row pairing `key` with `value`.
-pub fn key_value_row(key: impl Into<String>, value: impl Into<String>) -> KeyValueRowView {
+pub fn key_value_row<State: 'static>(
+    key: impl Into<String>,
+    value: impl Into<String>,
+) -> KeyValueRowView<State> {
     KeyValueRowView {
         key: key.into(),
         value: value.into(),
+        stacked: false,
+        mono: false,
+        trailing: None,
     }
 }
 
-impl KeyValueRowView {
-    fn lines(&self) -> Vec<String> {
-        vec![self.key.clone(), self.value.clone()]
+impl<State: 'static> KeyValueRowView<State> {
+    /// Put the value under the key even when both would fit on one line.
+    #[must_use]
+    pub fn stacked(mut self, stacked: bool) -> Self {
+        self.stacked = stacked;
+        self
+    }
+
+    /// Set the value in the theme's monospace family, for ids.
+    #[must_use]
+    pub fn mono(mut self, mono: bool) -> Self {
+        self.mono = mono;
+        self
+    }
+
+    /// A view at the row's trailing edge.
+    #[must_use]
+    pub fn trailing<V: View<State>>(mut self, view: V) -> Self {
+        self.trailing = Some(any(view));
+        self
     }
 }
 
-impl<State: 'static> View<State> for KeyValueRowView {
+impl<State: 'static> View<State> for KeyValueRowView<State> {
     type Element = KeyValueWidget;
 
-    fn build(&self, _ctx: &mut BuildCtx<'_>) -> KeyValueWidget {
-        KeyValueWidget::new(self.lines(), None)
+    fn build(&self, ctx: &mut BuildCtx<'_>) -> KeyValueWidget {
+        let trailing = self.trailing.as_ref().map(|t| build_child(t, ctx));
+        KeyValueWidget::row(&self.key, &self.value, self.mono, self.stacked, trailing)
     }
 
     fn rebuild(
         &self,
-        _prev: &Self,
+        prev: &Self,
         element: &mut KeyValueWidget,
-        _ctx: &mut BuildCtx<'_>,
+        ctx: &mut BuildCtx<'_>,
     ) -> ChangeFlags {
-        element.set_lines(self.lines())
+        let Body::Row {
+            key,
+            value,
+            mono,
+            stacked,
+            trailing,
+            ..
+        } = &mut element.body
+        else {
+            return ChangeFlags::NONE;
+        };
+        let mut flags = ChangeFlags::NONE;
+        let layout = ChangeFlags::LAYOUT | ChangeFlags::PAINT;
+        if key.set_content(self.key.clone()) {
+            flags |= layout;
+        }
+        if value.set_content(self.value.clone()) {
+            flags |= layout;
+        }
+        if *mono != self.mono {
+            *mono = self.mono;
+            // The cached shape is keyed on the style, so the next layout reshapes.
+            flags |= layout;
+        }
+        if *stacked != self.stacked {
+            *stacked = self.stacked;
+            flags |= layout;
+        }
+        if let (Some(pod), Some(next), Some(before)) = (
+            trailing.as_mut(),
+            self.trailing.as_ref(),
+            prev.trailing.as_ref(),
+        ) {
+            flags |= rebuild_child(before, next, pod, ctx);
+        }
+        flags
+    }
+
+    fn teardown(&self, element: &mut KeyValueWidget, ctx: &mut BuildCtx<'_>) {
+        if let (
+            Body::Row {
+                trailing: Some(pod),
+                ..
+            },
+            Some(view),
+        ) = (&mut element.body, self.trailing.as_ref())
+        {
+            teardown_child(view, pod, ctx);
+        }
     }
 }
 
@@ -169,43 +604,97 @@ pub fn timeline(steps: impl IntoIterator<Item = TimelineStep>) -> TimelineView {
     }
 }
 
-impl TimelineView {
-    fn lines(&self) -> Vec<String> {
-        self.steps.iter().map(|step| step.label.clone()).collect()
-    }
-}
-
 impl<State: 'static> View<State> for TimelineView {
     type Element = KeyValueWidget;
 
     fn build(&self, _ctx: &mut BuildCtx<'_>) -> KeyValueWidget {
-        KeyValueWidget::new(self.lines(), None)
+        KeyValueWidget::timeline(&self.steps)
     }
 
     fn rebuild(
         &self,
-        _prev: &Self,
+        prev: &Self,
         element: &mut KeyValueWidget,
         _ctx: &mut BuildCtx<'_>,
     ) -> ChangeFlags {
-        element.set_lines(self.lines())
+        if prev.steps == self.steps {
+            return ChangeFlags::NONE;
+        }
+        element.body = KeyValueWidget::timeline(&self.steps).body;
+        ChangeFlags::LAYOUT | ChangeFlags::PAINT
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frust::Brightness;
+    use frust::authoring::scene::GlyphRun;
     use frust::authoring::text::TextContext;
     use std::any::Any;
 
-    /// Build `view` headlessly and lay it out, returning the widget and its size.
-    fn laid_out<V: View<()>>(view: &V) -> (V::Element, Size) {
+    use crate::tokens::{Density, theme_with_density};
+
+    /// Records every shape drawn, in order.
+    #[derive(Default)]
+    struct Recorder {
+        rects: Vec<(Point, Size, Color)>,
+        discs: Vec<(Point, Size, Color)>,
+        strokes: Vec<Color>,
+        glyphs: usize,
+    }
+
+    impl PaintScene for Recorder {
+        fn fill_rect(&mut self, origin: Point, size: Size, color: Color) {
+            self.rects.push((origin, size, color));
+        }
+        fn draw_text(&mut self, _origin: Point, _text: &str) {}
+        fn fill_rounded_rect(&mut self, origin: Point, size: Size, _r: f64, color: Color) {
+            self.discs.push((origin, size, color));
+        }
+        fn stroke_path(&mut self, _o: Point, _p: &BezPath, _w: f64, brush: &Brush) {
+            if let Brush::Solid(c) = brush {
+                self.strokes.push(*c);
+            }
+        }
+        fn draw_glyph_run(&mut self, _run: GlyphRun) {
+            self.glyphs += 1;
+        }
+    }
+
+    /// Build `view` headlessly and lay it out `width` wide under `theme`.
+    fn laid_out_in<V: View<()>>(view: &V, width: f64, theme: Option<&Theme>) -> (V::Element, Size) {
         let mut next_id = 0u64;
         let mut widget = view.build(&mut BuildCtx::new(&mut next_id));
         let mut text_ctx = TextContext::new();
         let mut layout = LayoutCtx::with_text_context(&mut text_ctx as &mut dyn Any);
-        let size = widget.layout(&mut layout, &BoxConstraints::loose(Size::new(400.0, 400.0)));
+        if let Some(theme) = theme {
+            layout = layout.with_theme(theme);
+        }
+        let size = widget.layout(&mut layout, &BoxConstraints::loose(Size::new(width, 600.0)));
         (widget, size)
+    }
+
+    fn laid_out<V: View<()>>(view: &V) -> (V::Element, Size) {
+        laid_out_in(view, 400.0, None)
+    }
+
+    fn paint<W: Widget>(widget: &mut W, size: Size, theme: Option<&Theme>) -> Recorder {
+        let mut ctx = PaintCtx::for_test(Point::ORIGIN, size, frust::FrameTime::from_nanos(0));
+        if let Some(theme) = theme {
+            ctx = ctx.with_theme(theme);
+        }
+        let mut rec = Recorder::default();
+        widget.paint(&mut ctx, &mut rec);
+        rec
+    }
+
+    fn steps() -> [TimelineStep; 3] {
+        [
+            TimelineStep::new("Queued", StepState::Done),
+            TimelineStep::new("Running", StepState::Current).detail("Started a minute ago"),
+            TimelineStep::new("Shipped", StepState::Pending),
+        ]
     }
 
     #[test]
@@ -213,12 +702,96 @@ mod tests {
         let (row, size) = laid_out(&key_value_row("Region", "eu-west"));
         assert_eq!(row.lines(), vec!["Region", "eu-west"]);
         assert!(size.height > 0.0);
-        let steps = [
-            TimelineStep::new("Queued", StepState::Done),
-            TimelineStep::new("Running", StepState::Current),
-            TimelineStep::new("Shipped", StepState::Pending),
-        ];
-        let (tl, _) = laid_out(&timeline(steps));
-        assert_eq!(tl.lines(), vec!["Queued", "Running", "Shipped"]);
+        let (tl, _) = laid_out(&timeline(steps()));
+        assert_eq!(
+            tl.lines(),
+            vec!["Queued", "Running", "Started a minute ago", "Shipped"]
+        );
+    }
+
+    #[test]
+    fn the_row_stacks_at_a_narrow_width_and_stays_inline_at_a_wide_one() {
+        let view = key_value_row("Deployment region", "eu-west-1 (Ireland)");
+        let (wide, wide_size) = laid_out_in(&view, 400.0, None);
+        let (narrow, narrow_size) = laid_out_in(&view, 90.0, None);
+        assert!(!wide.is_stacked());
+        assert!(narrow.is_stacked());
+        assert!(
+            narrow_size.height > wide_size.height * 1.5,
+            "two lines tall"
+        );
+
+        let (forced, _) = laid_out_in(&view.stacked(true), 400.0, None);
+        assert!(forced.is_stacked(), "stacked(true) stacks at any width");
+    }
+
+    #[test]
+    fn an_inline_value_sits_at_the_trailing_edge() {
+        let (mut row, size) = laid_out(&key_value_row("Id", "a1"));
+        let rec = paint(&mut row, size, None);
+        assert!(rec.glyphs > 0);
+        assert_eq!(size.width, 400.0, "the row fills a bounded width");
+    }
+
+    #[test]
+    fn mono_changes_the_value_shape() {
+        let (plain, plain_size) = laid_out(&key_value_row("Id", "0123456789abcdef"));
+        let (mono, mono_size) = laid_out(&key_value_row("Id", "0123456789abcdef").mono(true));
+        assert_eq!(plain.lines(), mono.lines());
+        // Both lay out; the widths are not asserted, only that the monospace path runs.
+        assert!(plain_size.height > 0.0 && mono_size.height > 0.0);
+    }
+
+    #[test]
+    fn a_three_step_timeline_draws_two_connectors_and_distinct_markers() {
+        let (mut tl, size) = laid_out(&timeline(steps()));
+        let rec = paint(&mut tl, size, None);
+        assert_eq!(rec.rects.len(), 2, "one connector between each pair");
+        // Done: disc + tick; Current: ring + dot; Pending: disc.
+        assert_eq!(rec.discs.len(), 3);
+        assert_eq!(rec.strokes.len(), 2);
+        let (done, dot, pending) = (rec.discs[0], rec.discs[1], rec.discs[2]);
+        assert_ne!(done.2, pending.2, "Done and Pending differ in colour");
+        assert_ne!(dot.2, pending.2);
+        assert_ne!(done.2, dot.2);
+        assert!(
+            dot.1.width < done.1.width,
+            "the current dot sits inside a ring"
+        );
+        // Connectors run downward between markers and do not overlap.
+        assert!(rec.rects[0].0.y < rec.rects[1].0.y);
+    }
+
+    #[test]
+    fn the_markers_follow_the_text_scale() {
+        let plain = crate::theme();
+        let authored = plain.type_scale.clone();
+        let scaled = crate::theme().with_text_scale(&authored, 1.5);
+        let (mut a, size_a) = laid_out_in(&timeline(steps()), 400.0, Some(&plain));
+        let (mut b, size_b) = laid_out_in(&timeline(steps()), 400.0, Some(&scaled));
+        let first = paint(&mut a, size_a, Some(&plain)).discs[0].1.width;
+        let second = paint(&mut b, size_b, Some(&scaled)).discs[0].1.width;
+        assert!(second > first, "{second} vs {first}");
+    }
+
+    #[test]
+    fn both_densities_and_brightnesses_build() {
+        for density in [Density::Comfortable, Density::Touch] {
+            for brightness in [Brightness::Light, Brightness::Dark] {
+                let theme = theme_with_density(density).with_brightness(brightness);
+                let (mut row, size) =
+                    laid_out_in(&key_value_row("Key", "Value"), 300.0, Some(&theme));
+                assert!(paint(&mut row, size, Some(&theme)).glyphs > 0);
+                let (mut tl, size) = laid_out_in(&timeline(steps()), 300.0, Some(&theme));
+                assert_eq!(paint(&mut tl, size, Some(&theme)).rects.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn a_step_publishes_its_state_in_words() {
+        assert_eq!(state_words(StepState::Done), "Done");
+        assert_eq!(state_words(StepState::Current), "Current");
+        assert_eq!(state_words(StepState::Pending), "Pending");
     }
 }
