@@ -506,7 +506,14 @@ internal class CameraPreviewView(context: Context) : FrameLayout(context), Previ
         // `displayListener`, which is what covers a slot whose bounds never
         // change size on a rotation (a square slot).
         maybeSyncTargetRotation()
-        updatePreviewLayout()
+        // Re-fit after this layout pass, not inside it. `onSizeChanged` runs
+        // from `layout()`, after this FrameLayout has already measured the
+        // inner view with its old layout params: a size set here is laid out
+        // stale, and the inner view's `requestLayout` is lost when its own
+        // `layout()` clears `PFLAG_FORCE_LAYOUT`. When the new rotation's
+        // `TransformationInfo` arrives before the resize (landscape back to
+        // portrait), the inner view then kept the fit of the previous slot.
+        post { updatePreviewLayout() }
     }
 
     override fun onAttachedToWindow() {

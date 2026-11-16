@@ -272,6 +272,10 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 
 ### Fixed
 
+- `frust-camera`: on Android the camera preview no longer stays shrunk after the device is turned
+  from landscape back to portrait (a small portrait picture, as tall as the landscape slot, in the
+  middle of the slot until the preview was recreated). The preview is re-fitted after the layout
+  pass that resizes its slot instead of inside it.
 - An Android app no longer aborts when an accessibility client detaches or the host view is
   detached and the UI then changes (for example `uiautomator dump`, then a navigation or a
   rotation). On a OnePlus 9 (Android 15) the build before the bump aborted 10 of 10 and this one
