@@ -13,12 +13,24 @@
 //!
 //! | class | here |
 //! |---|---|
-//! | `rounded-full border font-medium tabular-nums` | [`crate::style::RADIUS_CONTROL`] + [`crate::style::BORDER_WIDTH`] |
+//! | `rounded-full border font-medium tabular-nums` | [`BeuiMetrics::radius_control`] + [`BeuiMetrics::border_width`] |
 //! | `h-6 gap-1.5 px-2 text-[11px]` | [`AnimatedBadgeSize::Sm`] |
 //! | `h-8 gap-2 px-3 text-xs` | [`AnimatedBadgeSize::Md`] |
 //! | `border-*/30 bg-*/10` | [`BORDER_ALPHA`] / [`FILL_ALPHA`] |
 //! | `bg-current opacity-10`, `scale: [0.94, 1.08, 0.94]` | the pulse |
 //! | `overflow-hidden` on both slots | the roll clips |
+//!
+//! # Density and the text scale
+//!
+//! A status badge is read, not pressed, so it takes no touch floor: like the
+//! [avatar](crate::components::avatar) it is sized around its text. The `md`
+//! label is the theme's `text-xs` ([`BeuiMetrics::text_xs`]); the `sm` rung's
+//! `text-[11px]` is an arbitrary step no metric names and keeps its ratio to
+//! `text-xs`. The rest of the rung — height, padding, gap and icon — is the
+//! [`AnimatedBadgeSize`] value scaled by the same type growth and by the OS
+//! text scale the label follows, so the pill keeps its proportions around a
+//! larger label instead of clipping it. Under the comfortable metrics at text
+//! scale `1.0` every value is the rung's own.
 //!
 //! # Degradations against upstream
 //!
@@ -61,13 +73,10 @@ use kurbo::{Arc, Point, Size, Vec2};
 use peniko::{Brush, Color};
 
 use crate::motion::Ramp;
-use crate::style::{
-    BORDER_WIDTH, PATH_TOLERANCE, RADIUS_CONTROL, TEXT_XS, resolve_radius, scale_alpha, spacing,
-    with_alpha,
-};
+use crate::style::{PATH_TOLERANCE, TEXT_XS, resolve_radius, scale_alpha, spacing, with_alpha};
 use crate::text::{LabelRun, ThemeTextType, themed_style};
 use crate::tokens::motion::SPRING_SWAP;
-use crate::tokens::{BEUI_LIGHT, BeuiTokens};
+use crate::tokens::{BEUI_LIGHT, BeuiMetrics, BeuiTokens};
 
 /// Alpha a status hue's border is painted at — `border-*/30`.
 pub const BORDER_ALPHA: f32 = 0.30;
@@ -197,6 +206,41 @@ impl AnimatedBadgeSize {
             AnimatedBadgeSize::Md => spacing(3.5),
         }
     }
+
+    /// This rung resolved against `m` at OS text scale `text_scale` (see the
+    /// [module docs](self)). The comfortable set at scale `1.0` answers the
+    /// rung's own values.
+    fn resolve(self, m: &BeuiMetrics, text_scale: f64) -> BadgeGeometry {
+        let type_growth = m.text_xs / TEXT_XS;
+        let text_size = match self {
+            AnimatedBadgeSize::Sm => self.text_size() * type_growth,
+            AnimatedBadgeSize::Md => m.text_xs,
+        };
+        let grow = type_growth * text_scale;
+        BadgeGeometry {
+            height: self.height() * grow,
+            padding_x: self.padding_x() * grow,
+            gap: self.gap() * grow,
+            text_size,
+            icon_size: self.icon_size() * grow,
+            radius: m.radius_control,
+            border_width: m.border_width,
+        }
+    }
+}
+
+/// One badge rung resolved against the theme's metrics and text scale — what
+/// `layout` sizes the pill from and `paint` draws it with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BadgeGeometry {
+    height: f64,
+    padding_x: f64,
+    gap: f64,
+    /// The label's size before the OS text scale, which shaping applies.
+    text_size: f64,
+    icon_size: f64,
+    radius: f64,
+    border_width: f64,
 }
 
 /// A declarative beUI status badge. See the [module docs](self).
@@ -281,6 +325,8 @@ pub struct AnimatedBadgeWidget {
     icon_roll: Option<FrameTime>,
     /// The clock the perpetual parts (spin, pulse) are timed against.
     started: Option<FrameTime>,
+    /// The rung as the last layout resolved it.
+    geometry: BadgeGeometry,
 }
 
 /// The resolved fill, border and ink for one status.
@@ -313,7 +359,7 @@ impl AnimatedBadgeWidget {
     fn label_style(&self, theme: Option<&Theme>) -> TextStyle {
         // Shaped with an ink the paint pass overrides; keeping it constant
         // keeps the shape cache off the colour.
-        let style = TextStyle::new(self.size.text_size() as f32, Color::BLACK)
+        let style = TextStyle::new(self.geometry.text_size as f32, Color::BLACK)
             .with_weight(FontWeight::MEDIUM);
         themed_style(style, ThemeTextType::LabelSmall, theme)
     }
@@ -375,6 +421,7 @@ impl<State: 'static> View<State> for AnimatedBadgeView<State> {
             label_roll: None,
             icon_roll: None,
             started: None,
+            geometry: self.size.resolve(&BeuiMetrics::comfortable(), 1.0),
         }
     }
 
@@ -419,17 +466,23 @@ impl<State: 'static> View<State> for AnimatedBadgeView<State> {
 
 impl Widget for AnimatedBadgeWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        let style = self.label_style(Theme::from_layout_ctx(ctx));
+        let style = {
+            let theme = Theme::from_layout_ctx(ctx);
+            let scale = f64::from(theme.map_or(1.0, Theme::text_scale));
+            self.geometry = self.size.resolve(&BeuiMetrics::resolve(theme), scale);
+            self.label_style(theme)
+        };
+        let g = self.geometry;
         let label = self.label.layout(ctx, &style);
         if let Some(outgoing) = &mut self.outgoing {
             // Shaped so it can be painted mid-exit; it never widens the pill.
             outgoing.layout(ctx, &style);
         }
-        let mut width = self.size.padding_x() * 2.0 + label.width;
+        let mut width = g.padding_x * 2.0 + label.width;
         if self.show_icon {
-            width += self.size.icon_size() + self.size.gap();
+            width += g.icon_size + g.gap;
         }
-        bc.constrain(Size::new(width, self.size.height()))
+        bc.constrain(Size::new(width, g.height))
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
@@ -441,7 +494,8 @@ impl Widget for AnimatedBadgeWidget {
         let elapsed = now.saturating_sub(started);
         let origin = ctx.origin();
         let size = ctx.size();
-        let radius = resolve_radius(RADIUS_CONTROL, size.width, size.height);
+        let g = self.geometry;
+        let radius = resolve_radius(g.radius, size.width, size.height);
 
         let pulsing = self.pulses() && !reduce;
         if pulsing {
@@ -456,13 +510,13 @@ impl Widget for AnimatedBadgeWidget {
                     origin.y - (grown.height - size.height) / 2.0,
                 ),
                 grown,
-                resolve_radius(RADIUS_CONTROL, grown.width, grown.height),
+                resolve_radius(g.radius, grown.width, grown.height),
                 with_alpha(colors.ink, alpha),
             );
         }
 
         scene.fill_rounded_rect(origin, size, radius, colors.fill);
-        let inset = BORDER_WIDTH / 2.0;
+        let inset = g.border_width / 2.0;
         let outline = kurbo::RoundedRect::from_rect(
             kurbo::Rect::from_origin_size(Point::ORIGIN, size).inset(-inset),
             (radius - inset).max(0.0),
@@ -470,7 +524,7 @@ impl Widget for AnimatedBadgeWidget {
         scene.stroke_path(
             origin,
             &Shape::to_path(&outline, PATH_TOLERANCE),
-            BORDER_WIDTH,
+            g.border_width,
             &Brush::Solid(colors.border),
         );
 
@@ -481,9 +535,9 @@ impl Widget for AnimatedBadgeWidget {
         let icon_progress = self.advance_roll(now, reduce, Roll::Icon);
         let label_progress = self.advance_roll(now, reduce, Roll::Label);
 
-        let mut x = origin.x + self.size.padding_x();
+        let mut x = origin.x + g.padding_x;
         if self.show_icon {
-            let icon = self.size.icon_size();
+            let icon = g.icon_size;
             let slot = Point::new(x, origin.y + (size.height - icon) / 2.0);
             let slot_size = Size::new(icon, icon);
             // `overflow-hidden` on the icon slot: a rolling glyph disappears at
@@ -530,7 +584,7 @@ impl Widget for AnimatedBadgeWidget {
                 );
             }
             scene.pop_clip();
-            x += icon + self.size.gap();
+            x += icon + g.gap;
         }
 
         let label = self.label.size();
@@ -538,7 +592,7 @@ impl Widget for AnimatedBadgeWidget {
         scene.push_clip(
             Point::new(slot.x, origin.y),
             Size::new(
-                (size.width - (slot.x - origin.x) - self.size.padding_x()).max(0.0),
+                (size.width - (slot.x - origin.x) - g.padding_x).max(0.0),
                 size.height,
             ),
         );
@@ -644,7 +698,7 @@ impl AnimatedBadgeWidget {
         }
         let colors = self.colors(status, theme);
         let ink = scale_alpha(colors.ink, alpha as f32);
-        let slot = self.size.icon_size();
+        let slot = self.geometry.icon_size;
         let at = Point::new(
             origin.x + (slot - edge) / 2.0,
             origin.y + (slot - edge) / 2.0 + offset * slot,
@@ -873,6 +927,78 @@ mod tests {
         assert_eq!(AnimatedBadgeSize::Sm.icon_size(), 12.0, "size-3");
         assert_eq!(AnimatedBadgeSize::Md.icon_size(), 14.0, "size-3.5");
         assert_eq!(AnimatedBadgeSize::default(), AnimatedBadgeSize::Md);
+    }
+
+    /// Lay `view` out under `theme`, returning the pill's size.
+    fn size_in(view: &AnimatedBadgeView<()>, theme: &Theme) -> Size {
+        let mut next_id = 0u64;
+        let mut widget = View::<()>::build(view, &mut BuildCtx::new(&mut next_id));
+        let mut text_ctx = TextContext::new();
+        let mut layout =
+            LayoutCtx::with_resources(Some(&mut text_ctx as &mut dyn Any), Some(theme as &dyn Any));
+        widget.layout(&mut layout, &BoxConstraints::loose(Size::new(400.0, 200.0)))
+    }
+
+    /// The comfortable metrics resolve every rung to its class-list values; a
+    /// touch theme grows the label to its `text-xs` step and the pill around
+    /// it, but takes no touch floor — a status badge is not pressed.
+    #[test]
+    fn the_rungs_resolve_from_the_metrics() {
+        let comfortable = BeuiMetrics::comfortable();
+        for size in AnimatedBadgeSize::ALL {
+            let g = size.resolve(&comfortable, 1.0);
+            assert_eq!(g.height, size.height(), "{size:?}");
+            assert_eq!(g.padding_x, size.padding_x(), "{size:?}");
+            assert_eq!(g.gap, size.gap(), "{size:?}");
+            assert_eq!(g.text_size, size.text_size(), "{size:?}");
+            assert_eq!(g.icon_size, size.icon_size(), "{size:?}");
+        }
+
+        let touch = BeuiMetrics::touch();
+        assert_eq!(
+            AnimatedBadgeSize::Md.resolve(&touch, 1.0).text_size,
+            touch.text_xs
+        );
+
+        let desk = crate::tokens::theme_with_density(crate::tokens::Density::Comfortable);
+        let phone = crate::tokens::theme_with_density(crate::tokens::Density::Touch);
+        for size in AnimatedBadgeSize::ALL {
+            let view = animated_badge::<()>("Deploying").size(size);
+            let plain = laid_out(&view);
+            let d = size_in(&view, &desk);
+            assert_eq!(d.height, size.height(), "{size:?} comfortable");
+            let mut text_ctx = TextContext::new();
+            let mut layout = LayoutCtx::with_text_context(&mut text_ctx as &mut dyn Any);
+            let mut plain = plain;
+            assert_eq!(
+                plain.layout(&mut layout, &BoxConstraints::loose(Size::new(400.0, 200.0))),
+                d
+            );
+            let p = size_in(&view, &phone);
+            assert!(
+                p.height > d.height && p.width > d.width,
+                "{size:?} {p:?} vs {d:?}"
+            );
+            assert!(
+                p.height < touch.min_touch_target,
+                "{size:?}: no touch floor"
+            );
+        }
+    }
+
+    /// The pill grows with the OS text scale its label follows.
+    #[test]
+    fn the_pill_grows_with_the_text_scale() {
+        let plain = crate::theme();
+        let authored = plain.type_scale.clone();
+        let scaled = crate::theme().with_text_scale(&authored, 1.5);
+        let view = animated_badge::<()>("Deploying");
+        let base = size_in(&view, &plain);
+        let big = size_in(&view, &scaled);
+        assert!(
+            big.height > base.height && big.width > base.width,
+            "{big:?} vs {base:?}"
+        );
     }
 
     /// Hiding the icon narrows the pill by exactly the icon and its gap.

@@ -24,13 +24,31 @@
 //!
 //! | class | here |
 //! |---|---|
-//! | `rounded-2xl border border-border/80 bg-background p-2` | [`style::RADIUS_2XL`], [`PROMPT_PADDING`] |
+//! | `rounded-2xl border border-border/80 bg-background p-2` | [`BeuiMetrics::radius_card`] / [`BeuiMetrics::border_width`], [`PROMPT_PADDING`] |
 //! | `focus-within:border-foreground/25` | [`style::FOCUS_BORDER_ALPHA`]-scaled, crossfaded on a [`Lane`] |
 //! | textarea `px-2 pt-1.5 text-sm leading-6` | [`PROMPT_FIELD_PADDING_X`] / [`PROMPT_FIELD_PADDING_Y`] |
-//! | `rows={minRows}` … `maxRows * 24` | [`PROMPT_MIN_ROWS`] / [`PROMPT_MAX_ROWS`] × [`style::LINE_HEIGHT_INPUT`] |
-//! | action row `mt-1 flex min-h-8` | [`PROMPT_ACTION_GAP`] / [`PROMPT_ACTION_ROW_HEIGHT`] |
-//! | send button `ml-auto size-8 rounded-full` | [`PROMPT_BUTTON_EDGE`] |
+//! | `rows={minRows}` … `maxRows * 24` | [`PROMPT_MIN_ROWS`] / [`PROMPT_MAX_ROWS`] × [`BeuiMetrics::line_height_input`] |
+//! | action row `mt-1 flex min-h-8` | [`PROMPT_ACTION_GAP`] / [`BeuiMetrics::height_sm`] ([`PROMPT_ACTION_ROW_HEIGHT`]) |
+//! | send button `ml-auto size-8 rounded-full` | [`BeuiMetrics::size_icon_button`] ([`PROMPT_BUTTON_EDGE`]) |
+//! | arrow `size-4`, stop `size-3` | [`BeuiMetrics::icon_size`], the stop square at the same ratio |
 //! | `disabled` → `opacity-60` | [`style::DISABLED_OPACITY_INPUT`] |
+//!
+//! # Density and the text scale
+//!
+//! Every size above that a [`BeuiMetrics`] field names is read from the
+//! theme's metrics at layout; the `PROMPT_*` size constants are the
+//! comfortable values. Under [`Density::Touch`](crate::tokens::Density::Touch)
+//! the send button is a touch-sized circle and its hit area is never smaller
+//! than [`BeuiMetrics::min_touch_target`]: like
+//! [`button`](crate::components::button), the painted circle stays centred in
+//! a hit area grown to the floor, and the action row grows to hold it. The
+//! field's padding and corner are fixed insets no metric names, baked into the
+//! wrapped field at build.
+//!
+//! The typed text and placeholder are the baseline field's, which follows the
+//! OS text scale itself. The rows the field reserves and grows to follow the
+//! same scale, so a larger text size still shows `minRows`..`maxRows` lines
+//! and the composer keeps growing with multi-line text.
 //!
 //! # The send button's three states
 //!
@@ -75,13 +93,14 @@ use frust::authoring::{
 };
 use frust::{Theme, text_input};
 
+use crate::agents::code_block::text_factor;
 use crate::components::switch::TRACK_COLOR_RAMP;
 use crate::motion::{Presence, Ramp};
 use crate::press::{Lane, inside_inclusive as inside, is_activation_key, lerp_color, presses};
 use crate::style::{self, disabled_tint, scale_alpha, with_alpha};
 use crate::text::ThemeTextType;
 use crate::tokens::motion::{SPRING_PRESS, SPRING_SWAP};
-use crate::tokens::{BEUI_LIGHT, BeuiPalette};
+use crate::tokens::{BEUI_LIGHT, BeuiMetrics, BeuiPalette};
 
 /// The type-scale role the prompt's family (typed text and placeholder)
 /// resolves from at layout.
@@ -99,10 +118,13 @@ pub const PROMPT_FIELD_PADDING_Y: f64 = style::SPACING_UNIT * 1.5;
 /// The gap between the field and the action row, in logical px (`mt-1`).
 pub const PROMPT_ACTION_GAP: f64 = style::SPACING_UNIT;
 
-/// The action row's height, in logical px (`min-h-8`).
+/// The action row's height under the comfortable metrics, in logical px
+/// (`min-h-8`). Laid out from [`BeuiMetrics::height_sm`], grown to hold the
+/// send button's hit area.
 pub const PROMPT_ACTION_ROW_HEIGHT: f64 = style::HEIGHT_SM;
 
-/// The send button's edge, in logical px (`size-8`).
+/// The send button's edge under the comfortable metrics, in logical px
+/// (`size-8`). Laid out from [`BeuiMetrics::size_icon_button`].
 pub const PROMPT_BUTTON_EDGE: f64 = style::HEIGHT_SM;
 
 /// How many lines the field shows before it grows (`minRows = 2`).
@@ -129,10 +151,9 @@ const FRAME_BORDER_ALPHA: f32 = 0.8;
 /// Alpha of the composer's focused hairline (`focus-within:border-foreground/25`).
 const FRAME_FOCUS_ALPHA: f32 = 0.25;
 
-/// The send arrow's icon edge, in logical px (`size-4`).
-const SEND_ICON_SIZE: f64 = style::ICON_SIZE;
-
-/// The stop square's edge, in logical px (`size-3`).
+/// The stop square's edge under the comfortable metrics, in logical px
+/// (`size-3`). No metric names it; it keeps its ratio to the arrow's
+/// [`BeuiMetrics::icon_size`] (`size-4`).
 const STOP_ICON_SIZE: f64 = 12.0;
 
 /// How far the swapping icon travels, in logical px (`y: ±3`).
@@ -444,9 +465,13 @@ pub struct PromptInputWidget {
     button_pressed: bool,
     button_captured: bool,
 
+    /// The metrics the last layout resolved from the live theme; paint and
+    /// the event pass read them from here (an event carries no theme).
+    metrics: BeuiMetrics,
     /// The field row's box, resolved by layout.
     field_box: Rect,
-    /// The button's box, resolved by layout.
+    /// The button's hit area, resolved by layout: the painted circle, grown
+    /// to [`BeuiMetrics::min_touch_target`] when that is larger.
     button_box: Rect,
     /// The whole frame's box, resolved by layout.
     frame: Size,
@@ -478,7 +503,8 @@ impl PromptInputWidget {
         self.swap.phase()
     }
 
-    /// The button's box inside the composer, as of the last layout.
+    /// The button's hit area inside the composer, as of the last layout —
+    /// the painted circle, or the touch minimum centred on it when larger.
     pub fn button_box(&self) -> Rect {
         self.button_box
     }
@@ -519,8 +545,18 @@ impl PromptInputWidget {
         }
     }
 
+    /// The painted circle's edge: the metric, never larger than the hit area.
+    fn button_edge(&self) -> f64 {
+        self.metrics
+            .size_icon_button
+            .min(self.button_box.width())
+            .max(0.0)
+    }
+
     /// Paint the button's icon pair at `centre`, staged by the swap.
     fn paint_icons(&self, scene: &mut dyn PaintScene, centre: Point, ink: Color, swap: f64) {
+        let send_size = self.metrics.icon_size;
+        let stop_size = STOP_ICON_SIZE * (self.metrics.icon_size / style::ICON_SIZE);
         // The arrow leaves upward as the square arrives from below —
         // upstream's `{ opacity, y: ±3, scale: 0.8 }` pair.
         let send_alpha = (1.0 - swap).clamp(0.0, 1.0) as f32;
@@ -528,14 +564,14 @@ impl PromptInputWidget {
             let scale = ICON_SWAP_SCALE + (1.0 - ICON_SWAP_SCALE) * (1.0 - swap);
             let rise = -ICON_SWAP_RISE * swap;
             let at = Point::new(
-                centre.x - SEND_ICON_SIZE / 2.0,
-                centre.y - SEND_ICON_SIZE / 2.0 + rise,
+                centre.x - send_size / 2.0,
+                centre.y - send_size / 2.0 + rise,
             );
             scene.push_transform(icon_transform(centre, scale));
             scene.stroke_path(
                 at,
-                &arrow_up_path(SEND_ICON_SIZE),
-                LUCIDE_STROKE * SEND_ICON_SIZE / LUCIDE_VIEWBOX,
+                &arrow_up_path(send_size),
+                LUCIDE_STROKE * send_size / LUCIDE_VIEWBOX,
                 &Brush::Solid(scale_alpha(ink, send_alpha)),
             );
             scene.pop_transform();
@@ -547,10 +583,10 @@ impl PromptInputWidget {
             scene.push_transform(icon_transform(centre, scale));
             scene.fill_rounded_rect(
                 Point::new(
-                    centre.x - STOP_ICON_SIZE / 2.0,
-                    centre.y - STOP_ICON_SIZE / 2.0 + rise,
+                    centre.x - stop_size / 2.0,
+                    centre.y - stop_size / 2.0 + rise,
                 ),
-                Size::new(STOP_ICON_SIZE, STOP_ICON_SIZE),
+                Size::new(stop_size, stop_size),
                 style::RADIUS_SM / 2.0,
                 scale_alpha(ink, stop_alpha),
             );
@@ -588,6 +624,7 @@ impl<State: 'static> View<State> for PromptInputView<State> {
             button_hovered: false,
             button_pressed: false,
             button_captured: false,
+            metrics: BeuiMetrics::comfortable(),
             field_box: Rect::ZERO,
             button_box: Rect::ZERO,
             frame: Size::ZERO,
@@ -638,19 +675,25 @@ impl<State: 'static> View<State> for PromptInputView<State> {
 
 impl Widget for PromptInputWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
+        let (m, factor) = {
+            let theme = Theme::from_layout_ctx(ctx);
+            (BeuiMetrics::resolve(theme), text_factor(theme))
+        };
+        self.metrics = m;
         let width = if bc.max().width.is_finite() {
             bc.max().width
         } else {
-            style::HEIGHT_INPUT * 8.0
+            m.height_input * 8.0
         };
         let inner_width = (width - PROMPT_PADDING * 2.0).max(0.0);
 
         // `rows={minRows}`: the field never shrinks below its own minimum, and
-        // the baseline field caps its own growth at `max_rows`.
-        let min_height =
-            self.min_rows as f64 * style::LINE_HEIGHT_INPUT + PROMPT_FIELD_PADDING_Y * 2.0;
-        let max_height = self.max_rows.max(self.min_rows) as f64 * style::LINE_HEIGHT_INPUT
-            + PROMPT_FIELD_PADDING_Y * 2.0;
+        // the baseline field caps its own growth at `max_rows`. A row is the
+        // field's line height, which follows the OS text scale.
+        let line = m.line_height_input * factor;
+        let min_height = self.min_rows as f64 * line + PROMPT_FIELD_PADDING_Y * 2.0;
+        let max_height =
+            self.max_rows.max(self.min_rows) as f64 * line + PROMPT_FIELD_PADDING_Y * 2.0;
         let field = self.field.layout_child(
             ctx,
             &BoxConstraints::new(
@@ -665,17 +708,21 @@ impl Widget for PromptInputWidget {
             Size::new(inner_width, field.height),
         );
 
-        // `ml-auto`: the button sits at the action row's trailing edge.
+        // `ml-auto`: the button sits at the action row's trailing edge. Its
+        // hit area is the painted circle grown to the touch floor, and the row
+        // grows to hold it.
+        let hit = m.size_icon_button.max(m.min_touch_target);
+        let row_height = m.height_sm.max(hit);
         let row_top = self.field_box.max_y() + PROMPT_ACTION_GAP;
         self.button_box = Rect::from_origin_size(
             Point::new(
-                width - PROMPT_PADDING - PROMPT_BUTTON_EDGE,
-                row_top + (PROMPT_ACTION_ROW_HEIGHT - PROMPT_BUTTON_EDGE) / 2.0,
+                width - PROMPT_PADDING - hit,
+                row_top + (row_height - hit) / 2.0,
             ),
-            Size::new(PROMPT_BUTTON_EDGE, PROMPT_BUTTON_EDGE),
+            Size::new(hit, hit),
         );
 
-        self.frame = Size::new(width, row_top + PROMPT_ACTION_ROW_HEIGHT + PROMPT_PADDING);
+        self.frame = Size::new(width, row_top + row_height + PROMPT_PADDING);
         bc.constrain(self.frame)
     }
 
@@ -735,8 +782,9 @@ impl Widget for PromptInputWidget {
         // stroked over it (the same ordering `input` records).
         self.field.paint_child(ctx, scene);
 
-        let radius = style::resolve_radius(style::RADIUS_2XL, self.frame.width, self.frame.height);
-        let inset = style::BORDER_WIDTH / 2.0;
+        let m = self.metrics;
+        let radius = style::resolve_radius(m.radius_card, self.frame.width, self.frame.height);
+        let inset = m.border_width / 2.0;
         let frame = RoundedRect::from_rect(
             Rect::from_origin_size(Point::ORIGIN, self.frame).inset(-inset),
             (radius - inset).max(0.0),
@@ -744,7 +792,7 @@ impl Widget for PromptInputWidget {
         scene.stroke_path(
             origin,
             &Shape::to_path(&frame, style::PATH_TOLERANCE),
-            style::BORDER_WIDTH,
+            m.border_width,
             &Brush::Solid(border),
         );
 
@@ -757,19 +805,15 @@ impl Widget for PromptInputWidget {
         if !pressable {
             fill = scale_alpha(fill, style::DISABLED_OPACITY);
         }
-        let button_at = Point::new(origin.x + self.button_box.x0, origin.y + self.button_box.y0);
-        let centre = Point::new(
-            button_at.x + PROMPT_BUTTON_EDGE / 2.0,
-            button_at.y + PROMPT_BUTTON_EDGE / 2.0,
-        );
+        // The painted circle is centred in the hit area; with no touch growth
+        // they match.
+        let edge = self.button_edge();
+        let hit_centre = self.button_box.center();
+        let centre = Point::new(origin.x + hit_centre.x, origin.y + hit_centre.y);
+        let button_at = Point::new(centre.x - edge / 2.0, centre.y - edge / 2.0);
         let press_scale = crate::press::press_scale(style::PRESS_SCALE, self.press.value());
         scene.push_transform(icon_transform(centre, press_scale));
-        scene.fill_rounded_rect(
-            button_at,
-            Size::new(PROMPT_BUTTON_EDGE, PROMPT_BUTTON_EDGE),
-            PROMPT_BUTTON_EDGE / 2.0,
-            fill,
-        );
+        scene.fill_rounded_rect(button_at, Size::new(edge, edge), edge / 2.0, fill);
         let icon_ink = if pressable {
             paint.icon
         } else {
@@ -1251,6 +1295,125 @@ mod tests {
         );
         assert!(flags.contains(ChangeFlags::PAINT));
         assert_eq!(widget.send_state(), PromptInputSend::Ready);
+    }
+
+    // ---- Density and the touch minimum ---------------------------------------
+
+    /// Lay `view` out under `theme`.
+    fn laid_out_in(view: &PromptInputView<String>, theme: &Theme) -> PromptInputWidget {
+        let mut next_id = 0u64;
+        let mut widget = View::<String>::build(view, &mut BuildCtx::new(&mut next_id));
+        let mut text_ctx = TextContext::new();
+        let mut layout =
+            LayoutCtx::with_resources(Some(&mut text_ctx as &mut dyn Any), Some(theme as &dyn Any));
+        widget.layout(&mut layout, &BoxConstraints::loose(BOX));
+        widget
+    }
+
+    /// A press-and-release at `at`, reporting how many prompts were sent.
+    fn sends_on_press_at(widget: &mut PromptInputWidget, at: Point) -> usize {
+        use std::cell::Cell;
+        use std::rc::Rc as StdRc;
+
+        let sent = StdRc::new(Cell::new(0));
+        let seen = sent.clone();
+        widget.on_submit = Some(erase_callback_arg(
+            &(StdRc::new(move |_: &mut String, _prompt: String| seen.set(seen.get() + 1))
+                as OnText<String>),
+        ));
+        let mut state = String::from("hello");
+        for phase in [PointerPhase::Down, PointerPhase::Up] {
+            dispatch(
+                widget,
+                &mut state,
+                &InputEvent::Pointer(PointerEvent {
+                    phase,
+                    position: at,
+                    button: PointerButton::Primary,
+                }),
+            );
+        }
+        sent.get()
+    }
+
+    #[test]
+    fn a_comfortable_theme_lays_the_composer_out_at_the_style_constants() {
+        let theme = crate::tokens::theme_with_density(crate::tokens::Density::Comfortable);
+        let themed = laid_out_in(&view("hello"), &theme);
+        let plain = laid_out(&view("hello"));
+        assert_eq!(themed.button_box(), plain.button_box());
+        assert_eq!(themed.field_box(), plain.field_box());
+        assert_eq!(themed.frame, plain.frame);
+        assert_eq!(themed.button_box().width(), PROMPT_BUTTON_EDGE);
+        assert_eq!(themed.button_box().height(), PROMPT_BUTTON_EDGE);
+    }
+
+    #[test]
+    fn under_touch_the_send_button_has_a_touch_sized_hit_area() {
+        let theme = crate::tokens::theme_with_density(crate::tokens::Density::Touch);
+        let m = BeuiMetrics::resolve(Some(&theme));
+        assert!(m.min_touch_target >= 44.0);
+        let mut widget = laid_out_in(&view("hello"), &theme);
+        let hit = widget.button_box();
+        assert!(hit.width() >= m.min_touch_target, "width {}", hit.width());
+        assert!(
+            hit.height() >= m.min_touch_target,
+            "height {}",
+            hit.height()
+        );
+        assert!(
+            (hit.max_x() - (BOX.width - PROMPT_PADDING)).abs() < 1e-6,
+            "still `ml-auto`"
+        );
+        assert!(
+            hit.max_y() <= widget.frame.height - PROMPT_PADDING + 1e-6,
+            "the row holds it"
+        );
+        // A press at the hit area's corner — outside the comfortable 32 px
+        // circle's reach — still sends.
+        let corner = Point::new(hit.x0 + 1.0, hit.y0 + 1.0);
+        assert_eq!(sends_on_press_at(&mut widget, corner), 1);
+    }
+
+    #[test]
+    fn a_small_send_circle_keeps_its_paint_and_grows_its_hit_area() {
+        // A metric set whose icon button sits below the floor, as a custom one
+        // may: the circle stays, the hit area grows around it.
+        let mut m = BeuiMetrics::touch();
+        m.size_icon_button = 32.0;
+        let theme = Theme::builder(crate::theme()).extension(m).build();
+        let mut widget = laid_out_in(&view("hello"), &theme);
+        let hit = widget.button_box();
+        assert_eq!(hit.width(), m.min_touch_target);
+        let (rec, _) = painted(&mut widget, 0, Some(&theme));
+        let circle = rec
+            .rounded
+            .iter()
+            .find(|(_, size, _)| (size.width - 32.0).abs() < 1e-6)
+            .expect("the 32 px circle");
+        assert!(
+            (circle.0.x + 16.0 - hit.center().x).abs() < 1e-6
+                && (circle.0.y + 16.0 - hit.center().y).abs() < 1e-6,
+            "centred in the hit area"
+        );
+        // Inside the hit area, outside the painted circle.
+        let margin = Point::new(hit.x0 + 2.0, hit.center().y);
+        assert!(margin.x < circle.0.x);
+        assert_eq!(sends_on_press_at(&mut widget, margin), 1);
+    }
+
+    #[test]
+    fn the_reserved_rows_follow_the_text_scale() {
+        let authored = crate::theme().type_scale.clone();
+        let scaled = crate::theme().with_text_scale(&authored, 1.5);
+        let big = laid_out_in(&view(""), &scaled);
+        let base = laid_out(&view(""));
+        assert!(
+            big.field_box().height() > base.field_box().height(),
+            "{} vs {}",
+            big.field_box().height(),
+            base.field_box().height()
+        );
     }
 
     /// The composer publishes the wrapped field's node plus its own button.

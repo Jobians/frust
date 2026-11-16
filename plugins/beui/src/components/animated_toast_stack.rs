@@ -13,14 +13,28 @@
 //! | item `exit={{opacity:0, x:32, scale:0.96, 0.18s EASE_OUT}}` | [`TOAST_STACK_EXIT_SLIDE`], [`TOAST_STACK_EXIT_SCALE`], [`TOAST_STACK_EXIT`] |
 //! | `drag="x"`, `dragElastic={0.18}`, dismiss past `offset.x > 72` | [`TOAST_STACK_DRAG_ELASTIC`], [`TOAST_STACK_SWIPE_DISMISS`] |
 //! | `maxVisible = 4`, `toasts.slice(-maxVisible)` | [`TOAST_STACK_MAX_VISIBLE`] |
-//! | surface `rounded-2xl border border-border bg-card/95 p-3 shadow-2xl` | [`TOAST_STACK_RADIUS`], [`TOAST_STACK_PADDING`], [`TOAST_STACK_SURFACE_ALPHA`], the `shadow-2xl` recipe |
+//! | surface `rounded-2xl border border-border bg-card/95 p-3 shadow-2xl` | [`BeuiMetrics::radius_card`] ([`TOAST_STACK_RADIUS`]), [`TOAST_STACK_PADDING`], [`TOAST_STACK_SURFACE_ALPHA`], the `shadow-2xl` recipe |
 //! | `w-[calc(100vw-2rem)] max-w-sm gap-2` | [`TOAST_STACK_MAX_WIDTH`], [`TOAST_STACK_GAP`], [`TOAST_STACK_MARGIN`] |
 //! | icon wrap `h-7 w-7 rounded-full`, row `gap-3` | [`TOAST_STACK_ICON_BOX`], [`TOAST_STACK_ICON_GAP`] |
-//! | title `text-sm font-medium`, description `mt-0.5 text-xs` | [`crate::style::TEXT_SM`] / [`crate::style::TEXT_XS`], [`TOAST_STACK_TITLE_GAP`] |
+//! | title `text-sm font-medium`, description `mt-0.5 text-xs` | [`BeuiMetrics::text_sm`] / [`BeuiMetrics::text_xs`], [`TOAST_STACK_TITLE_GAP`] |
 //! | action `mt-2 h-7 rounded-full bg-primary/[0.06] px-3 text-xs` | [`TOAST_STACK_ACTION_GAP`], [`TOAST_STACK_ACTION_HEIGHT`], [`TOAST_STACK_ACTION_WASH`] |
 //! | `POSITION_CLASS` (`left-4 top-4` … `bottom-6 right-4`) | [`AnimatedToastStackPosition`], [`TOAST_STACK_MARGIN`], [`TOAST_STACK_MARGIN_BOTTOM`] |
 //! | `STATUS_CLASS` (`text-primary bg-primary/10`, …) | [`AnimatedToastStackStatus`]'s resolved inks and washes |
 //! | collapsed peek `y: index * 8`, inset `index * 12` (`notification-stack.tsx`) | [`TOAST_STACK_PEEK`], [`TOAST_STACK_INSET`] |
+//!
+//! # Density and the text scale
+//!
+//! The card's radius and its three type steps (title `text-sm`, description
+//! and action `text-xs`) are read from the theme's [`BeuiMetrics`] at layout;
+//! the text is shaped through the catalog's text helpers, so it also follows
+//! the OS text scale. The close and action buttons keep their painted `h-7`
+//! shapes, but each one's hit area is never smaller than
+//! [`BeuiMetrics::min_touch_target`]: the shape stays centred in a hit area
+//! grown to the floor (the [`button`](crate::components::button) rule), and
+//! under a touch theme the action row grows to hold it, so the card does too.
+//! The card's insets, the status mark and the stacking geometry are fixed
+//! values no metric names. The event pass hit-tests against the metrics the
+//! last layout resolved, since an event carries no theme.
 //!
 //! # Premise correction: upstream's own file is a gap-separated list
 //!
@@ -120,8 +134,8 @@ use crate::motion::{Presence, PresencePhase, Ramp};
 use crate::press::{Lane, presses};
 use crate::style::{self, with_alpha};
 use crate::text::{LabelRun, ThemeTextType, themed_style};
-use crate::tokens::BeuiTokens;
 use crate::tokens::motion::{EASE_OUT, SPRING_GLIDE};
+use crate::tokens::{BeuiMetrics, BeuiTokens};
 
 // ---- Motion ----------------------------------------------------------------
 
@@ -210,7 +224,8 @@ pub const TOAST_STACK_MARGIN_BOTTOM: f64 = 24.0;
 /// The card's padding, in logical px (`p-3`).
 pub const TOAST_STACK_PADDING: f64 = 12.0;
 
-/// The card's corner radius, in logical px (`rounded-2xl`).
+/// The card's corner radius under the comfortable metrics, in logical px
+/// (`rounded-2xl`). Painted from [`BeuiMetrics::radius_card`].
 pub const TOAST_STACK_RADIUS: f64 = style::RADIUS_2XL;
 
 /// The card fill's alpha (`bg-card/95`).
@@ -238,13 +253,15 @@ pub const TOAST_STACK_TITLE_GAP: f64 = 2.0;
 /// The gap above the action button, in logical px (`mt-2`).
 pub const TOAST_STACK_ACTION_GAP: f64 = 8.0;
 
-/// The action button's height, in logical px (`h-7`).
+/// The action button's painted height, in logical px (`h-7`). Its hit area
+/// and row grow to [`BeuiMetrics::min_touch_target`] when that is larger.
 pub const TOAST_STACK_ACTION_HEIGHT: f64 = 28.0;
 
 /// The action button's horizontal padding, in logical px (`px-3`).
 pub const TOAST_STACK_ACTION_PADDING_X: f64 = 12.0;
 
-/// The close button's box, in logical px (`h-7 w-7`).
+/// The close button's painted box, in logical px (`h-7 w-7`). Its hit area
+/// grows to [`BeuiMetrics::min_touch_target`] around it when that is larger.
 pub const TOAST_STACK_CLOSE_BOX: f64 = 28.0;
 
 /// The action button's resting wash (`bg-primary/[0.06]`).
@@ -580,22 +597,40 @@ fn resolve_colors(status: AnimatedToastStackStatus, theme: Option<&Theme>) -> To
 
 /// The title style (`text-sm font-medium`), in the theme's `label_large`
 /// family.
-fn title_style(theme: Option<&Theme>) -> TextStyle {
-    let style = TextStyle::new(style::TEXT_SM as f32, crate::text::SHAPING_INK)
-        .with_weight(FontWeight::MEDIUM);
+fn title_style(theme: Option<&Theme>, m: &BeuiMetrics) -> TextStyle {
+    let style =
+        TextStyle::new(m.text_sm as f32, crate::text::SHAPING_INK).with_weight(FontWeight::MEDIUM);
     themed_style(style, ThemeTextType::LabelLarge, theme)
 }
 
 /// The description style (`text-xs`, regular weight), in the theme's
 /// `body_small` family.
-fn body_style(theme: Option<&Theme>) -> TextStyle {
-    let style = TextStyle::new(style::TEXT_XS as f32, crate::text::SHAPING_INK);
+fn body_style(theme: Option<&Theme>, m: &BeuiMetrics) -> TextStyle {
+    let style = TextStyle::new(m.text_xs as f32, crate::text::SHAPING_INK);
     themed_style(style, ThemeTextType::BodySmall, theme)
 }
 
 /// The action label style (`text-xs font-medium`).
-fn action_style(theme: Option<&Theme>) -> TextStyle {
-    body_style(theme).with_weight(FontWeight::MEDIUM)
+fn action_style(theme: Option<&Theme>, m: &BeuiMetrics) -> TextStyle {
+    body_style(theme, m).with_weight(FontWeight::MEDIUM)
+}
+
+/// The height the action row reserves under `m`: the painted `h-7`, or the
+/// touch floor when that is taller.
+fn action_row_height(m: &BeuiMetrics) -> f64 {
+    TOAST_STACK_ACTION_HEIGHT.max(m.min_touch_target)
+}
+
+/// `shape` grown about its centre so neither edge is below `floor` — a
+/// button's hit area around its painted shape.
+fn grown_to(shape: Rect, floor: f64) -> Rect {
+    if shape.width() >= floor && shape.height() >= floor {
+        return shape;
+    }
+    let width = shape.width().max(floor);
+    let height = shape.height().max(floor);
+    let centre = shape.center();
+    Rect::from_center_size(centre, Size::new(width, height))
 }
 
 /// One retained toast.
@@ -710,6 +745,7 @@ impl<State: 'static> View<State> for AnimatedToastStackView<State> {
             max_visible: self.max_visible,
             area: Size::ZERO,
             width: 0.0,
+            metrics: BeuiMetrics::comfortable(),
             expand: Lane::at_rest(TOAST_STACK_RAMP, 0.0),
             expanded: false,
             armed: None,
@@ -752,6 +788,9 @@ pub struct AnimatedToastStackWidget {
     area: Size,
     /// Every card's shared width, from the last layout.
     width: f64,
+    /// The metrics the last layout resolved from the live theme; paint and
+    /// the event pass's hit tests read them from here.
+    metrics: BeuiMetrics,
     /// `0` collapsed, `1` expanded — the hover-driven spread.
     expand: Lane,
     /// Whether a pointer is on the stack.
@@ -912,8 +951,8 @@ impl AnimatedToastStackWidget {
         }
     }
 
-    /// The close button's box inside `card`.
-    fn close_rect(&self, card: Rect) -> Rect {
+    /// The close button's painted box inside `card`.
+    fn close_box(&self, card: Rect) -> Rect {
         Rect::from_origin_size(
             Point::new(
                 card.x1 - TOAST_STACK_PADDING - TOAST_STACK_CLOSE_BOX,
@@ -923,19 +962,34 @@ impl AnimatedToastStackWidget {
         )
     }
 
-    /// The action button's box inside `card`, given its measured label.
-    fn action_rect(&self, index: usize, card: Rect) -> Option<Rect> {
+    /// The close button's hit area inside `card`: its painted box, grown to
+    /// the touch floor about its centre.
+    fn close_rect(&self, card: Rect) -> Rect {
+        grown_to(self.close_box(card), self.metrics.min_touch_target)
+    }
+
+    /// The action button's painted pill inside `card`, given its measured
+    /// label: centred in the action row along the card's bottom inset.
+    fn action_pill(&self, index: usize, card: Rect) -> Option<Rect> {
         let slot = &self.slots[index];
         let label = slot.action.as_ref()?;
         let text_x = card.x0 + TOAST_STACK_PADDING + TOAST_STACK_ICON_BOX + TOAST_STACK_ICON_GAP;
         let width = label.size().width + TOAST_STACK_ACTION_PADDING_X * 2.0;
+        let row = action_row_height(&self.metrics);
         Some(Rect::from_origin_size(
             Point::new(
                 text_x,
-                card.y1 - TOAST_STACK_PADDING - TOAST_STACK_ACTION_HEIGHT,
+                card.y1 - TOAST_STACK_PADDING - row + (row - TOAST_STACK_ACTION_HEIGHT) / 2.0,
             ),
             Size::new(width, TOAST_STACK_ACTION_HEIGHT),
         ))
+    }
+
+    /// The action button's hit area inside `card`: its pill, grown to the
+    /// touch floor about its centre.
+    fn action_rect(&self, index: usize, card: Rect) -> Option<Rect> {
+        self.action_pill(index, card)
+            .map(|pill| grown_to(pill, self.metrics.min_touch_target))
     }
 
     /// What a widget-local `pos` lands on, front card first.
@@ -1094,9 +1148,12 @@ fn draw_close_mark(scene: &mut dyn PaintScene, centre: Point, color: Color) {
 impl Widget for AnimatedToastStackWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
         let theme = Theme::from_layout_ctx(ctx);
-        let title = title_style(theme);
-        let body = body_style(theme);
-        let action = action_style(theme);
+        let m = BeuiMetrics::resolve(theme);
+        self.metrics = m;
+        let title = title_style(theme, &m);
+        let body = body_style(theme, &m);
+        let action = action_style(theme, &m);
+        let action_row = action_row_height(&m);
 
         self.area = Size::new(
             crate::overlay::finite_or_zero(bc.max().width),
@@ -1120,7 +1177,7 @@ impl Widget for AnimatedToastStackWidget {
             let content = title_size.height
                 + description.map_or(0.0, |height| TOAST_STACK_TITLE_GAP + height)
                 + if has_action {
-                    TOAST_STACK_ACTION_GAP + TOAST_STACK_ACTION_HEIGHT
+                    TOAST_STACK_ACTION_GAP + action_row
                 } else {
                     0.0
                 };
@@ -1197,21 +1254,16 @@ impl Widget for AnimatedToastStackWidget {
                     * Affine::translate(-pivot.to_vec2()),
             );
 
+            let radius = self.metrics.radius_card;
             scene.draw_shadow(
                 card_origin,
                 card_size,
-                TOAST_STACK_RADIUS,
+                radius,
                 TOAST_STACK_SHADOW_STD_DEV,
                 with_alpha(Color::BLACK, TOAST_STACK_SHADOW_ALPHA),
             );
-            scene.fill_rounded_rect(card_origin, card_size, TOAST_STACK_RADIUS, colors.surface);
-            crate::press::stroke_outline(
-                scene,
-                card_origin,
-                card_size,
-                TOAST_STACK_RADIUS,
-                colors.border,
-            );
+            scene.fill_rounded_rect(card_origin, card_size, radius, colors.surface);
+            crate::press::stroke_outline(scene, card_origin, card_size, radius, colors.border);
 
             let content = self.content_alpha(index);
             if content > 0.0 {
@@ -1452,19 +1504,8 @@ impl AnimatedToastStackWidget {
         }
         scene.pop_clip();
 
-        if let Some(label) = &slot.action {
-            let rect = Rect::from_origin_size(
-                Point::new(
-                    text_x,
-                    card_origin.y + card_size.height
-                        - TOAST_STACK_PADDING
-                        - TOAST_STACK_ACTION_HEIGHT,
-                ),
-                Size::new(
-                    label.size().width + TOAST_STACK_ACTION_PADDING_X * 2.0,
-                    TOAST_STACK_ACTION_HEIGHT,
-                ),
-            );
+        let card = Rect::from_origin_size(card_origin, card_size);
+        if let (Some(label), Some(rect)) = (&slot.action, self.action_pill(index, card)) {
             let wash = if self.hovered_button == Some((slot.id, ToastTarget::Action)) {
                 TOAST_STACK_HOVER_WASH
             } else {
@@ -1487,13 +1528,7 @@ impl AnimatedToastStackWidget {
         }
 
         if slot.dismissible {
-            let rect = Rect::from_origin_size(
-                Point::new(
-                    card_origin.x + card_size.width - TOAST_STACK_PADDING - TOAST_STACK_CLOSE_BOX,
-                    card_origin.y + TOAST_STACK_PADDING,
-                ),
-                Size::new(TOAST_STACK_CLOSE_BOX, TOAST_STACK_CLOSE_BOX),
-            );
+            let rect = self.close_box(card);
             let hovered = self.hovered_button == Some((slot.id, ToastTarget::Close));
             if hovered {
                 scene.fill_rounded_rect(
@@ -1985,6 +2020,108 @@ mod tests {
             &pointer(PointerPhase::Down, Point::new(20.0, 20.0)),
         );
         assert_eq!(result, EventResult::Ignored);
+    }
+
+    // ---- Density and the touch minimum ---------------------------------------
+
+    /// Lay `widget` out under `theme` and settle it there.
+    fn settle_in(widget: &mut AnimatedToastStackWidget, theme: &Theme) {
+        let mut tcx = TextContext::new();
+        let mut ctx =
+            LayoutCtx::with_resources(Some(&mut tcx as &mut dyn Any), Some(theme as &dyn Any));
+        widget.layout(&mut ctx, &BoxConstraints::new(Size::ZERO, AREA));
+        widget.advance(ft_ms(0.0), true);
+    }
+
+    #[test]
+    fn a_comfortable_theme_keeps_the_buttons_at_their_painted_size() {
+        let theme = crate::tokens::theme_with_density(crate::tokens::Density::Comfortable);
+        let mut widget = laid_out(vec![animated_toast(1, "Saved").action("Undo")]);
+        settle(&mut widget);
+        let plain = widget.card_rect(0).expect("card");
+        settle_in(&mut widget, &theme);
+        let card = widget.card_rect(0).expect("card");
+        assert_eq!(card, plain, "the comfortable card is the unthemed one");
+        assert_eq!(widget.close_rect(card), widget.close_box(card));
+        assert_eq!(
+            widget.action_rect(0, card),
+            widget.action_pill(0, card),
+            "no growth without a floor"
+        );
+        assert_eq!(widget.close_box(card).height(), TOAST_STACK_CLOSE_BOX);
+    }
+
+    #[test]
+    fn under_touch_a_toasts_dismiss_and_action_hit_areas_clear_the_floor() {
+        let theme = crate::tokens::theme_with_density(crate::tokens::Density::Touch);
+        let floor = BeuiMetrics::resolve(Some(&theme)).min_touch_target;
+        assert!(floor >= 44.0);
+        let mut widget = laid_out(vec![animated_toast(1, "Saved").action("Undo")]);
+        settle_in(&mut widget, &theme);
+        let card = widget.card_rect(0).expect("card");
+
+        let close = widget.close_rect(card);
+        assert!(
+            close.width() >= floor && close.height() >= floor,
+            "{close:?}"
+        );
+        assert!(card.contains(close.origin()) && card.contains(Point::new(close.x1, close.y1)));
+        let painted = widget.close_box(card);
+        assert_eq!(
+            painted.width(),
+            TOAST_STACK_CLOSE_BOX,
+            "the cross keeps its box"
+        );
+        assert_eq!(painted.center(), close.center(), "centred in the hit area");
+
+        let action = widget.action_rect(0, card).expect("action");
+        assert!(
+            action.width() >= floor && action.height() >= floor,
+            "{action:?}"
+        );
+        assert!(action.y1 <= card.y1 + 1e-9, "the card grew to hold it");
+
+        // A press in the grown margin, outside the painted 28 px shape, fires.
+        let mut log = Log::default();
+        let corner = Point::new(close.x0 + 1.0, close.y0 + 1.0);
+        assert!(!painted.contains(corner));
+        dispatch(&mut widget, &pointer(PointerPhase::Down, corner), &mut log);
+        dispatch(&mut widget, &pointer(PointerPhase::Up, corner), &mut log);
+        assert_eq!(log.dismissed, vec![1]);
+
+        let pill = widget.action_pill(0, card).expect("pill");
+        let below = Point::new(pill.center().x, action.y1 - 1.0);
+        assert!(!pill.contains(below));
+        dispatch(&mut widget, &pointer(PointerPhase::Down, below), &mut log);
+        dispatch(&mut widget, &pointer(PointerPhase::Up, below), &mut log);
+        assert_eq!(log.actioned, vec![1]);
+    }
+
+    #[test]
+    fn under_touch_the_text_and_card_grow_and_the_radius_follows_the_metrics() {
+        let touch = crate::tokens::theme_with_density(crate::tokens::Density::Touch);
+        let m = BeuiMetrics::resolve(Some(&touch));
+        let toasts = || {
+            vec![
+                animated_toast(1, "Saved")
+                    .description("Draft")
+                    .action("Undo"),
+            ]
+        };
+        let mut desk = laid_out(toasts());
+        settle(&mut desk);
+        let mut phone = laid_out(toasts());
+        settle_in(&mut phone, &touch);
+        assert!(phone.slots[0].size.height > desk.slots[0].size.height);
+        assert!(phone.slots[0].title.size().height > desk.slots[0].title.size().height);
+
+        let (rec, _, _) = paint_at(&mut phone, 0.0, Some(&touch));
+        assert!(
+            rec.rrects
+                .iter()
+                .any(|(_, _, radius, _)| *radius == m.radius_card),
+            "the surface takes the card radius"
+        );
     }
 
     /// Every tone and every anchor is constructible and paints a card.
