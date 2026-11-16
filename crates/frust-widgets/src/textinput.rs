@@ -453,10 +453,10 @@ use std::time::Duration;
 use frust_core::accesskit::{Action, CustomAction, Role};
 use frust_core::{
     AnyView, BoxConstraints, BuildCtx, ChangeFlags, CornerRadii, EditCommand, EditingState,
-    EventCtx, EventResult, FrameTime, ImeContentType, ImeEvent, ImeState, InputEvent, Key,
-    LayoutCtx, NamedKey, OutsideTap, OverlayBand, OverlayInput, PaintCtx, PaintScene, PointerPhase,
-    SelectionToolbarActions, SelectionToolbarPolicy, SelectionToolbarRequest, SemanticsCtx,
-    TOUCH_SLOP, View, Widget, selection_toolbar_builder, selection_toolbar_policy,
+    EventCtx, EventResult, FocusHandle, FrameTime, ImeContentType, ImeEvent, ImeState, InputEvent,
+    Key, LayoutCtx, NamedKey, OutsideTap, OverlayBand, OverlayInput, PaintCtx, PaintScene,
+    PointerPhase, SelectionToolbarActions, SelectionToolbarPolicy, SelectionToolbarRequest,
+    SemanticsCtx, TOUCH_SLOP, View, Widget, selection_toolbar_builder, selection_toolbar_policy,
 };
 use frust_text::{
     EditOp, EditingStateBytes, TextContext, TextEditor, TextStyle, sanitize_paste, utf16_to_byte,
@@ -728,6 +728,11 @@ pub struct TextInputView<State: 'static> {
     on_submit: Option<OnText<State>>,
     on_caret_change: Option<crate::authoring::TypedArgCallback<State, CaretInfo>>,
     on_composing_change: Option<crate::authoring::TypedArgCallback<State, bool>>,
+    on_focus_change: Option<crate::authoring::TypedArgCallback<State, bool>>,
+    /// The app's handle — see [`TextInputView::focus_handle`].
+    focus_handle: Option<FocusHandle>,
+    /// See [`TextInputView::autofocus`].
+    autofocus: bool,
 }
 
 /// Create a controlled text field showing `value` that fires
@@ -766,6 +771,9 @@ pub fn text_input<State: 'static, F: Fn(&mut State, String) + 'static>(
         on_submit: None,
         on_caret_change: None,
         on_composing_change: None,
+        on_focus_change: None,
+        focus_handle: None,
+        autofocus: false,
     }
 }
 
@@ -818,12 +826,15 @@ impl<State: 'static> TextInputView<State> {
     /// the text, [`on_change`](text_input) runs first, so the callback may
     /// safely mutate app state.
     ///
-    /// Changes that happen without an event the field handles are **not**
-    /// reported: a controlled-value rebuild that moves the caret, a relayout
-    /// that reflows it onto another line, and focus granted programmatically
-    /// (the first report then comes with the next handled event). The field
-    /// has no deferred path that may call an app callback with state, so
-    /// those stay silent.
+    /// Focus granted programmatically ([`focus_handle`](Self::focus_handle),
+    /// [`autofocus`](Self::autofocus)) reports the caret too, once the grant
+    /// is delivered to the field, right after
+    /// [`on_focus_change`](Self::on_focus_change)`(true)`.
+    ///
+    /// Changes that happen with no event or deferred pass reaching the field
+    /// are **not** reported: a controlled-value rebuild that moves the caret
+    /// and a relayout that reflows it onto another line stay silent until the
+    /// next one.
     pub fn on_caret_change<F: Fn(&mut State, CaretInfo) + 'static>(mut self, f: F) -> Self {
         self.on_caret_change = Some(Rc::new(f));
         self
@@ -861,6 +872,52 @@ impl<State: 'static> TextInputView<State> {
     /// mid-composition: the replacement starts from the state last reported.
     pub fn on_composing_change<F: Fn(&mut State, bool) + 'static>(mut self, f: F) -> Self {
         self.on_composing_change = Some(Rc::new(f));
+        self
+    }
+
+    /// Take, release and observe the field's focus from app code.
+    ///
+    /// The field binds `handle` on every paint. `handle.request()` focuses
+    /// the field exactly as a tap would (session, IME state, soft keyboard,
+    /// visible caret) without moving the caret or the selection;
+    /// `handle.release()` blurs it; `handle.is_focused()` tracks it. A
+    /// request made before the field is mounted is granted when it mounts. A
+    /// disabled field refuses the grant.
+    pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
+        self.focus_handle = Some(handle);
+        self
+    }
+
+    /// Focus the field once, on its first paint after it mounts, the way
+    /// [`focus_handle`](Self::focus_handle)`.request()` would. Default
+    /// `false`. A rebuild never repeats the request, and a field that is
+    /// disabled at its first paint, or whose grant a modal trap refuses,
+    /// stays unfocused. It works with or without an app-supplied handle.
+    pub fn autofocus(mut self, autofocus: bool) -> Self {
+        self.autofocus = autofocus;
+        self
+    }
+
+    /// Be told when the field gains or loses focus.
+    ///
+    /// `on_focus_change(state, focused)` fires `true` when the field gains
+    /// focus and `false` when it loses it, once per transition and whatever
+    /// the cause: a tap, Tab, a [`focus_handle`](Self::focus_handle),
+    /// [`autofocus`](Self::autofocus), a tap elsewhere, Escape, a modal trap,
+    /// or the field being disabled. A change the field only observes while
+    /// painting reaches the callback with the next rebuild.
+    ///
+    /// Within one pass `true` fires before the first
+    /// [`on_caret_change`](Self::on_caret_change), and
+    /// [`on_composing_change`](Self::on_composing_change)`(false)` fires
+    /// before `false`.
+    ///
+    /// Best effort at the end of a field's life: a field unmounted (or
+    /// removed with a route change) while focused reports `false` only if it
+    /// still receives a pass before it is gone. A callback replaced while
+    /// focused starts from the state last reported.
+    pub fn on_focus_change<F: Fn(&mut State, bool) + 'static>(mut self, f: F) -> Self {
+        self.on_focus_change = Some(Rc::new(f));
         self
     }
 
@@ -1317,6 +1374,17 @@ pub struct TextInputWidget {
     on_submit: Option<crate::authoring::ErasedArgCallback<String>>,
     on_caret_change: Option<crate::authoring::ErasedArgCallback<CaretInfo>>,
     on_composing_change: Option<crate::authoring::ErasedArgCallback<bool>>,
+    on_focus_change: Option<crate::authoring::ErasedArgCallback<bool>>,
+    /// The focus state last handed to `on_focus_change`.
+    focus_reported: bool,
+    /// Bound every paint while `on_focus_change` is set, so the root reports
+    /// every change of the field's focus whatever its cause; also what
+    /// autofocus requests through.
+    own_focus: FocusHandle,
+    /// The app's handle, bound every paint beside `own_focus`.
+    app_focus: Option<FocusHandle>,
+    /// Autofocus is owed: cleared by the first paint.
+    autofocus_pending: bool,
     /// The composing state last handed to `on_composing_change`.
     composing_reported: bool,
     /// An empty `Compose` retracted the preedit while `true` had been
@@ -2600,6 +2668,14 @@ impl<State: 'static> View<State> for TextInputView<State> {
             composing_reported: false,
             retraction_held: false,
             composing_stale: false,
+            on_focus_change: self
+                .on_focus_change
+                .as_ref()
+                .map(crate::authoring::erase_callback_arg::<State, bool>),
+            focus_reported: false,
+            own_focus: FocusHandle::new(),
+            app_focus: self.focus_handle.clone(),
+            autofocus_pending: self.autofocus,
         };
         // Seeds the masked mirror when built obscured (a no-op otherwise).
         widget.rebuild_mask_editor();
@@ -2626,6 +2702,11 @@ impl<State: 'static> View<State> for TextInputView<State> {
             .on_composing_change
             .as_ref()
             .map(crate::authoring::erase_callback_arg::<State, bool>);
+        element.on_focus_change = self
+            .on_focus_change
+            .as_ref()
+            .map(crate::authoring::erase_callback_arg::<State, bool>);
+        element.app_focus = self.focus_handle.clone();
 
         let mut flags = ChangeFlags::NONE;
         if prev.placeholder != self.placeholder {
@@ -2660,6 +2741,10 @@ impl<State: 'static> View<State> for TextInputView<State> {
                 element.release_focus_pending = element.focused;
                 element.focused = false;
                 element.caret_reported = None;
+                // The loss reaches `on_focus_change` with the deferred pass.
+                if element.focus_reported && element.on_focus_change.is_some() {
+                    frust_core::mark_pending_result_flush();
+                }
                 element.captured = false;
                 // A field that stops being interactive mid-press keeps no
                 // gesture in flight either: the hold timer is capture-gated, so
@@ -2954,6 +3039,23 @@ impl Widget for TextInputWidget {
             self.outside_press_dismissed = false;
         }
 
+        // Programmatic focus. The field binds the app's handle, and its own
+        // while it has a listener (so every focus change reaches
+        // `on_focus_change`) or owes an autofocus request, which asks once, on
+        // the first paint, if the field can take focus. A field with neither
+        // binds nothing, so focus changes cost it no deferred frame.
+        let autofocus =
+            std::mem::take(&mut self.autofocus_pending) && self.focusable() && !ctx.has_focus();
+        if self.on_focus_change.is_some() || autofocus {
+            ctx.bind_focus_handle(&self.own_focus);
+        }
+        if autofocus {
+            self.own_focus.request();
+        }
+        if let Some(handle) = &self.app_focus {
+            ctx.bind_focus_handle(handle);
+        }
+
         // Chrome: a border-colored rounded rect with an inset background fills in
         // as the frame (there is no stroke-rect primitive on `PaintScene`).
         // The border width itself widens to `focus_ring_width` while focused,
@@ -3143,6 +3245,21 @@ impl Widget for TextInputWidget {
         if self.focused && !ctx.has_focus() {
             self.observe_focus_loss();
         }
+        // A focus granted or taken without an event this field handled is
+        // adopted here: a deferred focus change, or a focus-routed event.
+        if !self.focused
+            && ctx.has_focus()
+            && self.focusable()
+            && (ctx.focus_changed()
+                || matches!(
+                    event,
+                    InputEvent::Key(_) | InputEvent::Ime(_) | InputEvent::EditCommand(_)
+                ))
+        {
+            self.focused = true;
+            self.reset_blink();
+        }
+        self.report_focus(ctx);
         // A retraction waits for the commit that confirms it, and only that.
         // Any other event means nothing confirmed it: the composition ended.
         let confirms = matches!(
@@ -3160,6 +3277,7 @@ impl Widget for TextInputWidget {
         if !self.editor.is_composing() {
             self.composing_stale = false;
         }
+        self.report_focus(ctx);
         self.commit_scroll_x();
         self.report_caret(ctx);
         result
@@ -3217,6 +3335,23 @@ impl TextInputWidget {
         }
         self.composing_reported = now;
         if let Some(cb) = &mut self.on_composing_change {
+            cb(ctx, now);
+        }
+    }
+
+    /// Hand `on_focus_change` the focus state when it differs from the last
+    /// report. Composing ends are reported first, so `false` follows
+    /// `on_composing_change(false)`.
+    fn report_focus(&mut self, ctx: &mut EventCtx) {
+        let now = self.focused && self.focusable();
+        if now == self.focus_reported {
+            return;
+        }
+        if !now {
+            self.report_composing(ctx, false);
+        }
+        self.focus_reported = now;
+        if let Some(cb) = &mut self.on_focus_change {
             cb(ctx, now);
         }
     }

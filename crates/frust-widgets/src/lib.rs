@@ -47,6 +47,7 @@ mod icon_button;
 pub mod icons;
 mod image;
 mod indexed_stack;
+mod keep_focus;
 mod list_view;
 pub mod motion;
 pub mod nav;
@@ -109,6 +110,7 @@ pub use flex::{
 };
 /// Whether a floated surface claims keys as a modal, re-exported for
 /// [`OverlaySlot::set_keys`] and [`OverlayPortalView::keys`].
+pub use frust_core::FocusHandle;
 pub use frust_core::OverlayKeys;
 /// The axis a [`CustomScrollView`] scrolls along, re-exported so its
 /// [`axis`](CustomScrollView::axis) builder needs no direct `frust-core` import.
@@ -125,6 +127,7 @@ pub use icon::{
 pub use icon_button::{IconButton, IconButtonView, IconButtonWidget, icon_button};
 pub use image::{Image, ImageError, ImageFit, ImageSource, ImageView, ImageWidget};
 pub use indexed_stack::{IndexedStack, IndexedStackView, IndexedStackWidget, indexed_stack};
+pub use keep_focus::{KeepFocusView, KeepFocusWidget, keep_focus};
 pub use list_view::{ListView, ListViewWidget, list_view};
 pub use nav::hero::{HeroView, HeroWidget, hero};
 pub use nav::navigator::{
