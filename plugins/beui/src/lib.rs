@@ -40,9 +40,9 @@
 //!   [`Density::Comfortable`]: [`style::HEIGHT_MD`] is `h-10` = 40px and
 //!   [`style::HEIGHT_INPUT`] is `h-11` = 44px. [`Density::Touch`] is the phone
 //!   set, carried on the theme as [`BeuiMetrics`] and chosen with
-//!   [`install_with_density`]. Today the button and the input follow it and
-//!   clear the platform touch minimum; every other part still lays out at the
-//!   comfortable sizes until it is moved onto the metrics.
+//!   [`install_with_density`]. Today the alert, button, card, chip, grouped
+//!   list, input and key-value parts follow it; every other part still lays
+//!   out at the comfortable sizes until it is moved onto the metrics.
 //!
 //! # Installing it
 //!

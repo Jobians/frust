@@ -8,8 +8,8 @@
 //! ([`install_with_density`](crate::install_with_density)) instead of forking
 //! components; a component reads it through [`BeuiMetrics::resolve`].
 //!
-//! Only the parts that read it follow the density: today the button and the
-//! input. Every other part still lays out from [`crate::style`]'s constants,
+//! Only the parts that read it follow the density: today the alert, button,
+//! card, chip, grouped list, input and key-value parts. Every other part still lays out from [`crate::style`]'s constants,
 //! so it keeps the comfortable sizes under a touch theme until it is moved
 //! onto these metrics.
 //!

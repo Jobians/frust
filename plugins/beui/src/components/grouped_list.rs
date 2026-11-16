@@ -22,6 +22,7 @@
 //! title takes what is left. This module keeps its own one-line ellipsis run because
 //! [`crate::text::LabelRun`] shapes at an unbounded width.
 
+use std::any::Any;
 use std::rc::Rc;
 
 use frust::Theme;
@@ -174,13 +175,15 @@ impl GroupedListWidget {
 }
 
 /// The title inset a row pod reports, or `fallback` for a child that is not a row.
-fn title_inset_of(pod: &mut ChildPod, fallback: f64) -> f64 {
-    let widget = pod.widget_mut();
-    if let Some(row) = widget.downcast_mut::<ListRowWidget>() {
+///
+/// Reads through [`ChildPod::widget`], which leaves the pod's dirty flags alone.
+fn title_inset_of(pod: &ChildPod, fallback: f64) -> f64 {
+    let widget: &dyn Any = pod.widget();
+    if let Some(row) = widget.downcast_ref::<ListRowWidget>() {
         return row.title_inset;
     }
-    if let Some(boxed) = widget.downcast_mut::<Box<dyn Widget>>()
-        && let Some(row) = boxed.downcast_mut::<ListRowWidget>()
+    if let Some(boxed) = widget.downcast_ref::<Box<dyn Widget>>()
+        && let Some(row) = (&**boxed as &dyn Any).downcast_ref::<ListRowWidget>()
     {
         return row.title_inset;
     }
@@ -209,7 +212,7 @@ impl Widget for GroupedListWidget {
             pod.set_origin(Point::new(0.0, y));
             y += size.height;
             if index + 1 < count {
-                let inset = title_inset_of(pod, m.padding_x_input);
+                let inset = title_inset_of(&*pod, m.padding_x_input);
                 self.separators.push((y - m.border_width, inset));
             }
         }

@@ -241,14 +241,22 @@ impl Widget for ChipWidget {
         // grows around it to the platform minimum.
         let pill = bc.constrain(Size::new(width, height));
         self.pill = pill;
-        if self.pressable() {
+        let hit = if self.pressable() {
             bc.constrain(Size::new(
                 pill.width.max(m.min_touch_target),
                 pill.height.max(m.min_touch_target),
             ))
         } else {
             pill
+        };
+        if let Some(lead) = &mut self.leading {
+            let lead_h = lead.size().height;
+            lead.set_origin(Point::new(
+                (hit.width - pill.width.min(hit.width)) / 2.0 + pad_x,
+                (hit.height - lead_h) / 2.0,
+            ));
         }
+        hit
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
@@ -291,11 +299,6 @@ impl Widget for ChipWidget {
         };
         let mut x = pad_x;
         if let Some(lead) = &mut self.leading {
-            let lead_h = lead.size().height;
-            lead.set_origin(Point::new(
-                (hit.width - pill.width) / 2.0 + x,
-                (hit.height - lead_h) / 2.0,
-            ));
             x += lead.size().width + gap;
             lead.paint_child(ctx, scene);
         } else if self.show_dot {

@@ -1049,6 +1049,33 @@ fn chips_skip_an_unchanged_rebuild() {
 }
 
 #[test]
+fn a_chip_places_its_leading_child_in_layout() {
+    let view: PartView<Tags> = |state| {
+        any(row().child(
+            chip(state.label.clone())
+                .leading(block(16.0, 16.0))
+                .on_press(|_: &mut Tags| {}),
+        ))
+    };
+    for theme in DENSITIES {
+        let mut audit = Audit::new(tags(), theme(), view);
+        // Rebuild and layout only: no paint has run, so the position must
+        // already be final.
+        audit.root.rebuild(&mut audit.view, &mut audit.state);
+        audit.layout();
+        let before = audit.shape();
+        audit.frame();
+        audit.settle();
+        assert_eq!(
+            audit.shape(),
+            before,
+            "the leading child moved when the chip painted"
+        );
+        assert_quiet_rebuild(&mut audit, "chip with a leading view");
+    }
+}
+
+#[test]
 fn chips_relay_out_a_longer_label() {
     let mut audit = mount(&tags(), comfortable(), tags_view);
     let before = audit.sizes("ChipWidget");
@@ -1152,24 +1179,6 @@ fn settings_view(state: &mut Settings) -> AnyView<Settings> {
 }
 
 #[test]
-fn a_grouped_list_keeps_its_geometry_through_an_unchanged_rebuild() {
-    for theme in DENSITIES {
-        let mut audit = mount(&settings(), theme(), settings_view);
-        let dirty = quiet_rebuild(&mut audit, "grouped list");
-        // A row left dirty is the known defect pinned by the ignored test below;
-        // any other pod left dirty fails here.
-        assert!(
-            dirty.iter().all(|&name| name == "ListRowWidget"),
-            "grouped list: an unchanged rebuild left {dirty:?} layout-dirty"
-        );
-    }
-}
-
-#[test]
-#[ignore = "defect in plugins/beui/src/components/grouped_list.rs:178: GroupedListWidget::layout \
-            reads each non-last row's title inset through ChildPod::widget_mut, which marks the \
-            row pod layout- and paint-dirty on every layout, so an unchanged rebuild leaves it \
-            dirty; run with `cargo test -p frust-beui --test layout_skip_audit -- --ignored`"]
 fn a_grouped_list_skips_an_unchanged_rebuild() {
     for theme in DENSITIES {
         let mut audit = mount(&settings(), theme(), settings_view);
