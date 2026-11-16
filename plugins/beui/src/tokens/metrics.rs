@@ -2,11 +2,16 @@
 //!
 //! [`crate::style`]'s size constants are beUI's desktop-first web metrics, and
 //! they stay the [`Density::Comfortable`] set. [`Density::Touch`] is the phone
-//! set: every control height clears a platform touch-target minimum and the
-//! type steps grow toward a phone's reading size. The set rides the theme as an
-//! extension, so an app picks a density once
+//! set: every control height in it clears a platform touch-target minimum and
+//! the type steps grow toward a phone's reading size. The set rides the theme
+//! as an extension, so an app picks a density once
 //! ([`install_with_density`](crate::install_with_density)) instead of forking
 //! components; a component reads it through [`BeuiMetrics::resolve`].
+//!
+//! Only the parts that read it follow the density: today the button and the
+//! input. Every other part still lays out from [`crate::style`]'s constants,
+//! so it keeps the comfortable sizes under a touch theme until it is moved
+//! onto these metrics.
 //!
 //! **Sources** for the touch set, retrieved 2026-11-16: Apple's Human Interface
 //! Guidelines (*Accessibility*: a 44×44 pt minimum hit target; *Typography*:
@@ -24,7 +29,8 @@ pub enum Density {
     /// beUI's own desktop-first web metrics — [`crate::style`]'s constants.
     #[default]
     Comfortable,
-    /// The phone set: controls clear the platform touch minimum.
+    /// The phone set: the controls that read it clear the platform touch
+    /// minimum (see the [module docs](self)).
     Touch,
 }
 

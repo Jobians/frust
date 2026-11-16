@@ -34,6 +34,20 @@
 //! `corner_radius` (baked to the pill this field paints) and
 //! `padding(`[`style::PADDING_X_INPUT`]`, `[`FIELD_PADDING_Y`]`)`.
 //!
+//! # Following the density
+//!
+//! Those three values come from the theme's [`BeuiMetrics`], and a view has no
+//! theme at build: `build` bakes the comfortable set into the wrapped field.
+//! `layout` is where the live set is resolved, so `layout` is also where the
+//! field is brought onto it — when the resolved set differs from the one the
+//! field's chrome was built from, it rebuilds the field in place, chrome only,
+//! before laying it out. That lands on the first painted frame after a build
+//! under a touch theme and after a live density change, with no app rebuild;
+//! under a matching theme it does nothing. The re-style hands the field its
+//! own current text (the widget records every edit the field reports), so the
+//! controlled reconcile has nothing to do: typed text, selection, focus and
+//! the IME session are untouched.
+//!
 //! # Reusable by a sibling control
 //!
 //! A control that is *a beUI field plus something* — a combobox, a search box —
@@ -71,6 +85,7 @@
 //!   That is upstream's own inconsistency (every other transition in the file
 //!   names the catalog curve), and the port keeps it: [`Curve::EaseOut`].
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -383,15 +398,44 @@ impl<State: 'static> InputView<State> {
         self
     }
 
-    /// The wrapped baseline field, configured with its own chrome suppressed.
-    ///
-    /// `m` is the metric set the field's baked chrome (horizontal padding and
-    /// corner radius) is built from. A view has no theme at build time, so
-    /// `build` passes the comfortable set and a later `rebuild` passes the set
-    /// the widget last resolved in layout.
-    fn control(&self, m: &BeuiMetrics) -> impl View<State> + use<State> {
+    /// The wrapped field's configuration, recording edits into `seen`.
+    fn spec(&self, seen: &Rc<RefCell<String>>) -> FieldSpec<State> {
+        FieldSpec {
+            placeholder: self.placeholder.clone(),
+            disabled: self.disabled,
+            password: self.password,
+            on_change: self.on_change.clone(),
+            on_submit: self.on_submit.clone(),
+            seen: seen.clone(),
+        }
+    }
+}
+
+/// What the wrapped baseline field is configured from, less its value and its
+/// metric-derived chrome.
+///
+/// The widget keeps the latest one so `layout`, which has no view, can re-style
+/// the field (see the [module docs](self)' "Following the density").
+struct FieldSpec<State: 'static> {
+    placeholder: String,
+    disabled: bool,
+    password: bool,
+    on_change: OnText<State>,
+    on_submit: Option<OnText<State>>,
+    /// The text the wrapped editor holds: the view's value after a build or a
+    /// rebuild (the controlled reconcile leaves the editor on it), then each
+    /// edit, which the field reports through `on_change` before the app sees it.
+    seen: Rc<RefCell<String>>,
+}
+
+impl<State: 'static> FieldSpec<State> {
+    /// The wrapped baseline field showing `value`, configured with its own
+    /// chrome suppressed and its padding and corner radius taken from `m`.
+    fn control(&self, value: String, m: &BeuiMetrics) -> impl View<State> + use<State> {
         let on_change = self.on_change.clone();
-        let mut field = text_input(self.value.clone(), move |state: &mut State, text| {
+        let seen = self.seen.clone();
+        let mut field = text_input(value, move |state: &mut State, text: String| {
+            seen.borrow_mut().clone_from(&text);
             on_change(state, text)
         })
         .placeholder(self.placeholder.clone())
@@ -408,6 +452,40 @@ impl<State: 'static> InputView<State> {
             field = field.on_submit(move |state: &mut State, text| on_submit(state, text));
         }
         field
+    }
+}
+
+/// The `State`-free face of a [`FieldSpec`], which is what the widget holds.
+trait Restyle {
+    /// Rebuild the field in `child` from `built`'s chrome to `next`'s.
+    fn restyle(
+        &self,
+        child: &mut ChildPod,
+        built: &BeuiMetrics,
+        next: &BeuiMetrics,
+        ctx: &mut BuildCtx<'_>,
+    ) -> ChangeFlags;
+}
+
+impl<State: 'static> Restyle for FieldSpec<State> {
+    fn restyle(
+        &self,
+        child: &mut ChildPod,
+        built: &BeuiMetrics,
+        next: &BeuiMetrics,
+        ctx: &mut BuildCtx<'_>,
+    ) -> ChangeFlags {
+        // The editor's own text on both sides: the controlled reconcile
+        // compares the next value against it, so an edit the app has not
+        // confirmed yet is neither reverted nor re-seeded (which would also
+        // move the caret).
+        let value = self.seen.borrow().clone();
+        rebuild_child(
+            &self.control(value.clone(), built),
+            &self.control(value, next),
+            child,
+            ctx,
+        )
     }
 }
 
@@ -479,8 +557,19 @@ pub struct InputWidget {
     was_focused: bool,
     /// The metrics the last `layout` resolved from the live theme.
     metrics: BeuiMetrics,
-    /// The metrics the wrapped field's baked chrome was last built from.
+    /// The metrics the wrapped field's baked chrome was last built from. Only
+    /// `layout` moves it, by re-styling the field onto [`Self::metrics`].
     built_metrics: BeuiMetrics,
+    /// The latest view's field configuration, for that re-style.
+    spec: Box<dyn Restyle>,
+    /// The text the wrapped editor holds — see [`FieldSpec::seen`].
+    seen: Rc<RefCell<String>>,
+    /// The id counter of the re-style's `BuildCtx`. Like a component's, it is
+    /// local: a pod's subtree never enters the arena.
+    restyle_ids: u64,
+    /// How many times `layout` has re-styled the field.
+    #[cfg(test)]
+    restyles: u32,
 }
 
 impl<State: 'static> View<State> for InputView<State> {
@@ -488,8 +577,16 @@ impl<State: 'static> View<State> for InputView<State> {
 
     fn build(&self, ctx: &mut BuildCtx<'_>) -> InputWidget {
         let error = self.error_flag;
+        let seen = Rc::new(RefCell::new(self.value.clone()));
+        let spec = self.spec(&seen);
+        // No theme here: the comfortable chrome, which `layout` re-styles if
+        // the live theme resolves another set.
+        let child = build_child(
+            &spec.control(self.value.clone(), &BeuiMetrics::comfortable()),
+            ctx,
+        );
         InputWidget {
-            child: build_child(&self.control(&BeuiMetrics::comfortable()), ctx),
+            child,
             label: self.label.as_ref().map(ShapedText::new),
             message: self.error.as_ref().map(ShapedText::new),
             message_leaving: false,
@@ -514,6 +611,11 @@ impl<State: 'static> View<State> for InputView<State> {
             laid_message_height: 0.0,
             metrics: BeuiMetrics::comfortable(),
             built_metrics: BeuiMetrics::comfortable(),
+            spec: Box::new(spec),
+            seen,
+            restyle_ids: 0,
+            #[cfg(test)]
+            restyles: 0,
         }
     }
 
@@ -523,13 +625,18 @@ impl<State: 'static> View<State> for InputView<State> {
         element: &mut InputWidget,
         ctx: &mut BuildCtx<'_>,
     ) -> ChangeFlags {
+        // The chrome stays on the set it was built from; `layout` owns moving it.
+        let built = element.built_metrics;
+        let spec = self.spec(&element.seen);
         let mut flags = rebuild_child(
-            &prev.control(&element.built_metrics),
-            &self.control(&element.metrics),
+            &prev.spec(&element.seen).control(prev.value.clone(), &built),
+            &spec.control(self.value.clone(), &built),
             &mut element.child,
             ctx,
         );
-        element.built_metrics = element.metrics;
+        // The controlled reconcile leaves the editor on the view's value.
+        element.seen.borrow_mut().clone_from(&self.value);
+        element.spec = Box::new(spec);
 
         if prev.label != self.label {
             match (&mut element.label, &self.label) {
@@ -595,7 +702,9 @@ impl<State: 'static> View<State> for InputView<State> {
 
     fn teardown(&self, element: &mut InputWidget, ctx: &mut BuildCtx<'_>) {
         teardown_child(
-            &self.control(&element.built_metrics),
+            &self
+                .spec(&element.seen)
+                .control(self.value.clone(), &element.built_metrics),
             &mut element.child,
             ctx,
         );
@@ -603,6 +712,29 @@ impl<State: 'static> View<State> for InputView<State> {
 }
 
 impl InputWidget {
+    /// Bring the wrapped field's chrome onto `m`, the set this layout resolved:
+    /// a chrome-only rebuild of the field, run only when `m` differs from the
+    /// set the chrome was built from, so it converges after one run and costs
+    /// nothing while the theme agrees with the build.
+    fn follow_metrics(&mut self, m: BeuiMetrics) {
+        if m == self.built_metrics {
+            return;
+        }
+        let mut ctx = BuildCtx::new(&mut self.restyle_ids);
+        // Nothing is torn down or swapped, so no session can be orphaned; the
+        // chain is seeded from the pod's own link rather than "assume live".
+        ctx.set_has_focus(self.child.holds_live_focus());
+        // The returned flags are already marked on the pod (a padding change
+        // dirties its layout), and the pod is laid out right after this.
+        self.spec
+            .restyle(&mut self.child, &self.built_metrics, &m, &mut ctx);
+        self.built_metrics = m;
+        #[cfg(test)]
+        {
+            self.restyles += 1;
+        }
+    }
+
     /// The error shake's x offset at `now`, and whether it is still running.
     fn shake_offset(&self, now: FrameTime) -> (f64, bool) {
         let Some(start) = self.shake_start else {
@@ -655,6 +787,7 @@ impl Widget for InputWidget {
         let theme = Theme::from_layout_ctx(ctx);
         let m = BeuiMetrics::resolve(theme);
         self.metrics = m;
+        self.follow_metrics(m);
         let (ink, destructive) = match theme {
             Some(theme) => (theme.scheme().on_surface, theme.scheme().error),
             None => (FALLBACK_FOREGROUND, FALLBACK_DESTRUCTIVE),
@@ -854,7 +987,7 @@ mod tests {
     use super::*;
     use frust::authoring::scene::GlyphRun;
     use frust::authoring::text::TextContext;
-    use frust::authoring::{BezPath, PointerButton, PointerEvent};
+    use frust::authoring::{BezPath, PaintOutcome, PointerButton, PointerEvent};
     use frust::{Brightness, FrameTime};
     use frust_core::RenderRoot;
     use std::any::Any;
@@ -1052,6 +1185,278 @@ mod tests {
         let size = w.layout(&mut lctx, &BoxConstraints::loose(Size::new(200.0, 400.0)));
         assert_eq!(size.height, m.height_input);
         assert!(size.height >= 44.0 && size.width >= 44.0);
+    }
+
+    // ---- Density: the wrapped field's chrome follows the resolved metrics --
+
+    /// A field driven the way a frame-gated shell drives it: one rebuild to
+    /// mount it, then per frame a layout only when one is pending, and a paint.
+    /// It never rebuilds on a pump, so nothing but the widget itself can bring
+    /// the wrapped field onto the live metrics.
+    struct FrameDriver {
+        root: RenderRoot<String, InputView<String>>,
+        state: String,
+        tcx: TextContext,
+        /// Layout passes run so far.
+        layouts: u32,
+    }
+
+    impl FrameDriver {
+        fn mount(theme: Theme, value: &str) -> Self {
+            let mut d = FrameDriver {
+                root: RenderRoot::new(),
+                state: value.to_string(),
+                tcx: TextContext::new(),
+                layouts: 0,
+            };
+            d.root.set_theme(Box::new(theme));
+            let mut logic = |state: &mut String| {
+                input::<String, _>(state.clone(), |s: &mut String, t| *s = t).placeholder("Email")
+            };
+            d.root.rebuild(&mut logic, &mut d.state);
+            d
+        }
+
+        /// One frame at `millis`: a layout if one is pending, then a paint.
+        fn frame_at(&mut self, millis: f64) -> (Recorder, PaintOutcome) {
+            if self.root.take_change_flags().needs_layout() {
+                self.root
+                    .layout_with_text(WINDOW, &mut self.tcx as &mut dyn Any);
+                self.layouts += 1;
+            }
+            let mut rec = Recorder::default();
+            let outcome = self.root.paint(&mut rec, ft_ms(millis));
+            (rec, outcome)
+        }
+
+        fn frame(&mut self) -> (Recorder, PaintOutcome) {
+            self.frame_at(0.0)
+        }
+
+        /// Whether the last paint (`outcome`) left nothing to do: no frame, no
+        /// layout, no pending change.
+        fn idle_after(&self, outcome: &PaintOutcome) -> bool {
+            !outcome.needs_frame && !outcome.needs_layout && !self.root.has_pending_change_flags()
+        }
+
+        fn widget(&self) -> &InputWidget {
+            let id = self.root.root_id().expect("root built");
+            let w = self.root.tree().pod(id).expect("root pod").widget();
+            (w as &dyn Any)
+                .downcast_ref::<InputWidget>()
+                .expect("root is an InputWidget")
+        }
+
+        fn pointer(&mut self, phase: PointerPhase, x: f64, y: f64) {
+            self.root.event(
+                &mut self.state,
+                &InputEvent::Pointer(PointerEvent {
+                    phase,
+                    position: Point::new(x, y),
+                    button: PointerButton::Primary,
+                }),
+            );
+        }
+
+        fn key(&mut self, ch: char) {
+            self.root.event(
+                &mut self.state,
+                &InputEvent::Key(frust::authoring::KeyEvent {
+                    key: frust::authoring::Key::Character(ch.to_string()),
+                    modifiers: frust::authoring::Modifiers::default(),
+                    repeat: false,
+                }),
+            );
+        }
+
+        /// The wrapped field's value, as its semantics node publishes it.
+        fn field_value(&self) -> Option<String> {
+            let update = self.root.semantics();
+            update
+                .nodes
+                .iter()
+                .find(|(_, n)| n.role() == frust::authoring::Role::TextInput)
+                .and_then(|(_, n)| n.value().map(str::to_string))
+        }
+    }
+
+    /// The radius of the wrapped field's opaque background fill.
+    fn background_radius(rec: &Recorder) -> f64 {
+        let surface = crate::theme().scheme().surface;
+        rec.rrects
+            .iter()
+            .find(|(_, _, _, c)| *c == surface)
+            .expect("the wrapped field painted its background")
+            .2
+    }
+
+    /// The wrapped field's text origin: where its first glyph run lands, which
+    /// is the field's left padding across and its text top down. The only runs
+    /// a bare, unlabelled field paints are its own.
+    fn text_origin(rec: &Recorder) -> Point {
+        *rec.glyphs.first().expect("the field painted its text")
+    }
+
+    #[test]
+    fn built_under_touch_the_first_painted_frame_has_the_touch_chrome() {
+        use crate::tokens::{Density, theme_with_density};
+        let touch = theme_with_density(Density::Touch);
+        let m = BeuiMetrics::resolve(Some(&touch));
+        let c = BeuiMetrics::comfortable();
+        assert_ne!(m.padding_x_input, c.padding_x_input, "the sets differ here");
+        assert_ne!(m.height_input, c.height_input, "and here");
+
+        let mut d = FrameDriver::mount(touch, "hi");
+        let (rec, outcome) = d.frame();
+
+        assert_eq!(
+            d.widget().built_metrics,
+            m,
+            "the chrome was built from touch"
+        );
+        assert_eq!(
+            text_origin(&rec).x,
+            m.padding_x_input,
+            "the text starts at the touch padding"
+        );
+        assert!(
+            text_origin(&rec).y >= (m.height_input - m.line_height_input) / 2.0,
+            "and sits no higher than the touch vertical padding"
+        );
+        assert_eq!(
+            background_radius(&rec),
+            m.height_input / 2.0,
+            "the opaque background is the touch pill"
+        );
+
+        // One re-style, in the first layout, and then the field is settled.
+        assert_eq!(d.widget().restyles, 1);
+        assert_eq!(d.layouts, 1);
+        assert!(d.idle_after(&outcome), "nothing more is asked for");
+        let (_, again) = d.frame();
+        assert_eq!(d.layouts, 1, "no second layout");
+        assert_eq!(d.widget().restyles, 1, "no second re-style");
+        assert!(d.idle_after(&again));
+    }
+
+    #[test]
+    fn the_vertical_padding_follows_the_metrics_too() {
+        // A set whose vertical padding, not the centring, places the text: a
+        // 60 px field over a 10 px line pads 25 px top and bottom, more than
+        // centring any one-line run would (the comfortable set pads 10).
+        let m = BeuiMetrics {
+            height_input: 60.0,
+            line_height_input: 10.0,
+            ..BeuiMetrics::touch()
+        };
+        let theme = Theme::builder(crate::theme()).extension(m).build();
+        let mut d = FrameDriver::mount(theme, "hi");
+        let (rec, outcome) = d.frame();
+        assert_eq!(
+            text_origin(&rec),
+            Point::new(
+                m.padding_x_input,
+                (m.height_input - m.line_height_input) / 2.0
+            ),
+            "the text sits at this set's padding on the first painted frame"
+        );
+        assert_eq!(background_radius(&rec), m.height_input / 2.0);
+        assert_eq!(d.widget().restyles, 1);
+        assert!(d.idle_after(&outcome));
+    }
+
+    #[test]
+    fn under_the_default_theme_nothing_is_restyled_or_relaid() {
+        use crate::tokens::{Density, theme_with_density};
+        for theme in [crate::theme(), theme_with_density(Density::Comfortable)] {
+            let mut d = FrameDriver::mount(theme, "hi");
+            let (rec, outcome) = d.frame();
+            assert_eq!(
+                text_origin(&rec).x,
+                style::PADDING_X_INPUT,
+                "today's padding"
+            );
+            assert!(text_origin(&rec).y >= FIELD_PADDING_Y);
+            assert_eq!(background_radius(&rec), style::HEIGHT_INPUT / 2.0);
+            assert_eq!(d.widget().restyles, 0, "no re-style");
+            assert_eq!(d.layouts, 1, "the mount's own layout only");
+            assert!(d.idle_after(&outcome), "and no request for another");
+        }
+    }
+
+    #[test]
+    fn a_live_switch_to_touch_converges_within_one_frame() {
+        use crate::tokens::{Density, theme_with_density};
+        let mut d = FrameDriver::mount(theme_with_density(Density::Comfortable), "hi");
+        let (before, outcome) = d.frame();
+        assert!(d.idle_after(&outcome));
+        assert_eq!(d.layouts, 1);
+        assert_eq!(text_origin(&before).x, style::PADDING_X_INPUT);
+
+        let touch = theme_with_density(Density::Touch);
+        let m = BeuiMetrics::resolve(Some(&touch));
+        d.root.set_theme(Box::new(touch));
+        let (after, outcome) = d.frame();
+        assert_eq!(d.layouts, 2, "the theme swap's own layout, nothing more");
+        assert_eq!(text_origin(&after).x, m.padding_x_input);
+        assert!(text_origin(&after).y >= (m.height_input - m.line_height_input) / 2.0);
+        assert_eq!(background_radius(&after), m.height_input / 2.0);
+        assert_eq!(d.widget().built_metrics, m);
+        assert_eq!(d.widget().restyles, 1);
+        assert!(d.idle_after(&outcome), "then it asks for nothing");
+
+        let (_, again) = d.frame();
+        assert_eq!(d.layouts, 2);
+        assert_eq!(d.widget().restyles, 1);
+        assert!(d.idle_after(&again));
+
+        // And back: the same one-step convergence.
+        d.root
+            .set_theme(Box::new(theme_with_density(Density::Comfortable)));
+        let (back, outcome) = d.frame();
+        assert_eq!(text_origin(&back).x, style::PADDING_X_INPUT);
+        assert_eq!(background_radius(&back), style::HEIGHT_INPUT / 2.0);
+        assert_eq!(d.widget().restyles, 2);
+        assert!(d.idle_after(&outcome));
+    }
+
+    #[test]
+    fn typed_text_and_focus_survive_the_switch() {
+        use crate::tokens::{Density, theme_with_density};
+        let mut d = FrameDriver::mount(theme_with_density(Density::Comfortable), "");
+        d.frame();
+        d.pointer(PointerPhase::Down, 40.0, 20.0);
+        d.pointer(PointerPhase::Up, 40.0, 20.0);
+        d.frame();
+        assert!(d.root.is_focus_active(), "the field took focus");
+        // Typed with no app rebuild in between: the field holds text its view
+        // has never carried.
+        d.key('a');
+        d.key('b');
+        d.frame();
+        assert_eq!(d.state, "ab");
+        assert_eq!(d.field_value().as_deref(), Some("ab"));
+
+        let touch = theme_with_density(Density::Touch);
+        let m = BeuiMetrics::resolve(Some(&touch));
+        d.root.set_theme(Box::new(touch));
+        let (rec, outcome) = d.frame_at(3_000.0);
+        assert_eq!(d.widget().restyles, 1, "the switch re-styled the field");
+        assert_eq!(background_radius(&rec), m.height_input / 2.0);
+        assert_eq!(
+            d.field_value().as_deref(),
+            Some("ab"),
+            "the typed text is still in the field"
+        );
+        assert_eq!(d.state, "ab", "and no edit was reported");
+        assert!(d.root.is_focus_active(), "the field kept focus");
+        assert!(d.root.ime_state().is_some(), "and its IME session");
+        assert!(rec.ring().is_some(), "the chrome still reads focused");
+        assert!(!outcome.needs_layout && !d.root.has_pending_change_flags());
+
+        // Typing carries on from where it was.
+        d.key('c');
+        assert_eq!(d.state, "abc");
     }
 
     #[test]

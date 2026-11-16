@@ -39,8 +39,10 @@
 //! - **Desktop-first, with a touch density.** beUI's own metrics are kept as
 //!   [`Density::Comfortable`]: [`style::HEIGHT_MD`] is `h-10` = 40px and
 //!   [`style::HEIGHT_INPUT`] is `h-11` = 44px. [`Density::Touch`] is the phone
-//!   set — every control clears the platform touch minimum — carried on the
-//!   theme as [`BeuiMetrics`] and chosen with [`install_with_density`].
+//!   set, carried on the theme as [`BeuiMetrics`] and chosen with
+//!   [`install_with_density`]. Today the button and the input follow it and
+//!   clear the platform touch minimum; every other part still lays out at the
+//!   comfortable sizes until it is moved onto the metrics.
 //!
 //! # Installing it
 //!
