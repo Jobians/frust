@@ -161,6 +161,11 @@ STARTER_SET: list[tuple[str, str]] = [
     ("ARROW_DOWNWARD", "arrow_downward"),
     ("ARROW_FORWARD", "arrow_forward"),
     ("CONTENT_COPY", "content_copy"),
+    # -- status marks (warning triangle, shield, info circle) for design
+    #    systems that otherwise draw their own inline ---------------------
+    ("WARNING", "warning"),
+    ("SHIELD", "shield"),
+    ("INFO", "info"),
 ]
 
 MODULE_HEADER = '''\
