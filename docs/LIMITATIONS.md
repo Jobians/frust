@@ -3424,36 +3424,26 @@ module doc and `PaintCtx::register_focus_scope` in `crates/frust-core/src/widget
 
 ---
 
-### `overlay-no-auto-focus-on-appear` — the framework has no seam to claim focus (widget or IME) on mount
+### `overlay-no-auto-focus-on-appear` — modal and anchored hosts do not claim focus when they appear
 
-**Observed**: the framework exposes no auto-focus-on-appear hook a widget can call on mount —
-`EventCtx::request_focus` is reachable only from a widget's own event pass, which never runs for
-something nobody has touched yet. Two independent consequences: (1) neither `frust-shadcn`'s or
-`frust-beui`'s `modal`/`anchored` hosts, nor `frust_material::dialog`, claim focus when they
-appear — each claims focus only in response to a `Down` inside itself, so Escape (wired to fire
-only once the host holds focus) does nothing until a caller completes one pointer interaction with
-the overlay first; (2) `frust::TextInputView` has no `autofocus`/`request_focus` builder either, so
-`frust_material::search`'s full-screen view — whose upstream reference opens with `autoFocus: true`
-to raise the keyboard immediately — instead opens with no IME up until the user taps its field once.
+**Observed**: no overlay host claims focus on appear. Neither `frust-shadcn`'s or `frust-beui`'s `modal`/`anchored` hosts, nor
+`frust_material::dialog`, take focus when they open — each claims focus only in response to a `Down` inside itself, so Escape
+(wired to fire only once the host holds focus) does nothing until a caller completes one pointer interaction with the overlay
+first, and a modal pod's first focusable is not focused either. The framework now has the seam for a text field (`FocusHandle`,
+`autofocus`, which Material's full-screen `search` header field uses), so that half is fixed; a host has no focusable of its own to
+bind a handle to, and none of these hosts uses a handle.
 
-**Applies to**: `frust_shadcn::overlay::modal`/`anchored` and every component built on them
-(dialog, alert-dialog, sheet, drawer, command, popover, dropdown/context menu, select, combobox);
-`frust_beui::overlay::modal`/`anchored` and every beUI component built on them (same list shape,
-see PLUGINS_ARCHITECTURE.md's Design-System Plugins); `frust_material::dialog` (same gap);
-`frust_material::search`'s header field (IME-autofocus manifestation — no widget anywhere can claim
-focus programmatically on mount, text input included).
+**Applies to**: `frust_shadcn::overlay::modal`/`anchored` and every component built on them (dialog, alert-dialog, sheet,
+drawer, command, popover, dropdown/context menu, select, combobox); `frust_beui::overlay::modal`/`anchored` and every beUI
+component built on them (same list shape, see PLUGINS_ARCHITECTURE.md's Design-System Plugins); `frust_material::dialog` (same
+gap). A text field inside one of them can autofocus; the host around it still does not hold focus.
 
-**Why accepted**: a framework-level focus-management primitive (claim focus, or the text-input-
-specific `autofocus`, on mount) does not exist yet; every current design-system caller works around
-it the same documented way rather than inventing a per-crate special case. Closing the IME half
-needs a `frust-widgets` seam on `TextInputView` (an `autofocus` builder or a reachable
-`request_focus`); closing the general half needs a framework-wide claim-on-mount hook.
+**Why accepted**: a host-level claim-on-mount needs a host that is a focus stop itself, which no overlay host is today, and every
+design-system caller works around it the same documented way rather than inventing a per-crate special case.
 
-**Evidence**: `plugins/shadcn/src/overlay/modal.rs` and `plugins/shadcn/src/overlay/anchored.rs`
-module docs ("there is no auto-focus-on-appear hook in the framework");
-`plugins/beui/src/overlay/anchored.rs` module docs (same line, "there is no auto-focus-on-appear
-hook in the framework"); `plugins/material/src/search/mod.rs` module doc's "IME: no programmatic
-focus" section (explicitly names this as "the same framework gap").
+**Evidence**: `plugins/shadcn/src/overlay/modal.rs` and `plugins/shadcn/src/overlay/anchored.rs` module docs;
+`plugins/beui/src/overlay/anchored.rs` module docs; `plugins/material/src/overlay/modal.rs` module docs; the
+programmatic-focus seam in `crates/frust-core/src/focus_handle.rs`.
 
 ---
 
@@ -5135,10 +5125,9 @@ the framework."
 rides the claim-on-press model alone. Module docs call the gap out explicitly for
 buttons, split button, sliders, and the dropdown panel; every other focus-visual seam in the
 catalog (menus, dialogs, text fields) rides the identical model without its own restatement. See
-`overlay-no-auto-focus-on-appear` for the sibling gap this entry does not re-cover: no widget
-(material's `dialog`/`search` included) can claim focus programmatically **on mount** either —
-that entry is the register's existing home for the on-appear half; this entry covers the
-between-controls traversal half.
+`overlay-no-auto-focus-on-appear` for the sibling gap this entry does not re-cover: the overlay
+hosts (material's `dialog` included) claim no focus **on appear** either — that entry is the register's
+home for the on-appear half; this entry covers the between-controls traversal half.
 
 **Why accepted / fix direction**: the traversal half is now per-control catalog work — each
 control answers `is_focusable`, activates on a bare Space/Enter while focused, and reads its ring
@@ -5470,7 +5459,9 @@ width, dash on/off/phase must be finite — and an effective dash cycle must
 also be *normalizable*: its derived period `on + off` finite and positive with
 the phase reducible into it, since two individually finite lengths can
 overflow the period to `+inf` and spin kurbo's dash iterator forever) and
-refuses the frame with `EngineError::InvalidGeometry` otherwise — required for totality: a `NaN`
+refuses the frame with `EngineError::InvalidGeometry { command, kind }` otherwise (`command` is the offending command's index in the
+scene, `kind` its variant name; a filter layer refused while it is recorded reports `None` and `"PushLayer"`; a non-finite transform is
+`InvalidTransform` with the same fields), which `frust_engine::validate_scene` and `frust::testing::Tester` raise on the CPU — required for totality: a `NaN`
 corner radius on an unbounded rect made `compile` never return, and a `NaN`
 stroke width cost ~420 ms/4.8 MB producing zero strips. There is no other
 renderer to fall back to, so a scene that emits non-finite geometry (a `NaN`
@@ -8052,13 +8043,13 @@ flush per `onStop`, 12.1 ms then 0.1 ms, none for the share sheet, and the cache
 
 ---
 
-### `testing-text-runs-engine-clips` — `Tester::text_runs` sees only clips a widget declares, and no text inputs
+### `testing-text-runs-engine-clips` — `Tester::text_runs` sees only clips a widget declares, and no text-input runs
 
-**Observed**: `text_runs` and `assert_no_text_overflow` read clips only from widgets that report `InspectDetail::Clip` (scroll, list and page views, viewports and their slivers, pan/zoom, the navigator). A clip pushed by any other widget (a design-system plugin widget, a rounded clip, a custom widget) is not consulted: a run it hides while inside its ancestors' boxes is not reported, and a run it legitimately keeps outside its own box reads as `outside_parent`. A `hidden` run (scrolled fully out of view) is not checked at all, so whether an over-wide or cut run is caught depends on the scroll position. Under `PanZoomWidget` the visibility judgement assumes an identity transform: inspect bounds ignore pan and zoom. `TextInput` runs are not reported at all.
+**Observed**: `text_runs` and `assert_no_text_overflow` read clips only from widgets that report `InspectDetail::Clip` (scroll, list and page views, viewports and their slivers, pan/zoom, the navigator). A clip pushed by any other widget (a design-system plugin widget, a rounded clip, a custom widget) is not consulted: a run it hides while inside its ancestors' boxes is not reported, and a run it legitimately keeps outside its own box reads as `outside_parent`. A `hidden` run (scrolled fully out of view) is not checked at all, so whether an over-wide or cut run is caught depends on the scroll position. Under `PanZoomWidget` the visibility judgement assumes an identity transform: inspect bounds ignore pan and zoom. `TextInput` now reports its own clip (`InspectDetail::Clip`), so a single-line field's clip is consulted like any other reporting widget's; its own text runs are still not reported.
 
 **Applies to**: `frust::testing::Tester` text-run diagnostics, all hosts.
 
-**Why accepted**: a clip exists only in the compiled scene unless its widget declares it through `inspect_detail`, and the viewports that lay content out past their box are the ones that do; a text input does not report a layout through `inspect_detail`. Both remaining gaps are outside the overflow class the API targets (a label cut or wider than its box).
+**Why accepted**: a clip exists only in the compiled scene unless its widget declares it through `inspect_detail`, and the viewports that lay content out past their box are the ones that do; a text input's text is laid out by its editor and does not report a run through `inspect_detail`. Both remaining gaps are outside the overflow class the API targets (a label cut or wider than its box).
 
 **Evidence**: `crates/frust/src/testing/text.rs` (module docs), `crates/frust-core/src/tree.rs` (`InspectDetail::Clip`).
 
@@ -8715,5 +8706,131 @@ shows the guard works, not that it was needed. Notification display was not obse
 **Trigger for removal**: a per-widget action contract that does not go through hit testing.
 
 **Evidence**: `crates/frust-core/src/app/semantics.rs` (click delivery) and `crates/frust-widgets/src/semantics.rs` (`tappable`). Code and headless tests; not run on a device.
+
+---
+
+### `photo-library-ios-no-size-bytes` — `Asset::size_bytes` is `None` on iOS
+
+**Observed**: `AssetQuery::with_details()` fills `Asset::size_bytes` on Android from `MediaStore`; on iOS it stays `None`, as it does on desktop. A size of zero or less from the platform also reads as `None`.
+
+**Applies to**: apps that show or budget by an asset's original size on iOS.
+
+**Workaround**: export the original (`export_original`) and read the file's length, or treat `None` as unknown.
+
+**Why accepted**: PhotoKit exposes no documented accessor for an asset resource's file size, so iOS reports no figure rather than one read from an undocumented key.
+
+**Trigger for removal**: Apple documents a size accessor for `PHAssetResource`.
+
+**Evidence**: `plugins/photo-library/src/apple_library.rs` (the detail row builder), `plugins/photo-library/README.md`.
+
+---
+
+### `testing-back-press-shared-per-thread` — two Testers on one thread share one Back press
+
+**Observed**: under the `test-support` feature a Back press is delivered to the back consumers on the thread that pushed it, so parallel tests on separate threads no longer see each other's presses. Two `Tester`s built on one thread still share the counter and the handles-back flag: a press pushed for one is seen by the other.
+
+**Applies to**: a test that builds more than one `Tester` on a thread and pushes a Back press.
+
+**Workaround**: keep one live Tester per thread when a test pushes a Back press, or drop the first before building the second.
+
+**Why accepted**: the source is keyed by thread, not by Tester, and a Tester does not own it.
+
+**Trigger for removal**: each Tester owns its Back source.
+
+**Evidence**: `crates/frust-reactive/src/back.rs` (`push_back_press` docs and the `test-support` thread-locals).
+
+---
+
+### `back-press-per-thread-under-test-support` — the `test-support` feature makes the Back source per-thread for the whole build
+
+**Observed**: with the `test-support` feature of `frust-reactive` enabled, the Back counter and the handles-back flag are thread-local for every consumer in that build, not only for tests. Cargo feature unification enables it for the whole build graph, so a binary built with it on (a test-support dev build of an app) reads a flag a shell thread wrote on another thread as `false`.
+
+**Applies to**: builds that enable `test-support` outside a test harness; a shell that pushes a press or polls the flag from a thread other than the UI thread under such a build.
+
+**Workaround**: keep `test-support` to dev-dependencies and test builds.
+
+**Why accepted**: a thread-local source is what makes parallel tests independent; a release build does not enable the feature.
+
+**Trigger for removal**: the per-thread source is selected at runtime rather than by feature.
+
+**Evidence**: `crates/frust-reactive/src/back.rs` (`COUNTER_HERE`, `HANDLES_BACK_HERE`).
+
+---
+
+### `animation-driven-custom-layout-unsupported` — no supported way to drive a custom layout from an animation value
+
+**Observed**: a widget that wants its own layout to follow an animation value (a size or offset that animates between layouts) has no supported route to the running driver: `PresenceWidget::driver()` returns the `Presence` for inspection only, and the animation vocabulary animates paint properties (opacity, scale, transform), not a custom `layout` input.
+
+**Applies to**: custom widgets that need a layout driven by an animation value.
+
+**Workaround**: animate a transform of an already laid-out child, or step app state and rebuild.
+
+**Why accepted**: no layout-driving animation seam exists; the driver a `PresenceWidget` holds is exposed for inspection only.
+
+**Trigger for removal**: a layout-driving animation seam is added.
+
+**Evidence**: `crates/frust-widgets/src/motion/presence.rs` (`PresenceWidget::driver`).
+
+---
+
+### `text-input-placeholder-clipped-not-ellipsized` — a single-line placeholder wider than the field is cut, not ellipsized
+
+**Observed**: a single-line `text_input` clips its placeholder to the inner box; a placeholder longer than the box is cut at the edge with no ellipsis, and is never scrolled.
+
+**Applies to**: single-line fields with a long placeholder in a narrow box.
+
+**Workaround**: shorten the placeholder or widen the field.
+
+**Why accepted**: the placeholder is clipped to the inner box and never scrolled; no overflow policy is applied to it.
+
+**Trigger for removal**: the placeholder gains an ellipsis or scroll policy.
+
+**Evidence**: `crates/frust-widgets/src/textinput.rs` (module docs, Clipping and scrolling).
+
+---
+
+### `long-press-global-position-lag` — a long press's `global_position` can lag an ancestor that moves without repainting the detector
+
+**Observed**: `LongPressMoveDetails::global_position` and `LongPressEndDetails::global_position` are the window origin the detector last painted at plus the local position. When an ancestor moves while the detector is not repainted (a controller scroll during a live press under a repaint boundary), the value lags the true window position; under a scaled ancestor it is not exact.
+
+**Applies to**: `on_long_press_move_update` and `on_long_press_end` consumers that map `global_position` to window space while an ancestor scrolls or scales.
+
+**Workaround**: use `local_position` and `offset_from_origin`, which do not depend on the painted origin.
+
+**Why accepted**: the detector reads the origin it last painted at, which is exact while nothing above it moves unpainted.
+
+**Trigger for removal**: the detector learns its window origin at event time.
+
+**Evidence**: `crates/frust-widgets/src/gesture.rs` (`LongPressMoveDetails`, `on_long_press_move_update` docs).
+
+---
+
+### `focus-handle-request-pending-after-unbind` — a focus request whose field the same rebuild unbinds stays pending
+
+**Observed**: a `FocusHandle` request whose field is unbound by the rebuild that follows (the field left the tree or stopped binding the handle) is not dropped: it stays pending until a field binds the handle again, then focuses it. A handle that stops being bound while its widget stays mounted gets no `on_focus_change` notice either.
+
+**Applies to**: apps that keep a `FocusHandle` across fields that come and go, or hand one handle to a field conditionally.
+
+**Workaround**: call `release()` on a handle that is no longer wanted, and bind a handle on every paint of the field it addresses.
+
+**Why accepted**: a request made before the field mounts is a supported use, so a request with no bound field is kept rather than dropped.
+
+**Trigger for removal**: a request carries a lifetime, or a handle is tied to its root.
+
+**Evidence**: `crates/frust-core/src/focus_handle.rs` (module and type docs).
+
+---
+
+### `focus-and-long-press-drag-no-device-evidence` — programmatic focus and the long-press drag have no device evidence yet
+
+**Observed**: `FocusHandle`, `autofocus`, `keep_focus`, the focus notice and the long-press follow-ups with their scroll veto are covered by headless tests only. No recorded run on an Android phone, an iPhone or macOS exists for the soft keyboard coming up on a request, a press that keeps focus, or a drag after a fired long press inside a scroll view.
+
+**Applies to**: all hosts; the keyboard and the touch path are what a headless test cannot show.
+
+**Why accepted**: the device gate walks the playground's Forms page after this change lands; until it is recorded the behaviour is code and headless-test only.
+
+**Trigger for removal**: the device gate's results are recorded.
+
+**Evidence**: `crates/frust/tests/text_input_focus.rs` and the long-press tests in `crates/frust-widgets/src/gesture.rs`; no device run.
 
 ---
