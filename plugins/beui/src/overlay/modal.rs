@@ -1226,6 +1226,10 @@ impl Widget for ModalWidget {
         self.fire_staged_close(ctx);
         if self.return_focus && (was_visible || self.is_visible()) {
             ctx.register_focus_scope(self.scope_key);
+            if !self.is_visible() {
+                // The scope closes on the paint after this one, and nothing else asks for it.
+                ctx.request_frame();
+            }
         }
         if self.escape_armed && self.dismissable() {
             ctx.register_shortcut(ShortcutDecl {
@@ -3368,6 +3372,36 @@ mod tests {
                 "press inside: {press_inside}"
             );
         }
+    }
+
+    /// A shell paints only the frames something asked for: the host asks for
+    /// the one after its exit settles, the paint that closes its scope.
+    #[test]
+    fn the_host_asks_for_the_paint_that_closes_its_scope() {
+        let mut h = FieldStack::new(true);
+        h.click(Point::new(10.0, 10.0));
+        h.frame(10);
+        let mut y = 12.0;
+        while !h.state.open {
+            y += 6.0;
+            assert!(y < 200.0, "the button is under the field");
+            h.click(Point::new(20.0, y));
+        }
+        h.frame(SETTLED);
+        h.state.open = false;
+        let mut ms = SETTLED + 2;
+        for painted in 0.. {
+            assert!(painted < 1000, "the exit settles");
+            h.pass();
+            let at = FrameTime::from_nanos(ms * 1_000_000);
+            let outcome = h.root.paint(&mut Recorder::default(), at);
+            if !outcome.needs_frame || typed_into(&mut h.root, &mut h.state).is_some() {
+                break;
+            }
+            ms += 16;
+        }
+        h.pass();
+        assert_eq!(typed_into(&mut h.root, &mut h.state), Some("below"));
     }
 
     /// A press the panel takes on the frame before its exit settles is still
