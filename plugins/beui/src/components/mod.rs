@@ -1,5 +1,6 @@
-//! The component modules, one per ported beUI component — the catalog's
-//! interaction primitives (controls, overlays, navigation, motion effects).
+//! The component modules: one per ported beUI component — the catalog's
+//! interaction primitives (controls, overlays, navigation, motion effects) — and
+//! the parts added in this repository for phone content.
 //!
 //! Two conventions keep the three sibling catalogs (`components`, [`agents`],
 //! [`blocks`]) workable side by side:
@@ -8,8 +9,11 @@
 //!   never a bare `Variant` or `Size`. The three families cover overlapping
 //!   ground (a swap control here, a swap block there), so an unprefixed name is
 //!   a collision waiting for the next module to land.
-//! - **The module list is fixed up front.** Every planned component has a module
-//!   from the start, so adding one never touches this file or `lib.rs`.
+//! - **The module list holds both kinds.** Every ported component has had a
+//!   module from the start, so porting one never touches this file or `lib.rs`.
+//!   The parts added in this repository for phone content have no upstream
+//!   component behind them: [`alert`], [`avatar`], [`card`], [`chip`],
+//!   [`grouped_list`] and [`key_value`]. A new one of those adds its module here.
 //!
 //! [`agents`]: crate::agents
 //! [`blocks`]: crate::blocks
