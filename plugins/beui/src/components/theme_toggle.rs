@@ -27,7 +27,9 @@
 //! catalogs' own demo apps use (`examples/glyph-catalog`'s `apply_theme`,
 //! `examples/huddle`'s settings use case): a [`ThemeBuilder`](frust::ThemeBuilder)
 //! over this catalog's own [`theme()`](crate::theme) with the wanted brightness
-//! pinned. The override is process-global and the running shell picks it up on
+//! pinned and, when the live theme carries a [`BeuiMetrics`] extension, that same
+//! extension re-attached — so toggling light/dark keeps an app's density instead
+//! of falling back to the comfortable set. The override is process-global and the running shell picks it up on
 //! its next frame.
 //!
 //! That is deliberately `set_app_theme` and not
@@ -72,8 +74,8 @@ use crate::style::{
     ACTIVE_CURSOR, PATH_TOLERANCE, PRESS_SCALE, RADIUS_ICON_BUTTON, SIZE_ICON_BUTTON,
     resolve_radius, scale_alpha,
 };
-use crate::tokens::BEUI_LIGHT;
 use crate::tokens::motion::{EASE_IN_OUT, EASE_OUT, SPRING_PRESS};
+use crate::tokens::{BEUI_LIGHT, BeuiMetrics};
 
 /// How long a rectangle wipe takes — `beui-rect-reveal 400ms`.
 pub const RECT_REVEAL: Duration = Duration::from_millis(400);
@@ -356,12 +358,39 @@ pub struct ThemeToggleWidget {
     /// When the reveal started, latched on its first paint.
     reveal: Option<FrameTime>,
     drive_app_theme: bool,
+    /// The [`BeuiMetrics`] the live theme carried at the last paint, re-attached
+    /// to the theme this toggle pushes.
+    live_metrics: Option<BeuiMetrics>,
     press: Sprung,
     /// Armed by a `Down` inside, cleared on `Up`/`Cancel`.
     captured: bool,
     /// A press state change waiting for a clock — only `paint` has one.
     press_pending: bool,
     on_toggle: ErasedArgCallback<Brightness>,
+}
+
+/// The theme the toggle pushes for `next` when the live theme is `live`: this
+/// catalog's [`theme()`](crate::theme) with `next` pinned, carrying the live
+/// theme's [`BeuiMetrics`] when it has one (so the density survives) and none
+/// when it does not. Pure: it never touches the process-global theme slot. The
+/// widget reaches the live theme only at paint, so it keeps the resolved
+/// extension and calls [`theme_with_metrics`]; this is the same step over a
+/// whole theme, which the tests drive.
+#[cfg(test)]
+fn toggled_theme(live: Option<&Theme>, next: Brightness) -> Theme {
+    theme_with_metrics(
+        live.and_then(|t| t.extension::<BeuiMetrics>()).copied(),
+        next,
+    )
+}
+
+/// [`toggled_theme`] over an already-resolved extension.
+fn theme_with_metrics(metrics: Option<BeuiMetrics>, next: Brightness) -> Theme {
+    let builder = Theme::builder(crate::theme()).brightness(next);
+    match metrics {
+        Some(metrics) => builder.extension(metrics).build(),
+        None => builder.build(),
+    }
 }
 
 impl ThemeToggleWidget {
@@ -413,7 +442,7 @@ impl ThemeToggleWidget {
             // The catalogs' own demo mechanism: a builder over this design
             // system's theme with the wanted brightness pinned, pushed through
             // the app-override slot.
-            frust::set_app_theme(Theme::builder(crate::theme()).brightness(next).build());
+            frust::set_app_theme(theme_with_metrics(self.live_metrics, next));
         }
         // The reveal plays from here whether or not the ambient theme follows;
         // a controlled toggle whose owner refuses the change simply reveals
@@ -438,6 +467,7 @@ impl<State: 'static> View<State> for ThemeToggleView<State> {
             outgoing: None,
             reveal: None,
             drive_app_theme: self.drive_app_theme,
+            live_metrics: None,
             press: Sprung::resting(1.0),
             captured: false,
             press_pending: false,
@@ -493,6 +523,7 @@ impl Widget for ThemeToggleWidget {
         let theme = Theme::from_paint_ctx(ctx);
         let reduce = theme.is_some_and(|t| t.motion.reduce_motion);
         let ink = theme.map_or(FALLBACK_INK, |t| t.scheme().on_surface);
+        self.live_metrics = theme.and_then(|t| t.extension::<BeuiMetrics>()).copied();
         // An uncontrolled toggle shows whatever the ambient theme reports, which
         // is what makes the self-driving form correct with no app state.
         if self.pinned.is_none()
@@ -843,6 +874,32 @@ mod tests {
     use frust::authoring::{Key, KeyEvent, Modifiers, NamedKey, PointerButton, PointerEvent};
     use frust_core::{BuildCtx, EventCtx, PaintCtx};
     use std::any::Any;
+
+    #[test]
+    fn toggled_theme_keeps_the_live_density() {
+        use crate::tokens::{Density, theme_with_density};
+        let touch = theme_with_density(Density::Touch);
+        let next = toggled_theme(Some(&touch), Brightness::Dark);
+        assert_eq!(next.brightness, Brightness::Dark);
+        assert_eq!(
+            BeuiMetrics::resolve(Some(&next)),
+            BeuiMetrics::for_density(Density::Touch)
+        );
+        assert!(next.extension::<BeuiMetrics>().is_some());
+    }
+
+    #[test]
+    fn toggled_theme_over_a_plain_theme_carries_no_metrics() {
+        let plain = crate::theme();
+        let next = toggled_theme(Some(&plain), Brightness::Dark);
+        assert_eq!(next.brightness, Brightness::Dark);
+        assert!(next.extension::<BeuiMetrics>().is_none());
+        assert!(
+            toggled_theme(None, Brightness::Light)
+                .extension::<BeuiMetrics>()
+                .is_none()
+        );
+    }
 
     /// The box every paint test lays the toggle into.
     const BOX: Size = Size::new(SIZE_ICON_BUTTON, SIZE_ICON_BUTTON);

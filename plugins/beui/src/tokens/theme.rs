@@ -25,6 +25,10 @@
 //! 7. `extension`: [`BeuiTokens`] (ring/glass/gradients/brand hues) and
 //!    [`NativeTypefaces`] (the bundled faces, for native controls).
 //!
+//! [`theme_with_density`] is the same theme plus one more extension,
+//! [`BeuiMetrics`] for the chosen [`Density`]; plain [`theme()`](fn@theme)
+//! carries none, which [`BeuiMetrics::resolve`] reads as the comfortable set.
+//!
 //! `Elevation` and `MotionScheme` stay at the neutral floor. beUI's shadows are
 //! Tailwind's flat CSS ladder picked per component rather than levels derived
 //! from a dp value, so they live in [`crate::style`] as constants; its motion
@@ -109,6 +113,7 @@ use frust::{
 };
 
 use super::fonts::{self, GEIST_VARIABLE_INDEX};
+use super::metrics::{BeuiMetrics, Density};
 use super::palette::{BEUI_DARK, BEUI_LIGHT, BeuiGlass, BeuiGradient, BeuiPalette};
 
 /// This design system's stable identity tag, carried on
@@ -669,6 +674,16 @@ pub fn theme() -> Theme {
         .extension(MonospaceFamily {
             family: mono_family(),
         })
+        .build()
+}
+
+/// The beUI theme with the [`BeuiMetrics`] extension for `density` attached —
+/// [`theme()`](fn@theme) otherwise unchanged.
+///
+/// This is what [`install_with_density`](crate::install_with_density) seeds.
+pub fn theme_with_density(density: Density) -> Theme {
+    ThemeBuilder::new(theme())
+        .extension(BeuiMetrics::for_density(density))
         .build()
 }
 
