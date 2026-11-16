@@ -67,7 +67,9 @@
 //! wiring-bug convention `push_back_press`/`Executor::spawn_local` enforce.
 
 use std::cell::RefCell;
+#[cfg(not(feature = "test-support"))]
 use std::sync::OnceLock;
+#[cfg(not(feature = "test-support"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use reactive_graph::signal::RwSignal;
@@ -91,13 +93,26 @@ pub struct BackPresses {
 /// [`deep_link`](crate::deep_link)'s slot) under the reactive root
 /// [`Owner`](reactive_graph::owner::Owner) on first access once
 /// [`ReactiveRuntime`] exists.
+#[cfg(not(feature = "test-support"))]
 static COUNTER: OnceLock<RwSignal<u64>> = OnceLock::new();
 
 /// The process-global "framework handles the next back press" flag. A plain
 /// [`AtomicBool`] (no reactive tracking — a shell polls it), defaulting to
 /// `false` (see the module docs' `handles_back` section). The **fallback**
 /// answer [`handles_back`] returns when no live provider is registered.
+#[cfg(not(feature = "test-support"))]
 static HANDLES_BACK: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "test-support")]
+thread_local! {
+    /// Under `test-support`, each thread has its own back-press counter, so a press pushed
+    /// on one test thread is never observed by another's consumers.
+    static COUNTER_HERE: std::cell::OnceCell<RwSignal<u64>> = const { std::cell::OnceCell::new() };
+
+    /// Under `test-support`, the polled flag is per thread too, so parallel tests cannot
+    /// overwrite each other's answer.
+    static HANDLES_BACK_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 thread_local! {
     /// The live "can the framework pop?" provider (see the module docs' timing
@@ -162,14 +177,22 @@ impl CanPopRegistration {
 /// ([`push_back_press`]'s pre-init case is handled separately, before this is
 /// ever reached): the caller must initialize the runtime first.
 fn counter() -> RwSignal<u64> {
-    *COUNTER.get_or_init(|| {
+    let create = || {
         let rt = ReactiveRuntime::get().expect(
             "frust-reactive: back_presses() was called before ReactiveRuntime::init — an app \
              must run under the Frust facade's entry point (which initializes the reactive \
              runtime) before reading back presses",
         );
         rt.with_owner(|| RwSignal::new(0))
-    })
+    };
+    #[cfg(not(feature = "test-support"))]
+    {
+        *COUNTER.get_or_init(create)
+    }
+    #[cfg(feature = "test-support")]
+    {
+        COUNTER_HERE.with(|here| *here.get_or_init(create))
+    }
 }
 
 /// Deliver a platform back press into the process-wide source. Called by a
@@ -185,6 +208,10 @@ fn counter() -> RwSignal<u64> {
 /// Panics if called off the UI thread (see the module docs' thread contract).
 /// A call before [`ReactiveRuntime::init`] does **not** panic — it is dropped
 /// with a logged warning (see the module docs).
+///
+/// With the `test-support` feature, a press is observed only by back consumers
+/// on the thread that pushed it, so tests running on separate threads do not
+/// see each other's presses (two testers on one thread still share a press).
 pub fn push_back_press() {
     if !is_ui_thread() {
         panic!(
@@ -222,7 +249,10 @@ pub fn back_presses() -> BackPresses {
 /// Unlike [`push_back_press`], this carries no thread constraint (it is a plain
 /// atomic store — the `theme_override` precedent).
 pub fn set_handles_back(handles: bool) {
+    #[cfg(not(feature = "test-support"))]
     HANDLES_BACK.store(handles, Ordering::Relaxed);
+    #[cfg(feature = "test-support")]
+    HANDLES_BACK_HERE.with(|flag| flag.set(handles));
 }
 
 /// Register a live provider [`handles_back`] consults to answer "would a back
@@ -299,7 +329,14 @@ pub fn handles_back() -> bool {
     if let Some(answer) = CAN_POP_PROVIDER.with(|slot| slot.borrow().as_ref().map(|(_, f)| f())) {
         return answer;
     }
-    HANDLES_BACK.load(Ordering::Relaxed)
+    #[cfg(not(feature = "test-support"))]
+    {
+        HANDLES_BACK.load(Ordering::Relaxed)
+    }
+    #[cfg(feature = "test-support")]
+    {
+        HANDLES_BACK_HERE.with(std::cell::Cell::get)
+    }
 }
 
 #[cfg(test)]
