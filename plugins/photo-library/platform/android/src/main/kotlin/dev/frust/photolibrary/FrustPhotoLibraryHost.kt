@@ -289,7 +289,8 @@ object FrustPhotoLibraryHost {
      * [assets]: parallel arrays for one page; [total] counts the whole query.
      * [modified] is `DATE_MODIFIED` in seconds; [favorites] is 1, 0 or -1 when
      * the platform does not report it; [names] and [types] are filled only when
-     * the call asked for details and hold only nulls otherwise.
+     * the call asked for details and hold only nulls otherwise; [sizes] is the
+     * original's `SIZE` in bytes, -1 when unknown or not asked for.
      */
     class AssetsResult(
         @JvmField val code: Int,
@@ -304,6 +305,7 @@ object FrustPhotoLibraryHost {
         @JvmField val favorites: IntArray,
         @JvmField val names: Array<String?>,
         @JvmField val types: Array<String?>,
+        @JvmField val sizes: LongArray,
     )
 
     /**
