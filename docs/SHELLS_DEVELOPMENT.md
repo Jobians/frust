@@ -479,6 +479,10 @@ ramp and the soft keyboard on focus return wait for a demo that runs on phones.
   ("hi, edit text") but not one reached with Tab. VO-Space opens the dialog and closes it from
   Discard; focus then returns nowhere and the VoiceOver cursor is left on the closed button's
   empty rectangle. Each focused field scrolls the page about 66 px, so the page does scroll here.
+- **beUI, macOS re-walk after the fix: focus return passes.** The beUI button is no traversal
+  stop, so focus returns to the last stop that held it, the Composer: after Discard, and after
+  Escape following a click inside the panel, a typed letter lands in the Composer, reached by
+  pointer or by Tab; with step 6's toggle off nothing holds focus. Windows was not re-walked.
 
 ## Browser manual gate (web)
 
