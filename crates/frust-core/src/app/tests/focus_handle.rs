@@ -19,6 +19,8 @@ struct Log {
     open: HashSet<&'static str>,
     /// Holders whose inner field the next rebuild unmounts.
     gone: HashSet<&'static str>,
+    /// Holders (by label) the next rebuild unmounts whole.
+    removed: HashSet<&'static str>,
     /// Pressed widgets that call `keep_focus`.
     keep: HashSet<&'static str>,
     /// Pressed widgets that call `request_focus`.
@@ -339,11 +341,21 @@ impl View<()> for TreeView {
     fn rebuild(&self, _prev: &Self, element: &mut Column, _ctx: &mut BuildCtx<'_>) -> ChangeFlags {
         let log = self.log.borrow();
         let mut flags = ChangeFlags::NONE;
+        let before = element.children.len();
+        element.children.retain(|pod| {
+            !pod.debug_label()
+                .is_some_and(|name| log.removed.contains(name))
+        });
+        if element.children.len() != before {
+            flags = ChangeFlags::LAYOUT | ChangeFlags::PAINT;
+        }
         for pod in &mut element.children {
-            let Some(name) = pod.debug_label().filter(|name| log.gone.contains(name)) else {
+            if !pod
+                .debug_label()
+                .is_some_and(|name| log.gone.contains(name))
+            {
                 continue;
-            };
-            let _ = name;
+            }
             if let Some(holder) = pod.widget_mut().downcast_mut::<Holder>()
                 && holder.inner.take().is_some()
             {
@@ -758,15 +770,16 @@ fn a_notification_reaches_the_widget_whose_focus_a_modal_trap_ended() {
 }
 
 #[test]
-fn a_notification_reaches_the_widget_whose_focused_descendant_was_unmounted() {
-    let log = log_with_handles(&["outer"]);
+fn an_ancestors_handle_reads_unfocused_while_a_descendant_holds() {
+    let log = log_with_handles(&["outer", "inner"]);
     let mut h = Harness::with_log(log, nested);
     h.tap(5.0, row(0));
+    assert!(h.handle("inner").is_focused());
     assert!(
-        h.handle("outer").is_focused(),
-        "an ancestor of the holder holds it"
+        !h.handle("outer").is_focused(),
+        "an ancestor is not the holder"
     );
-    assert_eq!(h.notices(), vec![("outer", true)]);
+    assert_eq!(h.notices(), vec![("inner", true)]);
 
     h.log.borrow_mut().gone.insert("outer");
     h.asked = true;
@@ -775,8 +788,97 @@ fn a_notification_reaches_the_widget_whose_focused_descendant_was_unmounted() {
         !h.root.is_focus_active(),
         "the orphan release ended the session"
     );
-    assert_eq!(h.notices(), vec![("outer", false)]);
     assert!(!h.handle("outer").is_focused());
+    assert_eq!(
+        h.notices(),
+        vec![],
+        "the ancestor never held, so none is owed"
+    );
+}
+
+#[test]
+fn a_request_on_an_ancestor_moves_the_session_to_it() {
+    let log = log_with_handles(&["outer", "inner"]);
+    let mut h = Harness::with_log(log, nested);
+    h.tap(5.0, row(0));
+    let epoch = h.root.focus_epoch();
+
+    h.handle("outer").request();
+    h.pump();
+    assert!(h.root.is_focus_active());
+    assert_ne!(
+        h.root.focus_epoch(),
+        epoch,
+        "the request was not dropped as held"
+    );
+    assert!(h.handle("outer").is_focused());
+    assert!(!h.handle("inner").is_focused());
+}
+
+#[test]
+fn a_release_on_an_ancestor_leaves_the_descendants_session_alone() {
+    let log = log_with_handles(&["outer", "inner"]);
+    let mut h = Harness::with_log(log, nested);
+    h.tap(5.0, row(0));
+    let epoch = h.root.focus_epoch();
+
+    h.handle("outer").release();
+    h.pump();
+    assert!(h.root.is_focus_active());
+    assert_eq!(h.root.focus_epoch(), epoch);
+    assert!(h.handle("inner").is_focused());
+    assert_eq!(h.focused(), Some("inner"));
+}
+
+#[test]
+fn unmounting_the_holders_ancestor_ends_the_session_and_notifies_the_survivors_only() {
+    let log = log_with_handles(&["a", "inner"]);
+    let mut h = Harness::with_log(log, nested);
+    h.tap(5.0, row(0));
+    assert_eq!(h.notices(), vec![("inner", true)]);
+
+    h.log.borrow_mut().removed.insert("outer");
+    h.asked = true;
+    h.pump();
+    assert!(!h.root.is_focus_active());
+    assert!(
+        !h.handle("inner").is_focused(),
+        "the unbound handle reads unfocused"
+    );
+    assert!(!h.handle("a").is_focused());
+    assert_eq!(h.notices(), vec![], "the survivor never held focus");
+    assert_eq!(h.focused(), None);
+}
+
+#[test]
+fn a_kept_press_stamp_never_comes_back_as_a_later_claim_epoch() {
+    let log = log_with_handles(&[]);
+    log.borrow_mut().claim.insert("late_claimer");
+    log.borrow_mut().keep.insert("keeper");
+    let mut h = Harness::with_log(log, two_fields);
+    h.tap(5.0, row(0));
+    // The first kept press has a claimer that ran before the keep, so its stamp stands (a keep
+    // made first suppresses the claim outright); the second claims nothing. No Up and no paint
+    // runs between them (an Up clears a pod's link), so the stamp is still there when the claim
+    // lands.
+    for y in [row(6), row(4), row(1)] {
+        h.root.event(&mut (), &pointer(PointerPhase::Down, 5.0, y));
+    }
+    h.asked = true;
+    h.pump();
+    assert_eq!(h.focused(), Some("b"));
+    let mut holders = 0;
+    let root = h.root.tree.pod(h.root.root_id.unwrap()).unwrap();
+    root.widget()
+        .visit_children(&mut |child| count_live_links(child, &mut holders));
+    assert_eq!(holders, 1, "only b holds a link on the live session");
+}
+
+/// The pods under `pod` (itself included) whose link names the live session.
+fn count_live_links(pod: &ChildPod, count: &mut usize) {
+    *count += usize::from(pod.holds_live_focus());
+    pod.widget()
+        .visit_children(&mut |child| count_live_links(child, count));
 }
 
 #[test]

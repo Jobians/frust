@@ -55,13 +55,9 @@ fn advance_focus_epoch(epoch: u64) -> u64 {
     }
 }
 
-/// [`advance_focus_epoch`], stepping over `burned`: an epoch a press that kept focus may have
-/// stamped on pods without committing it, so no session ever takes that value.
+/// [`advance_focus_epoch`] from the later of `epoch` and `burned`: no session reuses a stamp.
 fn advance_focus_epoch_past(epoch: u64, burned: u64) -> u64 {
-    match advance_focus_epoch(epoch) {
-        next if next == burned => advance_focus_epoch(next),
-        next => next,
-    }
+    advance_focus_epoch(epoch.max(burned))
 }
 
 /// What [`RenderRoot::event`]'s overlay pre-pass decided about one incoming event.
@@ -110,7 +106,7 @@ pub struct RenderRoot<State: 'static, V: View<State>> {
     focus_notice: Vec<u64>,
     /// `(focus_epoch, focus_active, overlay count)` as the handles were last refreshed; `None` forces a refresh.
     handles_synced: Option<(u64, bool, usize)>,
-    /// A claim epoch stamped on pods by a press that kept focus; never handed to a session.
+    /// The highest claim epoch a kept press may have stamped on pods; sessions only advance past it.
     burned_epoch: u64,
     /// The last committed focus target and the open focus-return scopes (`crate::focus_scope`).
     focus_returns: FocusReturns,

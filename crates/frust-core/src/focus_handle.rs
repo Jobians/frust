@@ -19,6 +19,9 @@
 //! [`EventCtx::focus_changed`](crate::event::EventCtx::focus_changed) to that stop's widget, with
 //! `has_focus()` read from the live session and `&mut State` in scope, for an app callback. A
 //! widget compares with the value it last reported: its own pass's changes are announced too.
+//! A handle's stop holds the session only when it is the holder itself, not an ancestor of it.
+//! The notice needs every ancestor to forward the broadcast; a handle bound from a pod that is no
+//! traversal stop makes its requests no-ops.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

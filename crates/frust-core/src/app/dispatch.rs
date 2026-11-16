@@ -77,6 +77,8 @@ struct FocusStop {
     surface: Option<OverlayKey>,
     /// Whether the pod and every ancestor hold live focus links.
     current: bool,
+    /// Whether this stop is the session's holder: the deepest `current` stop of the walk.
+    holder: bool,
 }
 
 /// The traversal walk's state: the floated pods the last paint drew, and the stops so far.
@@ -107,6 +109,7 @@ impl FocusWalk<'_> {
                 id,
                 surface,
                 current: chain,
+                holder: false,
             });
         }
         widget.visit_focus_children(&mut |child| self.visit(child, chain, surface));
@@ -232,7 +235,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         }
         if root.kept_focus {
             // Pods may have stamped the candidate epoch for a claim that was then ignored.
-            self.burned_epoch = frame.candidate_focus_epoch;
+            self.burned_epoch = self.burned_epoch.max(frame.candidate_focus_epoch);
         }
         root.ime_published = root.ime.is_some();
         self.publish_ime(event, root.focus_req, root.ime.take());
@@ -871,7 +874,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             let Some(stop) = stops.iter().find(|stop| stop.id == stop_id) else {
                 continue;
             };
-            let holds = self.focus_active && stop.current;
+            let holds = self.focus_active && stop.holder;
             match intent {
                 Intent::Request if !holds && self.grant_focus(state, stop) => {
                     self.set_keyboard_focus(false);
@@ -908,7 +911,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         let stops = self.focus_stops();
         let mut changed = false;
         for bound in &self.focus_handles {
-            let held = self.focus_active && stops.iter().any(|s| s.id == bound.stop && s.current);
+            let held = self.focus_active && stops.iter().any(|s| s.id == bound.stop && s.holder);
             bound.handle.set_focused(held);
             if bound.handle.note_seen(held) {
                 changed = true;
@@ -968,10 +971,14 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
                     id: ROOT_STOP,
                     surface: None,
                     current: chain,
+                    holder: false,
                 });
             }
             root.widget()
                 .visit_focus_children(&mut |pod| walk.visit(pod, chain, None));
+        }
+        if let Some(last) = walk.stops.iter_mut().rfind(|stop| stop.current) {
+            last.holder = true;
         }
         walk.stops
     }
