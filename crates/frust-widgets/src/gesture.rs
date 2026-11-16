@@ -67,6 +67,14 @@
 //!   hold-progress exactly as before, even when no drag slop has been crossed
 //!   yet; a drag recognizer can still start later in the same press. A
 //!   long-press that already fired keeps the press: no drag starts after it.
+//!   With [`on_long_press_move_update`](GestureDetectorView::on_long_press_move_update),
+//!   [`on_long_press_end`](GestureDetectorView::on_long_press_end) or
+//!   [`on_long_press_cancel`](GestureDetectorView::on_long_press_cancel) set,
+//!   the fired press also reports its later moves, release and cancellation,
+//!   and until its `Up` or `Cancel` it vetoes every enclosing scroll surface
+//!   (on both axes) so none takes the drag over or cancels the detector;
+//!   before the long-press fires a drag past the slop still scrolls and
+//!   cancels the press.
 //! - **Cancel.** A platform `Cancel` before any drag started stays silent, as
 //!   for a tap. A `Cancel` after a drag started owes that recognizer's `cancel`
 //!   callback, but the `Cancel` arm itself never reaches application state (a
@@ -420,6 +428,36 @@ pub struct DoubleTapDetails {
     pub local_position: Point,
 }
 
+/// What an `on_long_press_move_update` callback receives for one `Move` of a
+/// press whose long-press has fired.
+///
+/// `#[non_exhaustive]` so fields can be added later; read the public fields.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct LongPressMoveDetails {
+    /// The pointer position, in the detector's coordinates. It may lie
+    /// outside the detector's bounds.
+    pub local_position: Point,
+    /// The pointer position in window coordinates.
+    pub global_position: Point,
+    /// The movement since the position at which the long press fired.
+    pub offset_from_origin: Vec2,
+}
+
+/// What an `on_long_press_end` callback receives when the press whose
+/// long-press fired is released.
+///
+/// `#[non_exhaustive]` so fields can be added later; read the public fields.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct LongPressEndDetails {
+    /// The release position, in the detector's coordinates. It may lie
+    /// outside the detector's bounds.
+    pub local_position: Point,
+    /// The release position in window coordinates.
+    pub global_position: Point,
+}
+
 /// Milliseconds from `earlier` to `now` on the paint clock, `0.0` if `now` is
 /// not later.
 fn elapsed_ms(now: FrameTime, earlier: FrameTime) -> f64 {
@@ -615,6 +653,9 @@ pub struct GestureDetectorView<State: 'static> {
     child: AnyView<State>,
     on_tap: Option<GestureCallback<State>>,
     on_long_press: Option<GestureCallback<State>>,
+    on_long_press_move_update: Option<TypedArgCallback<State, LongPressMoveDetails>>,
+    on_long_press_end: Option<TypedArgCallback<State, LongPressEndDetails>>,
+    on_long_press_cancel: Option<GestureCallback<State>>,
     on_tap_down: Option<TypedArgCallback<State, TapDownDetails>>,
     on_tap_up: Option<TypedArgCallback<State, TapUpDetails>>,
     on_tap_cancel: Option<GestureCallback<State>>,
@@ -636,6 +677,9 @@ pub fn GestureDetector<State: 'static, V: View<State>>(child: V) -> GestureDetec
         child: any(child),
         on_tap: None,
         on_long_press: None,
+        on_long_press_move_update: None,
+        on_long_press_end: None,
+        on_long_press_cancel: None,
         on_tap_down: None,
         on_tap_up: None,
         on_tap_cancel: None,
@@ -747,6 +791,42 @@ impl<State: 'static> GestureDetectorView<State> {
     /// never both (see the [module docs](self) for the firing semantics).
     pub fn on_long_press<F: Fn(&mut State) + 'static>(mut self, on_long_press: F) -> Self {
         self.on_long_press = Some(Rc::new(on_long_press));
+        self
+    }
+
+    /// Call `f` for every `Move` of a press after its long-press has fired,
+    /// with no slop and at any distance. Set without
+    /// [`on_long_press`](Self::on_long_press), the long-press still arms and
+    /// fires internally at the threshold.
+    ///
+    /// While any of this and its two siblings is set, the fired press vetoes
+    /// every enclosing scroll surface until its `Up` or `Cancel` (see the
+    /// [module docs](self)); the scroll view stays free to be scrolled through
+    /// its controller meanwhile.
+    pub fn on_long_press_move_update<F: Fn(&mut State, LongPressMoveDetails) + 'static>(
+        mut self,
+        f: F,
+    ) -> Self {
+        self.on_long_press_move_update = Some(Rc::new(f));
+        self
+    }
+
+    /// Call `f` when the press whose long-press fired is released.
+    /// See [`on_long_press_move_update`](Self::on_long_press_move_update).
+    pub fn on_long_press_end<F: Fn(&mut State, LongPressEndDetails) + 'static>(
+        mut self,
+        f: F,
+    ) -> Self {
+        self.on_long_press_end = Some(Rc::new(f));
+        self
+    }
+
+    /// Call `f` when the press whose long-press fired is cancelled instead of
+    /// released: a system cancel, a second contact, a route change. Not
+    /// followed by [`on_long_press_end`](Self::on_long_press_end). See
+    /// [`on_long_press_move_update`](Self::on_long_press_move_update).
+    pub fn on_long_press_cancel<F: Fn(&mut State) + 'static>(mut self, f: F) -> Self {
+        self.on_long_press_cancel = Some(Rc::new(f));
         self
     }
 
@@ -899,6 +979,25 @@ pub struct GestureDetectorWidget {
     state: Recognizer,
     on_tap: Option<ErasedCallback>,
     on_long_press: Option<ErasedCallback>,
+    on_long_press_move_update: Option<ErasedArgCallback<LongPressMoveDetails>>,
+    on_long_press_end: Option<ErasedArgCallback<LongPressEndDetails>>,
+    on_long_press_cancel: Option<ErasedCallback>,
+    /// The fired long-press is being tracked: its moves, release and
+    /// cancellation are reported and `long_press_vetoes` are raised. Set at
+    /// the fire when any of the three follow-up callbacks is wired.
+    long_press_live: bool,
+    /// Where the live long-press fired, the origin of
+    /// [`LongPressMoveDetails::offset_from_origin`].
+    long_press_origin: Point,
+    /// The latest position of the primary press, so a fire with no pointer
+    /// position (the Housekeeping pass) still has an origin.
+    press_last_pos: Point,
+    /// A `Cancel` ended a live long-press, whose `on_long_press_cancel` is
+    /// owed to the next state-bearing pass.
+    owed_long_press_cancel: bool,
+    /// The enclosing scroll surfaces' veto cells, captured on the `Down` and
+    /// raised from the fire until the press ends.
+    long_press_vetoes: Vec<Rc<std::cell::Cell<bool>>>,
     on_tap_down: Option<ErasedArgCallback<TapDownDetails>>,
     on_tap_up: Option<ErasedArgCallback<TapUpDetails>>,
     on_tap_cancel: Option<ErasedCallback>,
@@ -1002,6 +1101,52 @@ impl GestureDetectorWidget {
         self.velocity_y.record(t_ms, position.y);
     }
 
+    /// Whether any of the long-press follow-up callbacks is wired.
+    fn long_press_follow_wired(&self) -> bool {
+        self.on_long_press_move_update.is_some()
+            || self.on_long_press_end.is_some()
+            || self.on_long_press_cancel.is_some()
+    }
+
+    /// Whether the long-press timer takes part in a press at all.
+    fn long_press_wired(&self) -> bool {
+        self.on_long_press.is_some() || self.long_press_follow_wired()
+    }
+
+    fn set_long_press_veto(&self, raised: bool) {
+        for veto in &self.long_press_vetoes {
+            veto.set(raised);
+        }
+    }
+
+    /// Stop tracking a fired long-press and lower its scroll veto.
+    fn end_long_press_tracking(&mut self) {
+        self.long_press_live = false;
+        self.set_long_press_veto(false);
+        self.long_press_vetoes.clear();
+    }
+
+    /// The long-press just fired at `origin`: start reporting its follow-up
+    /// callbacks and veto the enclosing scroll surfaces.
+    fn begin_long_press_tracking(&mut self, origin: Point) {
+        if self.long_press_follow_wired() {
+            self.long_press_live = true;
+            self.long_press_origin = origin;
+            self.set_long_press_veto(true);
+        }
+    }
+
+    /// Run an owed `on_long_press_cancel`. Called only from passes that carry
+    /// real application state — never from the `Cancel` arm.
+    fn flush_owed_long_press_cancel(&mut self, ctx: &mut EventCtx) {
+        if std::mem::take(&mut self.owed_long_press_cancel)
+            && let Some(cb) = self.on_long_press_cancel.as_mut()
+        {
+            cb(ctx);
+            ctx.request_redraw();
+        }
+    }
+
     /// Whether any press-state callback is wired.
     fn press_wired(&self) -> bool {
         self.on_tap_down.is_some() || self.on_tap_up.is_some() || self.on_tap_cancel.is_some()
@@ -1067,11 +1212,17 @@ impl GestureDetectorWidget {
             Recognizer::Dragging { axis, .. } => Some(axis),
             _ => None,
         };
+        let cancelled_long_press = std::mem::take(&mut self.long_press_live);
+        self.end_long_press_tracking();
         self.state = Recognizer::Idle;
         self.primary = None;
         self.second_tap = false;
         if self.press_active {
             self.fire_tap_cancel(ctx);
+        }
+        if cancelled_long_press && let Some(cb) = self.on_long_press_cancel.as_mut() {
+            cb(ctx);
+            ctx.request_redraw();
         }
         if let Some(axis) = cancelled_drag
             && let Some(cb) = self.drag_callbacks(axis).cancel.as_mut()
@@ -1107,6 +1258,15 @@ impl GestureDetectorWidget {
     fn cancel_press_for_other_contact(&mut self, ctx: &mut EventCtx) {
         if self.press_active {
             self.fire_tap_cancel(ctx);
+        }
+        // A fired long-press ends with its cancel (never an end), and the
+        // scroll veto lifts.
+        if self.long_press_live {
+            self.end_long_press_tracking();
+            if let Some(cb) = self.on_long_press_cancel.as_mut() {
+                cb(ctx);
+                ctx.request_redraw();
+            }
         }
         if let Recognizer::Pressed { down_pos, .. } = self.state {
             self.state = if self.drags_wired() {
@@ -1145,6 +1305,17 @@ impl<State: 'static> View<State> for GestureDetectorView<State> {
             owed_single_tap: false,
             second_tap: false,
             on_long_press: self.on_long_press.as_ref().map(erase_callback),
+            on_long_press_move_update: self
+                .on_long_press_move_update
+                .as_ref()
+                .map(erase_callback_arg),
+            on_long_press_end: self.on_long_press_end.as_ref().map(erase_callback_arg),
+            on_long_press_cancel: self.on_long_press_cancel.as_ref().map(erase_callback),
+            long_press_live: false,
+            long_press_origin: Point::ZERO,
+            press_last_pos: Point::ZERO,
+            owed_long_press_cancel: false,
+            long_press_vetoes: Vec::new(),
             on_hold_progress: self.on_hold_progress.as_ref().map(erase_callback_arg),
             // `.max(1)` guards against a 0ms override: `f64::clamp` passes
             // NaN through unchanged, so an unguarded `0.0 / 0.0` divisor in
@@ -1174,6 +1345,12 @@ impl<State: 'static> View<State> for GestureDetectorView<State> {
     ) -> ChangeFlags {
         element.on_tap = self.on_tap.as_ref().map(erase_callback);
         element.on_long_press = self.on_long_press.as_ref().map(erase_callback);
+        element.on_long_press_move_update = self
+            .on_long_press_move_update
+            .as_ref()
+            .map(erase_callback_arg);
+        element.on_long_press_end = self.on_long_press_end.as_ref().map(erase_callback_arg);
+        element.on_long_press_cancel = self.on_long_press_cancel.as_ref().map(erase_callback);
         element.on_tap_down = self.on_tap_down.as_ref().map(erase_callback_arg);
         element.on_tap_up = self.on_tap_up.as_ref().map(erase_callback_arg);
         element.on_tap_cancel = self.on_tap_cancel.as_ref().map(erase_callback);
@@ -1219,7 +1396,7 @@ impl Widget for GestureDetectorWidget {
         // otherwise swallow the release, since a held press resolves as a
         // would-be long-press that fires nothing) nor request_frame's
         // pointlessly during the hold — a small battery win.
-        if (self.on_long_press.is_some() || self.on_hold_progress.is_some())
+        if (self.long_press_wired() || self.on_hold_progress.is_some())
             && let Recognizer::Pressed {
                 elapsed, progress, ..
             } = &mut self.state
@@ -1242,7 +1419,7 @@ impl Widget for GestureDetectorWidget {
                     // pointer event required. Gated on `on_long_press` being
                     // wired: an `on_hold_progress`-only detector has its
                     // delivery deferred to the next pointer event instead.
-                    if self.on_long_press.is_some() {
+                    if self.long_press_wired() {
                         frust_core::mark_pending_result_flush();
                         ctx.request_frame();
                     }
@@ -1282,6 +1459,7 @@ impl Widget for GestureDetectorWidget {
                 self.flush_owed_single_tap(ctx);
                 self.flush_owed_cancel(ctx);
                 self.flush_owed_tap_cancel(ctx);
+                self.flush_owed_long_press_cancel(ctx);
             }
             match p.phase {
                 PointerPhase::Down => {
@@ -1332,6 +1510,14 @@ impl Widget for GestureDetectorWidget {
                         progress: 0.0,
                     };
                     self.primary = Some(ctx.pointer_id());
+                    // A press that never saw its `Up`/`Cancel` stops tracking
+                    // before the next one starts; the new press captures the
+                    // veto cells of the surfaces forwarding this `Down`.
+                    self.end_long_press_tracking();
+                    if self.long_press_follow_wired() {
+                        self.long_press_vetoes = crate::scroll::ambient_scroll_vetoes();
+                    }
+                    self.press_last_pos = p.position;
                     self.hold.cancel();
                     self.velocity_x.clear();
                     self.velocity_y.clear();
@@ -1346,6 +1532,25 @@ impl Widget for GestureDetectorWidget {
                     // a chorded secondary move passes on without cancelling it.
                     if !presses(p) {
                         return self.child.event_child(ctx, event);
+                    }
+                    self.press_last_pos = p.position;
+                    // A fired long-press reports every move, at any distance.
+                    if self.long_press_live && matches!(self.state, Recognizer::Fired) {
+                        self.child.event_child(ctx, event);
+                        let origin = self.long_press_origin;
+                        let global = ctx.origin() + p.position.to_vec2();
+                        if let Some(cb) = self.on_long_press_move_update.as_mut() {
+                            cb(
+                                ctx,
+                                LongPressMoveDetails {
+                                    local_position: p.position,
+                                    global_position: global,
+                                    offset_from_origin: p.position - origin,
+                                },
+                            );
+                        }
+                        ctx.request_redraw();
+                        return EventResult::Handled;
                     }
                     // The press ends the moment the pointer passes the slop or
                     // leaves the bounds; `on_tap` and the other recognizers
@@ -1407,10 +1612,13 @@ impl Widget for GestureDetectorWidget {
                                 // so the press still resolves rather than silently dying.
                                 self.state = Recognizer::Fired;
                                 self.child.event_child(ctx, event);
+                                self.begin_long_press_tracking(p.position);
                                 if let Some(cb) = self.on_long_press.as_mut() {
                                     cb(ctx);
                                     ctx.request_redraw();
-                                } else if let Some(cb) = self.on_tap.as_mut() {
+                                } else if !self.long_press_follow_wired()
+                                    && let Some(cb) = self.on_tap.as_mut()
+                                {
                                     cb(ctx);
                                     ctx.request_redraw();
                                 }
@@ -1538,6 +1746,9 @@ impl Widget for GestureDetectorWidget {
                     };
                     let second_tap = std::mem::take(&mut self.second_tap);
                     let inside = !outside(p.position, ctx.size());
+                    let long_end =
+                        self.long_press_live || (fire_long && self.long_press_follow_wired());
+                    self.end_long_press_tracking();
                     self.state = Recognizer::Idle;
                     self.primary = None;
                     self.child.event_child(ctx, event);
@@ -1552,9 +1763,11 @@ impl Widget for GestureDetectorWidget {
                     // before on_tap_up, so the order is always down, long, up —
                     // the same order as when the Housekeeping pass fires it first.
                     let mut long_pressed = false;
-                    if fire_long && let Some(cb) = self.on_long_press.as_mut() {
-                        cb(ctx);
-                        ctx.request_redraw();
+                    if fire_long && self.long_press_wired() {
+                        if let Some(cb) = self.on_long_press.as_mut() {
+                            cb(ctx);
+                            ctx.request_redraw();
+                        }
                         long_pressed = true;
                     }
                     if std::mem::take(&mut self.press_active)
@@ -1602,6 +1815,16 @@ impl Widget for GestureDetectorWidget {
                         cb(ctx);
                         ctx.request_redraw();
                     }
+                    if long_end && let Some(cb) = self.on_long_press_end.as_mut() {
+                        cb(
+                            ctx,
+                            LongPressEndDetails {
+                                local_position: p.position,
+                                global_position: ctx.origin() + p.position.to_vec2(),
+                            },
+                        );
+                        ctx.request_redraw();
+                    }
                     if let Some(axis) = drag_end {
                         let velocity =
                             Vec2::new(self.velocity_x.velocity(), self.velocity_y.velocity());
@@ -1632,6 +1855,12 @@ impl Widget for GestureDetectorWidget {
                         frust_core::mark_pending_result_flush();
                         ctx.request_redraw();
                     }
+                    if self.long_press_live && self.on_long_press_cancel.is_some() {
+                        self.owed_long_press_cancel = true;
+                        frust_core::mark_pending_result_flush();
+                        ctx.request_redraw();
+                    }
+                    self.end_long_press_tracking();
                     if std::mem::take(&mut self.press_active) {
                         self.owed_tap_cancel = true;
                         frust_core::mark_pending_result_flush();
@@ -1661,6 +1890,7 @@ impl Widget for GestureDetectorWidget {
             self.flush_owed_single_tap(ctx);
             self.flush_owed_cancel(ctx);
             self.flush_owed_tap_cancel(ctx);
+            self.flush_owed_long_press_cancel(ctx);
             // Another contact of the gesture walking past to the widget below
             // that opted into it (a nested pinch or pan/zoom): it cancels a
             // pending press before the long-press check below can fire it.
@@ -1675,7 +1905,7 @@ impl Widget for GestureDetectorWidget {
             // own gate: an `on_hold_progress`-only press never reaches this
             // arm, so it keeps its original fire-on-move/up-arrival delivery
             // untouched.
-            if self.on_long_press.is_some()
+            if self.long_press_wired()
                 && let Recognizer::Pressed {
                     elapsed: true,
                     progress,
@@ -1686,6 +1916,7 @@ impl Widget for GestureDetectorWidget {
                 // the widget first wins the fire; the other finds `state` no
                 // longer `Pressed` and is a no-op (fire-exactly-once).
                 self.state = Recognizer::Fired;
+                self.begin_long_press_tracking(self.press_last_pos);
                 if let Some(cb) = self.on_long_press.as_mut() {
                     cb(ctx);
                     ctx.request_redraw();
@@ -4199,5 +4430,120 @@ mod tests {
         );
         assert_eq!(log.ends.len(), 1);
         assert!(log.cancels.is_empty());
+    }
+
+    /// Logs the long-press and its follow-ups, with the global position.
+    fn follow_detector(child: Blank) -> PressView {
+        GestureDetector::<PressLog, _>(child)
+            .on_long_press(|s: &mut PressLog| s.events.push("long".into()))
+            .on_long_press_move_update(|s: &mut PressLog, d: LongPressMoveDetails| {
+                s.events.push(format!(
+                    "move {} {} g{} {} o{} {}",
+                    d.local_position.x as i32,
+                    d.local_position.y as i32,
+                    d.global_position.x as i32,
+                    d.global_position.y as i32,
+                    d.offset_from_origin.x as i32,
+                    d.offset_from_origin.y as i32
+                ))
+            })
+            .on_long_press_end(|s: &mut PressLog, d: LongPressEndDetails| {
+                s.events.push(format!(
+                    "end {} {} g{} {}",
+                    d.local_position.x as i32,
+                    d.local_position.y as i32,
+                    d.global_position.x as i32,
+                    d.global_position.y as i32
+                ))
+            })
+            .on_long_press_cancel(|s: &mut PressLog| s.events.push("cancel".into()))
+    }
+
+    fn follow_logic(_: &mut PressLog) -> PressView {
+        follow_detector(Blank)
+    }
+
+    #[test]
+    fn a_fired_long_press_reports_moves_then_the_end() {
+        use PointerPhase::{Down, Move, Up};
+        fn padded(_: &mut PressLog) -> crate::PaddingView<PressLog> {
+            crate::Padding(crate::EdgeInsets::all(20.0), follow_detector(Blank))
+        }
+        let mut root = RenderRoot::new();
+        let mut log = PressLog::default();
+        root.rebuild(&mut { padded }, &mut log);
+        root.layout(Size::new(400.0, 400.0));
+        let frame = |root: &mut RenderRoot<PressLog, crate::PaddingView<PressLog>>,
+                     log: &mut PressLog,
+                     ms: f64| {
+            root.rebuild(&mut { padded }, log);
+            root.paint(&mut NullScene, ft(ms));
+        };
+        frame(&mut root, &mut log, 0.0);
+        root.event(&mut log, &touch(0, Down, 100.0, 100.0));
+        for ms in [16.0, 600.0, 616.0] {
+            frame(&mut root, &mut log, ms);
+        }
+        for (x, y) in [(110.0, 100.0), (150.0, 160.0), (60.0, 90.0)] {
+            root.event(&mut log, &touch(0, Move, x, y));
+        }
+        root.event(&mut log, &touch(0, Up, 60.0, 90.0));
+        assert_eq!(
+            log.events,
+            [
+                "long",
+                "move 90 80 g110 100 o10 0",
+                "move 130 140 g150 160 o50 60",
+                "move 40 70 g60 90 o-40 -10",
+                "end 40 70 g60 90",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_contact_after_the_fire_cancels_without_an_end() {
+        use PointerPhase::{Down, Move, Up};
+        // The pinch detector below opts into the second contact so it reaches
+        // the detector's broadcast path.
+        fn pinch_logic(_: &mut PressLog) -> PressView {
+            GestureDetector::<PressLog, _>(
+                crate::pinch::pinch_detector(Blank)
+                    .on_scale(|_: &mut PressLog, _: frust_core::event::ScaleEvent| {}),
+            )
+            .on_long_press(|s: &mut PressLog| s.events.push("long".into()))
+            .on_long_press_move_update(|s: &mut PressLog, _| s.events.push("move".into()))
+            .on_long_press_end(|s: &mut PressLog, _| s.events.push("end".into()))
+            .on_long_press_cancel(|s: &mut PressLog| s.events.push("cancel".into()))
+        }
+        let logic = pinch_logic;
+        let mut root = contact_root(logic);
+        let mut log = PressLog::default();
+        contact_frame(&mut root, logic, &mut log, 0.0);
+        root.event(&mut log, &touch(0, Down, 100.0, 100.0));
+        for ms in [16.0, 600.0, 616.0] {
+            contact_frame(&mut root, logic, &mut log, ms);
+        }
+        root.event(&mut log, &touch(0, Move, 105.0, 100.0));
+        root.event(&mut log, &touch(1, Down, 120.0, 100.0));
+        root.event(&mut log, &touch(0, Move, 140.0, 100.0));
+        root.event(&mut log, &touch(1, Up, 120.0, 100.0));
+        root.event(&mut log, &touch(0, Up, 140.0, 100.0));
+        assert_eq!(log.events, ["long", "move", "cancel"]);
+    }
+
+    #[test]
+    fn a_system_cancel_after_the_fire_owes_the_cancel_callback_once() {
+        use PointerPhase::{Cancel, Down};
+        let logic = follow_logic;
+        let mut root = contact_root(logic);
+        let mut log = PressLog::default();
+        contact_frame(&mut root, logic, &mut log, 0.0);
+        root.event(&mut log, &touch(0, Down, 100.0, 100.0));
+        for ms in [16.0, 600.0, 616.0] {
+            contact_frame(&mut root, logic, &mut log, ms);
+        }
+        root.event(&mut log, &touch(0, Cancel, 100.0, 100.0));
+        contact_frame(&mut root, logic, &mut log, 632.0);
+        assert_eq!(log.events, ["long", "cancel"]);
     }
 }
