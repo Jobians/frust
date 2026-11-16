@@ -47,9 +47,11 @@
 //! republishes the IME surface.
 //!
 //! `on_change` includes preedit text: a half-composed word reaches it as it is
-//! typed. While the field is composing, Enter confirms the IME's candidate, so
-//! `on_submit` never fires (and no newline is inserted) until the composition
-//! ends. Use [`on_composing_change`](TextInputView::on_composing_change) to act
+//! typed. While the field holds an IME preedit, Enter confirms the IME's
+//! candidate, so `on_submit` never fires (and no newline is inserted) until the
+//! composition ends. A composing range the platform keyboard owns (Android and
+//! iOS) does not hold Enter back: Enter ends the range, keeping its text, and
+//! then submits or inserts a newline as usual. Use [`on_composing_change`](TextInputView::on_composing_change) to act
 //! on committed text only: run the work when it reports `false`.
 //!
 //! An enabled field (read-only included) is also a Tab stop: root traversal can
@@ -839,9 +841,24 @@ impl<State: 'static> TextInputView<State> {
     /// value replace). `on_change` includes preedit text, so use this to act
     /// on committed text only (a search-as-you-type field queries on `false`).
     ///
+    /// An input method confirms a candidate as an empty preedit followed by
+    /// the committed text. The field treats that pair as one ending: `false`
+    /// fires once, after the `on_change` of the committed text, and `true` is
+    /// not reported again in between. A lone empty preedit (a cancel) reports
+    /// `false` with the next event the field handles; the field has no way to
+    /// call back without one. A composing range the platform keyboard owns is
+    /// reported like a preedit, and ends (reporting `false`) when Enter ends
+    /// it, before any submit callback runs.
+    ///
     /// A composition that ends without an event the field handles (a
     /// controlled-value replace, a blur routed past the field) is reported
-    /// with the next event the field handles.
+    /// with the next event the field handles, ahead of anything that event
+    /// starts. A composition left over from a focus session that ended this
+    /// way does not count as composing in the next one, so a later `true`
+    /// is always preceded by that `false`.
+    ///
+    /// Teardown does not report, and neither does a callback replaced
+    /// mid-composition: the replacement starts from the state last reported.
     pub fn on_composing_change<F: Fn(&mut State, bool) + 'static>(mut self, f: F) -> Self {
         self.on_composing_change = Some(Rc::new(f));
         self
@@ -1219,9 +1236,10 @@ pub struct TextInputWidget {
     corner_radius: f64,
     /// The horizontal scroll offset of a single-line field's text, in logical
     /// px — see [`scroll_x`](Self::scroll_x). Retained across passes; always 0
-    /// in multi-line mode. A `Cell` because the pointer, IME and caret mappings
-    /// that read it take `&self`.
-    scroll_x: std::cell::Cell<f64>,
+    /// in multi-line mode. Written only by
+    /// [`commit_scroll_x`](Self::commit_scroll_x); every mapping that reads it
+    /// is pure.
+    scroll_x: f64,
     /// The field's width as the last `layout` sized it — what the horizontal
     /// scroll rule measures the inner box against.
     field_width: f64,
@@ -1301,6 +1319,14 @@ pub struct TextInputWidget {
     on_composing_change: Option<crate::authoring::ErasedArgCallback<bool>>,
     /// The composing state last handed to `on_composing_change`.
     composing_reported: bool,
+    /// An empty `Compose` retracted the preedit while `true` had been
+    /// reported: the composition counts as live until the next event, so a
+    /// confirming `Commit` can report `false` after its own `on_change`.
+    retraction_held: bool,
+    /// The focus session the editor's composition belongs to has ended
+    /// without the field being told in time. A composition left over from it
+    /// does not count as composing until a new one starts.
+    composing_stale: bool,
     /// The last [`CaretInfo`] handed to `on_caret_change` in this focus
     /// session; `None` until the first report and again once focus is lost.
     caret_reported: Option<CaretInfo>,
@@ -1617,32 +1643,84 @@ impl TextInputWidget {
     }
 
     /// The horizontal scroll offset of a single-line field's text (content
-    /// shifted left, in logical px), retained in `self.scroll_x`. Every read
-    /// re-applies the rule to the current caret, text and width: keep the caret
-    /// rect (its width included) inside `[0, inner_width]`; never scroll past
-    /// the end, so text that fits sits at 0 and shrinking text pulls back with
-    /// no gap at the trailing edge; otherwise stay put. The caret's visual x
-    /// comes from the layout, so right-to-left and mixed text need no special
-    /// case. Always 0 in multi-line mode.
+    /// shifted left, in logical px). A pure read of the offset
+    /// [`commit_scroll_x`](Self::commit_scroll_x) last settled. Always 0 in
+    /// multi-line mode.
     fn scroll_x(&self) -> f64 {
+        self.scroll_x
+    }
+
+    /// Settle the horizontal scroll offset. The one place it is written; it
+    /// runs after every edit, caret move, composition change and layout, so
+    /// every read between them (pointer mapping, paint, the IME rect,
+    /// `caret_info`) sees the same value. The rule: keep the caret rect (its
+    /// width included) inside `[0, inner_width]`; while the caret is hidden
+    /// by the input method, keep the end of the composing range there
+    /// instead; never scroll past the end, so text that fits sits at 0 and
+    /// shrinking text pulls back with no gap at the trailing edge; otherwise
+    /// stay put. The caret's visual x comes from the layout, so
+    /// right-to-left and mixed text need no special case.
+    fn commit_scroll_x(&mut self) {
         if self.max_visible_lines.is_some() {
-            return 0.0;
+            self.scroll_x = 0.0;
+            return;
         }
         let inner = self.inner_width();
         let text_w = self.display().layout_size().width;
         let max = (text_w + self.caret_width as f64 - inner).max(0.0);
-        let mut s = self.scroll_x.get().clamp(0.0, max);
-        if let Some(c) = self.display().cursor_rect(self.caret_width) {
-            if c.x1 - s > inner {
-                s = c.x1 - inner;
+        let mut s = self.scroll_x.clamp(0.0, max);
+        let target = match self.display().cursor_rect(self.caret_width) {
+            Some(c) => Some((c.x0, c.x1)),
+            None => self.composing_end_x(text_w).map(|x| (x, x)),
+        };
+        if let Some((x0, x1)) = target {
+            if x1 - s > inner {
+                s = x1 - inner;
             }
-            if c.x0 - s < 0.0 {
-                s = c.x0;
+            if x0 - s < 0.0 {
+                s = x0;
             }
             s = s.clamp(0.0, max);
         }
-        self.scroll_x.set(s);
-        s
+        self.scroll_x = s;
+    }
+
+    /// The x of the end of the displayed composing range, for a caret the
+    /// input method hid. `text_w` is the displayed text's width, which is the
+    /// answer when the range ends the text.
+    fn composing_end_x(&mut self, text_w: f64) -> Option<f64> {
+        let state = self.display().editing_state_bytes();
+        let end = state.composing?.end.min(state.text.len());
+        if end >= state.text.len() {
+            return Some(text_w);
+        }
+        let prefix = state.text.get(..end)?;
+        let layout = self.text_ctx.layout(prefix, &self.applied_style, None);
+        Some(layout.size().width)
+    }
+
+    /// The rect the field's content is clipped to, for a field painted at
+    /// `origin` with `size`. Multi-line: the content band, inside the border
+    /// and the vertical padding. Single-line: horizontally the content box,
+    /// vertically the padding box, so descenders and the caret are not cut.
+    fn content_clip_rect(&self, origin: Point, size: Size) -> (Point, Size) {
+        if self.max_visible_lines.is_some() {
+            (
+                Point::new(origin.x + self.border_width, origin.y + self.pad_y),
+                Size::new(
+                    (size.width - 2.0 * self.border_width).max(0.0),
+                    (size.height - 2.0 * self.pad_y).max(0.0),
+                ),
+            )
+        } else {
+            (
+                Point::new(origin.x + self.pad_x, origin.y + self.border_width),
+                Size::new(
+                    self.inner_width(),
+                    (size.height - 2.0 * self.border_width).max(0.0),
+                ),
+            )
+        }
     }
 
     /// The x of the text content's left edge within the field: the inner
@@ -1695,6 +1773,7 @@ impl TextInputWidget {
         // Re-derive the masked mirror first: the IME surface published below
         // (and any metric read this pass) takes its caret rect from it.
         self.sync_mask();
+        self.commit_scroll_x();
         self.reset_blink();
         let after = self.editor.text().to_string();
         // `true` goes out ahead of the first preedit's `on_change`.
@@ -2089,11 +2168,17 @@ impl TextInputWidget {
                     NamedKey::Home => self.apply_edit(ctx, EditOp::Home { select }),
                     NamedKey::End => self.apply_edit(ctx, EditOp::End { select }),
                     NamedKey::Enter => {
-                        // While composing, Enter belongs to the input method:
-                        // it confirms a candidate, and the IME's own commit
-                        // follows. Neither submit nor newline.
-                        if self.editor.is_composing() {
+                        // While the editor owns a preedit, Enter belongs to the
+                        // input method: it confirms a candidate, and the IME's
+                        // own commit follows. Neither submit nor newline. A
+                        // platform-owned composing range (the keyboard's own
+                        // composing region) holds nothing back: Enter ends it,
+                        // text kept, and then acts as Enter normally does.
+                        if self.editor.has_preedit() && !self.composing_stale {
                             return EventResult::Handled;
+                        }
+                        if self.editor.is_composing() {
+                            self.end_composition(ctx);
                         }
                         // Single-line always submits (Enter is never a newline).
                         // Multi-line: the resolved `submit_on_enter`, inverted by
@@ -2115,8 +2200,7 @@ impl TextInputWidget {
                     }
                     NamedKey::Escape => {
                         ctx.release_focus();
-                        self.focused = false;
-                        self.caret_reported = None;
+                        self.observe_focus_loss();
                         // Escape dismisses the session, and the toolbar with it
                         // — it is the field's, not a surface of its own.
                         self.hide_toolbar(ctx);
@@ -2309,10 +2393,15 @@ impl TextInputWidget {
             // The caret a retraction carries is meaningless — there is no
             // marked text left to place it in — so it is deliberately unread.
             ImeEvent::Compose { text, .. } if text.is_empty() => {
+                // An input method confirms a candidate as this retraction
+                // followed by a `Commit`: keep the composition live until the
+                // next event, so `false` can follow the committed text.
+                self.retraction_held = self.composing_reported && self.focused;
                 self.apply_edit(ctx, EditOp::ClearCompose);
                 EventResult::Handled
             }
             ImeEvent::Compose { text, cursor } => {
+                self.composing_stale = false;
                 self.apply_edit(
                     ctx,
                     EditOp::Compose {
@@ -2329,21 +2418,17 @@ impl TextInputWidget {
                 // SUBMIT, exactly like `NamedKey::Enter` — it must never insert a
                 // literal '\n'. A newline-inserting multi-line field instead lands
                 // the literal newline, matching its `NamedKey::Enter` behavior.
-                if s == "\n" || s == "\r" || s == "\r\n" {
-                    if self.editor.is_composing() {
-                        // The newline confirms the composition: end it as a
-                        // normal commit of the preedit, and submit nothing.
-                        let before = self.editor.text().to_string();
-                        if self.editor.has_preedit() {
-                            self.editor.apply(EditOp::FinishCompose, &mut self.text_ctx);
-                        } else {
-                            let mut state = self.editor.editing_state_bytes();
-                            state.composing = None;
-                            self.editor
-                                .apply(EditOp::ApplyEditingState(state), &mut self.text_ctx);
-                        }
-                        self.finish_edit(ctx, before);
+                if is_newline_commit(s) {
+                    // The same rule as `NamedKey::Enter`: an editor-owned
+                    // preedit is confirmed by this newline (committed as it
+                    // stands, nothing submitted); a platform-owned range is
+                    // ended, and the newline then acts as Enter normally does.
+                    if self.editor.has_preedit() && !self.composing_stale {
+                        self.end_composition(ctx);
                         return EventResult::Handled;
+                    }
+                    if self.editor.is_composing() {
+                        self.end_composition(ctx);
                     }
                     if self.max_visible_lines.is_some() && !self.submit_on_enter {
                         self.apply_edit(ctx, EditOp::InsertNewline);
@@ -2363,6 +2448,10 @@ impl TextInputWidget {
                     self.apply_edit(ctx, EditOp::ClearCompose);
                     return EventResult::Handled;
                 }
+                // The commit that confirmed a held retraction: `false` goes
+                // out behind its `on_change`, below.
+                self.retraction_held = false;
+                self.composing_stale = false;
                 // Commit the given text via the compose machinery so it replaces
                 // any active preedit and lands at the caret in one edit. The
                 // caret goes to the END of the committed text: a `Compose` with
@@ -2382,6 +2471,7 @@ impl TextInputWidget {
                 EventResult::Handled
             }
             ImeEvent::ApplyEditingState(state) => {
+                self.composing_stale = false;
                 self.apply_edit(ctx, editing_state_to_op(state));
                 EventResult::Handled
             }
@@ -2389,6 +2479,11 @@ impl TextInputWidget {
             ImeEvent::Enabled | ImeEvent::Disabled => EventResult::Handled,
         }
     }
+}
+
+/// Whether an IME commit is the Return key arriving as text.
+fn is_newline_commit(s: &str) -> bool {
+    matches!(s, "\n" | "\r" | "\r\n")
 }
 
 /// Resolve the effective Enter-submits behavior: an explicit
@@ -2472,7 +2567,7 @@ impl<State: 'static> View<State> for TextInputView<State> {
             pad_y: self.pad_y,
             border_width: self.border_width,
             corner_radius: self.corner_radius,
-            scroll_x: std::cell::Cell::new(0.0),
+            scroll_x: 0.0,
             field_width: 0.0,
             caret_width: self.caret_width,
             focus_ring_width: self.focus_ring_width,
@@ -2503,6 +2598,8 @@ impl<State: 'static> View<State> for TextInputView<State> {
                 .as_ref()
                 .map(crate::authoring::erase_callback_arg::<State, bool>),
             composing_reported: false,
+            retraction_held: false,
+            composing_stale: false,
         };
         // Seeds the masked mirror when built obscured (a no-op otherwise).
         widget.rebuild_mask_editor();
@@ -2757,6 +2854,8 @@ impl Widget for TextInputWidget {
         self.toolbar.layout(ctx);
         let size = bc.constrain(Size::new(width, height));
         self.field_width = size.width;
+        // A width change moves the inner box the offset is measured against.
+        self.commit_scroll_x();
         size
     }
 
@@ -2844,8 +2943,7 @@ impl Widget for TextInputWidget {
         // session, it just holds one with no keyboard over it.
         let focused = ctx.has_focus() && self.focusable();
         if self.focused && !focused {
-            self.focused = false;
-            self.caret_reported = None;
+            self.observe_focus_loss();
             // The toolbar belongs to the session that was just blurred out from
             // under us, so it goes with it: the pod is dropped on the next
             // rebuild, and nothing is registered from this paint on. The
@@ -2893,25 +2991,8 @@ impl Widget for TextInputWidget {
         // height, single-line text and its placeholder run past the sides. Clip
         // the content band so nothing paints outside the field. Popped before
         // the toolbar anchor.
-        if self.max_visible_lines.is_some() {
-            scene.push_clip(
-                Point::new(origin.x + self.border_width, origin.y + self.pad_y),
-                Size::new(
-                    (size.width - 2.0 * self.border_width).max(0.0),
-                    (size.height - 2.0 * self.pad_y).max(0.0),
-                ),
-            );
-        } else {
-            // Horizontally the content box; vertically the padding box, so
-            // descenders and the caret are not cut.
-            scene.push_clip(
-                Point::new(origin.x + self.pad_x, origin.y + self.border_width),
-                Size::new(
-                    self.inner_width(),
-                    (size.height - 2.0 * self.border_width).max(0.0),
-                ),
-            );
-        }
+        let (clip_origin, clip_size) = self.content_clip_rect(origin, size);
+        scene.push_clip(clip_origin, clip_size);
 
         if self.editor.text().is_empty() && !focused {
             // Placeholder: shaped on demand through the widget-owned context.
@@ -3057,8 +3138,29 @@ impl Widget for TextInputWidget {
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
+        // A blur this field was never told about (a sibling took the focus):
+        // the session the composition belonged to is over.
+        if self.focused && !ctx.has_focus() {
+            self.observe_focus_loss();
+        }
+        // A retraction waits for the commit that confirms it, and only that.
+        // Any other event means nothing confirmed it: the composition ended.
+        let confirms = matches!(
+            event,
+            InputEvent::Ime(ImeEvent::Commit(s)) if !s.is_empty() && !is_newline_commit(s)
+        );
+        if self.retraction_held && !confirms {
+            self.retraction_held = false;
+        }
+        // Report an end the field could not report when it happened, before
+        // this event can start anything new.
+        self.report_composing(ctx, false);
         let result = self.dispatch_event(ctx, event);
         self.report_composing(ctx, false);
+        if !self.editor.is_composing() {
+            self.composing_stale = false;
+        }
+        self.commit_scroll_x();
         self.report_caret(ctx);
         result
     }
@@ -3107,7 +3209,9 @@ impl TextInputWidget {
         if self.on_composing_change.is_none() {
             return;
         }
-        let now = self.focused && self.editor.is_composing();
+        let now = self.focused
+            && !self.composing_stale
+            && (self.editor.is_composing() || self.retraction_held);
         if now == self.composing_reported || (rising_only && !now) {
             return;
         }
@@ -3115,6 +3219,31 @@ impl TextInputWidget {
         if let Some(cb) = &mut self.on_composing_change {
             cb(ctx, now);
         }
+    }
+
+    /// The focus session ended: drop what belongs to it. A composition the
+    /// editor still holds is left over from it and no longer counts as
+    /// composing.
+    fn observe_focus_loss(&mut self) {
+        self.focused = false;
+        self.caret_reported = None;
+        self.retraction_held = false;
+        self.composing_stale = true;
+    }
+
+    /// End the live composition, keeping its text: an editor-owned preedit
+    /// is committed as it stands, a platform-owned range is just released.
+    fn end_composition(&mut self, ctx: &mut EventCtx) {
+        let before = self.editor.text().to_string();
+        if self.editor.has_preedit() {
+            self.editor.apply(EditOp::FinishCompose, &mut self.text_ctx);
+        } else {
+            let mut state = self.editor.editing_state_bytes();
+            state.composing = None;
+            self.editor
+                .apply(EditOp::ApplyEditingState(state), &mut self.text_ctx);
+        }
+        self.finish_edit(ctx, before);
     }
 
     /// Hand `on_caret_change` the caret when it differs from the last report.
@@ -3148,8 +3277,7 @@ impl TextInputWidget {
             if ctx.has_focus() || self.release_focus_pending {
                 ctx.release_focus();
                 self.release_focus_pending = false;
-                self.focused = false;
-                self.caret_reported = None;
+                self.observe_focus_loss();
                 self.captured = false;
                 ctx.request_redraw();
             }
@@ -3276,8 +3404,7 @@ impl TextInputWidget {
                         // routing clears our focus path instead.
                         if self.focused {
                             ctx.release_focus();
-                            self.focused = false;
-                            self.caret_reported = None;
+                            self.observe_focus_loss();
                             self.hide_toolbar(ctx);
                             ctx.request_redraw();
                         }
@@ -4284,30 +4411,231 @@ mod tests {
         assert_eq!(state.composing_log, ["change:ab"]);
     }
 
+    /// A field that logs `on_change`, `on_composing_change` and submits into
+    /// one list, so their order is observable.
+    fn ordered_harness(
+        state: &mut AppState,
+        multiline: bool,
+    ) -> RenderRoot<AppState, TextInputView<AppState>> {
+        let mut root = RenderRoot::new();
+        let mut build = |s: &mut AppState| {
+            let field = text_input(s.value.clone(), |s: &mut AppState, v: String| {
+                s.composing_log.push(format!("change:{v}"));
+                s.value = v;
+            })
+            .on_submit(|s: &mut AppState, _v: String| {
+                s.submits += 1;
+                s.composing_log.push("submit".to_string());
+            })
+            .on_composing_change(|s: &mut AppState, c: bool| {
+                s.composing_log.push(format!("composing:{c}"));
+            });
+            if multiline { field.multiline(3) } else { field }
+        };
+        root.rebuild(&mut build, state);
+        root.layout(Size::new(300.0, 200.0));
+        root
+    }
+
+    fn platform_sync(composing_base: i32, composing_extent: i32) -> InputEvent {
+        InputEvent::Ime(ImeEvent::ApplyEditingState(EditingState {
+            text: "hello".to_string(),
+            selection_base: 5,
+            selection_extent: 5,
+            composing_base,
+            composing_extent,
+        }))
+    }
+
     #[test]
-    fn a_platform_composing_range_guards_enter_and_reports() {
+    fn a_platform_composing_range_ends_at_enter_which_then_submits() {
+        let mut state = AppState::default();
+        let mut root = ordered_harness(&mut state, false);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        root.event(&mut state, &platform_sync(2, 5));
+        assert!(widget(&root).editor.is_composing());
+        root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
+        assert_eq!(state.submits, 1, "a platform range does not hold Enter");
+        assert_eq!(widget(&root).editor.text(), "hello", "its text is kept");
+        assert!(!widget(&root).editor.is_composing());
+        assert_eq!(
+            state.composing_log,
+            [
+                "composing:true",
+                "change:hello",
+                "composing:false",
+                "submit"
+            ],
+            "`false` goes out before the submit callback"
+        );
+    }
+
+    #[test]
+    fn a_platform_range_that_stays_live_never_sticks_enter() {
+        let mut state = AppState::default();
+        let mut root = ordered_harness(&mut state, false);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        root.event(&mut state, &platform_sync(2, 5));
+        root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
+        // The keyboard asserts its composing region again, as it does while
+        // the user keeps typing over the last word.
+        root.event(&mut state, &platform_sync(2, 5));
+        root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
+        assert_eq!(state.submits, 2);
+        assert_eq!(
+            state.composing_log,
+            [
+                "composing:true",
+                "change:hello",
+                "composing:false",
+                "submit",
+                "composing:true",
+                "composing:false",
+                "submit"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_newline_commit_agrees_with_enter_under_a_platform_range() {
+        let mut state = AppState::default();
+        let mut root = ordered_harness(&mut state, false);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        root.event(&mut state, &platform_sync(2, 5));
+        commit(&mut root, &mut state, "\n");
+        assert_eq!(state.submits, 1);
+        assert_eq!(
+            state.composing_log,
+            [
+                "composing:true",
+                "change:hello",
+                "composing:false",
+                "submit"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_platform_range_under_a_newline_field_ends_then_inserts_the_newline() {
+        let mut state = AppState::default();
+        let mut root = ordered_harness(&mut state, true);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        root.event(&mut state, &platform_sync(2, 5));
+        root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
+        assert_eq!(widget(&root).editor.text(), "hello\n");
+        assert_eq!(state.submits, 0);
+        assert!(!widget(&root).editor.is_composing());
+    }
+
+    #[test]
+    fn a_confirmed_candidate_reports_false_once_after_the_committed_text() {
         let mut state = AppState::default();
         let mut root = composing_harness(&mut state);
         root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
-        let sync = |composing_base: i32, composing_extent: i32| {
-            InputEvent::Ime(ImeEvent::ApplyEditingState(EditingState {
-                text: "hello".to_string(),
-                selection_base: 5,
-                selection_extent: 5,
-                composing_base,
-                composing_extent,
-            }))
-        };
-        root.event(&mut state, &sync(2, 5));
-        root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
-        assert_eq!(state.submits, 0, "a platform range guards Enter too");
-        root.event(&mut state, &sync(-1, -1));
+        compose(&mut root, &mut state, "ni");
+        compose(&mut root, &mut state, "");
+        commit(&mut root, &mut state, "X");
         assert_eq!(
             state.composing_log,
-            ["composing:true", "change:hello", "composing:false"]
+            [
+                "composing:true",
+                "change:ni",
+                "change:",
+                "change:X",
+                "composing:false"
+            ]
         );
-        root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
-        assert_eq!(state.submits, 1);
+    }
+
+    #[test]
+    fn a_cancelled_composition_reports_false_with_the_next_event() {
+        let mut state = AppState::default();
+        let mut root = composing_harness(&mut state);
+        root.event(&mut state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        compose(&mut root, &mut state, "ni");
+        compose(&mut root, &mut state, "");
+        assert_eq!(
+            state.composing_log,
+            ["composing:true", "change:ni", "change:"],
+            "nothing confirmed or cancelled it yet"
+        );
+        root.event(
+            &mut state,
+            &named(NamedKey::ArrowLeft, Modifiers::default()),
+        );
+        assert_eq!(
+            state.composing_log,
+            ["composing:true", "change:ni", "change:", "composing:false"]
+        );
+        compose(&mut root, &mut state, "a");
+        assert_eq!(
+            state.composing_log.last().map(String::as_str),
+            Some("change:a"),
+            "a new composition reports true after that false"
+        );
+        assert_eq!(state.composing_log[4], "composing:true");
+    }
+
+    #[test]
+    fn a_blur_the_field_never_saw_still_reports_false_before_a_later_true() {
+        #[derive(Default)]
+        struct S {
+            value: String,
+            log: Vec<String>,
+        }
+        fn logic(s: &mut S) -> crate::FlexView<S> {
+            crate::column()
+                .child(
+                    text_input(s.value.clone(), |s: &mut S, v: String| s.value = v)
+                        .on_composing_change(|s: &mut S, c: bool| s.log.push(format!("{c}"))),
+                )
+                .child(crate::button("ok", |_s: &mut S| {}))
+        }
+        for paint_between in [false, true] {
+            let mut state = S::default();
+            let mut root: RenderRoot<S, crate::FlexView<S>> = RenderRoot::new();
+            root.rebuild(&mut logic, &mut state);
+            let mut tcx = frust_text::TextContext::new();
+            root.layout_with_text(Size::new(300.0, 200.0), &mut tcx as &mut dyn Any);
+            let tap = |root: &mut RenderRoot<S, crate::FlexView<S>>, state: &mut S, y: f64| {
+                root.event(state, &pointer(PointerPhase::Down, 10.0, y));
+                root.event(state, &pointer(PointerPhase::Up, 10.0, y));
+            };
+            tap(&mut root, &mut state, 10.0);
+            root.event(
+                &mut state,
+                &InputEvent::Ime(ImeEvent::Compose {
+                    text: "ni".to_string(),
+                    cursor: Some((2, 2)),
+                }),
+            );
+            assert_eq!(state.log, ["true"]);
+            // A sibling takes the focus: the field is never told.
+            tap(&mut root, &mut state, 45.0);
+            if paint_between {
+                root.paint(&mut NullScene, FrameTime::ZERO);
+            }
+            assert_eq!(state.log, ["true"], "nothing reaches the field yet");
+            // Refocus: the next event the field handles.
+            tap(&mut root, &mut state, 10.0);
+            assert_eq!(
+                state.log,
+                ["true", "false"],
+                "paint_between={paint_between}"
+            );
+            root.event(
+                &mut state,
+                &InputEvent::Ime(ImeEvent::Compose {
+                    text: "x".to_string(),
+                    cursor: Some((1, 1)),
+                }),
+            );
+            assert_eq!(
+                state.log,
+                ["true", "false", "true"],
+                "paint_between={paint_between}"
+            );
+        }
     }
 
     #[test]
@@ -9859,6 +10187,114 @@ mod tests {
             panic!("no glyphs")
         };
         assert_eq!(*x, widget(&root).pad_x);
+    }
+
+    #[test]
+    fn mapping_a_pointer_position_does_not_change_the_scroll_offset() {
+        let mut state = AppState::default();
+        let mut root = narrow_harness(&mut state);
+        commit_narrow(&mut root, &mut state, &"m".repeat(40));
+        let w = widget(&root);
+        let before = w.scroll_x;
+        assert!(before > 0.0);
+        let height = w.content_height() + 2.0 * w.pad_y;
+        for x in [0.0, 30.0, 60.0, 400.0] {
+            let _ = w.editor_point(Point::new(x, 10.0), height);
+            let _ = w.content_origin_x();
+            let _ = w.caret_info(Size::new(NARROW, height));
+        }
+        assert_eq!(widget(&root).scroll_x, before);
+    }
+
+    #[test]
+    fn narrowing_the_field_settles_the_offset_in_layout() {
+        let mut state = AppState::default();
+        let mut root = narrow_harness(&mut state);
+        commit_narrow(&mut root, &mut state, &"m".repeat(40));
+        root.layout(Size::new(NARROW / 2.0, 200.0));
+        let w = widget(&root);
+        assert!(
+            caret_x1(&root) - w.scroll_x <= w.inner_width() + 1e-6,
+            "the caret is inside the narrower box once layout returns"
+        );
+    }
+
+    #[test]
+    fn a_hidden_caret_keeps_the_end_of_the_composing_range_in_view() {
+        let mut state = AppState::default();
+        let mut root = narrow_harness(&mut state);
+        let long = "m".repeat(40);
+        root.event(
+            &mut state,
+            &InputEvent::Ime(ImeEvent::Compose {
+                text: long.clone(),
+                cursor: None,
+            }),
+        );
+        root.layout(Size::new(NARROW, 200.0));
+        let w = widget(&root);
+        assert!(w.display().cursor_rect(w.caret_width).is_none());
+        let end = w.display().layout_size().width;
+        assert!(w.scroll_x > 0.0, "the composing end scrolled into view");
+        assert!(
+            end - w.scroll_x <= w.inner_width() + 1e-6 && end - w.scroll_x >= 0.0,
+            "end {end} at {} inside [0, {}]",
+            end - w.scroll_x,
+            w.inner_width()
+        );
+    }
+
+    /// Records the clip and every plain rect fill (selection, caret).
+    #[derive(Default)]
+    struct ClipRectRecorder {
+        clip: Option<(Point, Size)>,
+        rects: Vec<Rect>,
+    }
+
+    impl PaintScene for ClipRectRecorder {
+        fn fill_rect(&mut self, o: Point, s: Size, _c: Color) {
+            self.rects
+                .push(Rect::new(o.x, o.y, o.x + s.width, o.y + s.height));
+        }
+        fn fill_rounded_rect(&mut self, _o: Point, _s: Size, _r: f64, _c: Color) {}
+        fn draw_text(&mut self, _o: Point, _t: &str) {}
+        fn draw_glyph_run(&mut self, _run: frust_scene::GlyphRun) {}
+        fn push_clip(&mut self, origin: Point, size: Size) {
+            self.clip = Some((origin, size));
+        }
+    }
+
+    #[test]
+    fn a_scrolled_field_paints_its_caret_and_selection_inside_the_clip() {
+        let mut state = AppState::default();
+        let mut root = narrow_harness(&mut state);
+        commit_narrow(&mut root, &mut state, &"m".repeat(40));
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        for pass in 0..2 {
+            if pass == 1 {
+                for _ in 0..3 {
+                    root.event(&mut state, &named(NamedKey::ArrowLeft, shift));
+                }
+            }
+            let mut rec = ClipRectRecorder::default();
+            root.paint(&mut rec, FrameTime::ZERO);
+            let (o, s) = rec.clip.expect("clip");
+            let clip = Rect::new(o.x, o.y, o.x + s.width, o.y + s.height);
+            assert!(widget(&root).scroll_x > 0.0);
+            assert!(!rec.rects.is_empty(), "pass {pass} paints a caret");
+            for r in &rec.rects {
+                assert!(
+                    r.x0 >= clip.x0 - 1e-6
+                        && r.x1 <= clip.x1 + 1e-6
+                        && r.y0 >= clip.y0 - 1e-6
+                        && r.y1 <= clip.y1 + 1e-6,
+                    "pass {pass}: {r:?} outside clip {clip:?}"
+                );
+            }
+        }
     }
 
     #[test]
