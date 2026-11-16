@@ -508,7 +508,7 @@ mod tests {
     use frust::authoring::{Role, Size};
     use frust::testing::{Tester, TesterOptions, find};
     use frust::{Brightness, CrossAxisAlignment, IconWidget, Theme, View, row};
-    use frust_beui::{BeuiMetrics, Density};
+    use frust_beui::{BeuiMetrics, Density, theme_with_density};
     use frust_shell_common::ThemeOverrideWatcher;
 
     use super::{MAX_CONTENT_WIDTH, density_theme, page};
@@ -527,14 +527,13 @@ mod tests {
     /// holds this, so two writers never interleave.
     static OVERRIDE_SLOT: Mutex<()> = Mutex::new(());
 
-    /// The page in the gallery's own scrolling slot, under `theme`.
+    /// The page in the gallery's own scrolling slot, under `theme`. The app
+    /// state is built inside the Tester, which owns the reactive runtime its
+    /// back fallback needs.
     fn page_tester(theme: Theme, size: Size) -> Tester<AppState, impl View<AppState>> {
-        Tester::with_options(
-            AppState::default(),
-            |_: &mut AppState| scroll_slot(page()),
-            size,
-            &TesterOptions::default().theme(theme),
-        )
+        Tester::new_with(size, &TesterOptions::default().theme(theme), || {
+            (AppState::default(), |_: &mut AppState| scroll_slot(page()))
+        })
     }
 
     const THEMES: [(Density, Brightness); 4] = [
@@ -603,6 +602,34 @@ mod tests {
         assert!(touch > comfortable);
     }
 
+    /// The chips derive their selection from the live theme, so a phone
+    /// started under `install_with_density(Density::Touch)` opens the page on
+    /// Touch with no state of its own to agree with.
+    #[test]
+    fn the_chips_start_on_the_density_the_app_installed() {
+        for density in [Density::Comfortable, Density::Touch] {
+            let tester = page_tester(theme_with_density(density), PHONE);
+            let metrics = BeuiMetrics::for_density(density);
+            let summary = match density {
+                Density::Touch => format!(
+                    "Touch: controls clear {:.0} px, a medium button is {:.0} px tall.",
+                    metrics.min_touch_target, metrics.height_md
+                ),
+                _ => format!(
+                    "Comfortable: beUI's own sizes, a medium button is {:.0} px tall.",
+                    metrics.height_md
+                ),
+            };
+            assert_eq!(tester.find(&find::value(&summary)).len(), 1, "{density:?}");
+        }
+        let host = if cfg!(any(target_os = "android", target_os = "ios")) {
+            Density::Touch
+        } else {
+            Density::Comfortable
+        };
+        assert_eq!(crate::start_density(), host);
+    }
+
     #[test]
     fn pressing_the_counter_row_updates_its_value() {
         let theme = density_theme(Density::Touch, Brightness::Light);
@@ -666,17 +693,16 @@ mod tests {
         assert!(Page::ALL.contains(&Page::Content));
 
         // The shell's own rail beside the shell's own page dispatch.
-        let mut app = Tester::new(
-            AppState::default(),
-            |s: &mut AppState| {
+        let mut app = Tester::new_with(DESKTOP, &TesterOptions::default(), || {
+            let build = |s: &mut AppState| {
                 let body = page_body(s.page, s);
                 row()
                     .child(shell_sidebar(s))
                     .flex(1, scroll_slot(body))
                     .cross_axis(CrossAxisAlignment::Stretch)
-            },
-            DESKTOP,
-        );
+            };
+            (AppState::default(), build)
+        });
         assert_eq!(app.state().page, Page::Home);
         // The rail's item nodes carry no bounds of their own, so the tap aims
         // at the item's icon: the rail's icons come first, in `Page::ALL` order.

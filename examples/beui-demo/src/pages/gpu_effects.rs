@@ -30,10 +30,10 @@
 //! *renders* 3D still depends on [`GpuFx::availability`] — a device exists
 //! only once the desktop shell has opened its first surface, and
 //! `FRUST_BEUI_NO_GPU_FX=1` turns the whole path off regardless of the
-//! build. Every component already carries that degrade in its own contract,
-//! so the "3D" pane below is always the real component call — it simply
-//! paints its 2D path in the two cases above, same as it would without ever
-//! calling the opt-in.
+//! build; on Android and iOS beUI keeps it off altogether, so a phone renders
+//! every variant's 2D path. Every component carries that degrade in its own
+//! contract, so the "3D" pane below is always the real component call — it
+//! simply paints its 2D path in those cases.
 
 use frust::{CrossAxisAlignment, SizedBox, Theme, View, column, container, row, text, use_context};
 use frust_beui::blocks::project_folder::{folder_preview, project_folder};
@@ -413,6 +413,11 @@ fn availability_note() -> String {
             "Compiled with `gpu-effects`, but {KILL_SWITCH_ENV_VAR}=1 is set: every \
              3D pane below degrades to its ordinary 2D path."
         ),
+        FxAvailability::NoDevice if cfg!(any(target_os = "android", target_os = "ios")) => {
+            "Compiled with `gpu-effects`, but beUI keeps the 3D path off on \
+             phones: every 3D pane below renders its ordinary 2D path."
+                .to_string()
+        }
         FxAvailability::NoDevice => {
             "Compiled with `gpu-effects`, but no desktop shell has opened its \
              first surface yet, so no GPU device is reachable: every 3D pane \
@@ -437,7 +442,9 @@ pub fn page() -> impl View<AppState> {
                  non-default `gpu-effects` cargo feature \u{2014} real perspective \
                  through an offscreen render the engine composites, rather than \
                  the scene's affine transform. Each pair below is the same \
-                 component twice: its ordinary 2D path, and the 3D opt-in.",
+                 component twice: its ordinary 2D path, and the 3D opt-in. \
+                 beUI keeps the 3D path off on Android and iOS, so on a phone \
+                 every variant renders its 2D path.",
         ))
         .child(gap(6.0))
         .child(muted(availability_note()))

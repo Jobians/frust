@@ -27,12 +27,13 @@ frust run -d <device>    # Android / iOS device or simulator
 ```
 
 The desktop preview opens a real winit window titled "beUI Gallery".
-`frust_beui::install()` runs in `frust::app!`'s `setup` block, so the app
-starts themed with beUI's own token tables (`frust_beui::theme()`) rather
-than the framework's neutral fallback. The window opens at the desktop
-shell's own default size (800×600 logical px); set
-`FRUST_WINDOW_SIZE=<width>x<height>` before running for a roomier gallery
-view of the sidebar-plus-content shell.
+`frust_beui::install_with_density` runs in `frust::app!`'s `setup` block, so
+the app starts themed with beUI's own token tables rather than the
+framework's neutral fallback (see "Phones" below for the density). The
+window opens at the desktop shell's own default size (800×600 logical px);
+set `FRUST_WINDOW_SIZE=<width>x<height>` before running for a roomier
+gallery view of the sidebar-plus-content shell, or a width under 720 for the
+phone shell.
 
 It gates from its own directory rather than with `-p` from the repo root:
 
@@ -46,7 +47,8 @@ cargo test \
 
 ## Nav shell
 
-The rail is `frust_beui::components::animated_sidebar` — the catalog's own
+This section is the wide shell, at a layout width of 720 logical px or more;
+"Phones" below covers the narrower one. The rail is `frust_beui::components::animated_sidebar` — the catalog's own
 motion-driven sidebar, collapsible via the top bar's
 Collapse/Expand button. `animated_sidebar` ports upstream's panel-and-menu,
 not a labelled-group header slot (see that module's own doc comment), so this
@@ -100,8 +102,8 @@ Theming) alongside the active page's title.
 
 ## Theming today vs. TODO
 
-- **Wired today:** `frust_beui::install()` seeds the beUI theme as the app
-  default; every `theme_toggle` instance (top bar, Theming and Content pages)
+- **Wired today:** `frust_beui::install_with_density` seeds the beUI theme
+  as the app default; every `theme_toggle` instance (top bar, Theming and Content pages)
   flips brightness live through `frust::set_app_theme`, keeping the density
   the Content page's chips chose; every swatch, button, and
   text run on Home/Theming resolves through beUI's own tokens
@@ -111,6 +113,39 @@ Theming) alongside the active page's title.
   live timeline; the nav rail is a flat list rather than a grouped/labelled
   one (see "Nav shell" above); every section page hosts its state in a
   page-local component, so a page starts fresh each time it is opened.
+
+## Phones
+
+The shell follows the layout width, not the target OS: below 720 logical px
+(`nav::COMPACT_BREAKPOINT`) a phone shell replaces the rail, so a narrow
+desktop window shows it too.
+
+- **Top bar:** a Menu button, the page title and the light/dark toggle, each
+  control at least the touch minimum (44 px on Apple targets, 48 px
+  elsewhere) in either density.
+- **Page list:** the Menu button opens every page in a left `drawer`, grouped
+  under the Motion, Agents and Blocks headers as beUI list rows. Choosing a
+  page shows it and closes the list; a backdrop tap, Escape and the Android
+  back press close it too. The drawer is mounted in the shell's stack, so the
+  back press reaches it through a `frust::BackFallback` that claims the press
+  only while the list is open; with the list closed, back leaves the app as
+  usual.
+- **Safe area and keyboard:** the whole shell sits in a `frust::safe_area`
+  with `.keyboard(true)`, so the top bar starts below the status bar or notch
+  and the page ends above the home indicator, or above the soft keyboard
+  while it is open. The page's scroll view then keeps a focused field's caret
+  in view, which is what keeps the Chat page's composer and the Content
+  page's text field above the keyboard.
+- **Density:** Android and iOS start under `Density::Touch`
+  (`frust_beui::install_with_density`), every other target under
+  `Density::Comfortable`. The Content page's density chips read the live
+  theme rather than a state of their own, so they open on whichever density
+  the app started with.
+
+Fifteen of the twenty pages still lay out wider than a 390 px phone in
+places (fixed-width stages, rows that do not wrap, wide specimens); the
+shell's own test records which ones. Content, Agents · Primitives,
+Agents · Panels, Blocks · Morph and Theming fit.
 
 ## GPU Effects
 
@@ -131,7 +166,8 @@ Compiling the feature in is not the same as rendering 3D: a device is only
 reachable once the desktop shell has opened its first surface (beUI keeps the
 3D path off on Android and iOS), and `FRUST_BEUI_NO_GPU_FX=1` turns the whole path back off
 regardless of the build. Every component already carries that degrade in its
-own contract, so a `--features gpu-effects` build with no reachable device
+own contract (so a phone, where beUI keeps the 3D path off, renders every
+variant's 2D path), so a `--features gpu-effects` build with no reachable device
 renders exactly the default build's 2D panes — the GPU Effects page states
 which of the three cases the current run is in.
 
