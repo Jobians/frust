@@ -520,6 +520,40 @@ fn ime_compose_then_commit_inserts_composed_text() {
 }
 
 #[test]
+fn enter_during_a_preedit_confirms_the_candidate_without_submitting() {
+    let mut root = RenderRoot::new();
+    let mut logic = |s: &mut AppState| AnyView::new(NotesApp.build(s));
+    let mut state = NotesApp.init();
+    let mut tcx = TextContext::new();
+
+    let scene = frame(&mut root, &mut logic, &mut state, &mut tcx);
+    let field = center(field_rect(&scene));
+    tap(&mut root, &mut state, field);
+
+    root.event(
+        &mut state,
+        &InputEvent::Ime(ImeEvent::Compose {
+            text: "ni".to_string(),
+            cursor: Some((2, 2)),
+        }),
+    );
+    root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
+    assert!(
+        state.notes.is_empty(),
+        "Enter while composing must not submit the half-composed text"
+    );
+    assert_eq!(state.draft, "ni", "the preedit is left untouched");
+
+    root.event(
+        &mut state,
+        &InputEvent::Ime(ImeEvent::Commit("\u{4f60}\u{597d}".to_string())),
+    );
+    assert_eq!(state.draft, "\u{4f60}\u{597d}");
+    root.event(&mut state, &named(NamedKey::Enter, Modifiers::default()));
+    assert_eq!(state.notes.len(), 1, "Enter after the commit submits");
+}
+
+#[test]
 fn keyed_delete_removes_the_correct_middle_row() {
     let mut root = RenderRoot::new();
     let mut logic = |s: &mut AppState| AnyView::new(NotesApp.build(s));

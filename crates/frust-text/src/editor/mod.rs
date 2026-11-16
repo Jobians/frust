@@ -365,6 +365,13 @@ impl TextEditor {
         self.composition.preedit.is_some()
     }
 
+    /// Whether a composition is live: either the desktop preedit or a
+    /// platform-owned composing range (Android/iOS state sync). Matches
+    /// `editing_state_bytes().composing.is_some()` without allocating.
+    pub fn is_composing(&self) -> bool {
+        self.composition.range().is_some()
+    }
+
     /// The current editing value in byte offsets.
     pub fn editing_state_bytes(&self) -> EditingStateBytes {
         EditingStateBytes {
@@ -1064,6 +1071,43 @@ mod tests {
         let st = ed.editing_state_bytes();
         assert_eq!(st.composing, None, "commit clears the composing region");
         assert_eq!(ed.text(), "ni");
+    }
+
+    #[test]
+    fn is_composing_covers_preedit_and_platform_range() {
+        let (mut ed, mut cx) = editor();
+        assert!(!ed.is_composing());
+        ed.apply(
+            EditOp::Compose {
+                text: "ni".into(),
+                cursor: Some((2, 2)),
+            },
+            &mut cx,
+        );
+        assert!(ed.is_composing());
+        ed.apply(EditOp::FinishCompose, &mut cx);
+        assert!(!ed.is_composing());
+        ed.apply(
+            EditOp::ApplyEditingState(EditingStateBytes {
+                text: "hello".into(),
+                base: 5,
+                extent: 5,
+                composing: Some(0..5),
+            }),
+            &mut cx,
+        );
+        assert!(!ed.has_preedit());
+        assert!(ed.is_composing());
+        ed.apply(
+            EditOp::ApplyEditingState(EditingStateBytes {
+                text: "hello".into(),
+                base: 5,
+                extent: 5,
+                composing: None,
+            }),
+            &mut cx,
+        );
+        assert!(!ed.is_composing());
     }
 
     #[test]
