@@ -36,11 +36,34 @@
 //! | class | here |
 //! |---|---|
 //! | `flex w-full items-start gap-2` (+`flex-row-reverse` for `user`) | the row, [`MESSAGE_ROW_GAP`] apart, mirrored by [`MessageFrom`] |
-//! | avatar `size-7 rounded-full bg-muted text-xs font-medium` | [`MESSAGE_AVATAR_SIZE`] |
+//! | avatar `size-7 rounded-full bg-muted text-xs font-medium` | [`avatar`](crate::components::avatar::avatar) at [`AvatarSize::Md`] ([`MESSAGE_AVATAR_SIZE`]), [`AvatarTone::Muted`] |
 //! | content `flex min-w-0 flex-1 flex-col gap-1.5` | [`MESSAGE_COLUMN_GAP`] |
 //! | header/footer `px-1 text-[11px]` | [`MESSAGE_META_PADDING_X`] / [`MESSAGE_META_TEXT`] |
 //! | footer `min-h-5` | [`MESSAGE_FOOTER_MIN_HEIGHT`] |
 //! | marker `rounded-full bg-muted/70 px-2.5 py-1 text-xs max-w-[88%]` | [`message_marker`] |
+//!
+//! # The avatar is the catalog's avatar part
+//!
+//! [`MessageView::avatar`] mounts [`crate::components::avatar`]'s circle as a
+//! child — `Md`, muted — which is the look this row always painted: the same
+//! 28 px edge, fill, ink, weight and type-scale role. Like that part, the
+//! initials are upper-cased and cut to two grapheme clusters, the circle grows
+//! with the OS text scale, and it does not follow the density (an avatar is
+//! not a touch target). A [placeholder](MessageView::avatar_placeholder)
+//! reserves the same scaled edge, so a grouped follow-up row stays aligned.
+//! The circle publishes no node of its own: the row's accessible name already
+//! says who sent it.
+//!
+//! # Density and the text scale
+//!
+//! The row's own text — name, timestamp, footer and the marker's label — is
+//! shaped through the catalog's text helpers, so it follows the OS text scale.
+//! Its type steps come from the theme's [`BeuiMetrics`]: the marker is
+//! `text-xs` ([`BeuiMetrics::text_xs`]) and the metadata's `text-[11px]`, an
+//! arbitrary step no metric names, keeps its ratio to `text-xs`. The gaps and
+//! paddings are fixed insets with no metric behind them. The row carries no
+//! control of its own; an action composed into its content (a
+//! [`crate::components::button`]) keeps its own touch-sized hit area.
 //!
 //! # Entrance
 //!
@@ -60,32 +83,36 @@
 //!   row here is gone the frame after the rebuild that stopped returning it.
 //!   [`crate::motion::Presence`] exists for a caller that wants to keep one
 //!   mounted through an exit, but the row does not mount itself.
-//! - **The avatar is text, not a slot.** Upstream takes a `ReactNode` (an
-//!   `<img>`, an icon). This port takes a short string — initials — and paints
-//!   it in the circle; an image avatar is a caller's own composition problem
-//!   until the catalog has an image primitive to hand it.
+//! - **The avatar is initials, not a slot.** Upstream takes a `ReactNode` (an
+//!   `<img>`, an icon). This port takes a short string — initials — and shows
+//!   it in the catalog's avatar circle; an image avatar is a caller's own
+//!   composition (the [avatar part](crate::components::avatar) takes an image)
+//!   placed in the content slot.
 //! - **Metadata is two strings, not a slot.** `MessageHeader`/`MessageFooter`
 //!   are arbitrary children upstream; here they are the name/timestamp pair and
 //!   one footer string, which is what every upstream preview actually puts in
 //!   them.
 
 use frust::Theme;
-use frust::authoring::text::{FontWeight, TextStyle};
+use frust::authoring::text::TextStyle;
 use frust::authoring::{
     Affine, AnyView, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, Color, EventCtx, EventResult,
     InputEvent, LayoutCtx, PaintCtx, PaintScene, Point, Role, SemanticsCtx, Size, View, Widget,
     any, build_child, rebuild_child, route_event_single, teardown_child, visit_children,
 };
 
+use crate::agents::code_block::text_factor;
+use crate::components::avatar::{AvatarSize, AvatarTone, AvatarView, AvatarWidget, avatar};
 use crate::motion::Ramp;
 use crate::press::Lane;
 use crate::style::{self, scale_alpha};
 use crate::text::{Label, ThemeTextType};
 use crate::tokens::motion::SPRING_PRESS;
-use crate::tokens::{BEUI_LIGHT, BeuiPalette, sans_family};
+use crate::tokens::{BEUI_LIGHT, BeuiMetrics, BeuiPalette, sans_family};
 
-/// The avatar's edge, in logical px (`size-7`).
-pub const MESSAGE_AVATAR_SIZE: f64 = 28.0;
+/// The avatar's edge at text scale `1.0`, in logical px (`size-7`) —
+/// [`AvatarSize::Md`]'s edge.
+pub const MESSAGE_AVATAR_SIZE: f64 = AvatarSize::Md.edge();
 
 /// The gap between the avatar and the content column, in logical px (`gap-2`).
 pub const MESSAGE_ROW_GAP: f64 = style::SPACING_UNIT * 2.0;
@@ -98,7 +125,9 @@ pub const MESSAGE_COLUMN_GAP: f64 = style::SPACING_UNIT * 1.5;
 /// hair inside the bubble's own curve.
 pub const MESSAGE_META_PADDING_X: f64 = style::SPACING_UNIT;
 
-/// The metadata type size, in logical px (`text-[11px]`).
+/// The metadata type size under the comfortable metrics, in logical px
+/// (`text-[11px]`). A theme's metrics scale it by their `text-xs` step's ratio
+/// to [`style::TEXT_XS`] (see the [module docs](self)).
 pub const MESSAGE_META_TEXT: f64 = 11.0;
 
 /// The footer row's reserved height, in logical px (`min-h-5`).
@@ -164,7 +193,7 @@ impl MessageFrom {
 /// The colours one message row resolves.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MessagePaint {
-    /// The avatar circle's fill (`bg-muted`).
+    /// The muted fill a marker washes from (`bg-muted`, the avatar's too).
     avatar: Color,
     /// The metadata ink (`text-muted-foreground`).
     meta: Color,
@@ -193,31 +222,31 @@ impl MessagePaint {
 /// at layout.
 const META_ROLE: ThemeTextType = ThemeTextType::LabelSmall;
 
-/// The type-scale role the avatar's initials take their family from at layout.
-const AVATAR_ROLE: ThemeTextType = ThemeTextType::LabelMedium;
-
 /// The type-scale role a marker's label takes its family from at layout.
 const MARKER_ROLE: ThemeTextType = ThemeTextType::LabelMedium;
+
+/// The metadata type size under `m`: [`MESSAGE_META_TEXT`] at `m`'s `text-xs`
+/// ratio to the comfortable step, so the comfortable set keeps it exactly.
+fn meta_text(m: &BeuiMetrics) -> f64 {
+    MESSAGE_META_TEXT * (m.text_xs / style::TEXT_XS)
+}
 
 /// The metadata text style: `text-[11px] leading-none text-muted-foreground`.
 /// The family here is the unthemed base; `layout` shapes in [`META_ROLE`]'s
 /// family.
-fn meta_style(color: Color) -> TextStyle {
+fn meta_style(color: Color, m: &BeuiMetrics) -> TextStyle {
     TextStyle::default()
         .with_family(sans_family())
-        .with_size(MESSAGE_META_TEXT as f32)
+        .with_size(meta_text(m) as f32)
         .with_color(color)
 }
 
-/// The avatar's initials style: `text-xs font-medium text-muted-foreground`.
-/// The family here is the unthemed base; `layout` shapes in [`AVATAR_ROLE`]'s
-/// family.
-fn avatar_style(color: Color) -> TextStyle {
-    TextStyle::default()
-        .with_family(sans_family())
-        .with_weight(FontWeight::MEDIUM)
-        .with_size(style::TEXT_XS as f32)
-        .with_color(color)
+/// The row's avatar: the catalog's avatar part at the row's own `size-7`,
+/// muted (`bg-muted text-muted-foreground`).
+fn avatar_view<State: 'static>(initials: &str) -> AvatarView<State> {
+    avatar(initials)
+        .size(AvatarSize::Md)
+        .tone(AvatarTone::Muted)
 }
 
 /// A declarative beUI message row. See the [module docs](self).
@@ -312,9 +341,11 @@ impl<State: 'static> MessageView<State> {
 pub struct MessageWidget {
     from: MessageFrom,
     content: ChildPod,
-    /// The avatar's initials, shaped once; `None` for a placeholder or no
-    /// avatar at all.
-    avatar: Option<Label>,
+    /// The avatar part; `None` for a placeholder or no avatar at all.
+    avatar: Option<ChildPod>,
+    /// The avatar's edge (painted or placeholder), resolved by layout: the
+    /// base edge times the OS text scale.
+    avatar_edge: f64,
     /// Whether the avatar's box is reserved even with nothing to paint in it.
     avatar_slot: bool,
     name: Option<Label>,
@@ -325,7 +356,7 @@ pub struct MessageWidget {
     entrance: Lane,
     /// Whether the entrance has been staged onto the lane yet.
     staged: bool,
-    /// The avatar circle's box, resolved by layout.
+    /// The avatar circle's origin, resolved by layout.
     avatar_box: Option<Point>,
     /// Where the header baseline row sits, resolved by layout.
     header_at: Option<(Point, Option<Point>)>,
@@ -357,6 +388,16 @@ impl MessageWidget {
         self.content.origin()
     }
 
+    /// The initials the avatar shows (upper-cased and cut, as the avatar part
+    /// shows them); `None` for a placeholder or no avatar.
+    pub fn avatar_initials(&self) -> Option<&str> {
+        let pod = self.avatar.as_ref()?;
+        let widget: &dyn std::any::Any = pod.widget();
+        widget
+            .downcast_ref::<AvatarWidget>()
+            .map(AvatarWidget::initials)
+    }
+
     /// Stage the entrance the first time a clock is available; a row built
     /// without `animateIn` — or under `reduce_motion` — lands immediately.
     fn stage(&mut self, reduce_motion: bool) {
@@ -374,7 +415,7 @@ impl MessageWidget {
     /// reserved.
     fn avatar_column(&self) -> f64 {
         if self.avatar_slot {
-            MESSAGE_AVATAR_SIZE + MESSAGE_ROW_GAP
+            self.avatar_edge + MESSAGE_ROW_GAP
         } else {
             0.0
         }
@@ -389,7 +430,11 @@ impl<State: 'static> View<State> for MessageView<State> {
         MessageWidget {
             from: self.from,
             content: build_child(&self.content, ctx),
-            avatar: self.avatar.as_ref().map(Label::new),
+            avatar: self
+                .avatar
+                .as_deref()
+                .map(|initials| build_child(&avatar_view::<State>(initials), ctx)),
+            avatar_edge: MESSAGE_AVATAR_SIZE,
             avatar_slot: self.avatar.is_some() || self.avatar_placeholder,
             name: self.name.as_ref().map(Label::new),
             timestamp: self.timestamp.as_ref().map(Label::new),
@@ -424,7 +469,12 @@ impl<State: 'static> View<State> for MessageView<State> {
             element.avatar_slot = slot;
             flags |= ChangeFlags::LAYOUT | ChangeFlags::PAINT;
         }
-        flags |= reconcile(&mut element.avatar, self.avatar.as_deref());
+        flags |= reconcile_avatar::<State>(
+            &mut element.avatar,
+            prev.avatar.as_deref(),
+            self.avatar.as_deref(),
+            ctx,
+        );
         flags |= reconcile(&mut element.name, self.name.as_deref());
         flags |= reconcile(&mut element.timestamp, self.timestamp.as_deref());
         flags |= reconcile(&mut element.footer, self.footer.as_deref());
@@ -435,6 +485,38 @@ impl<State: 'static> View<State> for MessageView<State> {
 
     fn teardown(&self, element: &mut MessageWidget, ctx: &mut BuildCtx<'_>) {
         teardown_child(&self.content, &mut element.content, ctx);
+        if let (Some(initials), Some(pod)) = (self.avatar.as_deref(), element.avatar.as_mut()) {
+            teardown_child(&avatar_view::<State>(initials), pod, ctx);
+        }
+    }
+}
+
+/// Reconcile the avatar pod from `prev`'s initials to `next`'s, returning the
+/// flags the change owes: an unchanged avatar rebuilds to nothing, one that
+/// appears or disappears changes the row's geometry.
+fn reconcile_avatar<State: 'static>(
+    pod: &mut Option<ChildPod>,
+    prev: Option<&str>,
+    next: Option<&str>,
+    ctx: &mut BuildCtx<'_>,
+) -> ChangeFlags {
+    let old = prev.map(avatar_view::<State>);
+    let new = next.map(avatar_view::<State>);
+    if let (Some(old), Some(new), Some(existing)) = (&old, &new, pod.as_mut()) {
+        return rebuild_child(old, new, existing, ctx);
+    }
+    let had = match (old, pod.take()) {
+        (Some(old), Some(mut existing)) => {
+            teardown_child(&old, &mut existing, ctx);
+            true
+        }
+        (_, existing) => existing.is_some(),
+    };
+    *pod = new.map(|new| build_child(&new, ctx));
+    if had || pod.is_some() {
+        ChangeFlags::LAYOUT | ChangeFlags::PAINT
+    } else {
+        ChangeFlags::NONE
     }
 }
 
@@ -464,8 +546,15 @@ impl Widget for MessageWidget {
         } else {
             0.0
         };
-        let paint = MessagePaint::resolve(Theme::from_layout_ctx(ctx));
-        let meta = meta_style(paint.meta);
+        let (paint, m, factor) = {
+            let theme = Theme::from_layout_ctx(ctx);
+            (
+                MessagePaint::resolve(theme),
+                BeuiMetrics::resolve(theme),
+                text_factor(theme),
+            )
+        };
+        let meta = meta_style(paint.meta, &m);
 
         // Shape the metadata first: the column's height is the sum of the rows
         // it actually carries.
@@ -481,8 +570,12 @@ impl Widget for MessageWidget {
             .footer
             .as_mut()
             .map(|run| run.layout_themed(ctx, &meta, META_ROLE));
+        // The avatar part scales its own edge by the text scale; a placeholder
+        // reserves the same edge so a grouped follow-up stays aligned.
+        self.avatar_edge = MESSAGE_AVATAR_SIZE * factor;
         if let Some(avatar) = self.avatar.as_mut() {
-            avatar.layout_themed(ctx, &avatar_style(paint.meta), AVATAR_ROLE);
+            let edge = Size::new(self.avatar_edge, self.avatar_edge);
+            avatar.layout_child(ctx, &BoxConstraints::tight(edge));
         }
 
         let column_x = if self.from.is_mirrored() {
@@ -560,25 +653,22 @@ impl Widget for MessageWidget {
         // sender's direction puts it.
         self.avatar_box = self.avatar_slot.then(|| {
             let x = if self.from.is_mirrored() {
-                (row_width - MESSAGE_AVATAR_SIZE).max(0.0)
+                (row_width - self.avatar_edge).max(0.0)
             } else {
                 0.0
             };
             Point::new(x, 0.0)
         });
+        if let (Some(avatar), Some(at)) = (self.avatar.as_mut(), self.avatar_box) {
+            avatar.set_origin(at);
+        }
 
         self.row = Size::new(row_width, y.max(content_size.height));
         bc.constrain(self.row)
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
-        let (reduce_motion, paint) = {
-            let theme = Theme::from_paint_ctx(ctx);
-            (
-                theme.is_some_and(|t| t.motion.reduce_motion),
-                MessagePaint::resolve(theme),
-            )
-        };
+        let reduce_motion = Theme::from_paint_ctx(ctx).is_some_and(|t| t.motion.reduce_motion);
         self.stage(reduce_motion);
 
         let now = ctx.frame_time();
@@ -609,22 +699,10 @@ impl Widget for MessageWidget {
             scene.push_layer(origin, self.row, alpha);
         }
 
-        if let Some(at) = self.avatar_box {
-            let at = Point::new(origin.x + at.x, origin.y + at.y);
-            let box_size = Size::new(MESSAGE_AVATAR_SIZE, MESSAGE_AVATAR_SIZE);
-            // A placeholder is `invisible`: it holds the space and paints
-            // nothing, which is exactly what keeps a grouped follow-up aligned.
-            if let Some(avatar) = self.avatar.as_ref() {
-                scene.fill_rounded_rect(at, box_size, MESSAGE_AVATAR_SIZE / 2.0, paint.avatar);
-                let text = avatar.size();
-                avatar.paint(
-                    Point::new(
-                        at.x + (MESSAGE_AVATAR_SIZE - text.width) / 2.0,
-                        at.y + (MESSAGE_AVATAR_SIZE - text.height) / 2.0,
-                    ),
-                    scene,
-                );
-            }
+        // A placeholder is `invisible`: it holds the space and paints nothing,
+        // which is exactly what keeps a grouped follow-up aligned.
+        if let Some(avatar) = self.avatar.as_mut() {
+            avatar.paint_child(ctx, scene);
         }
 
         if let Some((name_at, stamp_at)) = self.header_at {
@@ -673,7 +751,7 @@ impl Widget for MessageWidget {
         );
     }
 
-    visit_children!(content);
+    visit_children!(avatar, content);
 }
 
 // ---- The marker ------------------------------------------------------------
@@ -753,10 +831,16 @@ impl Widget for MessageMarkerWidget {
         } else {
             0.0
         };
-        let ink = MessagePaint::resolve(Theme::from_layout_ctx(ctx)).meta;
+        let (ink, m) = {
+            let theme = Theme::from_layout_ctx(ctx);
+            (
+                MessagePaint::resolve(theme).meta,
+                BeuiMetrics::resolve(theme),
+            )
+        };
         let text = self.label.layout_themed(
             ctx,
-            &meta_style(ink).with_size(style::TEXT_XS as f32),
+            &meta_style(ink, &m).with_size(m.text_xs as f32),
             MARKER_ROLE,
         );
         let cap = row_width * MESSAGE_MARKER_MAX_WIDTH_FRACTION;
@@ -769,13 +853,16 @@ impl Widget for MessageMarkerWidget {
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
-        let paint = MessagePaint::resolve(Theme::from_paint_ctx(ctx));
+        let (paint, m) = {
+            let theme = Theme::from_paint_ctx(ctx);
+            (MessagePaint::resolve(theme), BeuiMetrics::resolve(theme))
+        };
         let origin = ctx.origin();
         let at = Point::new(origin.x + self.pill_x, origin.y);
         scene.fill_rounded_rect(
             at,
             self.pill,
-            style::resolve_radius(style::RADIUS_FULL, self.pill.width, self.pill.height),
+            style::resolve_radius(m.radius_control, self.pill.width, self.pill.height),
             scale_alpha(paint.avatar, MARKER_FILL_ALPHA),
         );
         let text = self.label.size();
@@ -1066,6 +1153,174 @@ mod tests {
             "capped: {}",
             widget.pill_size().width
         );
+    }
+
+    // ---- The avatar part, density and the touch minimum --------------------
+
+    /// Lay `view` out under `theme`.
+    fn laid_out_in(view: &MessageView<()>, theme: &Theme) -> MessageWidget {
+        let mut next_id = 0u64;
+        let mut widget = View::<()>::build(view, &mut BuildCtx::new(&mut next_id));
+        let mut text_ctx = TextContext::new();
+        let mut layout =
+            LayoutCtx::with_resources(Some(&mut text_ctx as &mut dyn Any), Some(theme as &dyn Any));
+        widget.layout(&mut layout, &BoxConstraints::loose(ROW));
+        widget
+    }
+
+    /// The size of the deepest pod under `widget`, following its last child.
+    fn innermost_size(widget: &dyn Widget) -> Option<Size> {
+        let mut found = None;
+        widget.visit_children(&mut |pod| {
+            found = innermost_size(pod.widget()).or(Some(pod.size()));
+        });
+        found
+    }
+
+    /// The row's avatar is the catalog's avatar part, showing the same
+    /// initials, and under the comfortable metrics it paints what the row
+    /// always painted: a 28 px muted circle on the sender's side.
+    #[test]
+    fn the_avatar_part_shows_the_same_initials_and_paints_the_same_circle() {
+        let mut received =
+            laid_out(&message::<(), _>(MessageFrom::Assistant, text("hi")).avatar("AI"));
+        assert_eq!(received.avatar_initials(), Some("AI"));
+        let (rec, _) = painted(&mut received, 0, None);
+        assert_eq!(
+            rec.rounded,
+            vec![(
+                Point::ORIGIN,
+                Size::new(MESSAGE_AVATAR_SIZE, MESSAGE_AVATAR_SIZE),
+                FALLBACK.muted
+            )],
+            "the unthemed muted circle"
+        );
+        assert!(rec.glyph_runs > 0, "the initials are drawn");
+
+        let theme = crate::tokens::theme_with_density(crate::tokens::Density::Comfortable);
+        let mut sent = laid_out_in(
+            &message::<(), _>(MessageFrom::User, text("hi")).avatar("ED"),
+            &theme,
+        );
+        assert_eq!(sent.avatar_initials(), Some("ED"));
+        let (rec, _) = painted(&mut sent, 0, Some(&theme));
+        assert_eq!(
+            rec.rounded[0],
+            (
+                Point::new(ROW.width - MESSAGE_AVATAR_SIZE, 0.0),
+                Size::new(MESSAGE_AVATAR_SIZE, MESSAGE_AVATAR_SIZE),
+                theme.scheme().surface_container_highest
+            ),
+            "the themed muted circle on the trailing edge"
+        );
+
+        // A touch theme shows the same initials in the same circle: an avatar
+        // is not a touch target.
+        let touch = crate::tokens::theme_with_density(crate::tokens::Density::Touch);
+        let row = laid_out_in(
+            &message::<(), _>(MessageFrom::Assistant, text("hi")).avatar("AI"),
+            &touch,
+        );
+        assert_eq!(row.avatar_initials(), Some("AI"));
+        assert_eq!(
+            row.content_origin().x,
+            MESSAGE_AVATAR_SIZE + MESSAGE_ROW_GAP
+        );
+        assert_eq!(
+            laid_out(&message::<(), _>(MessageFrom::User, text("hi"))).avatar_initials(),
+            None
+        );
+    }
+
+    /// Swapping the initials rebuilds the avatar part in place; dropping the
+    /// avatar for a placeholder keeps the column where it was.
+    #[test]
+    fn a_rebuild_reconciles_the_avatar_part() {
+        let ai = message::<(), _>(MessageFrom::Assistant, text("hi")).avatar("AI");
+        let mut widget = laid_out(&ai);
+        let mut next_id = 0u64;
+        let flags = View::<()>::rebuild(&ai, &ai, &mut widget, &mut BuildCtx::new(&mut next_id));
+        assert_eq!(flags, ChangeFlags::NONE, "same initials, nothing owed");
+
+        let ed = message::<(), _>(MessageFrom::Assistant, text("hi")).avatar("ED");
+        let flags = View::<()>::rebuild(&ed, &ai, &mut widget, &mut BuildCtx::new(&mut next_id));
+        assert!(flags.contains(ChangeFlags::LAYOUT));
+        relayout(&mut widget);
+        assert_eq!(widget.avatar_initials(), Some("ED"));
+
+        let held = message::<(), _>(MessageFrom::Assistant, text("hi")).avatar_placeholder(true);
+        let column = widget.content_origin().x;
+        let flags = View::<()>::rebuild(&held, &ed, &mut widget, &mut BuildCtx::new(&mut next_id));
+        assert!(flags.contains(ChangeFlags::LAYOUT));
+        relayout(&mut widget);
+        assert_eq!(widget.avatar_initials(), None);
+        assert_eq!(
+            widget.content_origin().x,
+            column,
+            "the column stays aligned"
+        );
+    }
+
+    /// A message action — a beUI button composed into the bubble the row
+    /// carries — keeps its touch-sized hit area: neither the row nor the bubble
+    /// squeezes it.
+    #[test]
+    fn a_message_action_keeps_a_touch_sized_hit_area() {
+        use crate::agents::message_bubble::message_bubble;
+        use crate::components::button::{ButtonSize, button};
+
+        let row = || {
+            message::<(), _>(
+                MessageFrom::Assistant,
+                message_bubble::<(), _>(button::<()>("Copy", |_| {}).size(ButtonSize::Sm)),
+            )
+            .avatar("AI")
+        };
+        let comfortable = crate::tokens::theme_with_density(crate::tokens::Density::Comfortable);
+        let desk = laid_out_in(&row(), &comfortable);
+        let action = innermost_size(&desk).expect("the action's pod");
+        assert_eq!(
+            action.height,
+            style::HEIGHT_SM,
+            "the comfortable `sm` button"
+        );
+
+        let touch = crate::tokens::theme_with_density(crate::tokens::Density::Touch);
+        let floor = BeuiMetrics::resolve(Some(&touch)).min_touch_target;
+        assert!(floor >= 44.0);
+        let phone = laid_out_in(&row(), &touch);
+        let action = innermost_size(&phone).expect("the action's pod");
+        assert!(action.width >= floor, "width {}", action.width);
+        assert!(action.height >= floor, "height {}", action.height);
+    }
+
+    /// Under a touch theme the row's type steps follow the metrics; under the
+    /// comfortable ones they are the class list's own.
+    #[test]
+    fn the_metadata_and_marker_type_follow_the_metrics() {
+        assert_eq!(meta_text(&BeuiMetrics::comfortable()), MESSAGE_META_TEXT);
+        let touch = BeuiMetrics::touch();
+        assert!(meta_text(&touch) > MESSAGE_META_TEXT);
+
+        let marker = |theme: &Theme| {
+            let mut next_id = 0u64;
+            let view = message_marker("Today");
+            let mut widget = View::<()>::build(&view, &mut BuildCtx::new(&mut next_id));
+            let mut text_ctx = TextContext::new();
+            let mut layout = LayoutCtx::with_resources(
+                Some(&mut text_ctx as &mut dyn Any),
+                Some(theme as &dyn Any),
+            );
+            widget.layout(&mut layout, &BoxConstraints::loose(ROW));
+            widget.pill_size()
+        };
+        let desk = marker(&crate::tokens::theme_with_density(
+            crate::tokens::Density::Comfortable,
+        ));
+        let phone = marker(&crate::tokens::theme_with_density(
+            crate::tokens::Density::Touch,
+        ));
+        assert!(phone.height > desk.height, "{phone:?} vs {desk:?}");
     }
 
     // ---- Typeface: the row's metadata and the marker follow the theme -------

@@ -26,7 +26,7 @@
 //!
 //! | class | here |
 //! |---|---|
-//! | `rounded-2xl` | [`style::RADIUS_2XL`] |
+//! | `rounded-2xl` | [`BeuiMetrics::radius_card`] |
 //! | `px-3.5 py-2.5` | [`BUBBLE_PADDING_X`] / [`BUBBLE_PADDING_Y`] |
 //! | `min-w-9` | [`BUBBLE_MIN_WIDTH`] |
 //! | `max-w-[82%]` | [`BUBBLE_MAX_WIDTH_FRACTION`] |
@@ -41,6 +41,15 @@
 //!
 //! Both are [`Lane`]s, retargeted on the first paint (a build carries no clock)
 //! and snapped outright under `reduce_motion`.
+//!
+//! # Density and the text scale
+//!
+//! The surface's radius is the theme's [`BeuiMetrics::radius_card`], which no
+//! density changes. The bubble carries no text and no control of its own: what
+//! it wraps sizes itself (a [`crate::components::button`] inside it keeps its
+//! touch-sized hit area), and the padding is a fixed inset with no metric
+//! behind it, so a touch theme lays a bubble out exactly as the comfortable one
+//! does around the same content.
 //!
 //! # Degradations against upstream
 //!
@@ -78,7 +87,7 @@ use crate::motion::Ramp;
 use crate::press::{Lane, stroke_outline};
 use crate::style::{self, scale_alpha, with_alpha};
 use crate::tokens::motion::{EASE_OUT, SPRING_PRESS};
-use crate::tokens::{BEUI_LIGHT, BeuiPalette};
+use crate::tokens::{BEUI_LIGHT, BeuiMetrics, BeuiPalette};
 
 /// Horizontal padding inside the bubble, in logical px (`px-3.5`).
 pub const BUBBLE_PADDING_X: f64 = 14.0;
@@ -486,11 +495,12 @@ impl Widget for MessageBubbleWidget {
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
-        let (reduce_motion, paint) = {
+        let (reduce_motion, paint, metrics) = {
             let theme = Theme::from_paint_ctx(ctx);
             (
                 theme.is_some_and(|t| t.motion.reduce_motion),
                 BubblePaint::resolve(self.variant, theme),
+                BeuiMetrics::resolve(theme),
             )
         };
         self.stage(reduce_motion);
@@ -520,7 +530,7 @@ impl Widget for MessageBubbleWidget {
                     * Affine::translate((-pivot_x, -pivot_y)),
             );
             let radius =
-                style::resolve_radius(style::RADIUS_2XL, self.bubble.width, self.bubble.height);
+                style::resolve_radius(metrics.radius_card, self.bubble.width, self.bubble.height);
             let at = Point::new(origin.x + self.bubble_x, origin.y);
             scene.fill_rounded_rect(
                 at,
