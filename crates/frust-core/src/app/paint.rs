@@ -7,6 +7,7 @@ use super::RenderRoot;
 use super::session::traps_focus;
 use crate::anim::{FrameTime, animation_time_scale};
 use crate::event::ImeState;
+use crate::focus_handle::{BoundHandle, FocusBindPass};
 use crate::focus_scope::{FocusScopeKey, FocusScopePass, LiveSession, ScopeId};
 use crate::overlay::{
     OverlayEntry, OverlayHit, OverlayKey, OverlayPaintPass, sort_into_paint_order,
@@ -51,6 +52,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         let toolbar_pass = SelectionToolbarPass::enter();
         let shortcut_pass = ShortcutPaintPass::enter();
         let scope_pass = FocusScopePass::enter();
+        let bind_pass = FocusBindPass::enter();
         // The pods compare their stamps against this root's session.
         self.publish_focus_session();
         // Number this pass (see `paint_serial`).
@@ -92,14 +94,42 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             outcome.needs_frame_paced_only = false;
         }
 
+        // A request still pending on a bound handle is granted by the next rebuild: ask for it.
+        if self.rebind_focus_handles(bind_pass.take()) {
+            outcome.needs_frame = true;
+            outcome.needs_frame_paced_only = false;
+        }
+
         self.resolve_session_surface(main_tree_ime, holder, holder_ime);
         // A modal registered by this paint ends a main-tree session now, not at the next event.
         self.trap_modal_focus();
+        // A change that happened inside this paint owes its widget a broadcast frame.
+        if self.refresh_focus_handles() {
+            outcome.needs_frame = true;
+            outcome.needs_frame_paced_only = false;
+        }
 
         // Last, so a field painted inside a floated pod is resolved like any other.
         self.resolve_selection_toolbar(toolbar_pass.take());
 
         outcome
+    }
+
+    /// Replace the bound handles with this paint's. A handle no longer bound reads unfocused.
+    /// Returns whether a bound handle holds a request the next rebuild must grant.
+    fn rebind_focus_handles(&mut self, bound: Vec<BoundHandle>) -> bool {
+        for old in &self.focus_handles {
+            if !bound.iter().any(|new| new.handle.same(&old.handle)) {
+                old.handle.set_focused(false);
+                old.handle.note_seen(false);
+            }
+        }
+        self.focus_handles = bound;
+        self.handles_synced = None;
+        for bound in &self.focus_handles {
+            bound.handle.note_painted();
+        }
+        self.focus_request_waiting()
     }
 
     /// Diff this paint's focus-return scopes, the widget registrations then every trapping overlay
@@ -198,6 +228,8 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         ctx.set_hovered(self.hover_active);
         ctx.set_hover_epoch(self.hover_epoch);
         pod.widget_mut().paint(&mut ctx, scene);
+        // What no pod below claimed was bound by the root widget itself (stop `0`).
+        crate::focus_handle::resolve_binds(0, || 0);
         pod.clear_flags();
         // Collected for `resolve_session_surface`, and only while a session is live,
         // so a lagging widget cannot resurrect the surface a blur dropped.

@@ -5,7 +5,7 @@ use std::rc::Weak;
 
 use kurbo::Rect;
 
-use super::{RenderRoot, advance_focus_epoch};
+use super::{RenderRoot, advance_focus_epoch_past};
 use crate::event::{CursorIcon, ImeState, PointerId};
 use crate::overlay::{OverlayHit, OverlayInput, OverlayKey, OverlayKeys};
 use crate::view::View;
@@ -27,6 +27,7 @@ pub(super) fn release_focus_session_in(
     ime_slot: &mut Option<ImeState>,
     generation: &mut u64,
     focus_epoch: &mut u64,
+    burned_epoch: u64,
     root_identity: u64,
 ) {
     let moved = *focus_active || ime_slot.is_some();
@@ -35,7 +36,7 @@ pub(super) fn release_focus_session_in(
     if moved {
         *generation = generation.wrapping_add(1);
         // Only on an actual release: a `Down` on already-blurred chrome must move nothing.
-        *focus_epoch = advance_focus_epoch(*focus_epoch);
+        *focus_epoch = advance_focus_epoch_past(*focus_epoch, burned_epoch);
         crate::widget::set_live_focus_session(root_identity, *focus_epoch, *focus_epoch);
     }
 }
@@ -141,6 +142,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             &mut self.ime_state,
             &mut self.focus_ime_gen,
             &mut self.focus_epoch,
+            self.burned_epoch,
             self.root_identity,
         );
         self.focus_surface = None;

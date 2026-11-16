@@ -1,0 +1,430 @@
+//! A text field's focus from app code: `autofocus`, a `FocusHandle`, `on_focus_change`, and the
+//! `keep_focus` wrapper that lets a sibling control take a press without ending the session.
+//!
+//! Needs the facade's `test-support` feature (`cargo test -p frust-ui --features test-support`);
+//! without it the file compiles to nothing.
+
+#![cfg(feature = "test-support")]
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::Duration;
+
+use frust::testing::Tester;
+use frust::{
+    Component, FocusHandle, View, button, column, component, either, keep_focus, overlay_portal,
+    text, text_input,
+};
+use kurbo::{Point, Size};
+
+const FRAME: Duration = Duration::from_millis(16);
+
+/// What the button does when tapped.
+#[derive(Clone, Copy, PartialEq)]
+enum Tap {
+    Count,
+    Request,
+    Reveal,
+}
+
+struct Model {
+    value: String,
+    focus_log: Vec<bool>,
+    clicks: u32,
+    tap: Tap,
+    keep: bool,
+    autofocus: bool,
+    show_field: bool,
+}
+
+type Shared = Rc<RefCell<Model>>;
+
+fn model(tap: Tap) -> Shared {
+    Rc::new(RefCell::new(Model {
+        value: String::new(),
+        focus_log: Vec::new(),
+        clicks: 0,
+        tap,
+        keep: false,
+        autofocus: false,
+        show_field: true,
+    }))
+}
+
+struct Page {
+    model: Shared,
+    handle: FocusHandle,
+}
+
+impl Page {
+    fn tap_button(&self) -> impl View<Shared> + use<> {
+        let handle = self.handle.clone();
+        button("Tap", move |model: &mut Shared| {
+            let mut model = model.borrow_mut();
+            model.clicks += 1;
+            match model.tap {
+                Tap::Count => {}
+                Tap::Request => handle.request(),
+                Tap::Reveal => model.show_field = true,
+            }
+        })
+    }
+}
+
+impl Component for Page {
+    type State = Shared;
+
+    fn init(&self) -> Shared {
+        self.model.clone()
+    }
+
+    fn build(&self, model: &mut Shared) -> impl View<Shared> {
+        let (value, keep, autofocus, show_field) = {
+            let model = model.borrow();
+            (
+                model.value.clone(),
+                model.keep,
+                model.autofocus,
+                model.show_field,
+            )
+        };
+        column()
+            .child(either(
+                keep,
+                || keep_focus(self.tap_button()),
+                || self.tap_button(),
+            ))
+            .when(show_field, |col| {
+                col.child(
+                    text_input(value, |model: &mut Shared, v: String| {
+                        model.borrow_mut().value = v;
+                    })
+                    .focus_handle(self.handle.clone())
+                    .autofocus(autofocus)
+                    .on_focus_change(|model: &mut Shared, focused: bool| {
+                        model.borrow_mut().focus_log.push(focused);
+                    }),
+                )
+            })
+    }
+}
+
+fn page(model: &Shared, handle: &FocusHandle) -> Tester<(), impl View<()>> {
+    let (model, handle) = (model.clone(), handle.clone());
+    Tester::new(
+        (),
+        move |_: &mut ()| {
+            component(Page {
+                model: model.clone(),
+                handle: handle.clone(),
+            })
+        },
+        Size::new(400.0, 300.0),
+    )
+}
+
+/// A few frames: enough for a deferred focus change and its notification. A focused field blinks
+/// its caret, so the tree never goes idle and `pump_and_settle` cannot be used.
+fn settle<S: 'static, V: View<S>>(tester: &mut Tester<S, V>) {
+    for _ in 0..4 {
+        tester.pump(FRAME);
+    }
+}
+
+fn center_of<S: 'static, V: View<S>>(tester: &Tester<S, V>, type_suffix: &str) -> Point {
+    tester
+        .inspect()
+        .into_iter()
+        .find(|node| node.type_name.ends_with(type_suffix))
+        .unwrap_or_else(|| panic!("the page holds a {type_suffix}"))
+        .bounds
+        .center()
+}
+
+fn tap_on<S: 'static, V: View<S>>(tester: &mut Tester<S, V>, type_suffix: &str) {
+    let at = center_of(tester, type_suffix);
+    tester.tap(at);
+    settle(tester);
+}
+
+#[test]
+fn an_autofocus_field_is_focused_within_a_few_frames_with_no_input() {
+    let (model, handle) = (model(Tap::Count), FocusHandle::new());
+    model.borrow_mut().autofocus = true;
+    let mut tester = page(&model, &handle);
+    tester.pump(FRAME);
+    settle(&mut tester);
+
+    assert!(tester.focus_info().is_some(), "the field took focus");
+    assert!(handle.is_focused(), "and the handle reports it");
+    assert_eq!(model.borrow().focus_log, [true]);
+}
+
+#[test]
+fn a_button_requesting_the_handle_focuses_the_field() {
+    let (model, handle) = (model(Tap::Request), FocusHandle::new());
+    let mut tester = page(&model, &handle);
+    assert!(tester.focus_info().is_none());
+
+    tap_on(&mut tester, "ButtonWidget");
+
+    assert_eq!(model.borrow().clicks, 1);
+    assert!(
+        tester.focus_info().is_some(),
+        "the request focused the field"
+    );
+    assert!(handle.is_focused());
+    assert_eq!(model.borrow().focus_log, [true]);
+}
+
+#[test]
+fn a_press_on_a_keep_focus_button_keeps_the_field_focused() {
+    let (model, handle) = (model(Tap::Count), FocusHandle::new());
+    model.borrow_mut().keep = true;
+    let mut tester = page(&model, &handle);
+    tap_on(&mut tester, "TextInputWidget");
+    let field = tester.focus_info().expect("the tap focused the field").node;
+
+    tap_on(&mut tester, "ButtonWidget");
+
+    assert_eq!(model.borrow().clicks, 1, "the button still ran its tap");
+    assert_eq!(
+        tester.focus_info().map(|info| info.node),
+        Some(field),
+        "the field kept its session"
+    );
+    assert!(handle.is_focused());
+    assert_eq!(
+        model.borrow().focus_log,
+        [true],
+        "and was never told it lost focus"
+    );
+}
+
+#[test]
+fn the_same_button_without_keep_focus_blurs_the_field() {
+    let (model, handle) = (model(Tap::Count), FocusHandle::new());
+    let mut tester = page(&model, &handle);
+    tap_on(&mut tester, "TextInputWidget");
+    let field = tester.focus_info().expect("the tap focused the field").node;
+
+    tap_on(&mut tester, "ButtonWidget");
+
+    assert_eq!(model.borrow().clicks, 1);
+    assert_ne!(
+        tester.focus_info().map(|info| info.node),
+        Some(field),
+        "the press ended the field's session"
+    );
+    assert!(!handle.is_focused());
+}
+
+#[test]
+fn on_focus_change_records_one_true_and_one_false_for_tap_in_then_tap_out() {
+    let (model, handle) = (model(Tap::Count), FocusHandle::new());
+    let mut tester = page(&model, &handle);
+    assert!(model.borrow().focus_log.is_empty());
+
+    tap_on(&mut tester, "TextInputWidget");
+    assert_eq!(model.borrow().focus_log, [true]);
+
+    tap_on(&mut tester, "ButtonWidget");
+    assert_eq!(model.borrow().focus_log, [true, false]);
+}
+
+#[test]
+fn a_field_that_mounts_later_takes_a_pending_handle_request() {
+    let (model, handle) = (model(Tap::Reveal), FocusHandle::new());
+    model.borrow_mut().show_field = false;
+    let mut tester = page(&model, &handle);
+    handle.request();
+    settle(&mut tester);
+    assert!(
+        tester.focus_info().is_none(),
+        "nothing is mounted to take it"
+    );
+
+    tap_on(&mut tester, "ButtonWidget");
+
+    assert!(
+        tester.focus_info().is_some(),
+        "the field took the pending request"
+    );
+    assert!(handle.is_focused());
+    assert_eq!(model.borrow().focus_log, [true]);
+}
+
+/// An autofocus field floated in an `overlay_portal` surface, reporting to `focus_log`.
+struct PortalPage {
+    model: Shared,
+    handle: FocusHandle,
+}
+
+impl Component for PortalPage {
+    type State = Shared;
+
+    fn init(&self) -> Shared {
+        self.model.clone()
+    }
+
+    fn build(&self, _model: &mut Shared) -> impl View<Shared> {
+        overlay_portal(text("anchor")).overlay(Some(
+            text_input(String::new(), |_: &mut Shared, _: String| {})
+                .focus_handle(self.handle.clone())
+                .autofocus(true)
+                .on_focus_change(|model: &mut Shared, focused: bool| {
+                    model.borrow_mut().focus_log.push(focused);
+                }),
+        ))
+    }
+}
+
+#[test]
+fn an_autofocus_field_inside_overlay_content_reports_its_gain_and_its_release() {
+    let (model, handle) = (model(Tap::Count), FocusHandle::new());
+    let (m, h) = (model.clone(), handle.clone());
+    let mut tester = Tester::new(
+        (),
+        move |_: &mut ()| {
+            component(PortalPage {
+                model: m.clone(),
+                handle: h.clone(),
+            })
+        },
+        Size::new(400.0, 300.0),
+    );
+    tester.pump(FRAME);
+    settle(&mut tester);
+    assert!(handle.is_focused(), "the floated field took focus");
+    assert_eq!(model.borrow().focus_log, [true]);
+
+    handle.release();
+    settle(&mut tester);
+    assert!(!handle.is_focused());
+    assert_eq!(model.borrow().focus_log, [true, false]);
+}
+
+/// A field, then a second field inside `keep_focus`, each reporting to its own log.
+struct KeptPage {
+    model: Shared,
+    kept_log: Rc<RefCell<Vec<bool>>>,
+}
+
+impl Component for KeptPage {
+    type State = Shared;
+
+    fn init(&self) -> Shared {
+        self.model.clone()
+    }
+
+    fn build(&self, _model: &mut Shared) -> impl View<Shared> {
+        let kept_log = self.kept_log.clone();
+        column()
+            .child(
+                text_input(String::new(), |_: &mut Shared, _: String| {}).on_focus_change(
+                    |model: &mut Shared, focused: bool| model.borrow_mut().focus_log.push(focused),
+                ),
+            )
+            .child(keep_focus(
+                text_input(String::new(), |_: &mut Shared, _: String| {}).on_focus_change(
+                    move |_: &mut Shared, focused: bool| kept_log.borrow_mut().push(focused),
+                ),
+            ))
+    }
+}
+
+#[test]
+fn a_field_pressed_inside_keep_focus_neither_takes_nor_reports_focus() {
+    let model = model(Tap::Count);
+    let kept_log = Rc::new(RefCell::new(Vec::new()));
+    let (m, k) = (model.clone(), kept_log.clone());
+    let mut tester = Tester::new(
+        (),
+        move |_: &mut ()| {
+            component(KeptPage {
+                model: m.clone(),
+                kept_log: k.clone(),
+            })
+        },
+        Size::new(400.0, 300.0),
+    );
+    settle(&mut tester);
+    let fields: Vec<Point> = tester
+        .inspect()
+        .into_iter()
+        .filter(|node| node.type_name.ends_with("TextInputWidget"))
+        .map(|node| node.bounds.center())
+        .collect();
+    assert_eq!(fields.len(), 2);
+    tester.tap(fields[0]);
+    settle(&mut tester);
+    let first = tester.focus_info().expect("the tap focused the first").node;
+    assert_eq!(model.borrow().focus_log, [true]);
+
+    tester.tap(fields[1]);
+    settle(&mut tester);
+
+    assert_eq!(
+        tester.focus_info().map(|info| info.node),
+        Some(first),
+        "the first field kept the session"
+    );
+    assert_eq!(model.borrow().focus_log, [true], "and was not told it lost");
+    assert!(
+        kept_log.borrow().is_empty(),
+        "the kept field reported nothing"
+    );
+}
+
+/// One field inside `keep_focus`, logging the caret offsets it reports.
+struct KeptHolderPage {
+    carets: Rc<RefCell<Vec<usize>>>,
+}
+
+impl Component for KeptHolderPage {
+    type State = ();
+
+    fn init(&self) {}
+
+    fn build(&self, _: &mut ()) -> impl View<()> {
+        let carets = self.carets.clone();
+        keep_focus(
+            text_input("hello wide world".to_string(), |_: &mut (), _: String| {})
+                .on_caret_change(move |_: &mut (), caret| carets.borrow_mut().push(caret.offset)),
+        )
+    }
+}
+
+#[test]
+fn a_focused_field_inside_keep_focus_still_moves_its_caret_on_a_press() {
+    let carets = Rc::new(RefCell::new(Vec::new()));
+    let c = carets.clone();
+    let mut tester = Tester::new(
+        (),
+        move |_: &mut ()| component(KeptHolderPage { carets: c.clone() }),
+        Size::new(400.0, 300.0),
+    );
+    settle(&mut tester);
+    let bounds = tester
+        .inspect()
+        .into_iter()
+        .find(|node| node.type_name.ends_with("TextInputWidget"))
+        .expect("the field is mounted")
+        .bounds;
+    let y = bounds.center().y;
+
+    tester.tap(Point::new(bounds.x0 + 14.0, y));
+    settle(&mut tester);
+    let field = tester.focus_info().expect("the first tap focused it").node;
+    let after_first = *carets.borrow().last().expect("focus reported a caret");
+
+    tester.tap(Point::new(bounds.x0 + 90.0, y));
+    settle(&mut tester);
+
+    assert_eq!(tester.focus_info().map(|info| info.node), Some(field));
+    let after_second = *carets.borrow().last().unwrap();
+    assert!(
+        after_second > after_first,
+        "the second press moved the caret: {after_first} then {after_second}"
+    );
+}

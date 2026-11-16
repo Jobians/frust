@@ -9,6 +9,7 @@ mod cursor;
 /// The [`RenderRoot::event`] file-drag follow-up: every `Drop`/`Cancel`,
 /// handled or not, is followed by an `Ended` broadcast.
 mod file_drop;
+mod focus_handle;
 mod focus_ime;
 mod focus_return;
 mod focus_traversal;
