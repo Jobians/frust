@@ -59,8 +59,9 @@
 //! constraints are unbounded on the scroll axis — the trap [`the seam's own
 //! docs`](super) spell out.
 //!
-//! A host switched to [`AnchoredOverlayView::floating`] drops that contract:
-//! see [*Floating in the root overlay layer*](#floating-in-the-root-overlay-layer).
+//! A host switched to [`AnchoredOverlayView::floating`] drops that contract —
+//! the full-area mount is the inline host's alone: see [*Floating in the root
+//! overlay layer*](#floating-in-the-root-overlay-layer).
 //!
 //! Mount it **unconditionally** and hand the open flag down through
 //! [`AnchoredOverlayView::open`]: that is the kept-mounted shape
@@ -148,29 +149,57 @@
 //!   outside taps off, so it still swallows a press that lands on it and lets
 //!   every other press through, exactly as the inline host does.
 //!
-//! What floating costs, all of it the framework portal's own v1 list:
+//! The mode is a per-frame prop: [`AnchoredOverlayView::floating`] may flip
+//! between two rebuilds of the same host, which tears the content down in its
+//! old home and builds it afresh in the new one (its retained state does not
+//! survive the move), and a host dropped while floating tears its pod down with
+//! it. Nothing stays registered either way: a registration lives for one paint
+//! pass, and a host that no longer floats no longer registers.
+//!
+//! # Accessibility of a floated panel
+//!
+//! The root never walks a floated pod for semantics, so the host publishes the
+//! content's nodes itself, from its own place in the main tree. A node's bounds
+//! come from the origin of the pod that publishes it, and the floated pod's
+//! origin is pinned to zero (the root paints it at the registered rect), so the
+//! floated pod translates its content by the placed rect's origin minus the
+//! host's own for the length of the semantics pass alone. Every node the
+//! content publishes therefore carries the rect the panel is painted at — in a
+//! full-area `Stack`, beside the trigger or inside a modal alike — and an
+//! assistive-technology `Click` or `Focus`, which the root performs as a press
+//! at a node's centre, lands on the painted panel. While the entrance or exit
+//! ramp plays the bounds are the panel's resting rect, which is also what a
+//! press is hit-tested against.
+//!
+//! What floating still costs, against the inline host:
 //!
 //! - **No hover inside the panel.** An overlay event is a broadcast and records
 //!   no hover, so content that reads `PaintCtx::is_hovered` paints unhovered.
-//! - **Semantics at the host's position.** The root never walks a floated pod
-//!   for semantics, so the host publishes the content's nodes itself — under
-//!   its own position and the panel's size, since a node's bounds come from
-//!   the pod that publishes it. A host mounted right after its trigger lands
-//!   them within the panel's offset of the panel itself.
+//! - **The panel is the root's key scope while open.** The consuming
+//!   outside-tap registration masks main-tree shortcuts until the panel closes,
+//!   and scopes Tab traversal to the panel's own stops — of which a list has
+//!   none, so a Tab could not move focus at all. Tab therefore closes the
+//!   panel instead: a Tab or Shift+Tab the panel's focus path declines closes
+//!   it (and, as Escape does, hands the keyboard chain back), and each catalog
+//!   trigger that opens a floating panel closes it on Tab itself and keeps
+//!   focus, reading [`OverlayAnchor::floats_open`]; the next Tab then moves on
+//!   from the trigger. Moving on in the *same* keystroke is the framework's to
+//!   offer — traversal is scoped by any consuming registration, and no
+//!   `EventCtx` call can step it — so it is not done here.
 //! - **No broadcast but the slot's own** reaches the content: a
 //!   `Housekeeping` pass, a shortcut or a file-drop end stops at the host.
 
 use std::any::Any;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
 use frust::authoring::{
     Affine, AnyView, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, ErasedCallback, EventCtx,
-    EventResult, InputEvent, Key, LayoutCtx, NamedKey, OutsideTap, OverlayAnchor as PortalAnchor,
-    OverlaySlot, PaintCtx, PaintScene, Point, PointerPhase, Rect, SemanticsCtx, Size, Vec2, View,
-    Widget, any, build_child, erase_callback, mark_pending_result_flush, rebuild_child,
-    route_event_single, teardown_child, visit_children,
+    EventResult, InputEvent, Key, KeyEvent, LayoutCtx, NamedKey, OutsideTap,
+    OverlayAnchor as PortalAnchor, OverlaySlot, PaintCtx, PaintScene, Point, PointerPhase, Rect,
+    SemanticsCtx, Size, Vec2, View, Widget, any, build_child, erase_callback,
+    mark_pending_result_flush, rebuild_child, route_event_single, teardown_child, visit_children,
 };
 use frust::{FrameTime, Theme};
 
@@ -483,7 +512,12 @@ pub fn transform_origin(side: OverlaySide, align: OverlayAlign, rect: Rect) -> P
 /// `popover-position.ts`'s `ResizeObserver` + scroll/resize listeners, which
 /// re-measure for the same reason.
 #[derive(Clone, Debug, Default)]
-pub struct OverlayAnchor(Rc<std::cell::Cell<Rect>>);
+pub struct OverlayAnchor {
+    rect: Rc<Cell<Rect>>,
+    /// Whether a floating host anchored here registered its panel open on its
+    /// last paint (see [`OverlayAnchor::floats_open`]).
+    floats_open: Rc<Cell<bool>>,
+}
 
 impl OverlayAnchor {
     /// A fresh anchor, holding the degenerate rect at the window origin until a
@@ -498,13 +532,33 @@ impl OverlayAnchor {
     /// zero-size anchor at the window origin, which places an overlay at the
     /// top-left. In practice a trigger always paints before it can be pressed.
     pub fn rect(&self) -> Rect {
-        self.0.get()
+        self.rect.get()
     }
 
     /// Overwrite the captured rect — for a caller anchoring against something it
     /// positions itself: a context menu's press point, a caret, a canvas hit.
     pub fn set(&self, rect: Rect) {
-        self.0.set(rect);
+        self.rect.set(rect);
+    }
+
+    /// Whether a [floating](AnchoredOverlayView::floating) host anchored here
+    /// registered its panel **open** on its last paint — the registration that
+    /// scopes the root's Tab traversal to the panel (see the [module
+    /// docs](self#floating-in-the-root-overlay-layer)). A trigger reads it to
+    /// close such a panel on Tab; an inline, closed or exiting host leaves it
+    /// `false`.
+    pub fn floats_open(&self) -> bool {
+        self.floats_open.get()
+    }
+
+    /// Record what a floating host registered on this paint.
+    fn set_floats_open(&self, open: bool) {
+        self.floats_open.set(open);
+    }
+
+    /// Whether `other` is a clone of this anchor (the same cells).
+    fn is_same(&self, other: &OverlayAnchor) -> bool {
+        Rc::ptr_eq(&self.rect, &other.rect)
     }
 }
 
@@ -599,7 +653,8 @@ type OnState<State> = Rc<dyn Fn(&mut State)>;
 /// [`AnchoredOverlayView::on_dismiss`] to answer a light dismiss or Escape.
 pub fn anchored<State: 'static, V: View<State>>(content: V) -> AnchoredOverlayView<State> {
     AnchoredOverlayView {
-        content: any(content),
+        content: Rc::new(any(content)),
+        floated: None,
         anchor: OverlayAnchor::new(),
         placement: OverlayPlacement::default(),
         open: true,
@@ -607,16 +662,17 @@ pub fn anchored<State: 'static, V: View<State>>(content: V) -> AnchoredOverlayVi
         exit: Ramp::eased(ANCHORED_EXIT, EASE_OUT),
         on_dismiss: None,
         on_exited: None,
-        floating: false,
         stage: StageCell::default(),
     }
 }
 
 /// A declarative anchored-overlay host. See [`anchored`].
 pub struct AnchoredOverlayView<State: 'static> {
-    /// The content — wrapped in the floated pod's own staging view once
-    /// [`floating`](Self::floating) is set.
-    content: AnyView<State>,
+    /// The content, shared with the floated pod's staging view.
+    content: Rc<AnyView<State>>,
+    /// The floated pod's view — the content wrapped in its staging — while
+    /// [`floating`](Self::floating) is on; `None` for an inline host.
+    floated: Option<AnyView<State>>,
     anchor: OverlayAnchor,
     placement: OverlayPlacement,
     open: bool,
@@ -624,7 +680,6 @@ pub struct AnchoredOverlayView<State: 'static> {
     exit: Ramp,
     on_dismiss: Option<OnState<State>>,
     on_exited: Option<OnState<State>>,
-    floating: bool,
     /// What the host's paint hands a floated pod; shared with the wrapper the
     /// content is moved into.
     stage: StageCell,
@@ -632,41 +687,19 @@ pub struct AnchoredOverlayView<State: 'static> {
 
 impl<State: 'static> AnchoredOverlayView<State> {
     /// Float the content in the render root's overlay layer instead of placing
-    /// it inside this host's own box — see the [module
-    /// docs](self#floating-in-the-root-overlay-layer). A floating host needs no
-    /// full-area mount: it can sit anywhere under its trigger's ancestors, a
-    /// modal's content included.
-    pub fn floating(self) -> Self {
-        if self.floating {
-            return self;
-        }
-        let AnchoredOverlayView {
-            content,
-            anchor,
-            placement,
-            open,
-            enter,
-            exit,
-            on_dismiss,
-            on_exited,
-            stage,
-            ..
-        } = self;
-        AnchoredOverlayView {
-            content: any(FloatedView {
-                content,
-                stage: stage.clone(),
-            }),
-            anchor,
-            placement,
-            open,
-            enter,
-            exit,
-            on_dismiss,
-            on_exited,
-            floating: true,
-            stage,
-        }
+    /// it inside this host's own box (`true`), or keep it inline (`false`, the
+    /// default) — see the [module docs](self#floating-in-the-root-overlay-layer).
+    /// A floating host needs no full-area mount: it can sit anywhere under its
+    /// trigger's ancestors, a modal's content included. The last call wins, and
+    /// the flag may change between two frames of the same host.
+    pub fn floating(mut self, floating: bool) -> Self {
+        self.floated = floating.then(|| {
+            any(FloatedView {
+                content: Rc::clone(&self.content),
+                stage: self.stage.clone(),
+            })
+        });
+        self
     }
 
     /// Anchor the overlay to the rect `anchor` carries (see [`OverlayAnchor`]).
@@ -849,13 +882,12 @@ impl<State: 'static> View<State> for AnchoredOverlayView<State> {
     fn build(&self, ctx: &mut BuildCtx<'_>) -> AnchoredOverlayWidget {
         let mut presence = Presence::new(self.enter, self.exit);
         presence.set_open(self.open);
-        let (content, floated) = if self.floating {
-            (
+        let (content, floated) = match &self.floated {
+            Some(view) => (
                 build_child::<State, _>(&Vacant, ctx),
-                Some(self.mount_floated(ctx)),
-            )
-        } else {
-            (build_child(&self.content, ctx), None)
+                Some(mount_floated(view, ctx)),
+            ),
+            None => (build_child(&*self.content, ctx), None),
         };
         AnchoredOverlayWidget {
             content,
@@ -883,7 +915,15 @@ impl<State: 'static> View<State> for AnchoredOverlayView<State> {
         element: &mut AnchoredOverlayWidget,
         ctx: &mut BuildCtx<'_>,
     ) -> ChangeFlags {
+        // Each frame's view carries a fresh cell; it inherits what the last
+        // layout and paint staged, so a pass that skips both (or a semantics
+        // walk before them) still reads the panel's current placement.
+        self.stage.set(element.stage.get());
         element.stage = self.stage.clone();
+        if !element.anchor.is_same(&self.anchor) {
+            // The old anchor's trigger no longer has a panel here.
+            element.anchor.set_floats_open(false);
+        }
         let mut flags = self.rebuild_content(prev, element, ctx);
         if element.placement != self.placement {
             element.placement = self.placement;
@@ -920,26 +960,42 @@ impl<State: 'static> View<State> for AnchoredOverlayView<State> {
     }
 
     fn teardown(&self, element: &mut AnchoredOverlayWidget, ctx: &mut BuildCtx<'_>) {
-        if self.floating {
-            if let Some(slot) = floated_slot::<State>(&mut element.floated) {
-                slot.rebuild(Some(&self.content), None, ctx);
+        match &self.floated {
+            Some(view) => {
+                drop_floated::<State>(element, view, ctx);
+                teardown_child::<State, _>(&Vacant, &mut element.content, ctx);
             }
-            element.floated = None;
-            teardown_child::<State, _>(&Vacant, &mut element.content, ctx);
-        } else {
-            teardown_child(&self.content, &mut element.content, ctx);
+            None => teardown_child(&*self.content, &mut element.content, ctx),
         }
     }
 }
 
-impl<State: 'static> AnchoredOverlayView<State> {
-    /// A fresh slot with this view's content mounted in it.
-    fn mount_floated(&self, ctx: &mut BuildCtx<'_>) -> Box<dyn FloatSlot> {
-        let mut slot = OverlaySlot::<State>::new();
-        slot.rebuild(None, Some(&self.content), ctx);
-        Box::new(slot)
-    }
+/// A fresh slot with `view` — a floating host's staged content — mounted in it.
+fn mount_floated<State: 'static>(
+    view: &AnyView<State>,
+    ctx: &mut BuildCtx<'_>,
+) -> Box<dyn FloatSlot> {
+    let mut slot = OverlaySlot::<State>::new();
+    slot.rebuild(None, Some(view), ctx);
+    Box::new(slot)
+}
 
+/// Tear a floating host's pod down through `view` (the floated view it was
+/// last reconciled with) and drop the slot, so nothing of it is registered
+/// again; the anchor stops reporting an open floating panel.
+fn drop_floated<State: 'static>(
+    element: &mut AnchoredOverlayWidget,
+    view: &AnyView<State>,
+    ctx: &mut BuildCtx<'_>,
+) {
+    if let Some(slot) = floated_slot::<State>(&mut element.floated) {
+        slot.rebuild(Some(view), None, ctx);
+    }
+    element.floated = None;
+    element.anchor.set_floats_open(false);
+}
+
+impl<State: 'static> AnchoredOverlayView<State> {
     /// Reconcile the content in whichever home it has — the inline pod or the
     /// floated slot — moving it across when [`floating`](Self::floating)
     /// changed between two frames.
@@ -949,30 +1005,27 @@ impl<State: 'static> AnchoredOverlayView<State> {
         element: &mut AnchoredOverlayWidget,
         ctx: &mut BuildCtx<'_>,
     ) -> ChangeFlags {
-        match (prev.floating, self.floating) {
-            (false, false) => {
-                rebuild_child(&prev.content, &self.content, &mut element.content, ctx)
+        match (&prev.floated, &self.floated) {
+            (None, None) => {
+                rebuild_child(&*prev.content, &*self.content, &mut element.content, ctx)
             }
-            (true, true) => match floated_slot::<State>(&mut element.floated) {
-                Some(slot) => slot.rebuild(Some(&prev.content), Some(&self.content), ctx),
+            (Some(prev_view), Some(view)) => match floated_slot::<State>(&mut element.floated) {
+                Some(slot) => slot.rebuild(Some(prev_view), Some(view), ctx),
                 None => {
-                    element.floated = Some(self.mount_floated(ctx));
+                    element.floated = Some(mount_floated(view, ctx));
                     ChangeFlags::LAYOUT | ChangeFlags::PAINT
                 }
             },
-            (false, true) => {
-                teardown_child(&prev.content, &mut element.content, ctx);
+            (None, Some(view)) => {
+                teardown_child(&*prev.content, &mut element.content, ctx);
                 element.content = build_child::<State, _>(&Vacant, ctx);
-                element.floated = Some(self.mount_floated(ctx));
+                element.floated = Some(mount_floated(view, ctx));
                 ChangeFlags::LAYOUT | ChangeFlags::PAINT
             }
-            (true, false) => {
-                if let Some(slot) = floated_slot::<State>(&mut element.floated) {
-                    slot.rebuild(Some(&prev.content), None, ctx);
-                }
-                element.floated = None;
+            (Some(prev_view), None) => {
+                drop_floated::<State>(element, prev_view, ctx);
                 teardown_child::<State, _>(&Vacant, &mut element.content, ctx);
-                element.content = build_child(&self.content, ctx);
+                element.content = build_child(&*self.content, ctx);
                 ChangeFlags::LAYOUT | ChangeFlags::PAINT
             }
         }
@@ -983,12 +1036,20 @@ impl<State: 'static> AnchoredOverlayView<State> {
 /// host. The widget is not generic over the app state, so the slot is held
 /// erased and recovered here, in the view's typed `build`/`rebuild`/
 /// `teardown`, the only places that hold a typed view to reconcile it with.
+///
+/// The slot was built by the same host's typed view, so the downcast cannot
+/// miss short of a host whose state type changed under it; a miss would leave
+/// the old pod mounted beside a fresh one, so debug builds stop on it.
 fn floated_slot<State: 'static>(
     floated: &mut Option<Box<dyn FloatSlot>>,
 ) -> Option<&mut OverlaySlot<State>> {
-    floated
-        .as_mut()
-        .and_then(|slot| slot.as_any_mut().downcast_mut::<OverlaySlot<State>>())
+    let slot = floated.as_mut()?;
+    let typed = slot.as_any_mut().downcast_mut::<OverlaySlot<State>>();
+    debug_assert!(
+        typed.is_some(),
+        "a floating host's slot is not over the state its view reconciles it with"
+    );
+    typed
 }
 
 impl AnchoredOverlayWidget {
@@ -1018,12 +1079,17 @@ impl AnchoredOverlayWidget {
         slot.layout(ctx);
         let content = slot.pod_size();
         self.anchor_used = self.anchor.rect();
-        self.rect = place(
+        let placed = place(
             self.anchor_used,
             content,
             Rect::from_origin_size(Point::ORIGIN, self.window),
             self.placement,
-        ) - self.host_origin.to_vec2();
+        );
+        self.rect = placed - self.host_origin.to_vec2();
+        // Window space, so a semantics walk after this layout already
+        // publishes the panel where the coming paint will place it.
+        stage.placed = Some(placed.origin());
+        self.stage.set(stage);
         bc.constrain(Size::ZERO)
     }
 
@@ -1044,6 +1110,7 @@ impl AnchoredOverlayWidget {
             // pointer's path, so the exit report is not left waiting for an
             // event that may never come: the next rebuild owes a
             // `Housekeeping` broadcast, which drains it.
+            self.anchor.set_floats_open(false);
             if was_visible && self.on_exited.is_some() {
                 mark_pending_result_flush();
                 ctx.request_frame();
@@ -1070,12 +1137,16 @@ impl AnchoredOverlayWidget {
             align: self.placement.align,
             open: self.open,
             area: self.window,
+            placed: Some(placed.origin()),
         });
         slot.set_outside_tap(if self.open {
             OutsideTap::Notify { consume: true }
         } else {
             OutsideTap::Ignore
         });
+        // Mirrors the registration just made: only an open panel consumes
+        // outside taps, which is what scopes traversal to it.
+        self.anchor.set_floats_open(self.open);
         slot.place_at(placed.origin());
         let size = ctx.size();
         slot.paint(ctx, size);
@@ -1102,11 +1173,13 @@ impl AnchoredOverlayWidget {
                 ctx.request_redraw();
                 return result;
             }
-            // A key the focused panel declined: Escape closes the panel, and
-            // every other key falls through, as on the inline host.
+            // A key the focused panel declined: Escape closes the panel, and so
+            // does Tab, which the open panel's traversal scope would otherwise
+            // swallow (see the module docs); every other key falls through, as
+            // on the inline host.
             if result == EventResult::Ignored
                 && let InputEvent::Key(key) = event
-                && key.key == Key::Named(NamedKey::Escape)
+                && (key.key == Key::Named(NamedKey::Escape) || is_traversal_key(key))
             {
                 self.dismiss(ctx);
                 return EventResult::Handled;
@@ -1385,7 +1458,8 @@ impl Widget for AnchoredOverlayWidget {
         }
         match &self.floated {
             // The root walks no floated pod for semantics, so the host
-            // publishes it — at its own position (see the module docs).
+            // publishes it; the pod moves its content to the placed rect (see
+            // the module docs' accessibility section).
             Some(slot) => slot.visit_pod(&mut |pod| pod.semantics_child(ctx)),
             None => self.content.semantics_child(ctx),
         }
@@ -1418,6 +1492,9 @@ struct Stage {
     /// The host's area — the pod's layout fallback under a bare layout
     /// context, whose window size is zero.
     area: Size,
+    /// The placed panel's window-space top-left, once a layout or paint has
+    /// placed it — what the pod publishes its content's semantics at.
+    placed: Option<Point>,
 }
 
 impl Default for Stage {
@@ -1429,8 +1506,20 @@ impl Default for Stage {
             align: OverlayAlign::default(),
             open: true,
             area: Size::ZERO,
+            placed: None,
         }
     }
+}
+
+/// Whether `key` is a bare Tab or Shift+Tab — the keys the root's focus
+/// traversal answers, and the ones an open floating panel closes on (see the
+/// module docs).
+///
+/// Crate-internal: the catalog triggers that open a floating panel close it on
+/// the same keys.
+pub(crate) fn is_traversal_key(key: &KeyEvent) -> bool {
+    let mods = key.modifiers;
+    key.key == Key::Named(NamedKey::Tab) && !(mods.ctrl || mods.alt || mods.meta)
 }
 
 /// The host-to-pod staging handle. Each frame's view carries a fresh one; the
@@ -1441,13 +1530,16 @@ type StageCell = Rc<Cell<Stage>>;
 /// paints this pod in its own overlay pass, which is why the staging travels
 /// to it through [`Stage`] rather than being pushed around it by the host.
 struct FloatedView<State: 'static> {
-    content: AnyView<State>,
+    content: Rc<AnyView<State>>,
     stage: StageCell,
 }
 
 /// The retained widget for a [`FloatedView`].
 struct FloatedWidget {
-    content: ChildPod,
+    /// The content, in a cell only so the `&self` semantics pass can move it
+    /// to the placed rect for the length of that pass (see `semantics`); every
+    /// other pass reaches it through `get_mut`, with no runtime borrow.
+    content: RefCell<ChildPod>,
     stage: StageCell,
 }
 
@@ -1456,7 +1548,7 @@ impl<State: 'static> View<State> for FloatedView<State> {
 
     fn build(&self, ctx: &mut BuildCtx<'_>) -> FloatedWidget {
         FloatedWidget {
-            content: build_child(&self.content, ctx),
+            content: RefCell::new(build_child(&*self.content, ctx)),
             stage: self.stage.clone(),
         }
     }
@@ -1468,11 +1560,16 @@ impl<State: 'static> View<State> for FloatedView<State> {
         ctx: &mut BuildCtx<'_>,
     ) -> ChangeFlags {
         element.stage = self.stage.clone();
-        rebuild_child(&prev.content, &self.content, &mut element.content, ctx)
+        rebuild_child(
+            &*prev.content,
+            &*self.content,
+            element.content.get_mut(),
+            ctx,
+        )
     }
 
     fn teardown(&self, element: &mut FloatedWidget, ctx: &mut BuildCtx<'_>) {
-        teardown_child(&self.content, &mut element.content, ctx);
+        teardown_child(&*self.content, element.content.get_mut(), ctx);
     }
 }
 
@@ -1485,8 +1582,9 @@ impl Widget for FloatedWidget {
         } else {
             &fallback
         };
-        let size = self.content.layout_child(ctx, bc);
-        self.content.set_origin(Point::ORIGIN);
+        let content = self.content.get_mut();
+        let size = content.layout_child(ctx, bc);
+        content.set_origin(Point::ORIGIN);
         bc.constrain(size)
     }
 
@@ -1501,7 +1599,7 @@ impl Widget for FloatedWidget {
             stage.scale,
             stage.alpha,
         );
-        self.content.paint_child(ctx, scene);
+        self.content.get_mut().paint_child(ctx, scene);
         pop_stage(scene, layer_pushed);
     }
 
@@ -1514,7 +1612,7 @@ impl Widget for FloatedWidget {
         if down && self.stage.get().open {
             ctx.request_focus();
         }
-        if route_event_single(&mut self.content, ctx, event) == EventResult::Handled {
+        if route_event_single(self.content.get_mut(), ctx, event) == EventResult::Handled {
             return EventResult::Handled;
         }
         // A press on the panel's own background is the panel's.
@@ -1525,11 +1623,34 @@ impl Widget for FloatedWidget {
         }
     }
 
+    /// Publish the content at the rect the panel is painted at.
+    ///
+    /// The host publishes this pod from its own place in the main tree, so the
+    /// walk arrives here at the host's origin (this pod's own is pinned to
+    /// zero; see [`OverlaySlot::layout`]). The content is moved by the placed
+    /// origin minus that one for the pass, then put back: paint and routing
+    /// keep reading the zero origin the root's placement relies on.
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        self.content.semantics_child(ctx);
+        let Ok(mut content) = self.content.try_borrow_mut() else {
+            return;
+        };
+        let rest = content.origin();
+        let offset = self
+            .stage
+            .get()
+            .placed
+            .map_or(Vec2::ZERO, |placed| placed - ctx.origin());
+        content.set_origin(rest + offset);
+        content.semantics_child(ctx);
+        content.set_origin(rest);
     }
 
-    visit_children!(content);
+    // Hand-written rather than `visit_children!`: the one pod sits in a cell.
+    fn visit_children(&self, visitor: &mut dyn FnMut(&ChildPod)) {
+        if let Ok(content) = self.content.try_borrow() {
+            visitor(&content);
+        }
+    }
 }
 
 /// A floating host's inline content: nothing, since its content is the pod.
@@ -1870,6 +1991,10 @@ mod tests {
         open: bool,
         /// Presses the floating harness's full-window cover received.
         covered: u32,
+        /// The floating harness mounts its host inline instead.
+        inline: bool,
+        /// The floating harness drops its host from the tree.
+        unmounted: bool,
     }
 
     /// A fixed-size leaf that reports every press into the app state — enough to
@@ -2686,14 +2811,68 @@ mod tests {
         }
     }
 
+    /// The floating harness's content: a [`Panel`] that also counts how many
+    /// of its widgets are alive (built and not yet torn down) and how many
+    /// were ever built, and publishes one button node at its own bounds.
+    struct Counted {
+        live: Rc<Cell<i32>>,
+        built: Rc<Cell<u32>>,
+    }
+
+    impl View<AppState> for Counted {
+        type Element = CountedWidget;
+        fn build(&self, _ctx: &mut BuildCtx<'_>) -> CountedWidget {
+            self.live.set(self.live.get() + 1);
+            self.built.set(self.built.get() + 1);
+            CountedWidget(PanelWidget(CONTENT))
+        }
+        fn rebuild(
+            &self,
+            _prev: &Self,
+            _element: &mut CountedWidget,
+            _ctx: &mut BuildCtx<'_>,
+        ) -> ChangeFlags {
+            ChangeFlags::NONE
+        }
+        fn teardown(&self, _element: &mut CountedWidget, _ctx: &mut BuildCtx<'_>) {
+            self.live.set(self.live.get() - 1);
+        }
+    }
+
+    /// The retained half of [`Counted`].
+    struct CountedWidget(PanelWidget);
+
+    impl Widget for CountedWidget {
+        fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
+            self.0.layout(ctx, bc)
+        }
+        fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
+            self.0.paint(ctx, scene);
+        }
+        fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
+            self.0.event(ctx, event)
+        }
+        fn semantics(&self, ctx: &mut SemanticsCtx) {
+            ctx.push_node(frust::authoring::Role::Button, |node| {
+                node.set_label("panel")
+            });
+        }
+    }
+
     /// A floating host as the first child of a `Stack` whose later child is a
     /// full-window [`Cover`]: inline, the content would paint under the cover
-    /// and the cover would take every press.
+    /// and the cover would take every press. [`AppState::inline`] mounts the
+    /// same host inline and [`AppState::unmounted`] drops it, both from the
+    /// next [`pass`](Self::pass).
     struct FloatHarness {
         root: RenderRoot<AppState, frust::StackView<AppState>>,
         state: AppState,
         tcx: TextContext,
         anchor: OverlayAnchor,
+        /// The content's widgets alive right now.
+        live: Rc<Cell<i32>>,
+        /// The content's widgets ever built.
+        built: Rc<Cell<u32>>,
     }
 
     impl FloatHarness {
@@ -2708,6 +2887,8 @@ mod tests {
                 },
                 tcx: TextContext::new(),
                 anchor,
+                live: Rc::new(Cell::new(0)),
+                built: Rc::new(Cell::new(0)),
             };
             h.pass();
             h.paint(0);
@@ -2716,19 +2897,27 @@ mod tests {
 
         fn pass(&mut self) {
             let anchor = self.anchor.clone();
+            let live = self.live.clone();
+            let built = self.built.clone();
             let mut logic = move |s: &mut AppState| {
+                let host = anchored(Counted {
+                    live: live.clone(),
+                    built: built.clone(),
+                })
+                .floating(!s.inline)
+                .anchor(&anchor)
+                .open(s.open)
+                .on_dismiss(|s: &mut AppState| {
+                    s.dismissed += 1;
+                    s.open = false;
+                })
+                .on_exited(|s: &mut AppState| s.exited += 1);
                 frust::stack()
-                    .child(
-                        anchored(Panel(CONTENT))
-                            .floating()
-                            .anchor(&anchor)
-                            .open(s.open)
-                            .on_dismiss(|s: &mut AppState| {
-                                s.dismissed += 1;
-                                s.open = false;
-                            })
-                            .on_exited(|s: &mut AppState| s.exited += 1),
-                    )
+                    .child(frust::either(
+                        !s.unmounted,
+                        move || host,
+                        || Panel(Size::ZERO),
+                    ))
                     .child(Cover)
             };
             self.root.rebuild(&mut logic, &mut self.state);
@@ -2857,11 +3046,134 @@ mod tests {
     fn the_widget_reports_which_home_its_content_has() {
         let cell = OverlayAnchor::new();
         let mut counter = 0u64;
-        let floating = anchored(Panel(CONTENT)).floating().floating().anchor(&cell);
+        let floating = anchored(Panel(CONTENT))
+            .floating(true)
+            .floating(true)
+            .anchor(&cell);
         let w = View::<AppState>::build(&floating, &mut BuildCtx::new(&mut counter));
         assert!(w.is_floating() && w.is_open(), "floating is idempotent");
         let inline = anchored(Panel(CONTENT)).anchor(&cell);
         let w = View::<AppState>::build(&inline, &mut BuildCtx::new(&mut counter));
-        assert!(!w.is_floating());
+        assert!(!w.is_floating(), "inline by default");
+        let back = anchored(Panel(CONTENT))
+            .floating(true)
+            .floating(false)
+            .anchor(&cell);
+        let w = View::<AppState>::build(&back, &mut BuildCtx::new(&mut counter));
+        assert!(!w.is_floating(), "the last call wins");
+    }
+
+    /// The host sits at the window origin with no room of its own, the panel
+    /// is painted below the anchor: the content's node must carry the latter.
+    #[test]
+    fn a_floating_panels_semantics_carry_the_rect_it_is_painted_at() {
+        let h = FloatHarness::new();
+        assert_eq!(h.host_bounds().origin(), Point::ORIGIN);
+        let update = h.root.semantics();
+        let (_, node) = update
+            .nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some("panel"))
+            .expect("the floated content is published");
+        let bounds = node.bounds().expect("with bounds");
+        let rect = placed();
+        assert_eq!(
+            (bounds.x0, bounds.y0, bounds.x1, bounds.y1),
+            (rect.x0, rect.y0, rect.x1, rect.y1),
+            "at the placed rect, not at the host's own origin"
+        );
+    }
+
+    /// The floating harness after one more rebuild, layout and paint.
+    fn frame(h: &mut FloatHarness, ms: u64) -> Recorder {
+        h.pass();
+        h.paint(ms)
+    }
+
+    #[test]
+    fn flipping_floating_between_two_frames_moves_the_content_and_registers_nothing_stale() {
+        let mut h = FloatHarness::new();
+        assert_eq!((h.live.get(), h.built.get()), (1, 1));
+        assert!(h.anchor.floats_open(), "an open floating panel is reported");
+
+        // Floating → inline: the pod is torn down and the content built once
+        // in the host's own box, under the cover.
+        h.state.inline = true;
+        let rec = frame(&mut h, 5_000);
+        assert_eq!(
+            (h.live.get(), h.built.get()),
+            (1, 2),
+            "one live content, rebuilt"
+        );
+        assert_eq!(
+            rec.rects,
+            vec![(placed().origin(), CONTENT), (Point::ORIGIN, WINDOW)],
+            "painted once, inline, under the cover"
+        );
+        assert!(!h.anchor.floats_open());
+        // No registration outlived the move: a press on the panel's rect and
+        // one far from it both reach the cover, and neither dismisses.
+        h.press(placed().center());
+        h.press(Point::new(5.0, 5.0));
+        assert_eq!(
+            (h.state.pressed, h.state.covered, h.state.dismissed),
+            (0, 2, 0)
+        );
+
+        // Inline → floating: back in one pod, above the cover again.
+        h.state.inline = false;
+        let rec = frame(&mut h, 10_000);
+        assert_eq!((h.live.get(), h.built.get()), (1, 3));
+        assert_eq!(
+            rec.rects,
+            vec![(Point::ORIGIN, WINDOW), (placed().origin(), CONTENT)],
+            "painted once, floated above the cover"
+        );
+        assert!(h.anchor.floats_open());
+        h.press(placed().center());
+        assert_eq!((h.state.pressed, h.state.covered), (1, 2));
+    }
+
+    #[test]
+    fn dropping_a_floating_host_while_open_tears_its_pod_down() {
+        let mut h = FloatHarness::new();
+        h.state.unmounted = true;
+        let rec = frame(&mut h, 5_000);
+        assert_eq!(h.live.get(), 0, "the content was torn down");
+        assert!(
+            !rec.rects.contains(&(placed().origin(), CONTENT)),
+            "nothing floats"
+        );
+        assert!(!h.anchor.floats_open());
+        // Nothing registered: the press on the old panel rect is the cover's,
+        // and an outside one dismisses nothing.
+        h.press(placed().center());
+        h.press(Point::new(5.0, 5.0));
+        assert_eq!(
+            (h.state.pressed, h.state.covered, h.state.dismissed),
+            (0, 2, 0)
+        );
+    }
+
+    #[test]
+    fn dropping_a_floating_host_while_exiting_tears_its_pod_down() {
+        let mut h = FloatHarness::new();
+        h.paint(5_000);
+        h.state.open = false;
+        // Mid-exit: still registered (outside taps off) and still painting.
+        let rec = frame(&mut h, 5_016);
+        assert!(rec.rects.contains(&(placed().origin(), CONTENT)));
+        assert!(!h.anchor.floats_open(), "an exiting panel scopes nothing");
+
+        h.state.unmounted = true;
+        let rec = frame(&mut h, 5_032);
+        assert_eq!(h.live.get(), 0, "the content was torn down mid-exit");
+        assert!(!rec.rects.contains(&(placed().origin(), CONTENT)));
+        h.press(placed().center());
+        assert_eq!(
+            (h.state.pressed, h.state.covered),
+            (0, 1),
+            "the exiting panel's registration did not outlive its host"
+        );
     }
 }
