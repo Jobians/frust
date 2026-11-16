@@ -410,7 +410,13 @@ pub fn page(state: &PlaygroundState) -> impl View<PlaygroundState> {
                             origin.0 + details.local_position.x,
                             origin.1 + details.local_position.y,
                         );
-                        let from = grid_last.get().unwrap_or(here);
+                        // The first segment starts where the long press fired, so a fast
+                        // first move does not skip the cells in between.
+                        let fired = (
+                            here.0 - details.offset_from_origin.x,
+                            here.1 - details.offset_from_origin.y,
+                        );
+                        let from = grid_last.get().unwrap_or(fired);
                         grid_selected.update(|cells| {
                             for cell in cells_crossed(from, here) {
                                 cells[cell] = true;
@@ -505,7 +511,8 @@ pub fn page(state: &PlaygroundState) -> impl View<PlaygroundState> {
         .child(caption(
             "Drag inside the grid to scroll it. Press a cell and hold: it selects. Keep \
              dragging to select every cell the pointer crosses; the grid does not scroll \
-             while the selection is in progress. Release ends the selection.",
+             while the selection is in progress, so a drag past its edge also selects \
+             rows that are scrolled out of view. Release ends the selection.",
         ))
         .child(SizedBox(None, Some(8.0)))
         .child(caption(
@@ -617,12 +624,18 @@ mod tests {
             self.frames(3);
         }
 
-        /// The window bounds of the `n`-th laid-out widget whose type name contains `name`.
+        /// Whether a node's type name has `name` as the start of a path segment, so
+        /// `ButtonWidget` does not also match `IconButtonWidget`.
+        fn named(type_name: &str, name: &str) -> bool {
+            type_name.starts_with(name) || type_name.contains(&format!("::{name}"))
+        }
+
+        /// The window bounds of the `n`-th laid-out widget of type `name`.
         fn bounds(&self, name: &str, n: usize) -> Rect {
             self.root
                 .inspect()
                 .iter()
-                .filter(|node| node.type_name.contains(name))
+                .filter(|node| Self::named(node.type_name, name))
                 .nth(n)
                 .map(|node| node.bounds)
                 .unwrap_or_else(|| panic!("no laid-out {name} number {n}"))
@@ -632,7 +645,7 @@ mod tests {
             self.root
                 .inspect()
                 .iter()
-                .filter(|node| node.type_name.contains(name))
+                .filter(|node| Self::named(node.type_name, name))
                 .count()
         }
 
@@ -705,6 +718,18 @@ mod tests {
         assert!(
             forms.search_open.get_untracked() && forms.search_focused.get_untracked(),
             "the Focus field button expands the bar and focuses the field"
+        );
+    }
+
+    #[test]
+    fn a_fast_first_move_selects_the_cells_it_jumped_over() {
+        let mut h = Harness::new();
+        let (start, end) = (h.cell_center(0), h.cell_center(3));
+        long_press_drag(&mut h, start, &[end]);
+        assert_eq!(
+            h.selected(),
+            vec![0, 1, 2, 3],
+            "the first segment is swept from where the long press fired"
         );
     }
 

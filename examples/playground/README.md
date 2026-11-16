@@ -313,8 +313,9 @@ The sections, in order:
       half a second (it turns selected, count 1, dragging yes); without lifting, drag across
       other cells (every crossed cell is selected, the offset follows the pointer, and the
       grid does not scroll even when the pointer is dragged vertically); release (dragging
-      no, selection stays). A new long press starts a fresh selection. On desktop use the
-      mouse button; the expected result is the same.
+      no, selection stays). A new long press starts a fresh selection. The grid does not
+      auto-scroll, so a drag past its edge also selects rows that are scrolled out of view.
+      On desktop use the mouse button; the expected result is the same.
     Deep link: `frustplay://section/forms`.
 26. **Gate** — a `frust::StartGate` over a task that waits about two seconds. A **Fail next
     run** checkbox (read when a run starts) makes the task fail instead of succeed; **Run
