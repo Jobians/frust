@@ -32,6 +32,19 @@
 //! below it. This is a desktop-first web system whose metrics happen to be
 //! touch-friendly; that is the source's, not an adaptation made here.
 //!
+//! # Density
+//!
+//! The size constants below are the [`Density::Comfortable`] set. A theme can
+//! carry a [`BeuiMetrics`] instead ([`theme_with_density`]), and a component
+//! that reads [`BeuiMetrics::resolve`] follows it; one still reading a constant
+//! here paints the comfortable size whatever density the theme names. Each
+//! group below names the metrics fields that supersede it.
+//!
+//! [`Density::Comfortable`]: crate::tokens::Density::Comfortable
+//! [`BeuiMetrics`]: crate::tokens::BeuiMetrics
+//! [`BeuiMetrics::resolve`]: crate::tokens::BeuiMetrics::resolve
+//! [`theme_with_density`]: crate::tokens::theme_with_density
+//!
 //! # What is deliberately *not* here
 //!
 //! - **No state-layer overlay.** beUI does not tint a control on hover the way
@@ -66,6 +79,9 @@ pub fn spacing(steps: f64) -> f64 {
 }
 
 // ---- Control heights -------------------------------------------------------
+//
+// Superseded per density by `BeuiMetrics::{height_sm, height_md, height_lg,
+// size_icon_button, height_input}`, with `min_touch_target` as the floor.
 
 /// Control height for the `sm` button size: `h-8`.
 pub const HEIGHT_SM: f64 = 32.0;
@@ -83,6 +99,9 @@ pub const SIZE_ICON_BUTTON: f64 = 32.0;
 /// tap-target convention exactly.
 pub const HEIGHT_INPUT: f64 = 44.0;
 
+// Superseded per density by `BeuiMetrics::{padding_x_sm, padding_x_md,
+// padding_x_lg, padding_x_input, padding_x_input_icon}`.
+
 /// Horizontal padding of an `sm` button: `px-3`.
 pub const PADDING_X_SM: f64 = 12.0;
 /// Horizontal padding of an `md` button: `px-5` — roomier than the height step
@@ -96,10 +115,14 @@ pub const PADDING_X_INPUT: f64 = 14.0;
 /// `pl-10` / `pr-10`.
 pub const PADDING_X_INPUT_ICON: f64 = 40.0;
 
+// Superseded per density by `BeuiMetrics::{gap_sm, gap_md}`.
+
 /// Gap between a control's icon and its label at the `sm` size: `gap-1.5`.
 pub const GAP_SM: f64 = 6.0;
 /// Gap between a control's icon and its label at the `md`/`lg` sizes: `gap-2`.
 pub const GAP_MD: f64 = 8.0;
+
+// Superseded per density by `BeuiMetrics::{icon_size, icon_size_lg}`.
 
 /// Default icon edge inside a control: `[&_svg]:h-4 [&_svg]:w-4` (`input.tsx`'s
 /// icon slots, and the size every inline icon inherits).
@@ -109,6 +132,9 @@ pub const ICON_SIZE: f64 = 16.0;
 pub const ICON_SIZE_LG: f64 = 20.0;
 
 // ---- Text ------------------------------------------------------------------
+//
+// Superseded per density by `BeuiMetrics::{text_xs, text_sm, text_base,
+// line_height_input}`.
 
 /// `text-xs`: `sm`-button and badge text.
 pub const TEXT_XS: f64 = 12.0;
@@ -125,7 +151,9 @@ pub const LINE_HEIGHT_INPUT: f64 = 24.0;
 // Tailwind's default radius ladder, in logical px at the CSS default 16px root
 // font size. beUI authors no `--radius` override, so these are the framework
 // defaults its `rounded-*` classes resolve against — and the ladder
-// `crate::tokens::shape_scale` folds onto `ShapeScale`.
+// `crate::tokens::shape_scale` folds onto `ShapeScale`. The steps components
+// name per role are superseded per density by `BeuiMetrics::{radius_card,
+// radius_list, radius_control, radius_icon_button}`; the ladder itself is not.
 
 /// `rounded-sm` — `0.25rem`.
 pub const RADIUS_SM: f64 = 4.0;
@@ -167,6 +195,7 @@ pub const RADIUS_CONTROL: f64 = RADIUS_FULL;
 pub const RADIUS_ICON_BUTTON: f64 = RADIUS_LG;
 
 /// Border width for every bordered control: Tailwind's `border` = 1px.
+/// Superseded per density by `BeuiMetrics::border_width`.
 pub const BORDER_WIDTH: f64 = 1.0;
 
 /// Flattening tolerance for every path this catalog strokes or fills — the same

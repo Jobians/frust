@@ -11,10 +11,10 @@
 //!
 //! The crate is the whole system: the [`tokens`] module (the two vendored
 //! per-brightness tables, the 46-role `ColorScheme` fold, the [`BeuiTokens`]
-//! extension, the three glass recipes, the easing/spring constants, the bundled
-//! Geist + Geist Mono faces, the assembled [`theme()`](fn@theme)), the shared
-//! [`style`] vocabulary every component paints from, and the component catalog
-//! itself.
+//! extension, the [`BeuiMetrics`] size extension, the three glass recipes, the
+//! easing/spring constants, the bundled Geist + Geist Mono faces, the assembled
+//! [`theme()`](fn@theme)), the shared [`style`] vocabulary every component
+//! paints from, and the component catalog itself.
 //!
 //! # Charter
 //!
@@ -36,10 +36,11 @@
 //!   are first-class tokens ([`tokens::motion`]) rather than per-component
 //!   numbers, and reduced-motion is a requirement, not a nicety: upstream gates
 //!   its own effects on `useReducedMotion`, and so must a port.
-//! - **Desktop-first, touch-friendly by accident.** beUI's own metrics are kept:
-//!   [`style::HEIGHT_MD`] is `h-10` = 40px and [`style::HEIGHT_INPUT`] is `h-11`
-//!   = 44px, so its controls land at or near the mobile tap-target convention
-//!   without a density mechanism being invented here.
+//! - **Desktop-first, with a touch density.** beUI's own metrics are kept as
+//!   [`Density::Comfortable`]: [`style::HEIGHT_MD`] is `h-10` = 40px and
+//!   [`style::HEIGHT_INPUT`] is `h-11` = 44px. [`Density::Touch`] is the phone
+//!   set — every control clears the platform touch minimum — carried on the
+//!   theme as [`BeuiMetrics`] and chosen with [`install_with_density`].
 //!
 //! # Installing it
 //!
@@ -175,14 +176,14 @@ pub mod tokens;
 /// ([`tokens::motion`]) — a component names those through the module that
 /// explains them.
 pub use tokens::{
-    BEUI_DARK, BEUI_DESIGN_LANGUAGE, BEUI_LIGHT, BeuiGlass, BeuiGradient, BeuiPalette, BeuiTokens,
-    FALLBACK_RING, font_data, palette,
+    BEUI_DARK, BEUI_DESIGN_LANGUAGE, BEUI_LIGHT, BeuiGlass, BeuiGradient, BeuiMetrics, BeuiPalette,
+    BeuiTokens, Density, FALLBACK_RING, font_data, palette,
 };
 // Named through its own module path rather than folded into the group above: a
 // bare `tokens::theme` names both the module and the function (Rust keeps them
 // in separate namespaces), and a single-name re-export would lift *both* to the
 // crate root, publishing a second path to everything behind `tokens::theme`.
-pub use tokens::theme::theme;
+pub use tokens::theme::{theme, theme_with_density};
 
 /// Make beUI this app's starting point.
 ///
@@ -224,6 +225,17 @@ pub fn install() {
     }
 }
 
+/// [`install`], seeding [`theme_with_density`]`(density)` instead of
+/// [`theme()`](fn@theme) — the same two pushes, the same timing and thread
+/// contract, with the [`BeuiMetrics`] extension for `density` on the seeded
+/// theme. `install_with_density(Density::Touch)` is the phone setup.
+pub fn install_with_density(density: Density) {
+    frust::set_default_theme(theme_with_density(density));
+    for bytes in font_data() {
+        frust::register_app_fonts(bytes.to_vec());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use frust::{Brightness, DesignLanguage, NativeTypefaces};
@@ -250,6 +262,20 @@ mod tests {
         assert_eq!(crate::BeuiTokens::beui().ring_light, crate::BEUI_LIGHT.ring);
         assert_eq!(crate::FALLBACK_RING, crate::BEUI_LIGHT.ring);
         assert_eq!(crate::font_data().len(), 2);
+
+        // The density surface: both types, the theme constructor, and the
+        // installer (named, not called — it pushes a process-global).
+        assert!(theme.extension::<crate::BeuiMetrics>().is_none());
+        assert_eq!(
+            crate::BeuiMetrics::resolve(Some(&theme)),
+            crate::BeuiMetrics::comfortable()
+        );
+        let touch = crate::theme_with_density(crate::Density::Touch);
+        assert_eq!(
+            crate::BeuiMetrics::resolve(Some(&touch)),
+            crate::BeuiMetrics::touch()
+        );
+        let _: fn(crate::Density) = crate::install_with_density;
 
         // ...and the module paths the components consume read-only.
         assert_eq!(crate::style::HEIGHT_MD, 40.0);
