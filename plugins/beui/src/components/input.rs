@@ -96,7 +96,7 @@ use frust::authoring::{
     RoundedRect, SemanticsCtx, Shape, Size, View, Widget, build_child, rebuild_child,
     route_event_single, teardown_child, visit_children,
 };
-use frust::{Curve, FrameTime, Theme, text_input};
+use frust::{Curve, FocusHandle, FrameTime, Theme, text_input};
 
 use super::checkbox::{ICON_VIEWBOX, mark_path};
 use super::switch;
@@ -287,6 +287,7 @@ pub(crate) fn paint_field_frame(
 
 /// A view-held, typed text callback (erased by the wrapped baseline field).
 type OnText<State> = Rc<dyn Fn(&mut State, String)>;
+type OnFlag<State> = Rc<dyn Fn(&mut State, bool)>;
 
 /// A declarative beUI text field. See the [module docs](self).
 pub struct InputView<State: 'static> {
@@ -303,6 +304,10 @@ pub struct InputView<State: 'static> {
     password: bool,
     on_change: OnText<State>,
     on_submit: Option<OnText<State>>,
+    focus_handle: Option<FocusHandle>,
+    autofocus: bool,
+    on_focus_change: Option<OnFlag<State>>,
+    on_composing_change: Option<OnFlag<State>>,
 }
 
 /// Create a controlled beUI text field showing `value`, reporting each edit
@@ -327,6 +332,10 @@ pub fn input<State: 'static, F: Fn(&mut State, String) + 'static>(
         password: false,
         on_change: Rc::new(on_change),
         on_submit: None,
+        focus_handle: None,
+        autofocus: false,
+        on_focus_change: None,
+        on_composing_change: None,
     }
 }
 
@@ -348,6 +357,34 @@ impl<State: 'static> InputView<State> {
     /// Set the Enter handler (the baseline field's `on_submit`).
     pub fn on_submit<F: Fn(&mut State, String) + 'static>(mut self, on_submit: F) -> Self {
         self.on_submit = Some(Rc::new(on_submit));
+        self
+    }
+
+    /// Take, release and observe the field's focus from app code; forwarded to
+    /// the baseline field's `focus_handle`.
+    pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
+        self.focus_handle = Some(handle);
+        self
+    }
+
+    /// Focus the field once when it first paints; forwarded to the baseline
+    /// field's `autofocus`.
+    pub fn autofocus(mut self, autofocus: bool) -> Self {
+        self.autofocus = autofocus;
+        self
+    }
+
+    /// Be told when the field gains or loses focus; forwarded to the baseline
+    /// field's `on_focus_change`.
+    pub fn on_focus_change<F: Fn(&mut State, bool) + 'static>(mut self, f: F) -> Self {
+        self.on_focus_change = Some(Rc::new(f));
+        self
+    }
+
+    /// Be told when an IME composition starts or ends; forwarded to the
+    /// baseline field's `on_composing_change`.
+    pub fn on_composing_change<F: Fn(&mut State, bool) + 'static>(mut self, f: F) -> Self {
+        self.on_composing_change = Some(Rc::new(f));
         self
     }
 
@@ -406,6 +443,10 @@ impl<State: 'static> InputView<State> {
             password: self.password,
             on_change: self.on_change.clone(),
             on_submit: self.on_submit.clone(),
+            focus_handle: self.focus_handle.clone(),
+            autofocus: self.autofocus,
+            on_focus_change: self.on_focus_change.clone(),
+            on_composing_change: self.on_composing_change.clone(),
             seen: seen.clone(),
         }
     }
@@ -422,6 +463,10 @@ struct FieldSpec<State: 'static> {
     password: bool,
     on_change: OnText<State>,
     on_submit: Option<OnText<State>>,
+    focus_handle: Option<FocusHandle>,
+    autofocus: bool,
+    on_focus_change: Option<OnFlag<State>>,
+    on_composing_change: Option<OnFlag<State>>,
     /// The text the wrapped editor holds: the view's value after a build or a
     /// rebuild (the controlled reconcile leaves the editor on it), then each
     /// edit, which the field reports through `on_change` before the app sees it.
@@ -450,6 +495,17 @@ impl<State: 'static> FieldSpec<State> {
         .corner_radius(m.height_input / 2.0);
         if let Some(on_submit) = self.on_submit.clone() {
             field = field.on_submit(move |state: &mut State, text| on_submit(state, text));
+        }
+        if let Some(handle) = self.focus_handle.clone() {
+            field = field.focus_handle(handle);
+        }
+        field = field.autofocus(self.autofocus);
+        if let Some(f) = self.on_focus_change.clone() {
+            field = field.on_focus_change(move |state: &mut State, focused| f(state, focused));
+        }
+        if let Some(f) = self.on_composing_change.clone() {
+            field =
+                field.on_composing_change(move |state: &mut State, composing| f(state, composing));
         }
         field
     }
@@ -1168,6 +1224,40 @@ mod tests {
         let mut tcx = TextContext::new();
         let mut lctx = LayoutCtx::with_text_context(&mut tcx as &mut dyn Any);
         w.layout(&mut lctx, &BoxConstraints::loose(Size::new(width, 400.0)))
+    }
+
+    // ---- Focus control: the baseline field's setters, forwarded -----------
+
+    /// What the focus-forwarding test records.
+    #[derive(Default)]
+    struct FocusLog {
+        focus: Vec<bool>,
+    }
+
+    #[test]
+    fn autofocus_and_on_focus_change_reach_the_wrapped_field() {
+        let mut root: RenderRoot<FocusLog, InputView<FocusLog>> = RenderRoot::new();
+        root.set_theme(Box::new(crate::theme()));
+        let mut state = FocusLog::default();
+        let mut tcx = TextContext::new();
+        let handle = FocusHandle::new();
+        let mut logic = {
+            let handle = handle.clone();
+            move |_: &mut FocusLog| {
+                input::<FocusLog, _>("", |_: &mut FocusLog, _t| {})
+                    .autofocus(true)
+                    .focus_handle(handle.clone())
+                    .on_focus_change(|s: &mut FocusLog, focused| s.focus.push(focused))
+            }
+        };
+        // A few frames: the grant and its report arrive in later passes.
+        for frame in 0..6 {
+            root.rebuild(&mut logic, &mut state);
+            root.layout_with_text(WINDOW, &mut tcx as &mut dyn Any);
+            root.paint(&mut Recorder::default(), ft_ms(f64::from(frame) * 16.0));
+        }
+        assert!(handle.is_focused(), "autofocus focused the wrapped field");
+        assert_eq!(state.focus, [true]);
     }
 
     // ---- Layout -----------------------------------------------------------

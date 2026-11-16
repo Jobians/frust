@@ -135,7 +135,7 @@ use frust::authoring::{
     InputEvent, LayoutCtx, PaintCtx, PaintScene, PointerPhase, SemanticsCtx, ThemeTextType, View,
     Widget,
 };
-use frust::{AnimationController, Theme, text_input};
+use frust::{AnimationController, FocusHandle, Theme, text_input};
 use kurbo::{Point, RoundedRect, Shape, Size};
 use peniko::{Brush, Color};
 
@@ -227,6 +227,9 @@ pub enum TextFieldVariant {
 /// build).
 type OnText<State> = Rc<dyn Fn(&mut State, String)>;
 
+/// A view-held, typed flag callback (focus or composition changes).
+type OnFlag<State> = Rc<dyn Fn(&mut State, bool)>;
+
 /// A declarative M3 text field. See the [module docs](self).
 pub struct TextFieldView<State: 'static> {
     value: String,
@@ -240,6 +243,10 @@ pub struct TextFieldView<State: 'static> {
     enabled: bool,
     on_change: OnText<State>,
     on_submit: Option<OnText<State>>,
+    focus_handle: Option<FocusHandle>,
+    autofocus: bool,
+    on_focus_change: Option<OnFlag<State>>,
+    on_composing_change: Option<OnFlag<State>>,
 }
 
 /// Create a controlled M3 text field showing `value`, reporting each edit
@@ -264,6 +271,10 @@ pub fn text_field<State: 'static, F: Fn(&mut State, String) + 'static>(
         enabled: true,
         on_change: Rc::new(on_change),
         on_submit: None,
+        focus_handle: None,
+        autofocus: false,
+        on_focus_change: None,
+        on_composing_change: None,
     }
 }
 
@@ -340,6 +351,34 @@ impl<State: 'static> TextFieldView<State> {
         self
     }
 
+    /// Take, release and observe the field's focus from app code; forwarded to
+    /// the baseline field's `focus_handle`.
+    pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
+        self.focus_handle = Some(handle);
+        self
+    }
+
+    /// Focus the field once when it first paints; forwarded to the baseline
+    /// field's `autofocus`.
+    pub fn autofocus(mut self, autofocus: bool) -> Self {
+        self.autofocus = autofocus;
+        self
+    }
+
+    /// Be told when the field gains or loses focus; forwarded to the baseline
+    /// field's `on_focus_change`.
+    pub fn on_focus_change<F: Fn(&mut State, bool) + 'static>(mut self, f: F) -> Self {
+        self.on_focus_change = Some(Rc::new(f));
+        self
+    }
+
+    /// Be told when an IME composition starts or ends; forwarded to the
+    /// baseline field's `on_composing_change`.
+    pub fn on_composing_change<F: Fn(&mut State, bool) + 'static>(mut self, f: F) -> Self {
+        self.on_composing_change = Some(Rc::new(f));
+        self
+    }
+
     /// Whether an error text was set — the reference's `hasError`.
     fn has_error(&self) -> bool {
         self.error_text.is_some()
@@ -392,6 +431,17 @@ impl<State: 'static> TextFieldView<State> {
         .corner_radius(RADIUS);
         if let Some(on_submit) = self.on_submit.clone() {
             field = field.on_submit(move |state: &mut State, text| on_submit(state, text));
+        }
+        if let Some(handle) = self.focus_handle.clone() {
+            field = field.focus_handle(handle);
+        }
+        field = field.autofocus(self.autofocus);
+        if let Some(f) = self.on_focus_change.clone() {
+            field = field.on_focus_change(move |state: &mut State, focused| f(state, focused));
+        }
+        if let Some(f) = self.on_composing_change.clone() {
+            field =
+                field.on_composing_change(move |state: &mut State, composing| f(state, composing));
         }
         field
     }
@@ -1065,6 +1115,39 @@ mod tests {
             frust::authoring::text::set_default_locale(Some("ja"));
         });
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn autofocus_and_on_focus_change_reach_the_wrapped_field() {
+        #[derive(Default)]
+        struct FocusLog {
+            focus: Vec<bool>,
+        }
+        let handle = FocusHandle::new();
+        let mut logic = {
+            let handle = handle.clone();
+            move |_: &mut FocusLog| {
+                text_field::<FocusLog, _>("", |_: &mut FocusLog, _t| {})
+                    .autofocus(true)
+                    .focus_handle(handle.clone())
+                    .on_focus_change(|s: &mut FocusLog, focused| s.focus.push(focused))
+                    .on_composing_change(|_: &mut FocusLog, _| {})
+            }
+        };
+        let mut root: RenderRoot<FocusLog, TextFieldView<FocusLog>> = RenderRoot::new();
+        let mut state = FocusLog::default();
+        let mut tcx = TextContext::new();
+        // A few frames: the grant and its report arrive in later passes.
+        for frame in 0..6u64 {
+            root.rebuild(&mut logic, &mut state);
+            root.layout_with_text(WINDOW, &mut tcx as &mut dyn Any);
+            root.paint(
+                &mut Recorder::default(),
+                FrameTime::from_nanos(frame * 16_000_000),
+            );
+        }
+        assert!(handle.is_focused(), "autofocus focused the wrapped field");
+        assert_eq!(state.focus, [true]);
     }
 
     /// The window every harness lays out in.
