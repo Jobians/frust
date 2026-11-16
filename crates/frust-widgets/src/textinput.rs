@@ -275,6 +275,17 @@
 //! one arrives as an [`InputEvent::EditCommand`], which is exactly what a shell
 //! already dispatches for a platform edit menu.
 //!
+//! # Clipping and scrolling
+//!
+//! A field never paints outside its box. Both modes clip the selection, text,
+//! placeholder and caret to the inner box (reported through
+//! [`InspectDetail::Clip`](frust_core::InspectDetail::Clip)). A single-line field
+//! scrolls horizontally by a retained offset that keeps the caret rect inside the
+//! content box and never scrolls past the end; the placeholder is clipped, never
+//! scrolled. A multi-line field scrolls vertically (see below). The pointer, IME
+//! caret rect, [`CaretInfo`] and toolbar anchor all map through the same content
+//! origin, so they agree with what is drawn.
+//!
 //! # Multi-line mode
 //!
 //! [`TextInputView::multiline(max_visible_lines)`](TextInputView::multiline)
@@ -439,9 +450,9 @@ use std::time::Duration;
 
 use frust_core::accesskit::{Action, CustomAction, Role};
 use frust_core::{
-    AnyView, BoxConstraints, BuildCtx, ChangeFlags, EditCommand, EditingState, EventCtx,
-    EventResult, FrameTime, ImeContentType, ImeEvent, ImeState, InputEvent, Key, LayoutCtx,
-    NamedKey, OutsideTap, OverlayBand, OverlayInput, PaintCtx, PaintScene, PointerPhase,
+    AnyView, BoxConstraints, BuildCtx, ChangeFlags, CornerRadii, EditCommand, EditingState,
+    EventCtx, EventResult, FrameTime, ImeContentType, ImeEvent, ImeState, InputEvent, Key,
+    LayoutCtx, NamedKey, OutsideTap, OverlayBand, OverlayInput, PaintCtx, PaintScene, PointerPhase,
     SelectionToolbarActions, SelectionToolbarPolicy, SelectionToolbarRequest, SemanticsCtx,
     TOUCH_SLOP, View, Widget, selection_toolbar_builder, selection_toolbar_policy,
 };
@@ -453,6 +464,7 @@ use kurbo::{Point, Rect, Size, Vec2};
 use peniko::Color;
 
 use crate::authoring::presses;
+use crate::container::resolve_corner_radii;
 use crate::gesture::{DOUBLE_TAP_MS, LONG_PRESS_MS};
 use crate::overlay::{OverlayAlign, OverlayAnchor, OverlayPlacement, OverlaySide, OverlaySlot};
 use crate::text::{FamilySource, ThemeTextType};
@@ -965,7 +977,10 @@ impl<State: 'static> TextInputView<State> {
     }
 
     /// Override the chrome's corner radius, in logical px. Defaults to
-    /// [`RADIUS`] (6.0). See the module docs' "Chrome" section.
+    /// [`RADIUS`] (6.0). Resolved at paint like a container's radius: NaN or
+    /// negative paints square, and anything above half the shorter side
+    /// (infinity included) paints half the shorter side. See the module docs'
+    /// "Chrome" section.
     pub fn corner_radius(mut self, radius: f64) -> Self {
         self.corner_radius = radius;
         self
@@ -1202,6 +1217,14 @@ pub struct TextInputWidget {
     /// Resolved corner radius — see [`TextInputView::corner_radius`] and
     /// [`RADIUS`].
     corner_radius: f64,
+    /// The horizontal scroll offset of a single-line field's text, in logical
+    /// px — see [`scroll_x`](Self::scroll_x). Retained across passes; always 0
+    /// in multi-line mode. A `Cell` because the pointer, IME and caret mappings
+    /// that read it take `&self`.
+    scroll_x: std::cell::Cell<f64>,
+    /// The field's width as the last `layout` sized it — what the horizontal
+    /// scroll rule measures the inner box against.
+    field_width: f64,
     /// Resolved caret width — see [`TextInputView::caret_width`] and
     /// [`CARET_W`].
     caret_width: f32,
@@ -1587,6 +1610,49 @@ impl TextInputWidget {
         }
     }
 
+    /// The field's inner width: the box the text is visible through
+    /// horizontally.
+    fn inner_width(&self) -> f64 {
+        (self.field_width - 2.0 * self.pad_x).max(0.0)
+    }
+
+    /// The horizontal scroll offset of a single-line field's text (content
+    /// shifted left, in logical px), retained in `self.scroll_x`. Every read
+    /// re-applies the rule to the current caret, text and width: keep the caret
+    /// rect (its width included) inside `[0, inner_width]`; never scroll past
+    /// the end, so text that fits sits at 0 and shrinking text pulls back with
+    /// no gap at the trailing edge; otherwise stay put. The caret's visual x
+    /// comes from the layout, so right-to-left and mixed text need no special
+    /// case. Always 0 in multi-line mode.
+    fn scroll_x(&self) -> f64 {
+        if self.max_visible_lines.is_some() {
+            return 0.0;
+        }
+        let inner = self.inner_width();
+        let text_w = self.display().layout_size().width;
+        let max = (text_w + self.caret_width as f64 - inner).max(0.0);
+        let mut s = self.scroll_x.get().clamp(0.0, max);
+        if let Some(c) = self.display().cursor_rect(self.caret_width) {
+            if c.x1 - s > inner {
+                s = c.x1 - inner;
+            }
+            if c.x0 - s < 0.0 {
+                s = c.x0;
+            }
+            s = s.clamp(0.0, max);
+        }
+        self.scroll_x.set(s);
+        s
+    }
+
+    /// The x of the text content's left edge within the field: the inner
+    /// padding shifted left by the horizontal scroll. The one place the
+    /// horizontal origin is computed, beside
+    /// [`content_origin_y`](Self::content_origin_y).
+    fn content_origin_x(&self) -> f64 {
+        self.pad_x - self.scroll_x()
+    }
+
     /// Reset the blink so the caret is visible from the next painted frame
     /// (called on any edit / focus, during the clockless event pass). The actual
     /// epoch is recorded from `input_time` on the next paint.
@@ -1666,7 +1732,8 @@ impl TextInputWidget {
             composing_base: es.composing_base,
             composing_extent: es.composing_extent,
         };
-        let offset = origin.to_vec2() + Vec2::new(self.pad_x, self.content_origin_y(size.height));
+        let offset = origin.to_vec2()
+            + Vec2::new(self.content_origin_x(), self.content_origin_y(size.height));
         // The caret rect is a *screen* placement hint, so it comes from the
         // displayed (possibly masked) layout — while `editing` above stays the
         // real text the platform IME mirror needs.
@@ -1714,7 +1781,7 @@ impl TextInputWidget {
     /// coordinate space (used for caret placement / drag-selection).
     fn editor_point(&self, pos: Point, height: f64) -> (f32, f32) {
         (
-            (pos.x - self.pad_x) as f32,
+            (pos.x - self.content_origin_x()) as f32,
             (pos.y - self.content_origin_y(height)) as f32,
         )
     }
@@ -1804,7 +1871,7 @@ impl TextInputWidget {
     /// The offset from the field's own origin to the text content's — what a
     /// layout-local rect is translated by to become widget-local.
     fn content_offset(&self, height: f64) -> Vec2 {
-        Vec2::new(self.pad_x, self.content_origin_y(height))
+        Vec2::new(self.content_origin_x(), self.content_origin_y(height))
     }
 
     /// Whether a widget-local `pos` lands inside the current selection.
@@ -2405,6 +2472,8 @@ impl<State: 'static> View<State> for TextInputView<State> {
             pad_y: self.pad_y,
             border_width: self.border_width,
             corner_radius: self.corner_radius,
+            scroll_x: std::cell::Cell::new(0.0),
+            field_width: 0.0,
             caret_width: self.caret_width,
             focus_ring_width: self.focus_ring_width,
             toolbar: new_toolbar_slot(),
@@ -2596,6 +2665,11 @@ impl<State: 'static> View<State> for TextInputView<State> {
 }
 
 impl Widget for TextInputWidget {
+    /// [`frust_core::InspectDetail::Clip`]: the field clips its text to its box.
+    fn inspect_detail(&self) -> Option<frust_core::InspectDetail> {
+        Some(frust_core::InspectDetail::Clip)
+    }
+
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
         // Late-registered app fonts (a shell's per-frame font drain, after this
         // widget's private context was built) — a lock and a length compare
@@ -2681,7 +2755,9 @@ impl Widget for TextInputWidget {
         // which `View::rebuild` calls with no `LayoutCtx` in reach.
         self.window_size = ctx.window_size();
         self.toolbar.layout(ctx);
-        bc.constrain(Size::new(width, height))
+        let size = bc.constrain(Size::new(width, height));
+        self.field_width = size.width;
+        size
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
@@ -2796,31 +2872,43 @@ impl Widget for TextInputWidget {
         } else {
             self.border_width
         };
-        scene.fill_rounded_rect(origin, size, self.corner_radius, border_color);
+        let radius = resolve_corner_radii(CornerRadii::uniform(self.corner_radius), size).top_left;
+        scene.fill_rounded_rect(origin, size, radius, border_color);
         scene.fill_rounded_rect(
             Point::new(origin.x + border_w, origin.y + border_w),
             Size::new(
                 (size.width - 2.0 * border_w).max(0.0),
                 (size.height - 2.0 * border_w).max(0.0),
             ),
-            (self.corner_radius - border_w).max(0.0),
+            (radius - border_w).max(0.0),
             chrome.bg,
         );
 
         let text_origin = Point::new(
-            origin.x + self.pad_x,
+            origin.x + self.content_origin_x(),
             origin.y + self.content_origin_y(size.height),
         );
 
-        // Multi-line content can overflow the capped box; clip the text band so
-        // scrolled-out lines stay inside the field. Popped at the end of paint.
-        let clip_content = self.max_visible_lines.is_some();
-        if clip_content {
+        // Content can overflow the box: multi-line text scrolls past the capped
+        // height, single-line text and its placeholder run past the sides. Clip
+        // the content band so nothing paints outside the field. Popped before
+        // the toolbar anchor.
+        if self.max_visible_lines.is_some() {
             scene.push_clip(
                 Point::new(origin.x + self.border_width, origin.y + self.pad_y),
                 Size::new(
                     (size.width - 2.0 * self.border_width).max(0.0),
                     (size.height - 2.0 * self.pad_y).max(0.0),
+                ),
+            );
+        } else {
+            // Horizontally the content box; vertically the padding box, so
+            // descenders and the caret are not cut.
+            scene.push_clip(
+                Point::new(origin.x + self.pad_x, origin.y + self.border_width),
+                Size::new(
+                    self.inner_width(),
+                    (size.height - 2.0 * self.border_width).max(0.0),
                 ),
             );
         }
@@ -2837,7 +2925,12 @@ impl Widget for TextInputWidget {
                 ph_style.line_height = self.applied_style.line_height;
                 ph_style.letter_spacing = self.applied_style.letter_spacing;
                 let layout = self.text_ctx.layout(&self.placeholder, &ph_style, None);
-                for run in layout.to_scene_runs(text_origin) {
+                // Never scrolled: it sits at the content box's left edge.
+                let placeholder_origin = Point::new(
+                    origin.x + self.pad_x,
+                    origin.y + self.content_origin_y(size.height),
+                );
+                for run in layout.to_scene_runs(placeholder_origin) {
                     scene.draw_glyph_run(run);
                 }
             }
@@ -2916,9 +3009,7 @@ impl Widget for TextInputWidget {
             ctx.publish_ime_state(ime);
         }
 
-        if clip_content {
-            scene.pop_clip();
-        }
+        scene.pop_clip();
 
         // The selection toolbar, outside the clip because it is not drawn here
         // at all: the root paints every registered pod after the whole main
@@ -2986,7 +3077,7 @@ impl TextInputWidget {
     /// The caret as `on_caret_change` reports it. Always builds the value;
     /// `report_caret` is what skips the report when no listener is set.
     fn caret_info(&self, size: Size) -> CaretInfo {
-        let offset = Vec2::new(self.pad_x, self.content_origin_y(size.height));
+        let offset = Vec2::new(self.content_origin_x(), self.content_origin_y(size.height));
         let rect = self
             .display()
             .cursor_rect(self.caret_width)
@@ -9529,6 +9620,266 @@ mod tests {
                 .contains(ChangeFlags::LAYOUT),
             "role -> monospace reports LAYOUT"
         );
+    }
+
+    // --- Single-line clip and horizontal scroll ---
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Op {
+        Clip(Point, Size),
+        Pop,
+        Glyphs(f64),
+        RRect(Point, Size, f64),
+    }
+
+    /// Records clip pushes/pops, glyph-run x positions and rounded rects in
+    /// paint order.
+    #[derive(Default)]
+    struct OrderRecorder {
+        ops: Vec<Op>,
+    }
+
+    impl PaintScene for OrderRecorder {
+        fn fill_rect(&mut self, _o: Point, _s: Size, _c: Color) {}
+        fn fill_rounded_rect(&mut self, origin: Point, size: Size, radius: f64, _c: Color) {
+            self.ops.push(Op::RRect(origin, size, radius));
+        }
+        fn draw_text(&mut self, _o: Point, _t: &str) {}
+        fn draw_glyph_run(&mut self, run: frust_scene::GlyphRun) {
+            let x = run.transform.translation().x + run.glyphs.first().map_or(0.0, |g| g.x as f64);
+            self.ops.push(Op::Glyphs(x));
+        }
+        fn push_clip(&mut self, origin: Point, size: Size) {
+            self.ops.push(Op::Clip(origin, size));
+        }
+        fn pop_clip(&mut self) {
+            self.ops.push(Op::Pop);
+        }
+    }
+
+    const NARROW: f64 = 120.0;
+
+    fn narrow_harness(state: &mut AppState) -> RenderRoot<AppState, TextInputView<AppState>> {
+        let mut root = RenderRoot::new();
+        root.rebuild(&mut build, state);
+        root.layout(Size::new(NARROW, 200.0));
+        root.event(state, &pointer(PointerPhase::Down, 10.0, 10.0));
+        root
+    }
+
+    fn commit_narrow(
+        root: &mut RenderRoot<AppState, TextInputView<AppState>>,
+        state: &mut AppState,
+        text: &str,
+    ) {
+        root.event(state, &InputEvent::Ime(ImeEvent::Commit(text.into())));
+        root.layout(Size::new(NARROW, 200.0));
+    }
+
+    fn caret_x1(root: &RenderRoot<AppState, TextInputView<AppState>>) -> f64 {
+        let w = widget(root);
+        w.display().cursor_rect(w.caret_width).expect("caret").x1
+    }
+
+    #[test]
+    fn single_line_scroll_x_follows_the_caret_past_the_trailing_edge() {
+        let mut state = AppState::default();
+        let mut root = narrow_harness(&mut state);
+        let inner = widget(&root).inner_width();
+        assert!(inner > 0.0 && inner < NARROW);
+        let mut crossed = false;
+        for _ in 0..40 {
+            commit_narrow(&mut root, &mut state, "m");
+            let x1 = caret_x1(&root);
+            let scroll = widget(&root).scroll_x();
+            if x1 <= inner {
+                assert_eq!(scroll, 0.0, "no scroll while the caret fits");
+            } else {
+                crossed = true;
+                assert!(
+                    (scroll - (x1 - inner)).abs() < 1e-6,
+                    "scroll {scroll} keeps the caret's trailing edge {x1} at {inner}"
+                );
+            }
+        }
+        assert!(crossed, "the text outgrew the field");
+    }
+
+    #[test]
+    fn single_line_home_returns_scroll_x_to_zero() {
+        let mut state = AppState::default();
+        let mut root = narrow_harness(&mut state);
+        commit_narrow(&mut root, &mut state, &"m".repeat(40));
+        assert!(widget(&root).scroll_x() > 0.0);
+        root.event(&mut state, &named(NamedKey::Home, Modifiers::default()));
+        assert_eq!(widget(&root).scroll_x(), 0.0);
+    }
+
+    #[test]
+    fn single_line_deleting_from_the_end_leaves_no_gap() {
+        let mut state = AppState::default();
+        let mut root = narrow_harness(&mut state);
+        commit_narrow(&mut root, &mut state, &"m".repeat(40));
+        for _ in 0..39 {
+            root.event(
+                &mut state,
+                &named(NamedKey::Backspace, Modifiers::default()),
+            );
+            root.layout(Size::new(NARROW, 200.0));
+            let w = widget(&root);
+            let text_w = w.display().layout_size().width;
+            let scroll = w.scroll_x();
+            let max = (text_w + w.caret_width as f64 - w.inner_width()).max(0.0);
+            assert!(scroll <= max + 1e-6, "{scroll} leaves a gap past {max}");
+            assert!(caret_x1(&root) - scroll <= w.inner_width() + 1e-6);
+        }
+        assert_eq!(widget(&root).scroll_x(), 0.0, "short text is unscrolled");
+    }
+
+    #[test]
+    fn single_line_press_while_scrolled_lands_on_the_drawn_character() {
+        let mut state = AppState::default();
+        let mut root = narrow_harness(&mut state);
+        commit_narrow(&mut root, &mut state, &"m".repeat(40));
+        let scroll = widget(&root).scroll_x();
+        assert!(scroll > 100.0, "scrolled well past the first characters");
+        let press_x = 60.0;
+        root.event(&mut state, &pointer(PointerPhase::Down, press_x, 10.0));
+        let w = widget(&root);
+        let c = w.display().cursor_rect(w.caret_width).expect("caret");
+        let drawn_x = c.x0 - w.scroll_x() + w.pad_x;
+        assert!(
+            (drawn_x - press_x).abs() <= 10.0,
+            "caret drawn at {drawn_x}, pressed at {press_x}"
+        );
+        let es = w.editor.editing_state_bytes();
+        assert!(es.extent > 0 && es.extent < 40, "caret is mid-text");
+    }
+
+    #[test]
+    fn single_line_caret_rects_stay_inside_the_field_while_scrolled() {
+        let mut state = AppState::default();
+        let mut root = narrow_harness(&mut state);
+        commit_narrow(&mut root, &mut state, &"m".repeat(40));
+        let w = widget(&root);
+        assert!(w.scroll_x() > 0.0);
+        let size = Size::new(NARROW, w.content_height() + 2.0 * w.pad_y);
+        let bounds = Rect::from_origin_size(Point::ZERO, size);
+        let ime = w
+            .current_ime_state(Point::ZERO, size)
+            .caret
+            .expect("ime caret");
+        let info = w.caret_info(size).rect;
+        for (name, r) in [("ime", ime), ("caret_info", info)] {
+            assert!(
+                r.x0 >= bounds.x0 - 1e-6 && r.x1 <= bounds.x1 + 1e-6,
+                "{name} caret {r:?} outside {bounds:?}"
+            );
+            assert!(r.y0 >= bounds.y0 && r.y1 <= bounds.y1, "{name} y {r:?}");
+        }
+    }
+
+    #[test]
+    fn single_line_reports_a_clip_inspect_detail() {
+        let mut state = AppState::default();
+        let root = narrow_harness(&mut state);
+        assert_eq!(
+            widget(&root).inspect_detail(),
+            Some(frust_core::InspectDetail::Clip)
+        );
+    }
+
+    #[test]
+    fn a_long_placeholder_is_clipped_and_never_scrolled() {
+        let mut state = AppState::default();
+        let mut logic = |s: &mut AppState| build(s).placeholder("p".repeat(80));
+        let mut root = RenderRoot::new();
+        root.rebuild(&mut logic, &mut state);
+        root.layout(Size::new(NARROW, 200.0));
+        let mut rec = OrderRecorder::default();
+        root.paint(&mut rec, FrameTime::ZERO);
+        let clip = rec
+            .ops
+            .iter()
+            .position(|o| matches!(o, Op::Clip(..)))
+            .expect("placeholder painted under a clip");
+        let glyphs = rec
+            .ops
+            .iter()
+            .position(|o| matches!(o, Op::Glyphs(_)))
+            .expect("placeholder glyphs");
+        let pop = rec.ops.iter().position(|o| *o == Op::Pop).expect("pop");
+        assert!(clip < glyphs && glyphs < pop);
+        let Op::Glyphs(x) = rec.ops[glyphs] else {
+            unreachable!()
+        };
+        assert!((x - widget(&root).pad_x).abs() < 1e-6, "placeholder at {x}");
+    }
+
+    #[test]
+    fn an_overflowing_single_line_field_paints_its_glyphs_inside_a_clip() {
+        let mut state = AppState::default();
+        let mut root = narrow_harness(&mut state);
+        commit_narrow(&mut root, &mut state, &"m".repeat(40));
+        let mut rec = OrderRecorder::default();
+        root.paint(&mut rec, FrameTime::ZERO);
+        let pad_x = widget(&root).pad_x;
+        let clip = rec
+            .ops
+            .iter()
+            .position(|o| matches!(o, Op::Clip(..)))
+            .expect("clip");
+        let Op::Clip(origin, size) = rec.ops[clip] else {
+            unreachable!()
+        };
+        assert_eq!(origin.x, pad_x, "the horizontal clip is the content box");
+        assert_eq!(size.width, NARROW - 2.0 * pad_x);
+        let glyphs = rec
+            .ops
+            .iter()
+            .position(|o| matches!(o, Op::Glyphs(_)))
+            .expect("glyphs");
+        let pop = rec.ops.iter().position(|o| *o == Op::Pop).expect("pop");
+        assert!(clip < glyphs && glyphs < pop, "glyphs sit inside the clip");
+        let Op::Glyphs(x) = rec.ops[glyphs] else {
+            unreachable!()
+        };
+        assert!(x < pad_x, "the text is scrolled left of the content box");
+    }
+
+    #[test]
+    fn a_fitting_single_line_field_is_unscrolled() {
+        let mut state = AppState::default();
+        let mut root = narrow_harness(&mut state);
+        commit_narrow(&mut root, &mut state, "hi");
+        assert_eq!(widget(&root).scroll_x(), 0.0);
+        let mut rec = OrderRecorder::default();
+        root.paint(&mut rec, FrameTime::ZERO);
+        let Some(Op::Glyphs(x)) = rec.ops.iter().find(|o| matches!(o, Op::Glyphs(_))) else {
+            panic!("no glyphs")
+        };
+        assert_eq!(*x, widget(&root).pad_x);
+    }
+
+    #[test]
+    fn an_infinite_corner_radius_records_finite_radii() {
+        let mut state = AppState::default();
+        let mut logic = |s: &mut AppState| build(s).corner_radius(f64::INFINITY);
+        let mut root = RenderRoot::new();
+        root.rebuild(&mut logic, &mut state);
+        let size = root.layout(Size::new(NARROW, 200.0));
+        let mut rec = OrderRecorder::default();
+        root.paint(&mut rec, FrameTime::ZERO);
+        let radii: Vec<f64> = rec
+            .ops
+            .iter()
+            .filter_map(|o| match o {
+                Op::RRect(_, _, r) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        assert!(radii.len() >= 2 && radii.iter().all(|r| r.is_finite()));
+        assert_eq!(radii[0], size.width.min(size.height) / 2.0);
     }
 }
 
