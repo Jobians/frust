@@ -147,6 +147,26 @@ places (fixed-width stages, rows that do not wrap, wide specimens); the
 shell's own test records which ones. Content, Agents · Primitives,
 Agents · Panels, Blocks · Morph and Theming fit.
 
+## Device gates
+
+Walks of this gallery on real phones, in light and dark. A row is a single
+run on the build named below, not a standing guarantee.
+
+2026-11-16, Android: Pixel 5, Android 14, 1080×2340 at 440 dpi, 90 Hz;
+`frust build apk --profile --target-platform android-arm64` at `4f82ba9a`.
+
+| Check | Device and OS | Result | Note |
+|-------|---------------|--------|------|
+| 1. Touch targets on Content | Pixel 5, Android 14 | PASS | Small button 66×48 dp, list row 56 dp tall, other buttons 48 to 56 dp. Below 48 dp: the page's inline theme toggle (32 dp) and the select (40 dp). |
+| 2. OS font size, default and 1.3 | Pixel 5, Android 14 | PASS | beUI text grows and rows wrap, nothing clips or overlaps; button labels fit. The gallery's own headings, page descriptions and top-bar title keep their size. |
+| 3. Status and navigation bars | Pixel 5, Android 14 | PASS | Portrait and landscape; landscape is wide enough for the rail shell and clears the display cutout. |
+| 4. Keyboard | Pixel 5, Android 14 | FAIL | The Content field stays visible while typing. The Chat composer is revealed only to its caret line: the send button sits under the keyboard until the page is scrolled, and the composer can be scrolled back under it. |
+| 5. Toast | Pixel 5, Android 14 | PASS | Appears above the content and the navigation bar; closes from its button. It has no timeout of its own. |
+| 6. Scrolling Content | Pixel 5, Android 14 | PASS | Trace over six flings: frame time p50 6 to 11 ms, p95 13 ms, no skipped frame; scene encode 2 to 3.5 ms. |
+| 7. Log | Pixel 5, Android 14 | PASS | No panic, no crash and no GPU-effects warning; one process for the whole walk. |
+| 8. Navigation | Pixel 5, Android 14 | PASS | All 20 pages open. Back closes the page list; with the list closed it leaves the app from any page. Pages are wider than the phone in places, as listed under "Phones". |
+| 9. Draft dialog on Overlays | Pixel 5, Android 14 | PASS | Veto on: back keeps the dialog. Veto off: back closes it with its exit animation. Focus return on: focus goes back to Composer (the keyboard reopens after Discard, not after back). Off: neither returns. |
+
 ## GPU Effects
 
 ```bash
