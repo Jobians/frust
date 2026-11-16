@@ -287,11 +287,35 @@ The sections, in order:
     normal fields A and B; an obscured field C (password-classified); a **Push full-width
     route** button over a navigator with no horizontal padding (pushed pages show their depth
     and their own Push, so depth 3 is reachable); numbered filler rows; and field D as the last
-    row of the page, above the bottom navigation bar once scrolled to the end. The framework has
-    no programmatic focus, so Return on A does not move focus to B (it counts a press), and no
-    blur callback, so the status line shows the last caret report. The shell adds no inset around
-    the page; the navigator is at the left edge in portrait at phone width (with the wide-width
-    side rail it starts at the rail's right edge). Deep link: `frustplay://section/forms`.
+    row of the page, above the bottom navigation bar once scrolled to the end. Fields A to D
+    carry no focus handle, so Return on A does not move focus to B (it counts a press) and the
+    top status line shows the last caret report. The shell adds no inset around the page; the
+    navigator is at the left edge in portrait at phone width (with the wide-width side rail it
+    starts at the rail's right edge). Two more sections sit between the navigator and the
+    filler rows, and a **Focus field** button sits under the page status line:
+    - **Search bar.** A search icon button ("Open search") expands into a 150 px single-line
+      field with a long placeholder, so the placeholder overflows. The field autofocuses; an X
+      button ("Clear search") inside `keep_focus` empties it; losing focus collapses the bar
+      back to the icon. **Focus field** expands the bar and requests focus through a
+      `FocusHandle`. A status block shows focused yes/no, composing yes/no, the last
+      `on_change` value, the Return count and the last submitted value. Steps: tap the icon
+      (the field takes focus and the keyboard opens on a phone); type "abc" (change shows
+      `abc`); tap X (the field empties, keeps focus, and the keyboard stays up); press Return
+      (submits 1, last submit is the text at that moment); tap another field or the page
+      background (the bar collapses, focused reads no); tap **Focus field** (the bar expands
+      and is focused without a tap in the field). With an IME (Chinese or Japanese, or a
+      phone keyboard's suggestion composition) composing reads yes while the preedit text is
+      underlined and no after the commit.
+    - **Long-press drag.** A 260 px tall scroll view over a grid of 60 numbered cells (six
+      columns, ten rows, about three viewports tall), with a status line (selected count,
+      dragging yes/no, last offset from the press point). Steps: drag a finger or the mouse
+      quickly inside the grid (it scrolls, nothing is selected); press one cell and hold about
+      half a second (it turns selected, count 1, dragging yes); without lifting, drag across
+      other cells (every crossed cell is selected, the offset follows the pointer, and the
+      grid does not scroll even when the pointer is dragged vertically); release (dragging
+      no, selection stays). A new long press starts a fresh selection. On desktop use the
+      mouse button; the expected result is the same.
+    Deep link: `frustplay://section/forms`.
 26. **Gate** — a `frust::StartGate` over a task that waits about two seconds. A **Fail next
     run** checkbox (read when a run starts) makes the task fail instead of succeed; **Run
     again** remounts the gate so the task runs again. Expect a splash line, then a ready line
