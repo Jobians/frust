@@ -1,7 +1,7 @@
 # beui-demo
 
-The `frust-beui` design-system plugin's desktop gallery: nineteen pages that
-show every ported component interactively — a home page with the upstream
+The `frust-beui` design-system plugin's gallery: nineteen pages that show
+every ported component interactively — a home page with the upstream
 attribution, nine Motion pages (text effects, buttons, controls, selection,
 overlays, navigation, surfaces, data, and the WGSL shader backgrounds), three
 Agents pages (chat primitives, agent-output panels, the assembled chat app
@@ -9,35 +9,40 @@ over a mock streaming driver), four Blocks pages (command surfaces, morphing
 tabs and stacks, forms and upload, showcase blocks), a Theming page, and a
 GPU Effects page.
 
-Root-workspace member (covered by the `examples/*` glob in the root
-`Cargo.toml`, not standalone) — desktop-only, no Android/iOS output. Mirrors
-`examples/shadcn-demo`'s manifest shape closely, with one addition: a single
-non-default `gpu-effects` feature row (see "GPU Effects" below) forwarding to
-`frust-beui/gpu-effects`; the default build carries none of it.
+A **standalone workspace** (its own `[workspace]` root and `Cargo.lock`,
+excluded from the root one — see `Cargo.toml`'s header), shaped like
+`examples/material3-demo`: one tree drives the desktop preview and the
+generated `android/` and `ios/` host projects. The package is `beuidemo` (no
+hyphen) even though the directory keeps one: the crate name is the `.so`/`.a`
+leaf the Android and iOS shells load by identifier. The manifest adds a
+single non-default `gpu-effects` feature row (see "GPU Effects" below)
+forwarding to `frust-beui/gpu-effects`; the default build carries none of it.
 
 ## Run
 
+```bash
+cd examples/beui-demo
+cargo run                # desktop preview
+frust run -d <device>    # Android / iOS device or simulator
 ```
-cargo run -p beui-demo
+
+The desktop preview opens a real winit window titled "beUI Gallery".
+`frust_beui::install()` runs in `frust::app!`'s `setup` block, so the app
+starts themed with beUI's own token tables (`frust_beui::theme()`) rather
+than the framework's neutral fallback. The window opens at the desktop
+shell's own default size (800×600 logical px); set
+`FRUST_WINDOW_SIZE=<width>x<height>` before running for a roomier gallery
+view of the sidebar-plus-content shell.
+
+It gates from its own directory rather than with `-p` from the repo root:
+
+```bash
+cd examples/beui-demo
+cargo test \
+  && cargo clippy --all-targets -- -D warnings \
+  && cargo clippy --features gpu-effects --all-targets -- -D warnings \
+  && cargo fmt --check
 ```
-
-Opens a real winit window titled "beUI Gallery". `frust_beui::install()` runs
-in `frust::app!`'s `setup` block, so the app starts themed with beUI's own
-token tables (`frust_beui::theme()`) rather than the framework's neutral
-fallback.
-
-The window opens at the desktop shell's own default size (800×600 logical
-px); set `FRUST_WINDOW_SIZE=<width>x<height>` before running for a roomier
-gallery view of the sidebar-plus-content shell.
-
-### The `frust run` device gotcha
-
-If an Android device is attached, the workspace-root `frust run` auto-targets
-it instead of a desktop window — this crate has no Android/iOS build output at
-all, so that auto-target would fail or pick the wrong app. Use
-`cargo run -p beui-demo` (or run `frust run --watch` from *inside* this
-directory, which is desktop-only and has nothing else to prefer) for the
-desktop preview.
 
 ## Nav shell
 
@@ -98,15 +103,16 @@ Theming) alongside the active page's title.
 
 ## GPU Effects
 
-```
-cargo run -p beui-demo --features gpu-effects
+```bash
+cd examples/beui-demo
+cargo run --features gpu-effects
 ```
 
 Compiles the catalog's `gpu_fx` substrate in and turns on the five true-3D
 opt-ins the GPU Effects page pairs against their 2D path
 (`TiltCardView::gpu_face`, `WalletCardView::gpu_fan`, `WheelPicker::gpu_drum`,
 `CylinderCarouselView::gpu_cylinder`, `ProjectFolderView::gpu_fan`). The
-default build (`cargo run -p beui-demo`, no flag) never compiles `gpu_fx` at
+default build (`cargo run`, no flag) never compiles `gpu_fx` at
 all — the page still shows, with a placeholder in every 3D pane naming this
 command.
 
@@ -129,9 +135,9 @@ backend-specific code of its own — but that run is owed too.
 
 ## Verifying it
 
-This dev rig is headless — the binary is never run here. `cargo build -p
-beui-demo` is the runtime check, and `cargo check -p beui-demo --features
-gpu-effects` covers the feature-gated build compiling; a desktop container
-(dockur linux-native, `run-on-desktop.sh`) runs `cargo run -p beui-demo` (and,
-for the GPU Effects page, `cargo run -p beui-demo --features gpu-effects`)
-and captures the screenshot separately.
+This dev rig is headless — the binary is never run here. `cargo build` (from
+this directory) is the runtime check, `cargo check --features gpu-effects`
+covers the feature-gated build compiling, and `cargo ndk -t arm64-v8a check`
+covers the Android compile; a desktop container (dockur linux-native,
+`run-on-desktop.sh`) runs `cargo run` (and, for the GPU Effects page,
+`cargo run --features gpu-effects`) and captures the screenshot separately.

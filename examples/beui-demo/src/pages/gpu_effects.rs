@@ -23,9 +23,9 @@
 //!
 //! # Compiling both ways
 //!
-//! `cargo run -p beui-demo` (the default build) never touches `gpu_fx` at
-//! all: every pane below renders its ordinary 2D path, and the would-be 3D
-//! column names the flag that turns it on. `cargo run -p beui-demo --features
+//! From `examples/beui-demo`, `cargo run` (the default build) never touches
+//! `gpu_fx` at all: every pane below renders its ordinary 2D path, and the
+//! would-be 3D column names the flag that turns it on. `cargo run --features
 //! gpu-effects` compiles the five opt-ins in; whether a pane then actually
 //! *renders* 3D still depends on [`GpuFx::availability`] — a device exists
 //! only once the desktop shell has opened its first surface, and
@@ -51,7 +51,7 @@ use crate::nav::{caption, heading};
 
 /// The command line every "compile this pane in" placeholder names.
 #[cfg(not(feature = "gpu-effects"))]
-const BUILD_FLAG_HINT: &str = "cargo run -p beui-demo --features gpu-effects";
+const BUILD_FLAG_HINT: &str = "cargo run --features gpu-effects";
 
 /// The live theme, or the catalog's own baseline before a context exists.
 fn theme() -> Theme {

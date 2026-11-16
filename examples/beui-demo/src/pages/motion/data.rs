@@ -55,7 +55,7 @@ const TOASTS: [(AnimatedToastStackStatus, &str, &str, Option<&str>); 5] = [
     (
         AnimatedToastStackStatus::Success,
         "Deployment complete",
-        "beui-demo is live on the preview channel.",
+        "beuidemo is live on the preview channel.",
         Some("View"),
     ),
     (

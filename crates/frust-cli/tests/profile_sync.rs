@@ -3,34 +3,35 @@
 //! these tests are the automated backstop (there is no CI — the verify gate
 //! is the only enforcement):
 //!
-//! - `[profile.dev.package.<shader-crate>]` overrides live in FIVE
-//!   manifests (root, template, huddle, glyph-catalog, material3-demo) —
-//!   drift silently reopens the iOS launch-watchdog crash.
-//! - the `[profile.dev.package."*"]` wildcard lives in the SAME five
-//!   manifests (root, template, huddle, glyph-catalog, material3-demo — an
-//!   earlier examples-convergence deleted `catalog` and `inbox`, folding
-//!   their hand-sync role into `huddle`) — drift silently reopens the
-//!   measured size/perf regression.
-//! - `[profile.release]` hardening lives in TEN: those five plus five
+//! - `[profile.dev.package.<shader-crate>]` overrides live in SIX
+//!   manifests (root, template, huddle, glyph-catalog, material3-demo,
+//!   beui-demo) — drift silently reopens the iOS launch-watchdog crash.
+//! - the `[profile.dev.package."*"]` wildcard lives in the SAME six
+//!   manifests (root, template, huddle, glyph-catalog, material3-demo,
+//!   beui-demo — an earlier examples-convergence deleted `catalog` and
+//!   `inbox`, folding their hand-sync role into `huddle`) — drift silently
+//!   reopens the measured size/perf regression.
+//! - `[profile.release]` hardening lives in ELEVEN: those six plus five
 //!   standalone workspaces that hand-copied the block with no tripwire over
 //!   them — `benchmarks/frust_bench` (its numbers only mean anything if it
 //!   builds under the settings a shipped app does), the three further `frust
 //!   create` scaffolds `examples/playground`, `examples/shadertoy` and
 //!   `examples/native-widgets-demo`, and the wasm-only `examples/web-gallery`.
 //! - the cold-set `[profile.release.package.<crate>]` block (`opt-level =
-//!   "z"` for crates that do no per-frame work) lives in the NINE of those
-//!   ten that build an Android artifact — i.e. all but `web-gallery`, which
+//!   "z"` for crates that do no per-frame work) lives in the TEN of those
+//!   eleven that build an Android artifact — i.e. all but `web-gallery`, which
 //!   is wasm-only and deliberately has no package overrides. Drift here
 //!   silently drops a measured footprint win for one app, or demotes a
 //!   per-frame crate to `"z"` in one app alone and makes two apps' frame
 //!   numbers incomparable.
 //!
-//! `examples/glyph-catalog/Cargo.toml` and `examples/material3-demo/Cargo.toml`
-//! are two more full `frust create` scaffolds carrying their own copies of
-//! these blocks (same reason as `huddle`: each is a standalone workspace
-//! whose `[profile.*]` blocks only take effect in a workspace root) — they
-//! were hand-authored independently of the root/template/huddle trio, with
-//! no automated backstop until this test grew to cover them too.
+//! `examples/glyph-catalog/Cargo.toml`, `examples/material3-demo/Cargo.toml`
+//! and `examples/beui-demo/Cargo.toml` are three more full `frust create`
+//! scaffolds carrying their own copies of these blocks (same reason as
+//! `huddle`: each is a standalone workspace whose `[profile.*]` blocks only
+//! take effect in a workspace root) — they were hand-authored independently
+//! of the root/template/huddle trio, with no automated backstop until this
+//! test grew to cover them too (`beui-demo` copied `material3-demo`'s).
 //!
 //! The template manifest contains minijinja placeholders elsewhere in the
 //! file, so the blocks are extracted line-wise rather than TOML-parsed.
@@ -94,8 +95,9 @@ fn section_pairs(manifest: &str, header: &str) -> BTreeMap<String, String> {
 /// Every manifest carrying the hand-synced profile blocks: root, template,
 /// huddle (an earlier examples-convergence deleted the `catalog` and
 /// `inbox` examples, the other two manifests this used to compare), plus
-/// the two standalone example scaffolds that independently carry their own
-/// copies of the same blocks (`glyph-catalog`, `material3-demo`).
+/// the three standalone example scaffolds that independently carry their own
+/// copies of the same blocks (`glyph-catalog`, `material3-demo`,
+/// `beui-demo`).
 fn synced_manifests() -> Vec<std::path::PathBuf> {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     vec![
@@ -104,6 +106,7 @@ fn synced_manifests() -> Vec<std::path::PathBuf> {
         repo_root.join("examples/huddle/Cargo.toml"),
         repo_root.join("examples/glyph-catalog/Cargo.toml"),
         repo_root.join("examples/material3-demo/Cargo.toml"),
+        repo_root.join("examples/beui-demo/Cargo.toml"),
     ]
 }
 
@@ -116,7 +119,7 @@ fn synced_manifests() -> Vec<std::path::PathBuf> {
 /// shipped app does) and the wasm-only `examples/web-gallery`. They join the
 /// release-block comparison only, not the dev-override one
 /// (`synced_manifests`): `playground`'s and `shadertoy`'s dev override sets are
-/// narrower than the five above, and `native-widgets-demo`'s is the scaffold
+/// narrower than the six above, and `native-widgets-demo`'s is the scaffold
 /// template's copy, kept as `frust create` emitted it but — like
 /// `playground`'s — left outside the dev tripwire.
 fn release_profile_manifests() -> Vec<std::path::PathBuf> {
@@ -321,7 +324,7 @@ fn shader_stack_dev_overrides_identical_across_synced_manifests() {
 /// `[profile.dev.package.*]` block but forgotten in another escapes it
 /// entirely (both blocks agree on every key the shorter one has, and neither
 /// test looks at the KEY SET). This one compares the full set of override
-/// names across all five manifests instead.
+/// names across all six manifests instead.
 #[test]
 fn shader_stack_dev_override_name_set_is_identical_across_synced_manifests() {
     let manifests = synced_manifests();
@@ -364,7 +367,7 @@ fn shader_stack_dev_override_name_set_is_identical_across_synced_manifests() {
 /// (worse) quietly demotes a per-frame crate to `"z"` in one app and not the
 /// others, making two apps' frame numbers incomparable.
 ///
-/// Scope is `android_package_override_manifests()` — the nine manifests that
+/// Scope is `android_package_override_manifests()` — the ten manifests that
 /// build an Android artifact. `examples/web-gallery` is deliberately excluded;
 /// the next test pins that exclusion so it stays a decision rather than an
 /// oversight.
