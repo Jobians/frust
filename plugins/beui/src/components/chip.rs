@@ -11,9 +11,14 @@
 //!   ([`BeuiMetrics::min_touch_target`]), the same way [`button`](super::button)
 //!   does. `on_remove` fires only for a release in the trailing close zone and
 //!   never also fires `on_press`.
+//!
+//!   A pressable chip is a Tab stop. While it holds keyboard focus it paints a
+//!   ring around the painted pill (not the enlarged hit area); `Enter` and
+//!   `Space` run `on_press`, and `Delete` or `Backspace` run `on_remove`. Tab
+//!   itself is declined, so traversal moves on.
 //! - [`status_badge`] is the static, non-animated sibling of
 //!   [`animated_badge`](super::animated_badge): a soft-filled pill tinted by a
-//!   [`StatusTone`], with an optional leading dot.
+//!   [`StatusBadgeTone`], with an optional leading dot.
 //!
 //! # Colour roles
 //!
@@ -25,8 +30,11 @@
 //! `Neutral` reads the muted roles (`surface_container` fill,
 //! `on_surface_variant` ink, `outline_variant` border).
 //!
-//! The badge's label is the semantics label of a [`Role::Status`] node; a
-//! pressable chip is a [`Role::Button`].
+//! The badge's label is the semantics label of a [`Role::Status`] node; a chip
+//! with `on_press` is a [`Role::Button`] with a click action. A chip with
+//! `on_remove` also publishes a child [`Role::Button`] labelled `Remove <label>`
+//! with its own click action, so removal is reachable through the tree; a
+//! remove-only chip's body is a plain label.
 
 use std::rc::Rc;
 
@@ -34,13 +42,13 @@ use frust::Theme;
 use frust::authoring::text::TextStyle;
 use frust::authoring::{
     Action, AnyView, BezPath, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, Color,
-    ErasedCallback, EventCtx, EventResult, InputEvent, LayoutCtx, PaintCtx, PaintScene, Point,
-    PointerPhase, Role, SemanticsCtx, Size, Vec2, View, Widget, any, build_child, erase_callback,
-    rebuild_child, teardown_child,
+    ErasedCallback, EventCtx, EventResult, InputEvent, Key, LayoutCtx, NamedKey, PaintCtx,
+    PaintScene, Point, PointerPhase, Role, SemanticsCtx, Size, Vec2, View, Widget, any,
+    build_child, erase_callback, rebuild_child, teardown_child,
 };
 use peniko::Brush;
 
-use crate::press::{inside, presses, stroke_outline};
+use crate::press::{draw_focus_ring, inside, is_activation_key, presses, stroke_outline};
 use crate::style::{RADIUS_CONTROL, resolve_radius, spacing, with_alpha};
 use crate::text::{LabelRun, ThemeTextType, label_style};
 use crate::tokens::{BEUI_LIGHT, BeuiMetrics, BeuiTokens};
@@ -53,6 +61,9 @@ const TONE_BORDER_ALPHA: f32 = 0.30;
 const SELECTED_FILL_ALPHA: f32 = 0.14;
 /// Alpha of the ink overlay on a pressed chip.
 const PRESS_OVERLAY_ALPHA: f32 = 0.08;
+
+/// Gap between the painted pill and its keyboard focus ring.
+const RING_OFFSET: f64 = 2.0;
 
 /// Floor on the painted chip pill height.
 fn chip_min_height() -> f64 {
@@ -79,7 +90,7 @@ pub struct ChipWidget {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Kind {
     Chip,
-    Badge(StatusTone),
+    Badge(StatusBadgeTone),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,7 +151,7 @@ impl ChipWidget {
     }
 }
 
-/// The resolved fill, border and ink for one [`StatusTone`].
+/// The resolved fill, border and ink for one [`StatusBadgeTone`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ToneColors {
     fill: Color,
@@ -150,7 +161,7 @@ struct ToneColors {
 
 /// The fill, border and ink `tone` paints with; roles as the
 /// [module docs](self) state.
-fn tone_colors(tone: StatusTone, theme: Option<&Theme>) -> ToneColors {
+fn tone_colors(tone: StatusBadgeTone, theme: Option<&Theme>) -> ToneColors {
     let tokens = BeuiTokens::resolve(theme);
     let scheme = theme.map(Theme::scheme);
     let hue =
@@ -161,11 +172,11 @@ fn tone_colors(tone: StatusTone, theme: Option<&Theme>) -> ToneColors {
         ink: hue,
     };
     match tone {
-        StatusTone::Info => soft(hue(|s| s.primary, BEUI_LIGHT.primary)),
-        StatusTone::Success => soft(tokens.success),
-        StatusTone::Warning => soft(tokens.warning),
-        StatusTone::Danger => soft(hue(|s| s.error, BEUI_LIGHT.danger)),
-        StatusTone::Neutral => ToneColors {
+        StatusBadgeTone::Info => soft(hue(|s| s.primary, BEUI_LIGHT.primary)),
+        StatusBadgeTone::Success => soft(tokens.success),
+        StatusBadgeTone::Warning => soft(tokens.warning),
+        StatusBadgeTone::Danger => soft(hue(|s| s.error, BEUI_LIGHT.danger)),
+        StatusBadgeTone::Neutral => ToneColors {
             fill: hue(|s| s.surface_container, BEUI_LIGHT.card),
             border: hue(|s| s.outline_variant, BEUI_LIGHT.border),
             ink: hue(|s| s.on_surface_variant, BEUI_LIGHT.muted_foreground),
@@ -246,6 +257,7 @@ impl Widget for ChipWidget {
             Kind::Chip => chip_colors(self.selected, theme),
             Kind::Badge(tone) => tone_colors(tone, theme),
         };
+        let ring = BeuiTokens::resolve_ring(None, theme);
         let hit = ctx.size();
         let pill = if self.pill == Size::ZERO {
             hit
@@ -320,14 +332,36 @@ impl Widget for ChipWidget {
             };
             scene.stroke_path(at, &cross, 1.5, &Brush::Solid(ink));
         }
+
+        if self.pressable() && ctx.is_focused_for_ring() {
+            draw_focus_ring(scene, origin, pill, radius, RING_OFFSET, ring);
+        }
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
         if !self.pressable() {
             return EventResult::Ignored;
         }
-        let InputEvent::Pointer(p) = event else {
-            return EventResult::Ignored;
+        let p = match event {
+            InputEvent::Pointer(p) => p,
+            InputEvent::Key(key) => {
+                // Tab and every other key are declined so traversal moves on.
+                let cb = if is_activation_key(key) {
+                    self.on_press.as_mut()
+                } else if matches!(key.key, Key::Named(NamedKey::Delete | NamedKey::Backspace)) {
+                    self.on_remove.as_mut()
+                } else {
+                    None
+                };
+                return match cb {
+                    Some(cb) => {
+                        cb(ctx);
+                        EventResult::Handled
+                    }
+                    None => EventResult::Ignored,
+                };
+            }
+            _ => return EventResult::Ignored,
         };
         let size = ctx.size();
         match p.phase {
@@ -384,17 +418,52 @@ impl Widget for ChipWidget {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        let role = match self.kind {
-            Kind::Badge(_) => Role::Status,
-            Kind::Chip if self.pressable() => Role::Button,
-            Kind::Chip => Role::Label,
+        let label = self.label.content();
+        if self.kind != Kind::Chip || !self.pressable() {
+            let role = match self.kind {
+                Kind::Badge(_) => Role::Status,
+                Kind::Chip => Role::Label,
+            };
+            ctx.push_node(role, |node| node.set_label(label));
+            return;
+        }
+        let has_focus = ctx.has_focus();
+        let body_role = if self.on_press.is_some() {
+            Role::Button
+        } else {
+            Role::Label
         };
-        ctx.push_node(role, |node| {
-            node.set_label(self.label.content());
-            if self.on_press.is_some() {
-                node.add_action(Action::Click);
-            }
-        });
+        let mut remove_id = None;
+        let id = ctx.push_container(
+            body_role,
+            |node| {
+                node.set_label(label);
+                if self.on_press.is_some() {
+                    node.add_action(Action::Click);
+                }
+            },
+            |ctx| {
+                if self.on_remove.is_some() {
+                    remove_id = Some(ctx.push_node(Role::Button, |node| {
+                        node.set_label(format!("Remove {label}"));
+                        node.add_action(Action::Click);
+                    }));
+                }
+            },
+        );
+        if has_focus {
+            // A remove-only chip has no body action, so the removable node
+            // carries the focus.
+            ctx.set_focused(if self.on_press.is_some() {
+                id
+            } else {
+                remove_id.unwrap_or(id)
+            });
+        }
+    }
+
+    fn is_focusable(&self) -> bool {
+        self.pressable()
     }
 
     fn visit_children(&self, visitor: &mut dyn FnMut(&ChildPod)) {
@@ -414,7 +483,7 @@ impl ChipWidget {
 /// How a [`status_badge`] reads at a glance.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum StatusTone {
+pub enum StatusBadgeTone {
     /// No particular meaning.
     #[default]
     Neutral,
@@ -482,6 +551,16 @@ impl<State: 'static> ChipView<State> {
         element.selected = self.selected;
         element.on_press = self.on_press.as_ref().map(erase_callback);
         element.on_remove = self.on_remove.as_ref().map(erase_callback);
+        // A press on a zone whose handler is gone can never complete.
+        let stale = match element.captured {
+            Some(Zone::Body) => element.on_press.is_none(),
+            Some(Zone::Remove) => element.on_remove.is_none(),
+            None => false,
+        };
+        if stale {
+            element.captured = None;
+            element.pressed = false;
+        }
     }
 }
 
@@ -539,15 +618,15 @@ impl<State: 'static> View<State> for ChipView<State> {
     }
 }
 
-/// A chip carrying a [`StatusTone`]. See the [module docs](self).
+/// A chip carrying a [`StatusBadgeTone`]. See the [module docs](self).
 pub struct StatusBadgeView {
     label: String,
-    tone: StatusTone,
+    tone: StatusBadgeTone,
     dot: bool,
 }
 
 /// A status badge reading `label` in `tone`.
-pub fn status_badge(label: impl Into<String>, tone: StatusTone) -> StatusBadgeView {
+pub fn status_badge(label: impl Into<String>, tone: StatusBadgeTone) -> StatusBadgeView {
     StatusBadgeView {
         label: label.into(),
         tone,
@@ -557,7 +636,7 @@ pub fn status_badge(label: impl Into<String>, tone: StatusTone) -> StatusBadgeVi
 
 impl StatusBadgeView {
     /// The tone this badge carries.
-    pub fn tone(&self) -> StatusTone {
+    pub fn tone(&self) -> StatusBadgeTone {
         self.tone
     }
 
@@ -605,15 +684,15 @@ mod tests {
     use crate::tokens::{Density, theme_with_density};
     use frust::Brightness;
     use frust::authoring::text::TextContext;
-    use frust::authoring::{PointerButton, PointerEvent};
+    use frust::authoring::{KeyEvent, Modifiers, PointerButton, PointerEvent};
     use std::any::Any;
 
-    const TONES: [StatusTone; 5] = [
-        StatusTone::Neutral,
-        StatusTone::Info,
-        StatusTone::Success,
-        StatusTone::Warning,
-        StatusTone::Danger,
+    const TONES: [StatusBadgeTone; 5] = [
+        StatusBadgeTone::Neutral,
+        StatusBadgeTone::Info,
+        StatusBadgeTone::Success,
+        StatusBadgeTone::Warning,
+        StatusBadgeTone::Danger,
     ];
 
     #[derive(Default)]
@@ -680,12 +759,12 @@ mod tests {
             let theme = Theme::builder(crate::theme())
                 .brightness(brightness)
                 .build();
-            let neutral = tone_colors(StatusTone::Neutral, Some(&theme));
+            let neutral = tone_colors(StatusBadgeTone::Neutral, Some(&theme));
             for tone in TONES {
                 let (w, size) = laid_out_in_badge(tone, &theme);
                 assert!(size.width > 0.0 && size.height > 0.0, "{tone:?}");
                 assert_eq!(w.lines(), vec!["Live"]);
-                if tone != StatusTone::Neutral {
+                if tone != StatusBadgeTone::Neutral {
                     let c = tone_colors(tone, Some(&theme));
                     assert_ne!(c.fill, neutral.fill, "{tone:?} {brightness:?}");
                     assert_ne!(c.ink, neutral.ink, "{tone:?} {brightness:?}");
@@ -694,7 +773,7 @@ mod tests {
         }
     }
 
-    fn laid_out_in_badge(tone: StatusTone, theme: &Theme) -> (ChipWidget, Size) {
+    fn laid_out_in_badge(tone: StatusBadgeTone, theme: &Theme) -> (ChipWidget, Size) {
         let view = status_badge("Live", tone).dot(true);
         let mut next_id = 0u64;
         let mut widget = View::<()>::build(&view, &mut BuildCtx::new(&mut next_id));
@@ -780,5 +859,185 @@ mod tests {
             chip_colors(true, Some(&theme)),
             chip_colors(false, Some(&theme))
         );
+    }
+
+    // ---- Keyboard, semantics and rebuild ------------------------------------
+
+    fn key(key: Key) -> InputEvent {
+        InputEvent::Key(KeyEvent {
+            key,
+            modifiers: Modifiers::default(),
+            repeat: false,
+        })
+    }
+
+    /// A column of three chips under a real `RenderRoot`: pressable,
+    /// handler-less, pressable.
+    struct Harness {
+        root: frust_core::RenderRoot<Count, frust::FlexView<Count>>,
+        state: Count,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let mut h = Harness {
+                root: frust_core::RenderRoot::new(),
+                state: Count::default(),
+            };
+            h.root.set_theme(Box::new(crate::theme()));
+            let mut logic = |_s: &mut Count| {
+                frust::column::<Count>()
+                    .child(chip::<Count>("One").on_press(|c| c.press += 1))
+                    .child(chip::<Count>("Inert"))
+                    .child(
+                        chip::<Count>("Two")
+                            .on_press(|c| c.press += 10)
+                            .on_remove(|c| c.remove += 1),
+                    )
+            };
+            h.root.rebuild(&mut logic, &mut h.state);
+            h.root.layout_with_text(
+                Size::new(300.0, 300.0),
+                &mut TextContext::new() as &mut dyn Any,
+            );
+            h
+        }
+
+        fn send(&mut self, k: Key) {
+            self.root.event(&mut self.state, &key(k));
+        }
+
+        /// The label of the node semantics reports focused, if any.
+        fn focused_label(&self) -> Option<String> {
+            let update = self.root.semantics();
+            let focus = update.focus?;
+            update
+                .nodes
+                .iter()
+                .find(|(id, _)| *id == focus)
+                .and_then(|(_, n)| n.label().map(str::to_owned))
+        }
+    }
+
+    #[test]
+    fn tab_lands_on_a_pressable_chip_skips_inert_ones_and_moves_on() {
+        let mut h = Harness::new();
+        assert_eq!(h.focused_label(), None);
+        h.send(Key::Named(NamedKey::Tab));
+        assert_eq!(h.focused_label().as_deref(), Some("One"));
+        h.send(Key::Named(NamedKey::Tab));
+        assert_eq!(h.focused_label().as_deref(), Some("Two"));
+    }
+
+    #[test]
+    fn enter_and_space_each_fire_on_press_once() {
+        for k in [Key::Named(NamedKey::Enter), Key::Character(" ".into())] {
+            let mut h = Harness::new();
+            h.send(Key::Named(NamedKey::Tab));
+            h.send(k);
+            assert_eq!((h.state.press, h.state.remove), (1, 0));
+        }
+    }
+
+    #[test]
+    fn delete_and_backspace_fire_on_remove_and_not_on_press() {
+        for k in [NamedKey::Delete, NamedKey::Backspace] {
+            let mut h = Harness::new();
+            h.send(Key::Named(NamedKey::Tab));
+            h.send(Key::Named(NamedKey::Tab));
+            h.send(Key::Named(k));
+            assert_eq!((h.state.press, h.state.remove), (0, 1));
+        }
+    }
+
+    #[test]
+    fn a_chip_with_a_handler_is_focusable_and_one_without_is_not() {
+        let (w, _) = laid_out(&chip::<()>("A"));
+        assert!(!w.is_focusable());
+        let (w, _) = laid_out(&chip::<()>("A").on_press(|_| {}));
+        assert!(w.is_focusable());
+        let (w, _) = laid_out(&chip::<()>("A").on_remove(|_| {}));
+        assert!(w.is_focusable());
+    }
+
+    #[test]
+    fn a_remove_only_chip_is_a_stop_and_focuses_its_remove_node() {
+        let mut root = frust_core::RenderRoot::new();
+        root.set_theme(Box::new(crate::theme()));
+        let mut state = Count::default();
+        let mut logic = |_s: &mut Count| {
+            frust::column::<Count>().child(chip::<Count>("Tag").on_remove(|c| c.remove += 1))
+        };
+        root.rebuild(&mut logic, &mut state);
+        root.layout_with_text(
+            Size::new(300.0, 300.0),
+            &mut TextContext::new() as &mut dyn Any,
+        );
+        root.event(&mut state, &key(Key::Named(NamedKey::Tab)));
+        let update = root.semantics();
+        let focus = update.focus.expect("focused");
+        let (_, node) = update.nodes.iter().find(|(id, _)| *id == focus).unwrap();
+        assert_eq!(node.label(), Some("Remove Tag"));
+        // Enter has no body action on a remove-only chip.
+        root.event(&mut state, &key(Key::Named(NamedKey::Enter)));
+        assert_eq!(state.remove, 0);
+        root.event(&mut state, &key(Key::Named(NamedKey::Delete)));
+        assert_eq!(state.remove, 1);
+    }
+
+    fn actionable_buttons(view: ChipView<Count>) -> Vec<(String, bool)> {
+        let mut root = frust_core::RenderRoot::new();
+        root.set_theme(Box::new(crate::theme()));
+        let mut state = Count::default();
+        let mut logic = move |_s: &mut Count| ChipView {
+            label: view.label.clone(),
+            leading: None,
+            selected: false,
+            on_press: view.on_press.clone(),
+            on_remove: view.on_remove.clone(),
+        };
+        root.rebuild(&mut logic, &mut state);
+        root.layout_with_text(
+            Size::new(300.0, 300.0),
+            &mut TextContext::new() as &mut dyn Any,
+        );
+        root.semantics()
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.role() == Role::Button)
+            .map(|(_, n)| {
+                (
+                    n.label().unwrap_or_default().to_owned(),
+                    n.supports_action(Action::Click),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn semantics_publishes_the_remove_node_and_the_body_action_separately() {
+        let got = actionable_buttons(chip("Tag").on_remove(|_| {}));
+        assert_eq!(got, vec![("Remove Tag".into(), true)]);
+        let mut got = actionable_buttons(chip("Tag").on_press(|_| {}).on_remove(|_| {}));
+        got.sort();
+        assert_eq!(got, vec![("Remove Tag".into(), true), ("Tag".into(), true)]);
+        let got = actionable_buttons(chip("Tag").on_press(|_| {}));
+        assert_eq!(got, vec![("Tag".into(), true)]);
+    }
+
+    #[test]
+    fn removing_on_press_during_a_hold_clears_the_pressed_state() {
+        let theme = theme_with_density(Density::Comfortable);
+        let held = chip::<Count>("Tag").on_press(|c| c.press += 1);
+        let (mut w, size) = laid_out_in(&held, &theme);
+        let mut state = Count::default();
+        dispatch(&mut w, &mut state, size, &ev(PointerPhase::Down, 8.0, 8.0));
+        assert!(w.pressed && w.captured.is_some());
+        let next = chip::<Count>("Tag");
+        let mut next_id = 0u64;
+        View::<Count>::rebuild(&next, &held, &mut w, &mut BuildCtx::new(&mut next_id));
+        assert!(!w.pressed && w.captured.is_none());
+        dispatch(&mut w, &mut state, size, &ev(PointerPhase::Up, 8.0, 8.0));
+        assert_eq!(state.press, 0);
     }
 }
