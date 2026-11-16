@@ -386,7 +386,8 @@ impl<State: 'static> SearchViewContentView<State> {
         .border_width(0.0)
         .focus_ring_width(0.0)
         .corner_radius(0.0)
-        .padding(hpad + ACTION_SLOT, 0.0);
+        .padding(hpad + ACTION_SLOT, 0.0)
+        .autofocus(self.mode == SearchViewMode::FullScreen);
         if let Some(hint) = &self.hint {
             field = field.placeholder(hint.clone());
         }
@@ -1481,6 +1482,43 @@ mod tests {
         );
         dispatch(&mut w, &mut state, COMPACT, &ev(PointerPhase::Up, c.x, c.y));
         assert!(!state.open, "the back affordance fired on_back");
+    }
+
+    // ---- Focus on open ----
+
+    /// Mount `mode`'s content in a root and run a few frames, returning
+    /// whether any field holds focus afterwards.
+    fn holds_focus_after_opening(mode: SearchViewMode, anchor: Option<OverlayAnchor>) -> bool {
+        let mut logic = move |_s: &mut ()| {
+            search_view(String::new(), |_: &mut (), _| {})
+                .hint("Search recipes")
+                .into_content(mode, anchor.clone())
+        };
+        let mut root: RenderRoot<(), SearchViewContentView<()>> = RenderRoot::new();
+        let mut state = ();
+        let mut tcx = TextContext::new();
+        // A few frames: the grant arrives in a later pass than the first paint.
+        for frame in 0..6u64 {
+            root.rebuild(&mut logic, &mut state);
+            root.layout_with_text(COMPACT, &mut tcx as &mut dyn Any);
+            root.paint(&mut Recorder::default(), ft(frame * 16));
+        }
+        root.focus_info().is_some()
+    }
+
+    #[test]
+    fn the_full_screen_header_field_is_focused_when_the_view_opens() {
+        assert!(holds_focus_after_opening(SearchViewMode::FullScreen, None));
+    }
+
+    #[test]
+    fn the_docked_panel_leaves_focus_with_its_bar() {
+        let anchor = OverlayAnchor::new();
+        anchor.set(Rect::new(0.0, 0.0, 400.0, 56.0));
+        assert!(!holds_focus_after_opening(
+            SearchViewMode::Docked,
+            Some(anchor)
+        ));
     }
 
     // ---- Semantics ----

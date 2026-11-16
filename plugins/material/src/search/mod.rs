@@ -145,18 +145,14 @@
 //!   toward the anchor ([`crate::overlay::anchored_overlay`]'s ramp). The bar's
 //!   own focus-expand spring *is* ported ([`mod@bar`]).
 //!
-//! # IME: no programmatic focus
+//! # IME: the full-screen view opens focused
 //!
 //! The reference opens its view with `autoFocus: true` on the header field, so
-//! the keyboard is up before the user touches anything. The framework's
-//! baseline editable exposes **no programmatic-focus seam** — `TextInputView`
-//! has no `autofocus`/`request_focus` builder, and `EventCtx::request_focus` is
-//! reachable only from a widget's own event pass, which never runs for a field
-//! nobody has touched yet. A user therefore taps the view's field once before
-//! the keyboard appears. This is the same framework gap
-//! [`mod@crate::overlay::modal`] records for `Escape` ("there is no
-//! auto-focus-on-appear hook in the framework"), and it is not patched around
-//! here.
+//! the keyboard is up before the user touches anything. The full-screen view's
+//! header field sets the baseline field's `autofocus(true)`, so it takes focus
+//! on its first paint and the soft keyboard rises with the page. The docked
+//! panel does not: its anchoring bar already holds the focus the user gave it,
+//! and the panel leaves that session alone.
 //!
 //! # Symbol surface
 //!

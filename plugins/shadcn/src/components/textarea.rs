@@ -33,7 +33,7 @@ use frust::authoring::{
     LayoutCtx, PaintCtx, PaintScene, Point, PointerPhase, SemanticsCtx, Size, ThemeTextType, View,
     Widget, build_child, rebuild_child, route_event_single, teardown_child, visit_children,
 };
-use frust::{Theme, text_input};
+use frust::{FocusHandle, Theme, text_input};
 
 use crate::components::input::{FieldChrome, paint_field_border, resolve_field_border};
 use crate::hit::inside;
@@ -56,6 +56,7 @@ const UNBOUNDED_WIDTH: f64 = 200.0;
 /// A view-held, typed text callback (erased by the wrapped baseline field on
 /// build).
 type OnText<State> = Rc<dyn Fn(&mut State, String)>;
+type OnFlag<State> = Rc<dyn Fn(&mut State, bool)>;
 
 /// A declarative shadcn multi-line text field. See the [module docs](self).
 pub struct TextareaView<State: 'static> {
@@ -66,6 +67,10 @@ pub struct TextareaView<State: 'static> {
     flush: bool,
     max_visible_lines: usize,
     on_change: OnText<State>,
+    focus_handle: Option<FocusHandle>,
+    autofocus: bool,
+    on_focus_change: Option<OnFlag<State>>,
+    on_composing_change: Option<OnFlag<State>>,
 }
 
 /// Create a controlled shadcn textarea showing `value`, reporting each edit
@@ -85,6 +90,10 @@ pub fn textarea<State: 'static, F: Fn(&mut State, String) + 'static>(
         flush: false,
         max_visible_lines: DEFAULT_MAX_VISIBLE_LINES,
         on_change: Rc::new(on_change),
+        focus_handle: None,
+        autofocus: false,
+        on_focus_change: None,
+        on_composing_change: None,
     }
 }
 
@@ -92,6 +101,34 @@ impl<State: 'static> TextareaView<State> {
     /// Set the placeholder shown while the field is empty and unfocused.
     pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
         self.placeholder = placeholder.into();
+        self
+    }
+
+    /// Take, release and observe the field's focus from app code; forwarded to
+    /// the baseline field's `focus_handle`.
+    pub fn focus_handle(mut self, handle: FocusHandle) -> Self {
+        self.focus_handle = Some(handle);
+        self
+    }
+
+    /// Focus the field once when it first paints; forwarded to the baseline
+    /// field's `autofocus`.
+    pub fn autofocus(mut self, autofocus: bool) -> Self {
+        self.autofocus = autofocus;
+        self
+    }
+
+    /// Be told when the field gains or loses focus; forwarded to the baseline
+    /// field's `on_focus_change`.
+    pub fn on_focus_change<F: Fn(&mut State, bool) + 'static>(mut self, f: F) -> Self {
+        self.on_focus_change = Some(Rc::new(f));
+        self
+    }
+
+    /// Be told when an IME composition starts or ends; forwarded to the
+    /// baseline field's `on_composing_change`.
+    pub fn on_composing_change<F: Fn(&mut State, bool) + 'static>(mut self, f: F) -> Self {
+        self.on_composing_change = Some(Rc::new(f));
         self
     }
 
@@ -127,7 +164,7 @@ impl<State: 'static> TextareaView<State> {
     /// The wrapped baseline field in multi-line mode, its own chrome suppressed.
     fn control(&self) -> impl View<State> + use<State> {
         let on_change = self.on_change.clone();
-        text_input(self.value.clone(), move |state: &mut State, text| {
+        let mut field = text_input(self.value.clone(), move |state: &mut State, text| {
             on_change(state, text)
         })
         .placeholder(self.placeholder.clone())
@@ -136,7 +173,19 @@ impl<State: 'static> TextareaView<State> {
         .enabled(!self.disabled)
         .padding(style::spacing(3.0), style::spacing(2.0))
         .border_width(0.0)
-        .corner_radius(ShadcnRadius::shadcn().md)
+        .corner_radius(ShadcnRadius::shadcn().md);
+        if let Some(handle) = self.focus_handle.clone() {
+            field = field.focus_handle(handle);
+        }
+        field = field.autofocus(self.autofocus);
+        if let Some(f) = self.on_focus_change.clone() {
+            field = field.on_focus_change(move |state: &mut State, focused| f(state, focused));
+        }
+        if let Some(f) = self.on_composing_change.clone() {
+            field =
+                field.on_composing_change(move |state: &mut State, composing| f(state, composing));
+        }
+        field
     }
 }
 
@@ -313,6 +362,39 @@ mod tests {
                 .find(|(_, w, _)| *w == style::FOCUS_RING_WIDTH)
                 .map(|(_, _, c)| *c)
         }
+    }
+
+    #[test]
+    fn autofocus_and_on_focus_change_reach_the_wrapped_field() {
+        #[derive(Default)]
+        struct FocusLog {
+            focus: Vec<bool>,
+        }
+        let handle = FocusHandle::new();
+        let mut logic = {
+            let handle = handle.clone();
+            move |_: &mut FocusLog| {
+                textarea::<FocusLog, _>("", |_: &mut FocusLog, _t| {})
+                    .autofocus(true)
+                    .focus_handle(handle.clone())
+                    .on_focus_change(|s: &mut FocusLog, focused| s.focus.push(focused))
+                    .on_composing_change(|_: &mut FocusLog, _| {})
+            }
+        };
+        let mut root: RenderRoot<FocusLog, TextareaView<FocusLog>> = RenderRoot::new();
+        let mut state = FocusLog::default();
+        let mut tcx = TextContext::new();
+        // A few frames: the grant and its report arrive in later passes.
+        for frame in 0..6u64 {
+            root.rebuild(&mut logic, &mut state);
+            root.layout_with_text(WINDOW, &mut tcx as &mut dyn Any);
+            root.paint(
+                &mut Recorder::default(),
+                FrameTime::from_nanos(frame * 16_000_000),
+            );
+        }
+        assert!(handle.is_focused(), "autofocus focused the wrapped field");
+        assert_eq!(state.focus, [true]);
     }
 
     const WINDOW: Size = Size::new(240.0, 400.0);
