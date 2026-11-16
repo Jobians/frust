@@ -90,7 +90,10 @@ and `glifo` at `=0.3.0`). There is no `vello` crate in the graph — see lab 5.
    translucent draws split into depth-writing and depth-tested passes is lab 13's story; here, note
    only `EngineDraw::depth` → `GpuStrip::depth_index`. Errors: `EngineError` carries
    `InvalidGeometry` (a NaN/inf rect, radius, path point, stroke width, dash, glyph position),
-   `InvalidTransform`, `TargetTooLarge`, and more — every one returned, never panicked. That is
+   `InvalidTransform`, `TargetTooLarge`, and more — every one returned, never panicked. The two
+   non-finite refusals name the offending command (`command`: its index in the scene, `kind`: its
+   variant name), and `frust_engine::validate_scene` runs the same up-front walk on the CPU, with
+   no compiler or GPU, for a caller that wants the answer without a compile. That is
    E17, and `crates/frust-engine/tests/structure.rs` enforces it by grepping the engine's `compile`,
    `gpu` and `text` trees, `renderer.rs` and friends for `unwrap()`, `expect(`, `panic!(` outside
    test modules.
@@ -162,12 +165,19 @@ Add to the scratch test:
 ```rust
 let scene = scene_of(|b| b.fill_rect(Rect::new(f64::NAN, 20.0, 30.0, 30.0), Brush::Solid(RED)));
 match SceneCompiler::new(200, 200).compile(&scene, Affine::IDENTITY, (200, 200)) {
-    Err(EngineError::InvalidGeometry) => println!("NaN rect: refused, InvalidGeometry"),
+    Err(EngineError::InvalidGeometry { command, kind }) => {
+        println!("NaN rect: refused, InvalidGeometry at {command:?} ({kind})")
+    }
     other => println!("unexpected: {other:?}"),
 }
 ```
 
-Observed: `NaN rect: refused, InvalidGeometry` (a NaN *transform* is `InvalidTransform`).
+Expect the refusal to name the scene's one command (`command` is its index, `kind` its variant name) rather
+than only the error class: `NaN rect: refused, InvalidGeometry at Some(0) (FillRect)` (a NaN *transform* is
+`InvalidTransform`, which names its command the same way; the root transform reports kind `"root"`
+and a filter layer refused while it is recorded reports `None` and `"PushLayer"`). Swap the
+`compile` call for `frust_engine::validate_scene(&scene, Affine::IDENTITY, (200, 200))` and it
+returns the same `Err` with nothing compiled.
 `cargo test -p frust-engine --test compile_rects_paths refused` runs the 5 refusal tests; read
 `a_refused_frame_records_nothing_at_all` — a bad last command records nothing, and the compiler
 compiles the next frame cleanly.

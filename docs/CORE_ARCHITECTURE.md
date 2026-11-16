@@ -158,281 +158,262 @@ there. The facade's dependency on `frust-widgets`/`frust-theme` (WIDGETS) and th
   last-wins `set_haptic_sink`, and `perform_haptic()` (a no-op without a sink; `haptic_sink_installed()`
   probes). Core never links a platform plugin: the app wires one (see
   [PLUGINS_ARCHITECTURE.md](PLUGINS_ARCHITECTURE.md)). Re-exported flat from the facade and `frust::authoring`.
-- A paint pass also carries a frame-request contract: `PaintCtx::request_frame` (`TickClass::Transition`,
-  unpaced) marks the pass every-vsync (a max-lattice — any `Transition` request wins over a concurrent
-  `CosmeticLoop` one); `request_frame_paced`/`request_frame_paced_at(interval)` (`TickClass::CosmeticLoop`)
-  marks it merely throttleable and folds `interval` onto a separate MIN-lattice (tightest interval wins,
-  so a fast shimmer beside a slow caret paces the frame at the shimmer's rate; a bare
-  `request_frame_paced` folds in `Duration::ZERO`, meaning "at the theme's own rate"). Both aggregates
-  surface on `PaintOutcome` (`needs_frame_paced_only`, `paced_interval`) for the shell's frame gate to
-  resolve against the active theme's `cosmetic_loop_rate` (see SHELLS_ARCHITECTURE.md).
-- `RenderRoot::event` routes input through the retained tree, tracking capture/focus without a
-  separate registry. Events fall into three routing classes: hit-tested (pointer/scroll),
-  focus-routed (`Key`/`Ime`/`EditCommand`, delivered down the recorded focus path to whatever
-  widget holds focus *at delivery* — a clipboard verb belongs here because it is *about the
-  selection*, which lives wherever focus is), and **broadcast** — `InputEvent::Housekeeping`,
-  `InputEvent::Overlay`, `InputEvent::Shortcut` and a file drop's `FileDropPhase::Ended` follow-up,
-  events every container forwards ahead of its capture/focus/hit-test logic and never consumes.
-  A broadcast reaches every child except `Shortcut`, which a container narrows to the children that
-  take input (a navigator's Current page, an `IndexedStack`'s selected child) so a hidden declarer
-  never answers. A `Key` the focus path leaves unhandled goes on to the declined-key chain (see
-  Keyboard Shortcuts and Traversal). Per pointer event, `ChildPod` records the smallest hit-testing
-  pod (`Widget::hit_test_self`; layout wrappers opt out) for `EventCtx::track_pointer_hits`, a
-  pass-scoped side channel.
+- A paint pass also carries a frame-request contract: `PaintCtx::request_frame` (`TickClass::Transition`, unpaced) marks the pass
+  every-vsync (a max-lattice — any `Transition` request wins over a concurrent `CosmeticLoop` one);
+  `request_frame_paced`/`request_frame_paced_at(interval)` (`TickClass::CosmeticLoop`) marks it merely throttleable and folds
+  `interval` onto a separate MIN-lattice (tightest interval wins, so a fast shimmer beside a slow caret paces the frame at the
+  shimmer's rate; a bare `request_frame_paced` folds in `Duration::ZERO`, meaning "at the theme's own rate"). Both aggregates
+  surface on `PaintOutcome` (`needs_frame_paced_only`, `paced_interval`) for the shell's frame gate to resolve against the active
+  theme's `cosmetic_loop_rate` (see SHELLS_ARCHITECTURE.md).
+- `RenderRoot::event` routes input through the retained tree, tracking capture/focus without a separate registry. Events fall into
+  three routing classes: hit-tested (pointer/scroll), focus-routed (`Key`/`Ime`/`EditCommand`, delivered down the recorded focus
+  path to whatever widget holds focus *at delivery* — a clipboard verb belongs here because it is *about the selection*, which
+  lives wherever focus is), and **broadcast** — `InputEvent::Housekeeping`, `InputEvent::Overlay`, `InputEvent::Shortcut` and a
+  file drop's `FileDropPhase::Ended` follow-up, events every container forwards ahead of its capture/focus/hit-test logic and
+  never consumes. A broadcast reaches every child except `Shortcut`, which a container narrows to the children that take input (a
+  navigator's Current page, an `IndexedStack`'s selected child) so a hidden declarer never answers. A `Key` the focus path leaves
+  unhandled goes on to the declined-key chain (see Keyboard Shortcuts and Traversal). Per pointer event, `ChildPod` records the
+  smallest hit-testing pod (`Widget::hit_test_self`; layout wrappers opt out) for `EventCtx::track_pointer_hits`, a pass-scoped
+  side channel.
 - `RenderRoot::rebuild` dispatches a `Housekeeping` broadcast when a thread-local flag
-  (`mark_pending_result_flush`/`take_pending_result_flush`) is set — the seam a widget uses to run
-  a deferred callback that needs `&mut State` but was queued during the state-free view diff (a
-  navigator's pop-result and `frust-widgets`' gesture long-press latch are the shipped producers;
-  see WIDGETS_ARCHITECTURE.md). It then re-runs the root component's `build` + the view diff so the same frame
-  reflects the mutated state, bounded at `MAX_PENDING_RESULT_FLUSH_PASSES` (3) passes; a remainder
-  past the cap folds into `paint`'s `needs_frame` so a dirty-driven desktop loop still wakes for it
-  next frame. The dispatch's `EventOutcome` is propagated as part of the same contract: a
-  `needs_redraw` it reports folds into `ChangeFlags::PAINT` and the deferred-frame flag, so a
-  flushed callback whose only effect is `EventCtx::request_redraw` (no state the view diff can see)
-  still wakes both the mobile frame gate and the desktop `Wait` loop. A non-draining peek,
-  `has_pending_result_flush`, lets the mobile frame gate's `deferred_callbacks_pending` input force
-  a run before a skipped frame ever reaches the `rebuild` that would otherwise drain the mark.
-- A tracked signal write wakes the shell via the process-wide `FrameWaker`, triggering the next
-  rebuild.
-- `Component::init`/`teardown` creates/disposes a per-instance reactive `Owner` nested under its
-  parent's.
-- The `frust` facade re-exports core/widgets/theme/reactive as one flat API, bridging widgets and
-  reactive via its own glue modules so neither depends on the other — e.g. `router_glue`'s
-  `RouteObserver`, a `Copy`/`Send`/`Sync` reactive face over `frust-widgets`' signal-free route-state
-  publish (`NavigatorView::on_route_change`), reachable via `provide_context` and attached with
-  `.observe(view)`; `RouterDeepLinks::routes()` hands out the one wired to its own router.
-- `frust-paths`' dir/atomic-write helpers back GPU pipeline-cache persistence and preference
-  storage in the shells and plugins that consume it.
-- **Multi-contact pointer routing.** A `PointerId` (`PointerSource::Mouse`/`Touch` plus a slot)
-  names a live contact; `PointerEvent` itself carries no identity. A shell reports a non-mouse
-  contact as `InputEvent::PointerContact { pointer_id, event }`; the root unwraps it and delivers
-  the plain `InputEvent::Pointer` a widget already handles, with `EventCtx::pointer_id()` reporting
-  which contact it was (`PointerId::MOUSE` for a bare `Pointer`). With no live capture, slot `0` is
-  hit-tested exactly like the mouse and a capture taken on its `Down` latches that id as the
-  claimant; slot ≥ 1 is dropped. While a capture is live, the claimant's events take the captured
-  path as usual; another contact reaches only the captor — the widget that called
-  `EventCtx::capture_contacts()` on its capturing `Down` — and nothing above it on the active path:
-  each intervening container is handed an inert `InputEvent::Overlay` broadcast instead of running
-  its own pointer handling, while the real event rides alongside, re-based into each pod's space
-  (`ChildPod::event_child`/`walk_secondary`/`dispatch_local`); where a container does not forward
-  broadcasts to its children (an overlay owner whose captured pod is a floated surface), the real
-  event falls back to ordinary delivery to that child alone. Only the claimant's `Up`/`Cancel`
-  releases the capture. A thread-local `ContactPass` guard brackets each root dispatch with the
-  contact identity and opt-in flag so both survive a `ComponentWidget` boundary's fresh `EventCtx`.
-  A container that takes a gesture over from a captured child releases it through
-  `EventCtx::release_captured_child`, not `ChildPod::set_active(false)` directly: the claimant
-  keeps the capture until its own `Up`/`Cancel`, but the captor's contact opt-in ends
-  (`capture_contacts` clears) when the released subtree held it.
-- **Scale gestures.** `InputEvent::Scale(ScaleEvent { phase, scale_delta, focal, velocity })`
-  (`ScalePhase::Begin`/`Update`/`End`) is hit-tested and bubbles exactly like `Scroll`;
-  `OverlayEventKind::Scale` is its floated-surface mirror, and `InputEvent::position`/`translated`/
-  `transformed` cover both new variants alongside the existing ones.
-- **Desktop file drop.** `InputEvent::FileDrop(FileDropEvent { phase, position, paths })`
-  (`FileDropPhase::Hover`/`Drop`/`Cancel`) is hit-tested and bubbles by `position` exactly like
-  `Scroll`, so a container routes it with no change of its own. It is deliberately **not** routed
-  through the overlay pre-pass: a native OS drag is a window-level signal with no floated-surface
-  concept on the platform side, so it is hit-tested straight against the main tree — a drop target
-  living inside a popover is a gap this does not close (see `file-drop-desktop-only` in
-  [LIMITATIONS.md](LIMITATIONS.md)). Only `frust-shell-desktop` publishes it today (see
-  [SHELLS_ARCHITECTURE.md](SHELLS_ARCHITECTURE.md)); Android, iOS and web publish nothing. Every
-  `Drop` or `Cancel`, handled or not — it may resolve over a region with no drop target, or be
-  handled by one widget while the drag opened state in another — is followed by
-  `RenderRoot::event` in the same call with `FileDropPhase::Ended`, a positionless broadcast
-  (`is_broadcast()`), so all state the drag opened (`frust-widgets`' external drag sessions, one
-  per coordinator) ends; answering it must be idempotent. Dropped `paths` arrive verbatim from the
-  OS drag source and are untrusted input.
-- **Transformed pods.** `ChildPod::set_transform(Option<kurbo::Affine>)` places a child under an
-  arbitrary affine, opt-in and unset by default. While set, `ChildPod::contains`/`event_child` map a
-  point or a positioned event (`InputEvent::transformed`) through the inverse before hit-testing or
-  delivery, paint brackets the child in `PaintScene::push_transform`/`pop_transform`, and
-  `ChildPod::semantics_child` reports the subtree at the transformed rect's axis-aligned bounding
-  box (an approximation — see `transformed-subtree-semantics-aabb` in
-  [LIMITATIONS.md](LIMITATIONS.md)). `frust_core::hit::point_in_transformed_rect` is the public
-  helper a canvas hit closure or a pan/zoom container tests against directly (see
-  WIDGETS_ARCHITECTURE.md). A transform with no inverse (singular, non-finite) hits and paints
-  nothing; a pod with no transform takes the exact pre-existing path.
+  (`mark_pending_result_flush`/`take_pending_result_flush`) is set — the seam a widget uses to run a deferred callback that needs
+  `&mut State` but was queued during the state-free view diff (a navigator's pop-result and `frust-widgets`' gesture long-press
+  latch are the shipped producers; see WIDGETS_ARCHITECTURE.md). It then re-runs the root component's `build` + the view diff so
+  the same frame reflects the mutated state, bounded at `MAX_PENDING_RESULT_FLUSH_PASSES` (3) passes; a remainder past the cap
+  folds into `paint`'s `needs_frame` so a dirty-driven desktop loop still wakes for it next frame. The dispatch's `EventOutcome`
+  is propagated as part of the same contract: a `needs_redraw` it reports folds into `ChangeFlags::PAINT` and the deferred-frame
+  flag, so a flushed callback whose only effect is `EventCtx::request_redraw` (no state the view diff can see) still wakes both
+  the mobile frame gate and the desktop `Wait` loop. A non-draining peek, `has_pending_result_flush`, lets the mobile frame gate's
+  `deferred_callbacks_pending` input force a run before a skipped frame ever reaches the `rebuild` that would otherwise drain the
+  mark.
+- A tracked signal write wakes the shell via the process-wide `FrameWaker`, triggering the next rebuild.
+- `Component::init`/`teardown` creates/disposes a per-instance reactive `Owner` nested under its parent's.
+- The `frust` facade re-exports core/widgets/theme/reactive as one flat API, bridging widgets and reactive via its own glue
+  modules so neither depends on the other — e.g. `router_glue`'s `RouteObserver`, a `Copy`/`Send`/`Sync` reactive face over
+  `frust-widgets`' signal-free route-state publish (`NavigatorView::on_route_change`), reachable via `provide_context` and
+  attached with `.observe(view)`; `RouterDeepLinks::routes()` hands out the one wired to its own router.
+- `frust-paths`' dir/atomic-write helpers back GPU pipeline-cache persistence and preference storage in the shells and plugins
+  that consume it.
+- **Multi-contact pointer routing.** A `PointerId` (`PointerSource::Mouse`/`Touch` plus a slot) names a live contact;
+  `PointerEvent` itself carries no identity. A shell reports a non-mouse contact as `InputEvent::PointerContact { pointer_id,
+  event }`; the root unwraps it and delivers the plain `InputEvent::Pointer` a widget already handles, with
+  `EventCtx::pointer_id()` reporting which contact it was (`PointerId::MOUSE` for a bare `Pointer`). With no live capture, slot
+  `0` is hit-tested exactly like the mouse and a capture taken on its `Down` latches that id as the claimant; slot ≥ 1 is dropped.
+  While a capture is live, the claimant's events take the captured path as usual; another contact reaches only the captor — the
+  widget that called `EventCtx::capture_contacts()` on its capturing `Down` — and nothing above it on the active path: each
+  intervening container is handed an inert `InputEvent::Overlay` broadcast instead of running its own pointer handling, while the
+  real event rides alongside, re-based into each pod's space (`ChildPod::event_child`/`walk_secondary`/`dispatch_local`); where a
+  container does not forward broadcasts to its children (an overlay owner whose captured pod is a floated surface), the real event
+  falls back to ordinary delivery to that child alone. Only the claimant's `Up`/`Cancel` releases the capture. A thread-local
+  `ContactPass` guard brackets each root dispatch with the contact identity and opt-in flag so both survive a `ComponentWidget`
+  boundary's fresh `EventCtx`. A container that takes a gesture over from a captured child releases it through
+  `EventCtx::release_captured_child`, not `ChildPod::set_active(false)` directly: the claimant keeps the capture until its own
+  `Up`/`Cancel`, but the captor's contact opt-in ends (`capture_contacts` clears) when the released subtree held it.
+- **Scale gestures.** `InputEvent::Scale(ScaleEvent { phase, scale_delta, focal, velocity })` (`ScalePhase::Begin`/`Update`/`End`)
+  is hit-tested and bubbles exactly like `Scroll`; `OverlayEventKind::Scale` is its floated-surface mirror, and
+  `InputEvent::position`/`translated`/ `transformed` cover both new variants alongside the existing ones.
+- **Desktop file drop.** `InputEvent::FileDrop(FileDropEvent { phase, position, paths })` (`FileDropPhase::Hover`/`Drop`/`Cancel`)
+  is hit-tested and bubbles by `position` exactly like `Scroll`, so a container routes it with no change of its own. It is
+  deliberately **not** routed through the overlay pre-pass: a native OS drag is a window-level signal with no floated-surface
+  concept on the platform side, so it is hit-tested straight against the main tree — a drop target living inside a popover is a
+  gap this does not close (see `file-drop-desktop-only` in [LIMITATIONS.md](LIMITATIONS.md)). Only `frust-shell-desktop` publishes
+  it today (see [SHELLS_ARCHITECTURE.md](SHELLS_ARCHITECTURE.md)); Android, iOS and web publish nothing. Every `Drop` or `Cancel`,
+  handled or not — it may resolve over a region with no drop target, or be handled by one widget while the drag opened state in
+  another — is followed by `RenderRoot::event` in the same call with `FileDropPhase::Ended`, a positionless broadcast
+  (`is_broadcast()`), so all state the drag opened (`frust-widgets`' external drag sessions, one per coordinator) ends; answering
+  it must be idempotent. Dropped `paths` arrive verbatim from the OS drag source and are untrusted input.
+- **Transformed pods.** `ChildPod::set_transform(Option<kurbo::Affine>)` places a child under an arbitrary affine, opt-in and
+  unset by default. While set, `ChildPod::contains`/`event_child` map a point or a positioned event (`InputEvent::transformed`)
+  through the inverse before hit-testing or delivery, paint brackets the child in `PaintScene::push_transform`/`pop_transform`,
+  and `ChildPod::semantics_child` reports the subtree at the transformed rect's axis-aligned bounding box (an approximation — see
+  `transformed-subtree-semantics-aabb` in [LIMITATIONS.md](LIMITATIONS.md)). `frust_core::hit::point_in_transformed_rect` is the
+  public helper a canvas hit closure or a pan/zoom container tests against directly (see WIDGETS_ARCHITECTURE.md). A transform
+  with no inverse (singular, non-finite) hits and paints nothing; a pod with no transform takes the exact pre-existing path.
 - A compile-time `Send` assertion on `Scene` guards a future render-thread split.
-- **Introspection is read-only and zero cost when unused.** `WidgetTree::roots()`/`children()`
-  return the arena's own insertion order (the arena stays authoritative); `WidgetTree::inspect()`
-  (and `RenderRoot::inspect()`, the same walk over the live tree) produce a plain, owned
-  `InspectNode` snapshot per node — id, type name, debug label, absolute bounds, children —
-  descending through both the arena's own children and each widget's `Widget::visit_children`
-  (default-empty, so a container that hasn't opted in reads as a leaf), naming each node via
-  `Widget::type_name` (vtable dispatch) and `ChildPod::inspect_id`. A `WidgetPod`'s type name is
-  instead captured once at `WidgetPod::new_typed` construction, since a root pod's element type
-  cannot swap. Core carries no serde or devtools-specific knowledge; the DEVTOOLS unit owns
-  turning the snapshot into wire types (see DEVTOOLS_ARCHITECTURE.md).
+- **Introspection is read-only and zero cost when unused.** `WidgetTree::roots()`/`children()` return the arena's own insertion
+  order (the arena stays authoritative); `WidgetTree::inspect()` (and `RenderRoot::inspect()`, the same walk over the live tree)
+  produce a plain, owned `InspectNode` snapshot per node — id, type name, debug label, absolute bounds, children — descending
+  through both the arena's own children and each widget's `Widget::visit_children` (default-empty, so a container that hasn't
+  opted in reads as a leaf), naming each node via `Widget::type_name` (vtable dispatch) and `ChildPod::inspect_id`. A
+  `WidgetPod`'s type name is instead captured once at `WidgetPod::new_typed` construction, since a root pod's element type cannot
+  swap. Core carries no serde or devtools-specific knowledge; the DEVTOOLS unit owns turning the snapshot into wire types (see
+  DEVTOOLS_ARCHITECTURE.md).
 
 ## App Lifecycle
 
-`frust-reactive::app_lifecycle` is the process-wide app-lifecycle source, a Flutter-parity state
-machine beside deep links and back. `AppLifecycleState` is ordered `Detached`, `Resumed`,
-`Inactive`, `Hidden`, `Paused`. Each shell derives a target and calls `push_app_lifecycle`
-(shell-facing, UI-thread-only); like Flutter's binding it generates the intermediate steps between
-the current state and the target, so a listener sees every hop. `app_lifecycle().state()` is a
-tracked `RwSignal` read; an atomic process mirror also answers before the runtime is initialised.
+`frust-reactive::app_lifecycle` is the process-wide app-lifecycle source, a Flutter-parity state machine beside deep links and
+back. `AppLifecycleState` is ordered `Detached`, `Resumed`, `Inactive`, `Hidden`, `Paused`. Each shell derives a target and calls
+`push_app_lifecycle` (shell-facing, UI-thread-only); like Flutter's binding it generates the intermediate steps between the
+current state and the target, so a listener sees every hop. `app_lifecycle().state()` is a tracked `RwSignal` read; an atomic
+process mirror also answers before the runtime is initialised.
 
-`AppLifecycleListener` registers per-transition callbacks (`on_show`, `on_resume`, `on_hide`,
-`on_inactive`, `on_pause`, `on_restart`, `on_detach`, then `on_state_change`) that run synchronously
-on the UI thread. `request_app_exit` asks every `on_exit_requested` listener without
-short-circuiting; any `AppExitResponse::Cancel` cancels the exit. Which shells push which states,
-and which exits are asked, is in [SHELLS_ARCHITECTURE.md](SHELLS_ARCHITECTURE.md). `BackgroundTask` is the lifecycle-adjacent guard (backends from the background-task plugin: iOS assertion, Android short foreground service; no-op otherwise).
+`AppLifecycleListener` registers per-transition callbacks (`on_show`, `on_resume`, `on_hide`, `on_inactive`, `on_pause`,
+`on_restart`, `on_detach`, then `on_state_change`) that run synchronously on the UI thread. `request_app_exit` asks every
+`on_exit_requested` listener without short-circuiting; any `AppExitResponse::Cancel` cancels the exit. Which shells push which
+states, and which exits are asked, is in [SHELLS_ARCHITECTURE.md](SHELLS_ARCHITECTURE.md). `BackgroundTask` is the
+lifecycle-adjacent guard (backends from the background-task plugin: iOS assertion, Android short foreground service; no-op
+otherwise).
 
-`MemoryPressure` (`Moderate`: trim cheaply rebuilt caches; `Critical`: release everything off screen;
-`#[non_exhaustive]`) is a separate event, independent of the state machine. Shells call
-`push_memory_pressure` (UI-thread-only); `AppLifecycleListener::on_memory_pressure` listeners run in
-registration order, each under `catch_unwind`. It changes no state and fires no lifecycle hook;
-`last_memory_pressure()` is a diagnostic mirror of the event, not state.
+`MemoryPressure` (`Moderate`: trim cheaply rebuilt caches; `Critical`: release everything off screen; `#[non_exhaustive]`) is a
+separate event, independent of the state machine. Shells call `push_memory_pressure` (UI-thread-only);
+`AppLifecycleListener::on_memory_pressure` listeners run in registration order, each under `catch_unwind`. It changes no state and
+fires no lifecycle hook; `last_memory_pressure()` is a diagnostic mirror of the event, not state.
 
 ## Window Metrics and Context Delivery
 
-`WindowMetrics` (logical size, device-pixel scale, derived orientation, and window insets) is
-delivered via `provide_context` as a **plain value, not a signal** — exactly like `Theme` and
-`WindowInsets` already are. Only `deep_link`, `back` and `app_lifecycle` are true `RwSignal`s in the host-signal
-layer; theme, insets, and now metrics are re-provided plain values each time they change. A widget
-or component reads them inside `Component::build` via `use_context::<WindowMetrics>()` without any
-signal subscription. `WindowMetrics.insets` carries the window-control corners too; a corner change
-republishes both `WindowInsets` and `WindowMetrics` through the same guarded path.
+`WindowMetrics` (logical size, device-pixel scale, derived orientation, and window insets) is delivered via `provide_context` as a
+**plain value, not a signal** — exactly like `Theme` and `WindowInsets` already are. Only `deep_link`, `back` and `app_lifecycle`
+are true `RwSignal`s in the host-signal layer; theme, insets, and now metrics are re-provided plain values each time they change.
+A widget or component reads them inside `Component::build` via `use_context::<WindowMetrics>()` without any signal subscription.
+`WindowMetrics.insets` carries the window-control corners too; a corner change republishes both `WindowInsets` and `WindowMetrics`
+through the same guarded path.
 
-**Window commands and `WindowState`.** An app-drawn title bar asks for window actions through a
-process-global queue (`push_window_command` of a `WindowCommand`; bounded at 32, FIFO, overflow drops
-the oldest non-`RequestClose` entry), callable from any UI-side context. Only the desktop shell
-drains it, so mobile and web never do; it serves the single desktop window. `WindowState`
-(`maximized` — false while fullscreen — `fullscreen`, `focused`, `minimized`; `#[non_exhaustive]`) is a desktop-only plain
-context, re-provided on change like `WindowMetrics`. Drain points: [SHELLS_ARCHITECTURE.md](SHELLS_ARCHITECTURE.md).
+**Window commands and `WindowState`.** An app-drawn title bar asks for window actions through a process-global queue
+(`push_window_command` of a `WindowCommand`; bounded at 32, FIFO, overflow drops the oldest non-`RequestClose` entry), callable
+from any UI-side context. Only the desktop shell drains it, so mobile and web never do; it serves the single desktop window.
+`WindowState` (`maximized` — false while fullscreen — `fullscreen`, `focused`, `minimized`; `#[non_exhaustive]`) is a desktop-only
+plain context, re-provided on change like `WindowMetrics`. Drain points: [SHELLS_ARCHITECTURE.md](SHELLS_ARCHITECTURE.md).
 
-**Contexts are visible inside both build and event passes.** A root-level `provide_context` (the
-shell's root `Owner`) makes its context available to every `Component::build` **and** every
-`Widget::event` handler, since the shell runs both passes under the same owner. This includes
-`Theme`, `WindowMetrics`, and a root component's own `init`-installed contexts. A handler runs under
-its nearest enclosing component's owner (`ComponentWidget::event` enters it around the child
-dispatch), so it sees that component's context and its ancestors'. Owner-scoped work armed there
-(`Timer`, `on_cleanup`, `spawn_local_scoped`) stops when the component is disposed, not on rebuild; a
-disposed component dispatches without entering its owner. A child `frust::Owner` held in state cancels
-a group of that work earlier; work meant to outlive the component is armed under a longer-lived owner.
+**Contexts are visible inside both build and event passes.** A root-level `provide_context` (the shell's root `Owner`) makes its
+context available to every `Component::build` **and** every `Widget::event` handler, since the shell runs both passes under the
+same owner. This includes `Theme`, `WindowMetrics`, and a root component's own `init`-installed contexts. A handler runs under its
+nearest enclosing component's owner (`ComponentWidget::event` enters it around the child dispatch), so it sees that component's
+context and its ancestors'. Owner-scoped work armed there (`Timer`, `on_cleanup`, `spawn_local_scoped`) stops when the component
+is disposed, not on rebuild; a disposed component dispatches without entering its owner. A child `frust::Owner` held in state
+cancels a group of that work earlier; work meant to outlive the component is armed under a longer-lived owner.
 
-**Orientation is derived, not platform-sourced:** no platform callback in either mobile shell carries
-an orientation enum — the shell furnishes only `(width, height, scale)`. `Orientation` is computed
-via `Orientation::from_size()` (portrait when `height >= width`, including exact squares as
-portrait) and never tracks a device orientation-lock. This is a stable guarantee pinned by tests.
+**Orientation is derived, not platform-sourced:** no platform callback in either mobile shell carries an orientation enum — the
+shell furnishes only `(width, height, scale)`. `Orientation` is computed via `Orientation::from_size()` (portrait when `height >=
+width`, including exact squares as portrait) and never tracks a device orientation-lock. This is a stable guarantee pinned by
+tests.
 
-**Context is not reactive.** `provide_context` is a plain insert into the owner's context map — it
-notifies nothing — and `use_context` creates no subscription, so a metrics write neither marks the
-tracked scope dirty nor wakes a frame. A new value therefore becomes visible only on the **next**
-rebuild, which the resize or inset change that produced it already drives. Delivery is
-pull-on-next-frame, not push; do not write code that assumes writing a context triggers a rebuild.
-(Signal writes are the reactive path and do wake — but only `deep_link`, `back` and `app_lifecycle` are signals.)
-The app default locale is not a context either: it is a `frust-text` process value read on the
-shaping thread (see [RENDER_ARCHITECTURE.md](RENDER_ARCHITECTURE.md)).
+**Context is not reactive.** `provide_context` is a plain insert into the owner's context map — it notifies nothing — and
+`use_context` creates no subscription, so a metrics write neither marks the tracked scope dirty nor wakes a frame. A new value
+therefore becomes visible only on the **next** rebuild, which the resize or inset change that produced it already drives. Delivery
+is pull-on-next-frame, not push; do not write code that assumes writing a context triggers a rebuild. (Signal writes are the
+reactive path and do wake — but only `deep_link`, `back` and `app_lifecycle` are signals.) The app default locale is not a context
+either: it is a `frust-text` process value read on the shaping thread (see [RENDER_ARCHITECTURE.md](RENDER_ARCHITECTURE.md)).
 
-A shell must still re-provide only on actual change, guarded by `WindowMetricsPublisher`'s check.
-The reason is cost at the FFI boundary, not a rebuild storm: an unconditional per-frame re-provide
-would burn a lock write plus an allocation every frame on the mobile path. Separately, when a rebuild
-does run it rebuilds the whole app — there is no per-component skipping — which is affordable only
-because builds are cheap by construction.
+A shell must still re-provide only on actual change, guarded by `WindowMetricsPublisher`'s check. The reason is cost at the FFI
+boundary, not a rebuild storm: an unconditional per-frame re-provide would burn a lock write plus an allocation every frame on the
+mobile path. Separately, when a rebuild does run it rebuilds the whole app — there is no per-component skipping — which is
+affordable only because builds are cheap by construction.
 
 ## Focus/IME Lifecycle
 
-`RenderRoot` caches only two focus-adjacent values — `focus_active` (root-level mirror of "some
-widget holds focus") and `ime_state` (the last-published IME surface) — and they are always either
-both cleared or paired into one **active** session; there is no at-rest inactive surface. A widget
-publishing an *inactive* IME surface therefore reads as a full session release, not a value update:
-one primitive clears `focus_active` and `ime_state` together, exactly like an outside-tap blur or an
-explicit `EventCtx::release_focus`. A press that moves focus to a pod publishing no `ImeState` clears the
-surface at event time (`commit_pointer`); a press no widget took focus on blurs at its `Up`, only if it was a
-tap (within slop of its `Down`, one contact, not cancelled), so a drag keeps the keyboard up. `PaintCtx::focused_caret()` reads the stored caret.
+`RenderRoot` caches only two focus-adjacent values — `focus_active` (root-level mirror of "some widget holds focus") and
+`ime_state` (the last-published IME surface) — and they are always either both cleared or paired into one **active** session;
+there is no at-rest inactive surface. A widget publishing an *inactive* IME surface therefore reads as a full session release, not
+a value update: one primitive clears `focus_active` and `ime_state` together, exactly like an outside-tap blur or an explicit
+`EventCtx::release_focus`. A press that moves focus to a pod publishing no `ImeState` clears the surface at event time
+(`commit_pointer`); a press no widget took focus on blurs at its `Up`, only if it was a tap (within slop of its `Down`, one
+contact, not cancelled), so a drag keeps the keyboard up. `PaintCtx::focused_caret()` reads the stored caret.
 
-A monotonic `focus_ime_generation` counter bumps exactly once per release (a paired clear counts as
-one edge, not two) and once per focus/IME change otherwise. `RenderRoot::focus_ime_generation()`
-(exposed to shells via `AppTree::focus_ime_generation`) is what the mobile frame gate caches and
-diffs each tick to derive `FrameInputs::focus_or_ime_changed` (see SHELLS_ARCHITECTURE.md) — a
-same-value republish, such as the paint pass re-publishing an unchanged surface every frame a field
-stays focused, never moves it.
+A monotonic `focus_ime_generation` counter bumps exactly once per release (a paired clear counts as one edge, not two) and once
+per focus/IME change otherwise. `RenderRoot::focus_ime_generation()` (exposed to shells via `AppTree::focus_ime_generation`) is
+what the mobile frame gate caches and diffs each tick to derive `FrameInputs::focus_or_ime_changed` (see SHELLS_ARCHITECTURE.md) —
+a same-value republish, such as the paint pass re-publishing an unchanged surface every frame a field stays focused, never moves
+it.
 
-**A session has an identity, not just a flag.** `RenderRoot` carries a `focus_epoch` — focus's
-analog of the hover epoch below — and a `ChildPod` stamps it beside the link it records
-(`ChildPod::set_focused`), so a link names *which* session it belongs to rather than merely that one
-existed. A dispatch stamps claims with a candidate one step ahead: an honoured claim commits it, a
-session that ends inside the dispatch lands one step past it (so nothing that pass stamped
-survives), a dispatch that does neither keeps the live epoch, and a release outside a dispatch (an
-orphan drain) advances it once; a traversal grant's candidate sits two steps ahead while a session
-is live, leaving room for the release inside its pass. Every older link strands by arithmetic:
-`ChildPod::holds_live_focus` is the falsifiable read every routing decision takes, while the raw
-`is_focused` flag survives for the few things that legitimately want it (a paint-time cull
-exemption, a container's own sweep). Arithmetic rather than a sweep is what makes it work off-tree —
-a pod floated through the Overlay Portal is reachable by no container's blur sweep, and the root
-retires its stale link the next time it holds the pod. The paint seed is composed the same way, per
-link: `paint_child` ANDs the pod's own flag, its stamp against the live epoch, and the ancestor
-chain, so a branch proves its own claim instead of the root vouching for it from a frame behind.
+**A session has an identity, not just a flag.** `RenderRoot` carries a `focus_epoch` — focus's analog of the hover epoch below —
+and a `ChildPod` stamps it beside the link it records (`ChildPod::set_focused`), so a link names *which* session it belongs to
+rather than merely that one existed. A dispatch stamps claims with a candidate one step ahead: an honoured claim commits it, a
+session that ends inside the dispatch lands one step past it (so nothing that pass stamped survives), a dispatch that does neither
+keeps the live epoch, and a release outside a dispatch (an orphan drain) advances it once; a traversal grant's candidate sits two
+steps ahead while a session is live, leaving room for the release inside its pass. Every older link strands by arithmetic:
+`ChildPod::holds_live_focus` is the falsifiable read every routing decision takes, while the raw `is_focused` flag survives for
+the few things that legitimately want it (a paint-time cull exemption, a container's own sweep). Arithmetic rather than a sweep is
+what makes it work off-tree — a pod floated through the Overlay Portal is reachable by no container's blur sweep, and the root
+retires its stale link the next time it holds the pod. The paint seed is composed the same way, per link: `paint_child` ANDs the
+pod's own flag, its stamp against the live epoch, and the ancestor chain, so a branch proves its own claim instead of the root
+vouching for it from a frame behind.
 
-A structural rebuild that tears down, type-swaps, or clears the `focused` flag of a pod holding the
-recorded focus path — *on the live focus chain* — runs inside a state-free view diff with no
-`RenderRoot` handle to release the session itself. Liveness is tracked through the rebuild pass by
-a `BuildCtx` effective-focus AND-chain (`has_focus`/`with_focus_link`), seeded at the root from the
-session mirror (`focus_active || ime_state.is_some()`) and ANDed with each pod's live link
-(`holds_live_focus`, never the raw flag), so a link the session already stranded marks nothing. A
-live loss instead raises a thread-local `mark_focus_orphaned` flag — mirroring
-`mark_pending_result_flush` above, including the same idempotent, thread-affine, data-free shape —
-and `RenderRoot::rebuild` drains it (`take_focus_orphaned`) after its deferred-callback loop and
-releases the session, so the root's cached focus/IME state can never outlive the widget it described.
+A structural rebuild that tears down, type-swaps, or clears the `focused` flag of a pod holding the recorded focus path — *on the
+live focus chain* — runs inside a state-free view diff with no `RenderRoot` handle to release the session itself. Liveness is
+tracked through the rebuild pass by a `BuildCtx` effective-focus AND-chain (`has_focus`/`with_focus_link`), seeded at the root
+from the session mirror (`focus_active || ime_state.is_some()`) and ANDed with each pod's live link (`holds_live_focus`, never the
+raw flag), so a link the session already stranded marks nothing. A live loss instead raises a thread-local `mark_focus_orphaned`
+flag — mirroring `mark_pending_result_flush` above, including the same idempotent, thread-affine, data-free shape — and
+`RenderRoot::rebuild` drains it (`take_focus_orphaned`) after its deferred-callback loop and releases the session, so the root's
+cached focus/IME state can never outlive the widget it described.
+
+**Programmatic focus.** A `FocusHandle` (`focus_handle.rs`, re-exported flat by the facade) records an intent from app code:
+`request()` or `release()`, the last call winning, safe from a handler, a build or before the control mounts. A focusable widget
+binds it every paint with `PaintCtx::bind_focus_handle`, so the root learns the stop from the pod that painted it; an unbound
+handle is inert and keeps its request. The root grants a request as one traversal pass, at the next rebuild or event-pass end,
+and asks for the frame to get there: the grant clears the keyboard flag, replaces another stop's live session as a structural
+release and beats an owed focus return. `release()` ends the session only if its stop holds it, and `is_focused()` is true only
+for the holder itself, not a focusable ancestor. **A request is honoured or dropped by where it was made.** One made in an event
+handler is judged against the tree that handler's state produces: the pass end keeps it while the stop is out of reach (outside a
+trapping modal, disabled), and it is dropped only if the stop is still unreachable at the first rebuild after a paint, so closing
+a dialog and focusing a field in one handler works. One made from a timer, an async callback or a housekeeping-delivered handler
+is judged at the first rebuild. A request whose field the same rebuild unbinds stays pending until a field binds the handle again.
+
+**Focus-change notice.** When a bound handle's state differs from the one the root last saw, the next rebuild's housekeeping
+broadcast delivers `EventCtx::focus_changed()` to that stop's widget, with `has_focus()` read from the live session and
+`&mut State` in scope; the notice is deferred, never raised from the grant itself. It reaches only widgets that bound a handle,
+needs every ancestor to forward the broadcast, and is forwarded into floated overlay surfaces by their owner while
+`EventCtx::focus_notice_open()`. A handle that stops being bound while its widget stays mounted gets no notice.
+
+**Focus-keeping presses.** `EventCtx::keep_focus()` on a pointer `Down` arms no blur and makes the root ignore any
+`request_focus` on that press path, so the holder, its caret and its IME state stay as they are; call it before forwarding the
+press, and `press_keeps_focus()` reads it. A field pressed inside the `keep_focus(child)` view while another field holds focus
+takes no focus, and the holder itself keeps handling its own presses. This is not `overlay_portal(..).preserve_focus(..)`,
+which withdraws a floated surface's own focus claim so its child keeps the session.
 
 ## Keyboard Shortcuts and Traversal
 
 **Declaration.** A widget declares a `ShortcutDecl` (id, `Chord`, label, `ShortcutScope`) from its own `paint` through
-`PaintCtx::register_shortcut`, the same per-paint shape as an overlay entry: the table is rebuilt every paint, so a
-declarer that stops (or unmounts) stops matching after the next one, and a declaration counts as a paint publication
-so a retained page around it re-records. One made while the root paints a floated pod is stamped with that pod's
-`OverlayKey`. `Chord::parse` reads `"Mod+K"`-style specs with `Mod` fixed at compile time (Command on macOS/iOS, Ctrl
-elsewhere, `wasm32` included) and accepts `F1`–`F24` (`NamedKey::F1..F24`, delivered by the desktop and web shells;
-Android and iOS have no hardware-key path); `Chord::display` renders ⌘K or Ctrl+K by the same rule. A symbol key — a
-character neither alphanumeric nor whitespace, such as `?` or `+` — is Shift-insensitive, since shells report Shift
-for the keys that need it: `Chord::new` clears Shift and `matches` ignores it, so `"Shift+?"` is `"?"`; letters,
-digits, Space and named keys compare exactly. `RenderRoot::shortcut_hints(filter)`, `BuildCtx::shortcut_hints()` and
-`PaintCtx::shortcut_hints()` return the *previous* paint's declarations in paint order, masked and unreachable ones
-included, for a palette or help surface. The snapshot is per root: `RenderRoot` owns it and seeds its build and paint
-contexts (a component's inner build included); a context no root seeded reads empty.
+`PaintCtx::register_shortcut`, the same per-paint shape as an overlay entry: the table is rebuilt every paint, so a declarer that
+stops (or unmounts) stops matching after the next one, and a declaration counts as a paint publication so a retained page around
+it re-records. One made while the root paints a floated pod is stamped with that pod's `OverlayKey`. `Chord::parse` reads
+`"Mod+K"`-style specs with `Mod` fixed at compile time (Command on macOS/iOS, Ctrl elsewhere, `wasm32` included) and accepts
+`F1`–`F24` (`NamedKey::F1..F24`, delivered by the desktop and web shells; Android and iOS have no hardware-key path);
+`Chord::display` renders ⌘K or Ctrl+K by the same rule. A symbol key — a character neither alphanumeric nor whitespace, such as
+`?` or `+` — is Shift-insensitive, since shells report Shift for the keys that need it: `Chord::new` clears Shift and `matches`
+ignores it, so `"Shift+?"` is `"?"`; letters, digits, Space and named keys compare exactly. `RenderRoot::shortcut_hints(filter)`,
+`BuildCtx::shortcut_hints()` and `PaintCtx::shortcut_hints()` return the *previous* paint's declarations in paint order, masked
+and unreachable ones included, for a palette or help surface. The snapshot is per root: `RenderRoot` owns it and seeds its build
+and paint contexts (a component's inner build included); a context no root seeded reads empty.
 
-**The declined-key chain.** A `Key` no widget on the focus path handled is offered on, each offer a full dispatch of
-its own, until one is answered:
+**The declined-key chain.** A `Key` no widget on the focus path handled is offered on, each offer a full dispatch of its own,
+until one is answered:
 
-1. to the focus session's forward target — an owner calls `EventCtx::forward_declined_keys_to` so
-keys its focused editable declines reach its floated pod as `OverlayEventKind::Key` (bound to the session live after
-that pass, Interactive pods only), answered by `EventCtx::consume_overlay_key`; 2. an Escape, to the topmost **modal**
-pod the same way — one that is Interactive and either `OverlayKeys::Modal` or `OutsideTap::Notify { consume: true }`;
-a focused `TextInput` blurs on a bare Escape and declines it, so this step runs on the first press; 3. to the shortcut
-table in tier order — declarations stamped with the topmost Interactive pod, then main-tree `Local`, then `AppGlobal`,
-newest first within a tier, so a nested binding beats an enclosing one for the same chord; while a modal pod is open
-only its own tier is tried. Each candidate gets an `InputEvent::Shortcut(id)` broadcast (an
-`OverlayEventKind::Shortcut` through the owner's slot for a stamped one); its declarer answers that id alone
-`Handled`, which the `ChildPod` dispatch probe reports to the root past containers that return `Ignored`, and an
-unanswered delivery falls through to the next candidate; 4. a bare Tab or Shift+Tab, to focus traversal — unless
-`RenderRoot::set_tab_traversal(false)` leaves it unhandled for the host.
+1. to the focus session's forward target — an owner calls `EventCtx::forward_declined_keys_to` so keys its focused editable
+   declines reach its floated pod as `OverlayEventKind::Key` (bound to the session live after that pass, Interactive pods only),
+   answered by `EventCtx::consume_overlay_key`; 2. an Escape, to the topmost **modal** pod the same way — one that is Interactive
+   and either `OverlayKeys::Modal` or `OutsideTap::Notify { consume: true }`; a focused `TextInput` blurs on a bare Escape and
+   declines it, so this step runs on the first press; 3. to the shortcut table in tier order — declarations stamped with the
+   topmost Interactive pod, then main-tree `Local`, then `AppGlobal`, newest first within a tier, so a nested binding beats an
+   enclosing one for the same chord; while a modal pod is open only its own tier is tried. Each candidate gets an
+   `InputEvent::Shortcut(id)` broadcast (an `OverlayEventKind::Shortcut` through the owner's slot for a stamped one); its declarer
+   answers that id alone `Handled`, which the `ChildPod` dispatch probe reports to the root past containers that return `Ignored`,
+   and an unanswered delivery falls through to the next candidate; 4. a bare Tab or Shift+Tab, to focus traversal — unless
+   `RenderRoot::set_tab_traversal(false)` leaves it unhandled for the host.
 
-**Traversal.** The walk is pre-order over `Widget::visit_focus_children` (default: `visit_children`) and stops on pods
-whose widget answers `Widget::is_focusable` (default `false`), the root widget included; `Box<dyn Widget>`,
-`Either`/`EitherOfN` and the `shortcuts` wrapper forward both, and a container showing only some children narrows the
-visit (WIDGETS_CODE_STANDARDS.md's Keyboard Focus and Shortcuts). While a modal pod is open the walk runs inside it
-alone; a Transparent pod is never a stop, and a non-modal floated pod is reached through its owner — the portal calls
-`OverlaySlot::visit_focus_pod` after its child, so the pod's stops follow the owner's. Movement wraps; with nothing
-focused Tab lands on the first stop and Shift+Tab on the last. Each step delivers a grant — an `InputEvent::Shortcut`
-carrying an id private to the root, addressed to the target pod — that the pod records like `EventCtx::request_focus`.
-Only a landing grant releases the old session and commits the claim, so a step that lands from a live session advances
-`focus_epoch` twice; a stop the grant cannot reach is skipped for the next, and when none lands short of the focused
-stop the session, `focus_epoch` and the keyboard flag stay untouched and Tab is reported unhandled. A paint that
-registers an Interactive `OverlayKeys::Modal` pod ends a main-tree session at once (one a floated pod holds survives),
-so a field behind the modal takes no more keys. Focus returns when a focus-return scope (`focus_scope`) closes: an
-Interactive `Modal` entry is one implicitly, a widget opts in with `PaintCtx::register_focus_scope(FocusScopeKey)`
-every paint it is open. The root records the deepest traversal stop of the last committed claim or Tab grant with its
-keyboard flag (a user blur forgets it; a structural release keeps it, and so does a claim by a control that is no
-stop, made under the same innermost open scope); the return runs at the end of `RenderRoot::event` (after the event that beat
-the rebuild is routed) and in `rebuild`, granting that stop once if it is still in the current walk. A session
-started elsewhere is never taken over; one still held inside the closing scope is ended and replaced, and so is the
-invoker's own (unchanged since the open) when it sits on no stop.
+**Traversal.** The walk is pre-order over `Widget::visit_focus_children` (default: `visit_children`) and stops on pods whose
+widget answers `Widget::is_focusable` (default `false`), the root widget included; `Box<dyn Widget>`, `Either`/`EitherOfN` and the
+`shortcuts` wrapper forward both, and a container showing only some children narrows the visit (WIDGETS_CODE_STANDARDS.md's
+Keyboard Focus and Shortcuts). While a modal pod is open the walk runs inside it alone; a Transparent pod is never a stop, and a
+non-modal floated pod is reached through its owner — the portal calls `OverlaySlot::visit_focus_pod` after its child, so the pod's
+stops follow the owner's. Movement wraps; with nothing focused Tab lands on the first stop and Shift+Tab on the last. Each step
+delivers a grant — an `InputEvent::Shortcut` carrying an id private to the root, addressed to the target pod — that the pod
+records like `EventCtx::request_focus`. Only a landing grant releases the old session and commits the claim, so a step that lands
+from a live session advances `focus_epoch` twice; a stop the grant cannot reach is skipped for the next, and when none lands short
+of the focused stop the session, `focus_epoch` and the keyboard flag stay untouched and Tab is reported unhandled. A paint that
+registers an Interactive `OverlayKeys::Modal` pod ends a main-tree session at once (one a floated pod holds survives), so a field
+behind the modal takes no more keys. Focus returns when a focus-return scope (`focus_scope`) closes: an Interactive `Modal` entry
+is one implicitly, a widget opts in with `PaintCtx::register_focus_scope(FocusScopeKey)` every paint it is open. The root records
+the deepest traversal stop of the last committed claim or Tab grant with its keyboard flag (a user blur forgets it; a structural
+release keeps it, and so does a claim by a control that is no stop, made under the same innermost open scope); the return runs at
+the end of `RenderRoot::event` (after the event that beat the rebuild is routed) and in `rebuild`, granting that stop once if it
+is still in the current walk. A session started elsewhere is never taken over; one still held inside the closing scope is ended
+and replaced, and so is the invoker's own (unchanged since the open) when it sits on no stop.
 
-**Focus ring.** `PaintCtx::is_focused_for_ring()` is `has_focus` gated by the root's `FocusRingPolicy` (`Never`,
-`KeyboardOnly` by default, `Always`; `RenderRoot::set_focus_ring_policy`). Under `KeyboardOnly` it holds while the
-live focus came from a landing traversal grant; a pointer `Down`, any claim honoured outside a grant and any session
-release clear that flag — the analog of CSS `:focus-visible`. A ring change bumps the paint epoch, so retained pages
+**Focus ring.** `PaintCtx::is_focused_for_ring()` is `has_focus` gated by the root's `FocusRingPolicy` (`Never`, `KeyboardOnly` by
+default, `Always`; `RenderRoot::set_focus_ring_policy`). Under `KeyboardOnly` it holds while the live focus came from a landing
+traversal grant; a pointer `Down`, any claim honoured outside a grant and any session release clear that flag — the analog of CSS
+`:focus-visible`. A ring change bumps the paint epoch, so retained pages
 re-record. The facade re-exports this vocabulary flat and under `frust::authoring`.
 
 ## Hover and Cursor

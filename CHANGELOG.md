@@ -92,6 +92,16 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 - `frust-beui`'s `ButtonTone` gains a `Destructive` variant (a fill from the palette's destructive
   role with white ink, in both brightnesses). `ButtonTone` is an exhaustive enum. Migration: a
   `match` over `ButtonTone` adds a `ButtonTone::Destructive` arm.
+- `EngineError::InvalidGeometry` and `InvalidTransform` (`frust-engine`, re-exported by `frust-render`) were
+  unit variants and now carry `{ command: Option<usize>, kind: &'static str }`, the offending command's
+  index in the scene and its variant name. Migration: a `match` arm `EngineError::InvalidGeometry`
+  becomes `EngineError::InvalidGeometry { .. }` (likewise `InvalidTransform`), or binds the fields to
+  report the command.
+- A `frust::testing::Tester` test whose view paints a frame the engine would refuse (a non-finite
+  corner radius, an infinite rectangle, a transform that leaves the device grid, more backdrop blurs
+  than the per-frame cap) now fails, panicking at the call that painted it; before, the test passed
+  and only a device showed a blank frame. Migration: fix the view, or opt out for a test that paints
+  one on purpose with `TesterOptions::allow_refused_frames(true)` and read `Tester::refused_frames()`.
 
 ### Added
 
@@ -289,6 +299,32 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   layout width: a top bar, the page list in a beUI drawer, the system back press through an app-side
   `BackFallback`, safe-area and keyboard insets, and `Density::Touch` at start-up on Android and iOS.
   It has not yet been run on a device.
+- `frust_engine::validate_scene(&Scene, root, size)` (also `frust_render::validate_scene`): the engine's
+  up-front refusals (target size, non-finite transforms and geometry, the per-frame backdrop-blur cap)
+  run on the CPU with no compiler or GPU.
+- `frust::testing::Tester` validates every frame it paints, at the physical extent (size times scale).
+  `TesterOptions::allow_refused_frames`, `Tester::refused_frames()` and `RefusedFrame` record refused
+  frames instead of failing; `Tester::long_press_then_drag` drives a held press and a drag.
+- `text_input(..).on_composing_change(|state, composing| ..)` reports an IME composition starting and
+  ending (`false` follows the `on_change` of the text that ended it); `TextEditor::is_composing`.
+- Programmatic focus: `FocusHandle` (`request`, `release`, `is_focused`) with
+  `text_input(..).focus_handle(..)`, `.autofocus(true)` and `.on_focus_change(..)`. A request made in
+  an event handler is judged after the following rebuild, so closing a dialog and focusing a field in
+  one handler works. The beUI, shadcn and Material fields forward the four setters, and Material's
+  `SearchView` has them too.
+- `keep_focus(child)` and `EventCtx::keep_focus`: a press inside the wrapped control leaves the focused
+  field focused, so the soft keyboard stays up (not the same as `overlay_portal(..).preserve_focus(..)`,
+  which is about a floated surface's own presses). `EventCtx::focus_notice_open` and
+  `EventCtx::press_keeps_focus` serve widgets that forward focus notices or presses.
+- `clip(child)` (`.radius(..)`): clips a child's overflow to the view's own bounds.
+- `GestureDetector` `on_long_press_move_update`, `on_long_press_end` and `on_long_press_cancel`
+  (`LongPressMoveDetails`, `LongPressEndDetails`). While a fired long press owns the pointer, no
+  enclosing scroll view takes the drag.
+- `frust_photo_library::Asset::size_bytes`, filled by `AssetQuery::with_details()` on Android and `None`
+  on iOS and desktop. The Rust crate and the Android artifact must ship at the same version, because
+  the Kotlin result class gained a field.
+- `frust-drive`: `ProcessRunner::run_streaming_with_stderr`, which hands stderr lines to a second sink
+  as they arrive.
 
 ### Changed
 
@@ -309,6 +345,11 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   workspace) with the package `beuidemo` and the Android and iOS identifier `it.f0x.beuidemo`. Run it
   with `cargo run` from `examples/beui-demo`; the root workspace no longer has a `beui-demo`
   package, so `cargo run -p beui-demo` fails.
+- Material's full-screen search view now autofocuses its field, so the keyboard comes up when it opens;
+  `SearchView::autofocus(false)` keeps the old behaviour.
+- A single-line `text_input` now always records a clip. It clips selection, text, placeholder and caret
+  to its inner box, and scrolls horizontally to keep the caret in view; the placeholder is clipped,
+  not ellipsized.
 
 ### Fixed
 
@@ -328,6 +369,15 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   `.floating(true)`: the option panel paints above the modal instead of growing it and painting
   under its clip.
 - `frust-beui`'s `theme_toggle` keeps the live density when it flips light and dark.
+- A text field no longer fires `on_submit` while an IME composition is live. With a composing range the
+  platform keyboard owns (Android, iOS), Enter ends the range and then submits or inserts a newline.
+- `container` and `TextureView` clamp a non-finite or oversized corner radius to half the shorter side
+  (infinity is a capsule, NaN or negative is square), where a non-finite radius used to make the
+  engine refuse the whole frame.
+- Under the `test-support` feature a Back press reaches only the test thread that pushed it, so
+  parallel tests no longer see each other's presses.
+- `frust run` on a physical iPhone prints the app's stderr as it arrives, where it used to appear only
+  once the launch command exited.
 
 ## 0.6.6 — 2026-11-11
 
