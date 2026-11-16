@@ -1,7 +1,7 @@
 //! Key-value rows and stage timelines: [`key_value_row`] and [`timeline`].
 //!
 //! The read-only detail layout of a phone screen: a row pairing a key with its
-//! value, and a vertical timeline of [`TimelineStep`]s each in a [`StepState`].
+//! value, and a vertical timeline of [`TimelineStep`]s each in a [`TimelineStepState`].
 //!
 //! - [`key_value_row`] puts the key, in the secondary text colour, on the leading
 //!   side and the value on the trailing side. It stacks the value under the key when
@@ -15,21 +15,30 @@
 //!   line. Marker and connector geometry follow the scaled label line height, so the
 //!   OS text size and the density carry through.
 //!
+//! # Truncation
+//!
+//! Text stays inside the row. Inline, the key keeps its width up to half of the row
+//! (more when the value is short) and the value takes what is left; stacked, each
+//! line is bounded by the row's width less the trailing view. A timeline label or
+//! detail line is bounded by the width left of the marker column. Overflow is cut to
+//! one line with an ellipsis; this module keeps its own run because
+//! `LabelRun` shapes at an unbounded width.
+//!
 //! Semantics: a row publishes its key as the label and its value as the value; each
 //! timeline step publishes its label and its state in words ("Done", "Current",
 //! "Pending") as the value.
 
 use frust::Theme;
-use frust::authoring::text::TextStyle;
+use frust::authoring::text::{LocaleStamp, TextContext, TextLayout, TextOverflow, TextStyle};
 use frust::authoring::{
     AnyView, BezPath, BoxConstraints, Brush, BuildCtx, ChangeFlags, ChildPod, EventCtx,
     EventResult, InputEvent, LayoutCtx, PaintCtx, PaintScene, Role, SemanticsCtx, View, Widget,
-    any, build_child, rebuild_child, teardown_child,
+    any, build_child, rebuild_child, route_event_single, teardown_child,
 };
 use kurbo::{Point, Size, Vec2};
 use peniko::Color;
 
-use crate::text::{LabelRun, ThemeTextType, scaled_style};
+use crate::text::{ThemeTextType, scaled_style, themed_style};
 use crate::tokens::{BEUI_LIGHT, BeuiMetrics, BeuiTokens, mono_family};
 
 /// Connector stroke width, in logical px.
@@ -38,21 +47,112 @@ const CONNECTOR_WIDTH: f64 = 2.0;
 const RING_WIDTH: f64 = 2.0;
 /// Marker diameter as a fraction of the label's line height.
 const MARKER_SCALE: f64 = 0.7;
+/// The most of an inline row a key claims when the value is long too.
+const KEY_MAX_SHARE: f64 = 0.5;
+
+/// A cached one-line text run whose ink is applied at paint time and which cuts
+/// itself to a width with an ellipsis. Private copy: `LabelRun` has no bound.
+struct EllipsisRun {
+    content: String,
+    layout: Option<TextLayout>,
+    key: Option<(TextStyle, Option<u32>)>,
+    locale: LocaleStamp,
+}
+
+impl EllipsisRun {
+    fn new(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            layout: None,
+            key: None,
+            locale: LocaleStamp::default(),
+        }
+    }
+
+    fn content(&self) -> &str {
+        &self.content
+    }
+
+    fn set_content(&mut self, content: &str) -> bool {
+        if self.content == content {
+            return false;
+        }
+        self.content = content.to_owned();
+        self.layout = None;
+        true
+    }
+
+    /// Shape at `max_width` (unbounded for `None`), one line, ellipsis on overflow.
+    fn layout(&mut self, ctx: &mut LayoutCtx, style: &TextStyle, max_width: Option<f64>) -> Size {
+        let width = max_width.map(|w| w.max(0.0) as f32);
+        let key = (style.clone(), width.map(f32::to_bits));
+        if let Some(cached) = &self.layout
+            && self.key.as_ref() == Some(&key)
+            && self.locale.is_current(style.locale.as_deref())
+        {
+            return cached.size();
+        }
+        let stamp = LocaleStamp::for_style(style.locale.as_deref());
+        let laid = ctx.text_context::<TextContext>().layout_bounded(
+            &self.content,
+            style,
+            width,
+            Some(1),
+            TextOverflow::Ellipsis,
+        );
+        let size = laid.size();
+        self.layout = Some(laid);
+        self.key = Some(key);
+        self.locale = stamp;
+        size
+    }
+
+    /// Shape unbounded, then again at `cap` only when the text is wider than it.
+    fn fit(&mut self, ctx: &mut LayoutCtx, style: &TextStyle, cap: Option<f64>) -> Size {
+        let natural = self.layout(ctx, style, None);
+        match cap {
+            Some(cap) if natural.width > cap => self.layout(ctx, style, Some(cap)),
+            _ => natural,
+        }
+    }
+
+    fn size(&self) -> Size {
+        self.layout.as_ref().map_or(Size::ZERO, TextLayout::size)
+    }
+
+    fn paint(&self, origin: Point, color: Color, scene: &mut dyn PaintScene) {
+        if let Some(layout) = &self.layout {
+            for mut run in layout.to_scene_runs(origin) {
+                run.brush = Brush::Solid(color);
+                scene.draw_glyph_run(run);
+            }
+        }
+    }
+}
+
+/// The catalog's sans at `size`, themed for `role` and scaled by the OS text scale.
+fn part_style(ctx: &LayoutCtx, size: f64, role: ThemeTextType) -> TextStyle {
+    themed_style(
+        TextStyle::new(size as f32, Color::BLACK),
+        role,
+        Theme::from_layout_ctx(ctx),
+    )
+}
 
 /// The words a step's state publishes.
-fn state_words(state: StepState) -> &'static str {
+fn state_words(state: TimelineStepState) -> &'static str {
     match state {
-        StepState::Done => "Done",
-        StepState::Current => "Current",
-        StepState::Pending => "Pending",
+        TimelineStepState::Done => "Done",
+        TimelineStepState::Current => "Current",
+        TimelineStepState::Pending => "Pending",
     }
 }
 
 /// One step as the widget holds it.
 struct StepRow {
-    state: StepState,
-    label: LabelRun,
-    detail: Option<LabelRun>,
+    state: TimelineStepState,
+    label: EllipsisRun,
+    detail: Option<EllipsisRun>,
     /// Top of the step's row, set by layout.
     top: f64,
 }
@@ -60,8 +160,8 @@ struct StepRow {
 /// What the widget draws.
 enum Body {
     Row {
-        key: Box<LabelRun>,
-        value: Box<LabelRun>,
+        key: Box<EllipsisRun>,
+        value: Box<EllipsisRun>,
         mono: bool,
         stacked: bool,
         /// Whether the last layout fell back to the stacked arrangement.
@@ -85,8 +185,8 @@ impl KeyValueWidget {
     fn row(key: &str, value: &str, mono: bool, stacked: bool, trailing: Option<ChildPod>) -> Self {
         Self {
             body: Body::Row {
-                key: Box::new(LabelRun::new(key)),
-                value: Box::new(LabelRun::new(value)),
+                key: Box::new(EllipsisRun::new(key)),
+                value: Box::new(EllipsisRun::new(value)),
                 mono,
                 stacked,
                 narrow: false,
@@ -114,7 +214,7 @@ impl KeyValueWidget {
                 .iter()
                 .flat_map(|s| {
                     std::iter::once(s.label.content())
-                        .chain(s.detail.as_ref().map(LabelRun::content))
+                        .chain(s.detail.as_ref().map(EllipsisRun::content))
                 })
                 .collect(),
         }
@@ -129,8 +229,8 @@ impl KeyValueWidget {
 fn step_row(step: &TimelineStep) -> StepRow {
     StepRow {
         state: step.state,
-        label: LabelRun::new(step.label.clone()),
-        detail: step.detail.clone().map(LabelRun::new),
+        label: EllipsisRun::new(step.label.clone()),
+        detail: step.detail.clone().map(EllipsisRun::new),
         top: 0.0,
     }
 }
@@ -164,7 +264,7 @@ impl Widget for KeyValueWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
         let theme = Theme::from_layout_ctx(ctx);
         let metrics = BeuiMetrics::resolve(theme);
-        let sans = |size: f64| TextStyle::new(size as f32, Color::BLACK);
+        let avail = Some(bc.max().width).filter(|w| w.is_finite());
         match &mut self.body {
             Body::Row {
                 key,
@@ -174,17 +274,16 @@ impl Widget for KeyValueWidget {
                 narrow,
                 trailing,
             } => {
-                let key_size =
-                    key.layout_themed(ctx, &sans(metrics.text_sm), ThemeTextType::BodyMedium);
-                let value_size = if *mono {
+                let key_style = part_style(ctx, metrics.text_sm, ThemeTextType::BodyMedium);
+                let value_style = if *mono {
                     // `TypeScale` has no monospace slot, so the family is named here.
-                    let style = scaled_style(
-                        sans(metrics.text_base).with_family(mono_family()),
+                    scaled_style(
+                        TextStyle::new(metrics.text_base as f32, Color::BLACK)
+                            .with_family(mono_family()),
                         Theme::from_layout_ctx(ctx),
-                    );
-                    value.layout(ctx, &style)
+                    )
                 } else {
-                    value.layout_themed(ctx, &sans(metrics.text_base), ThemeTextType::BodyMedium)
+                    part_style(ctx, metrics.text_base, ThemeTextType::BodyMedium)
                 };
                 let trailing_size = trailing
                     .as_mut()
@@ -195,22 +294,39 @@ impl Widget for KeyValueWidget {
                 } else {
                     0.0
                 };
-                let inline_w = key_size.width + gap + value_size.width + trail_w;
-                *narrow = *stacked || inline_w > bc.max().width;
+                // The width the text may use: the row less the trailing view.
+                let room = avail.map(|w| (w - trail_w).max(0.0));
+                let key_nat = key.layout(ctx, &key_style, None);
+                let value_nat = value.layout(ctx, &value_style, None);
+                let inline_w = key_nat.width + gap + value_nat.width;
+                *narrow = *stacked || room.is_some_and(|r| inline_w > r);
+                let (key_size, value_size) = if *narrow {
+                    (
+                        key.fit(ctx, &key_style, room),
+                        value.fit(ctx, &value_style, room),
+                    )
+                } else {
+                    // The key keeps its width up to a share of the row, or what the
+                    // value leaves; the value takes the rest.
+                    let key_cap =
+                        room.map(|r| (r * KEY_MAX_SHARE).max(r - gap - value_nat.width).max(0.0));
+                    let key_size = key.fit(ctx, &key_style, key_cap);
+                    let value_cap = room.map(|r| (r - key_size.width - gap).max(0.0));
+                    (key_size, value.fit(ctx, &value_style, value_cap))
+                };
                 let (content_w, content_h) = if *narrow {
                     (
                         key_size.width.max(value_size.width) + trail_w,
                         key_size.height + value_size.height,
                     )
                 } else {
-                    (inline_w, key_size.height.max(value_size.height))
+                    (
+                        key_size.width + gap + value_size.width + trail_w,
+                        key_size.height.max(value_size.height),
+                    )
                 };
                 let height = content_h.max(trailing_size.height);
-                let width = if bc.max().width.is_finite() {
-                    bc.max().width
-                } else {
-                    content_w
-                };
+                let width = avail.unwrap_or(content_w);
                 let size = bc.constrain(Size::new(width, height));
                 if let Some(t) = trailing {
                     t.set_origin(Point::new(
@@ -225,29 +341,28 @@ impl Widget for KeyValueWidget {
                 marker,
                 column,
             } => {
-                let label_style = sans(metrics.text_base);
-                let detail_style = sans(metrics.text_sm);
-                let mut y = 0.0;
-                let mut width = 0.0_f64;
-                let mut line = 0.0_f64;
-                // Shape every label first: the marker column follows the label line height.
-                let mut sizes = Vec::with_capacity(steps.len());
-                for step in steps.iter_mut() {
-                    let label =
-                        step.label
-                            .layout_themed(ctx, &label_style, ThemeTextType::BodyMedium);
-                    let detail = step
-                        .detail
-                        .as_mut()
-                        .map(|d| d.layout_themed(ctx, &detail_style, ThemeTextType::BodyMedium));
-                    line = line.max(label.height);
-                    sizes.push((label, detail));
-                }
+                let label_style = part_style(ctx, metrics.text_base, ThemeTextType::BodyMedium);
+                let detail_style = part_style(ctx, metrics.text_sm, ThemeTextType::BodyMedium);
+                // The marker column follows the label line height, which one probe
+                // line gives without shaping every label twice.
+                let line = ctx
+                    .text_context::<TextContext>()
+                    .layout("M", &label_style, None)
+                    .size()
+                    .height;
                 *column = line;
                 *marker = (line * MARKER_SCALE).round().max(4.0);
                 let gap = metrics.gap_md;
-                for (step, (label, detail)) in steps.iter_mut().zip(sizes) {
+                let text_cap = avail.map(|w| (w - *column - gap).max(0.0));
+                let mut y = 0.0;
+                let mut width = 0.0_f64;
+                for step in steps.iter_mut() {
                     step.top = y;
+                    let label = step.label.fit(ctx, &label_style, text_cap);
+                    let detail = step
+                        .detail
+                        .as_mut()
+                        .map(|d| d.fit(ctx, &detail_style, text_cap));
                     let text_w = label.width.max(detail.map_or(0.0, |d| d.width));
                     width = width.max(*column + gap + text_w);
                     y += label.height + detail.map_or(0.0, |d| d.height) + gap;
@@ -325,7 +440,7 @@ impl Widget for KeyValueWidget {
                             scene.fill_rect(
                                 Point::new(centre.x - CONNECTOR_WIDTH / 2.0, from),
                                 Size::new(CONNECTOR_WIDTH, next - from),
-                                if step.state == StepState::Done {
+                                if step.state == TimelineStepState::Done {
                                     hues.done
                                 } else {
                                     hues.muted
@@ -340,9 +455,10 @@ impl Widget for KeyValueWidget {
 
     fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
         match &mut self.body {
+            // `route_event_single` ends the child's pointer capture on release.
             Body::Row {
                 trailing: Some(t), ..
-            } => t.event_child(ctx, event),
+            } => route_event_single(t, ctx, event),
             _ => EventResult::Ignored,
         }
     }
@@ -396,7 +512,13 @@ impl Widget for KeyValueWidget {
 }
 
 /// Draw one marker of diameter `d` centred on `centre`.
-fn paint_marker(scene: &mut dyn PaintScene, centre: Point, d: f64, state: StepState, hues: &Hues) {
+fn paint_marker(
+    scene: &mut dyn PaintScene,
+    centre: Point,
+    d: f64,
+    state: TimelineStepState,
+    hues: &Hues,
+) {
     let disc = |scene: &mut dyn PaintScene, d: f64, color: Color| {
         scene.fill_rounded_rect(
             Point::new(centre.x - d / 2.0, centre.y - d / 2.0),
@@ -406,7 +528,7 @@ fn paint_marker(scene: &mut dyn PaintScene, centre: Point, d: f64, state: StepSt
         );
     };
     match state {
-        StepState::Done => {
+        TimelineStepState::Done => {
             disc(scene, d, hues.done);
             let mut tick = BezPath::new();
             tick.move_to(Point::new(centre.x - d * 0.22, centre.y + d * 0.02));
@@ -419,7 +541,7 @@ fn paint_marker(scene: &mut dyn PaintScene, centre: Point, d: f64, state: StepSt
                 &Brush::Solid(hues.on_accent),
             );
         }
-        StepState::Current => {
+        TimelineStepState::Current => {
             let r = (d - RING_WIDTH) / 2.0;
             let ring = kurbo::Arc::new(centre, Vec2::new(r, r), 0.0, std::f64::consts::TAU, 0.0);
             scene.stroke_path(
@@ -430,14 +552,14 @@ fn paint_marker(scene: &mut dyn PaintScene, centre: Point, d: f64, state: StepSt
             );
             disc(scene, d * 0.4, hues.accent);
         }
-        StepState::Pending => disc(scene, d, hues.muted),
+        TimelineStepState::Pending => disc(scene, d, hues.muted),
     }
 }
 
 /// Where a [`TimelineStep`] stands.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum StepState {
+pub enum TimelineStepState {
     /// Finished.
     Done,
     /// In progress.
@@ -453,13 +575,13 @@ pub struct TimelineStep {
     /// The stage's label.
     pub label: String,
     /// Where the stage stands.
-    pub state: StepState,
+    pub state: TimelineStepState,
     detail: Option<String>,
 }
 
 impl TimelineStep {
     /// A step labelled `label` in `state`.
-    pub fn new(label: impl Into<String>, state: StepState) -> Self {
+    pub fn new(label: impl Into<String>, state: TimelineStepState) -> Self {
         Self {
             label: label.into(),
             state,
@@ -553,10 +675,10 @@ impl<State: 'static> View<State> for KeyValueRowView<State> {
         };
         let mut flags = ChangeFlags::NONE;
         let layout = ChangeFlags::LAYOUT | ChangeFlags::PAINT;
-        if key.set_content(self.key.clone()) {
+        if key.set_content(&self.key) {
             flags |= layout;
         }
-        if value.set_content(self.value.clone()) {
+        if value.set_content(&self.value) {
             flags |= layout;
         }
         if *mono != self.mono {
@@ -568,13 +690,12 @@ impl<State: 'static> View<State> for KeyValueRowView<State> {
             *stacked = self.stacked;
             flags |= layout;
         }
-        if let (Some(pod), Some(next), Some(before)) = (
-            trailing.as_mut(),
-            self.trailing.as_ref(),
+        flags |= rebuild_slot(
             prev.trailing.as_ref(),
-        ) {
-            flags |= rebuild_child(before, next, pod, ctx);
-        }
+            self.trailing.as_ref(),
+            trailing,
+            ctx,
+        );
         flags
     }
 
@@ -589,6 +710,29 @@ impl<State: 'static> View<State> for KeyValueRowView<State> {
         {
             teardown_child(view, pod, ctx);
         }
+    }
+}
+
+/// Reconcile the trailing slot across all four previous / next combinations, so the
+/// pod is present exactly when the view is.
+fn rebuild_slot<State: 'static>(
+    prev: Option<&AnyView<State>>,
+    next: Option<&AnyView<State>>,
+    pod: &mut Option<Box<ChildPod>>,
+    ctx: &mut BuildCtx<'_>,
+) -> ChangeFlags {
+    match (prev, next, pod.as_mut()) {
+        (Some(prev), Some(next), Some(pod)) => rebuild_child(prev, next, pod, ctx),
+        (Some(prev), None, Some(old)) => {
+            teardown_child(prev, old, ctx);
+            *pod = None;
+            ChangeFlags::LAYOUT | ChangeFlags::PAINT
+        }
+        (_, Some(next), _) => {
+            *pod = Some(Box::new(build_child(next, ctx)));
+            ChangeFlags::LAYOUT | ChangeFlags::PAINT
+        }
+        _ => ChangeFlags::NONE,
     }
 }
 
@@ -631,9 +775,152 @@ mod tests {
     use frust::Brightness;
     use frust::authoring::scene::GlyphRun;
     use frust::authoring::text::TextContext;
+    use frust::authoring::{PointerButton, PointerEvent, PointerPhase, SemanticsUpdate};
     use std::any::Any;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     use crate::tokens::{Density, theme_with_density};
+
+    /// The colour a [`Probe`] fills, to find it in a paint record.
+    const PROBE_INK: Color = Color::from_rgba8(200, 30, 30, 255);
+
+    /// A trailing child that records what reaches it and that it was torn down.
+    struct Probe {
+        id: u32,
+        hits: Rc<RefCell<Vec<u32>>>,
+        torn: Rc<Cell<u32>>,
+    }
+
+    struct ProbeWidget {
+        id: u32,
+        hits: Rc<RefCell<Vec<u32>>>,
+    }
+
+    impl Widget for ProbeWidget {
+        fn layout(&mut self, _ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
+            bc.constrain(Size::new(40.0, 30.0))
+        }
+        fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
+            scene.fill_rect(ctx.origin(), ctx.size(), PROBE_INK);
+        }
+        fn event(&mut self, _ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
+            if let InputEvent::Pointer(_) = event {
+                self.hits.borrow_mut().push(self.id);
+                return EventResult::Handled;
+            }
+            EventResult::Ignored
+        }
+        fn semantics(&self, ctx: &mut SemanticsCtx) {
+            let label = format!("probe {}", self.id);
+            ctx.push_node(Role::Button, |node| node.set_label(label.as_str()));
+        }
+    }
+
+    impl<S: 'static> View<S> for Probe {
+        type Element = ProbeWidget;
+        fn build(&self, _ctx: &mut BuildCtx<'_>) -> ProbeWidget {
+            ProbeWidget {
+                id: self.id,
+                hits: self.hits.clone(),
+            }
+        }
+        fn rebuild(
+            &self,
+            _prev: &Self,
+            element: &mut ProbeWidget,
+            _ctx: &mut BuildCtx<'_>,
+        ) -> ChangeFlags {
+            element.id = self.id;
+            ChangeFlags::NONE
+        }
+        fn teardown(&self, _element: &mut ProbeWidget, _ctx: &mut BuildCtx<'_>) {
+            self.torn.set(self.torn.get() + 1);
+        }
+    }
+
+    /// A row with a probe trailing view, or none.
+    fn probe_row(
+        id: Option<u32>,
+        hits: &Rc<RefCell<Vec<u32>>>,
+        torn: &Rc<Cell<u32>>,
+    ) -> KeyValueRowView<()> {
+        let row = key_value_row("Key", "Value");
+        match id {
+            Some(id) => row.trailing(Probe {
+                id,
+                hits: hits.clone(),
+                torn: torn.clone(),
+            }),
+            None => row,
+        }
+    }
+
+    fn rebuilt(prev: &KeyValueRowView<()>, next: &KeyValueRowView<()>, w: &mut KeyValueWidget) {
+        let mut next_id = 100u64;
+        next.rebuild(prev, w, &mut BuildCtx::new(&mut next_id));
+    }
+
+    fn relayout(w: &mut KeyValueWidget, width: f64) -> Size {
+        let mut text_ctx = TextContext::new();
+        let mut layout = LayoutCtx::with_text_context(&mut text_ctx as &mut dyn Any);
+        w.layout(&mut layout, &BoxConstraints::loose(Size::new(width, 600.0)))
+    }
+
+    fn pointer(phase: PointerPhase, x: f64, y: f64) -> InputEvent {
+        InputEvent::Pointer(PointerEvent {
+            phase,
+            position: Point::new(x, y),
+            button: PointerButton::Primary,
+        })
+    }
+
+    fn send(w: &mut KeyValueWidget, size: Size, event: &InputEvent) {
+        let mut state = ();
+        let any_state: &mut dyn Any = &mut state;
+        let mut ctx = EventCtx::new(any_state, Point::ZERO, size);
+        w.event(&mut ctx, event);
+    }
+
+    fn probe_painted(rec: &Recorder) -> bool {
+        rec.rects.iter().any(|(_, _, c)| *c == PROBE_INK)
+    }
+
+    /// The labels of every node `view` publishes after laying out at 400 px.
+    fn labels_after(rows: &[Option<u32>]) -> Vec<Vec<String>> {
+        let hits = Rc::new(RefCell::new(Vec::new()));
+        let torn = Rc::new(Cell::new(0));
+        let mut logic = |state: &mut usize| {
+            let id = rows[*state];
+            let row = key_value_row::<usize>("Key", "Value");
+            match id {
+                Some(id) => row.trailing(Probe {
+                    id,
+                    hits: hits.clone(),
+                    torn: torn.clone(),
+                }),
+                None => row,
+            }
+        };
+        let mut root = frust_core::RenderRoot::new();
+        let mut state;
+        let mut tcx = TextContext::new();
+        let mut out = Vec::new();
+        for step in 0..rows.len() {
+            state = step;
+            root.rebuild(&mut logic, &mut state);
+            root.layout_with_text(Size::new(400.0, 800.0), &mut tcx as &mut dyn Any);
+            let update: SemanticsUpdate = root.semantics();
+            out.push(
+                update
+                    .nodes
+                    .iter()
+                    .filter_map(|(_, n)| n.label().map(str::to_owned))
+                    .collect(),
+            );
+        }
+        out
+    }
 
     /// Records every shape drawn, in order.
     #[derive(Default)]
@@ -642,6 +929,8 @@ mod tests {
         discs: Vec<(Point, Size, Color)>,
         strokes: Vec<Color>,
         glyphs: usize,
+        /// The furthest right any glyph starts, in window space.
+        max_x: f64,
     }
 
     impl PaintScene for Recorder {
@@ -657,8 +946,12 @@ mod tests {
                 self.strokes.push(*c);
             }
         }
-        fn draw_glyph_run(&mut self, _run: GlyphRun) {
+        fn draw_glyph_run(&mut self, run: GlyphRun) {
             self.glyphs += 1;
+            let left = run.transform.translation().x;
+            for g in &run.glyphs {
+                self.max_x = self.max_x.max(left + f64::from(g.x));
+            }
         }
     }
 
@@ -691,9 +984,9 @@ mod tests {
 
     fn steps() -> [TimelineStep; 3] {
         [
-            TimelineStep::new("Queued", StepState::Done),
-            TimelineStep::new("Running", StepState::Current).detail("Started a minute ago"),
-            TimelineStep::new("Shipped", StepState::Pending),
+            TimelineStep::new("Queued", TimelineStepState::Done),
+            TimelineStep::new("Running", TimelineStepState::Current).detail("Started a minute ago"),
+            TimelineStep::new("Shipped", TimelineStepState::Pending),
         ]
     }
 
@@ -790,8 +1083,122 @@ mod tests {
 
     #[test]
     fn a_step_publishes_its_state_in_words() {
-        assert_eq!(state_words(StepState::Done), "Done");
-        assert_eq!(state_words(StepState::Current), "Current");
-        assert_eq!(state_words(StepState::Pending), "Pending");
+        assert_eq!(state_words(TimelineStepState::Done), "Done");
+        assert_eq!(state_words(TimelineStepState::Current), "Current");
+        assert_eq!(state_words(TimelineStepState::Pending), "Pending");
+    }
+
+    #[test]
+    fn a_trailing_view_added_on_a_later_rebuild_shows_and_lays_out() {
+        let hits = Rc::new(RefCell::new(Vec::new()));
+        let torn = Rc::new(Cell::new(0));
+        let (none, one) = (
+            probe_row(None, &hits, &torn),
+            probe_row(Some(1), &hits, &torn),
+        );
+        let (mut row, _) = laid_out(&none);
+        rebuilt(&none, &one, &mut row);
+        let size = relayout(&mut row, 400.0);
+        let rec = paint(&mut row, size, None);
+        let probe = rec.rects.iter().find(|(_, _, c)| *c == PROBE_INK);
+        let (at, probe_size, _) = probe.expect("the added child paints");
+        assert_eq!(at.x + probe_size.width, size.width, "at the trailing edge");
+    }
+
+    #[test]
+    fn a_trailing_view_removed_is_gone_everywhere_and_torn_down() {
+        let hits = Rc::new(RefCell::new(Vec::new()));
+        let torn = Rc::new(Cell::new(0));
+        let (one, none) = (
+            probe_row(Some(1), &hits, &torn),
+            probe_row(None, &hits, &torn),
+        );
+        let (mut row, size) = laid_out(&one);
+        assert!(probe_painted(&paint(&mut row, size, None)));
+
+        let mut next_id = 100u64;
+        let flags = none.rebuild(&one, &mut row, &mut BuildCtx::new(&mut next_id));
+        assert!(flags.contains(ChangeFlags::LAYOUT | ChangeFlags::PAINT));
+        assert_eq!(torn.get(), 1, "the removed child was torn down");
+
+        let size = relayout(&mut row, 400.0);
+        assert!(!probe_painted(&paint(&mut row, size, None)), "not painted");
+        let mut visited = 0;
+        row.visit_children(&mut |_| visited += 1);
+        assert_eq!(visited, 0, "not a child any more");
+        send(&mut row, size, &pointer(PointerPhase::Down, 395.0, 10.0));
+        assert!(hits.borrow().is_empty(), "receives no events");
+    }
+
+    #[test]
+    fn a_removed_trailing_view_leaves_the_semantics_tree() {
+        let labels = labels_after(&[Some(1), None]);
+        assert!(labels[0].iter().any(|l| l == "probe 1"));
+        assert!(!labels[1].iter().any(|l| l.starts_with("probe")));
+    }
+
+    #[test]
+    fn re_adding_a_trailing_view_builds_the_new_one() {
+        let hits = Rc::new(RefCell::new(Vec::new()));
+        let torn = Rc::new(Cell::new(0));
+        let first = probe_row(Some(1), &hits, &torn);
+        let none = probe_row(None, &hits, &torn);
+        let second = probe_row(Some(2), &hits, &torn);
+        let (mut row, _) = laid_out(&first);
+        rebuilt(&first, &none, &mut row);
+        rebuilt(&none, &second, &mut row);
+        let size = relayout(&mut row, 400.0);
+        send(
+            &mut row,
+            size,
+            &pointer(PointerPhase::Down, 395.0, size.height / 2.0),
+        );
+        assert_eq!(
+            *hits.borrow(),
+            vec![2],
+            "the new view's widget, not the old"
+        );
+        assert_eq!(torn.get(), 1);
+    }
+
+    #[test]
+    fn a_trailing_press_and_release_leaves_nothing_captured() {
+        let hits = Rc::new(RefCell::new(Vec::new()));
+        let torn = Rc::new(Cell::new(0));
+        let (mut row, _) = laid_out(&probe_row(Some(1), &hits, &torn));
+        let size = relayout(&mut row, 400.0);
+        let y = size.height / 2.0;
+        send(&mut row, size, &pointer(PointerPhase::Down, 395.0, y));
+        send(&mut row, size, &pointer(PointerPhase::Up, 395.0, y));
+        assert_eq!(hits.borrow().len(), 2);
+        send(&mut row, size, &pointer(PointerPhase::Down, 5.0, y));
+        assert_eq!(hits.borrow().len(), 2, "a press elsewhere is not captured");
+    }
+
+    #[test]
+    fn a_long_value_stays_inside_a_narrow_row() {
+        let value = "an exceptionally long value that cannot possibly fit on a phone row".repeat(2);
+        for view in [
+            key_value_row::<()>("Key", value.clone()),
+            key_value_row::<()>("Key", value.clone()).stacked(true),
+            key_value_row::<()>("A long key for the row", value.clone()),
+        ] {
+            let (mut row, size) = laid_out_in(&view, 320.0, None);
+            assert!(size.width <= 320.0);
+            let rec = paint(&mut row, size, None);
+            assert!(rec.glyphs > 0);
+            assert!(rec.max_x <= 320.0, "painted to {}", rec.max_x);
+        }
+    }
+
+    #[test]
+    fn a_long_timeline_label_and_detail_stay_inside_the_width() {
+        let long = "a stage label far longer than any phone screen could show".repeat(2);
+        let view =
+            timeline([TimelineStep::new(long.clone(), TimelineStepState::Current).detail(long)]);
+        let (mut tl, size) = laid_out_in(&view, 200.0, None);
+        assert!(size.width <= 200.0);
+        let rec = paint(&mut tl, size, None);
+        assert!(rec.max_x <= 200.0, "painted to {}", rec.max_x);
     }
 }
