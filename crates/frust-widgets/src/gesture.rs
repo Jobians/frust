@@ -74,7 +74,16 @@
 //!   and until its `Up` or `Cancel` it vetoes every enclosing scroll surface
 //!   (on both axes) so none takes the drag over or cancels the detector;
 //!   before the long-press fires a drag past the slop still scrolls and
-//!   cancels the press.
+//!   cancels the press. The detector re-asserts the veto on every `Move` it
+//!   reports, so a multi-contact recognizer below it that rewrites the shared
+//!   cell on its own events cannot lift it; it lowers the veto only when it
+//!   raised it, so a press that never fired writes no cell. The veto is a
+//!   single flag per scroll surface: a nested multi-contact recognizer shares
+//!   the cell, and ending a live press lowers it even if that recognizer had
+//!   raised it too. A detector torn down mid-press lowers its veto.
+//! - **Tap fallback.** With any of those three callbacks set, a fired
+//!   long-press no longer falls back to `on_tap`: the press ends in the
+//!   follow-up callbacks only, even when `on_long_press` itself is absent.
 //! - **Cancel.** A platform `Cancel` before any drag started stays silent, as
 //!   for a tap. A `Cancel` after a drag started owes that recognizer's `cancel`
 //!   callback, but the `Cancel` arm itself never reaches application state (a
@@ -308,6 +317,7 @@
 //! routing sees. A pod transform set during paint takes effect for routing
 //! only from the next frame.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use frust_core::event::{OverlayEvent, OverlayEventKind, PointerId};
@@ -789,6 +799,8 @@ impl<State: 'static> GestureDetectorView<State> {
     /// [`LONG_PRESS_MS`] without moving beyond [`TOUCH_SLOP`]. Composes with
     /// [`on_tap`](Self::on_tap): a given press fires exactly one of the two,
     /// never both (see the [module docs](self) for the firing semantics).
+    /// Without it, a fired long-press falls back to [`on_tap`](Self::on_tap)
+    /// unless one of the three long-press follow-up callbacks is set.
     pub fn on_long_press<F: Fn(&mut State) + 'static>(mut self, on_long_press: F) -> Self {
         self.on_long_press = Some(Rc::new(on_long_press));
         self
@@ -803,6 +815,13 @@ impl<State: 'static> GestureDetectorView<State> {
     /// every enclosing scroll surface until its `Up` or `Cancel` (see the
     /// [module docs](self)); the scroll view stays free to be scrolled through
     /// its controller meanwhile.
+    ///
+    /// Setting this, [`on_long_press_end`](Self::on_long_press_end) or
+    /// [`on_long_press_cancel`](Self::on_long_press_cancel) also stops a fired
+    /// long-press from falling back to [`on_tap`](Self::on_tap).
+    ///
+    /// `global_position` is the pointer's window-space position, taken from
+    /// the origin the detector last painted at.
     pub fn on_long_press_move_update<F: Fn(&mut State, LongPressMoveDetails) + 'static>(
         mut self,
         f: F,
@@ -812,7 +831,9 @@ impl<State: 'static> GestureDetectorView<State> {
     }
 
     /// Call `f` when the press whose long-press fired is released.
-    /// See [`on_long_press_move_update`](Self::on_long_press_move_update).
+    /// See [`on_long_press_move_update`](Self::on_long_press_move_update);
+    /// setting this also stops a fired long-press from falling back to
+    /// [`on_tap`](Self::on_tap).
     pub fn on_long_press_end<F: Fn(&mut State, LongPressEndDetails) + 'static>(
         mut self,
         f: F,
@@ -824,7 +845,13 @@ impl<State: 'static> GestureDetectorView<State> {
     /// Call `f` when the press whose long-press fired is cancelled instead of
     /// released: a system cancel, a second contact, a route change. Not
     /// followed by [`on_long_press_end`](Self::on_long_press_end). See
-    /// [`on_long_press_move_update`](Self::on_long_press_move_update).
+    /// [`on_long_press_move_update`](Self::on_long_press_move_update);
+    /// setting this also stops a fired long-press from falling back to
+    /// [`on_tap`](Self::on_tap).
+    ///
+    /// A detector torn down while its long-press is live delivers no terminal
+    /// callback: teardown has no application state to call it with. It does
+    /// lower the scroll veto the press raised.
     pub fn on_long_press_cancel<F: Fn(&mut State) + 'static>(mut self, f: F) -> Self {
         self.on_long_press_cancel = Some(Rc::new(f));
         self
@@ -973,6 +1000,27 @@ enum Recognizer {
     DoubleTapPending { first_up_at: FrameTime, at: Point },
 }
 
+/// The state of a fired long-press: tracked from the fire to its `Up` or
+/// `Cancel`, with the scroll veto it raised and the cancel it owes.
+#[derive(Default)]
+struct LongPressTrack {
+    /// The fired long-press is being tracked: its moves, release and
+    /// cancellation are reported and `vetoes` are raised. Set at the fire
+    /// when any of the three follow-up callbacks is wired.
+    live: bool,
+    /// Where the live long-press fired, the origin of
+    /// [`LongPressMoveDetails::offset_from_origin`].
+    origin: Point,
+    /// A `Cancel` ended a live long-press, whose `on_long_press_cancel` is
+    /// owed to the next state-bearing pass.
+    owed_cancel: bool,
+    /// The enclosing scroll surfaces' veto cells, captured on the `Down`.
+    vetoes: Vec<Rc<Cell<bool>>>,
+    /// This detector raised `vetoes` and has not lowered them yet; only then
+    /// does ending the press write the cells.
+    raised: bool,
+}
+
 /// The retained widget for a [`GestureDetectorView`].
 pub struct GestureDetectorWidget {
     child: ChildPod,
@@ -982,22 +1030,14 @@ pub struct GestureDetectorWidget {
     on_long_press_move_update: Option<ErasedArgCallback<LongPressMoveDetails>>,
     on_long_press_end: Option<ErasedArgCallback<LongPressEndDetails>>,
     on_long_press_cancel: Option<ErasedCallback>,
-    /// The fired long-press is being tracked: its moves, release and
-    /// cancellation are reported and `long_press_vetoes` are raised. Set at
-    /// the fire when any of the three follow-up callbacks is wired.
-    long_press_live: bool,
-    /// Where the live long-press fired, the origin of
-    /// [`LongPressMoveDetails::offset_from_origin`].
-    long_press_origin: Point,
+    /// The fired long-press being tracked, and what it owes.
+    long_press: LongPressTrack,
+    /// The detector's origin in window space, recorded at paint, the base of
+    /// the `global_position` of the long-press follow-up details.
+    window_origin: Point,
     /// The latest position of the primary press, so a fire with no pointer
     /// position (the Housekeeping pass) still has an origin.
     press_last_pos: Point,
-    /// A `Cancel` ended a live long-press, whose `on_long_press_cancel` is
-    /// owed to the next state-bearing pass.
-    owed_long_press_cancel: bool,
-    /// The enclosing scroll surfaces' veto cells, captured on the `Down` and
-    /// raised from the fire until the press ends.
-    long_press_vetoes: Vec<Rc<std::cell::Cell<bool>>>,
     on_tap_down: Option<ErasedArgCallback<TapDownDetails>>,
     on_tap_up: Option<ErasedArgCallback<TapUpDetails>>,
     on_tap_cancel: Option<ErasedCallback>,
@@ -1114,32 +1154,37 @@ impl GestureDetectorWidget {
     }
 
     fn set_long_press_veto(&self, raised: bool) {
-        for veto in &self.long_press_vetoes {
+        for veto in &self.long_press.vetoes {
             veto.set(raised);
         }
     }
 
-    /// Stop tracking a fired long-press and lower its scroll veto.
+    /// Stop tracking a fired long-press and lower the scroll veto this
+    /// detector raised. A press that never fired raised nothing, so it writes
+    /// no cell.
     fn end_long_press_tracking(&mut self) {
-        self.long_press_live = false;
-        self.set_long_press_veto(false);
-        self.long_press_vetoes.clear();
+        self.long_press.live = false;
+        if std::mem::take(&mut self.long_press.raised) {
+            self.set_long_press_veto(false);
+        }
+        self.long_press.vetoes.clear();
     }
 
     /// The long-press just fired at `origin`: start reporting its follow-up
     /// callbacks and veto the enclosing scroll surfaces.
     fn begin_long_press_tracking(&mut self, origin: Point) {
         if self.long_press_follow_wired() {
-            self.long_press_live = true;
-            self.long_press_origin = origin;
+            self.long_press.live = true;
+            self.long_press.origin = origin;
             self.set_long_press_veto(true);
+            self.long_press.raised = true;
         }
     }
 
     /// Run an owed `on_long_press_cancel`. Called only from passes that carry
     /// real application state — never from the `Cancel` arm.
     fn flush_owed_long_press_cancel(&mut self, ctx: &mut EventCtx) {
-        if std::mem::take(&mut self.owed_long_press_cancel)
+        if std::mem::take(&mut self.long_press.owed_cancel)
             && let Some(cb) = self.on_long_press_cancel.as_mut()
         {
             cb(ctx);
@@ -1212,7 +1257,7 @@ impl GestureDetectorWidget {
             Recognizer::Dragging { axis, .. } => Some(axis),
             _ => None,
         };
-        let cancelled_long_press = std::mem::take(&mut self.long_press_live);
+        let cancelled_long_press = std::mem::take(&mut self.long_press.live);
         self.end_long_press_tracking();
         self.state = Recognizer::Idle;
         self.primary = None;
@@ -1261,7 +1306,7 @@ impl GestureDetectorWidget {
         }
         // A fired long-press ends with its cancel (never an end), and the
         // scroll veto lifts.
-        if self.long_press_live {
+        if self.long_press.live {
             self.end_long_press_tracking();
             if let Some(cb) = self.on_long_press_cancel.as_mut() {
                 cb(ctx);
@@ -1311,11 +1356,9 @@ impl<State: 'static> View<State> for GestureDetectorView<State> {
                 .map(erase_callback_arg),
             on_long_press_end: self.on_long_press_end.as_ref().map(erase_callback_arg),
             on_long_press_cancel: self.on_long_press_cancel.as_ref().map(erase_callback),
-            long_press_live: false,
-            long_press_origin: Point::ZERO,
+            long_press: LongPressTrack::default(),
+            window_origin: Point::ZERO,
             press_last_pos: Point::ZERO,
-            owed_long_press_cancel: false,
-            long_press_vetoes: Vec::new(),
             on_hold_progress: self.on_hold_progress.as_ref().map(erase_callback_arg),
             // `.max(1)` guards against a 0ms override: `f64::clamp` passes
             // NaN through unchanged, so an unguarded `0.0 / 0.0` divisor in
@@ -1370,6 +1413,9 @@ impl<State: 'static> View<State> for GestureDetectorView<State> {
     }
 
     fn teardown(&self, element: &mut GestureDetectorWidget, ctx: &mut BuildCtx<'_>) {
+        // A live press cannot report its end from here (no application state
+        // is in scope), but the veto it raised must not outlive it.
+        element.end_long_press_tracking();
         crate::authoring::teardown_child(&self.child, &mut element.child, ctx);
     }
 }
@@ -1382,6 +1428,7 @@ impl Widget for GestureDetectorWidget {
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
+        self.window_origin = ctx.origin();
         // Measure the long-press/hold-progress across paints (the only pass
         // with a clock). Record the press epoch on the first paint, mark
         // `elapsed` once the hold exceeds the threshold, refresh the
@@ -1515,7 +1562,7 @@ impl Widget for GestureDetectorWidget {
                     // veto cells of the surfaces forwarding this `Down`.
                     self.end_long_press_tracking();
                     if self.long_press_follow_wired() {
-                        self.long_press_vetoes = crate::scroll::ambient_scroll_vetoes();
+                        self.long_press.vetoes = crate::scroll::ambient_scroll_vetoes();
                     }
                     self.press_last_pos = p.position;
                     self.hold.cancel();
@@ -1535,10 +1582,16 @@ impl Widget for GestureDetectorWidget {
                     }
                     self.press_last_pos = p.position;
                     // A fired long-press reports every move, at any distance.
-                    if self.long_press_live && matches!(self.state, Recognizer::Fired) {
+                    if self.long_press.live && matches!(self.state, Recognizer::Fired) {
                         self.child.event_child(ctx, event);
-                        let origin = self.long_press_origin;
-                        let global = ctx.origin() + p.position.to_vec2();
+                        // A multi-contact recognizer below rewrites the shared
+                        // cell on its own events; the press holds the veto
+                        // until its own `Up` or `Cancel`.
+                        if self.long_press.raised {
+                            self.set_long_press_veto(true);
+                        }
+                        let origin = self.long_press.origin;
+                        let global = self.window_origin + p.position.to_vec2();
                         if let Some(cb) = self.on_long_press_move_update.as_mut() {
                             cb(
                                 ctx,
@@ -1747,7 +1800,7 @@ impl Widget for GestureDetectorWidget {
                     let second_tap = std::mem::take(&mut self.second_tap);
                     let inside = !outside(p.position, ctx.size());
                     let long_end =
-                        self.long_press_live || (fire_long && self.long_press_follow_wired());
+                        self.long_press.live || (fire_long && self.long_press_follow_wired());
                     self.end_long_press_tracking();
                     self.state = Recognizer::Idle;
                     self.primary = None;
@@ -1820,7 +1873,7 @@ impl Widget for GestureDetectorWidget {
                             ctx,
                             LongPressEndDetails {
                                 local_position: p.position,
-                                global_position: ctx.origin() + p.position.to_vec2(),
+                                global_position: self.window_origin + p.position.to_vec2(),
                             },
                         );
                         ctx.request_redraw();
@@ -1855,8 +1908,8 @@ impl Widget for GestureDetectorWidget {
                         frust_core::mark_pending_result_flush();
                         ctx.request_redraw();
                     }
-                    if self.long_press_live && self.on_long_press_cancel.is_some() {
-                        self.owed_long_press_cancel = true;
+                    if self.long_press.live && self.on_long_press_cancel.is_some() {
+                        self.long_press.owed_cancel = true;
                         frust_core::mark_pending_result_flush();
                         ctx.request_redraw();
                     }
@@ -4545,5 +4598,226 @@ mod tests {
         root.event(&mut log, &touch(0, Cancel, 100.0, 100.0));
         contact_frame(&mut root, logic, &mut log, 632.0);
         assert_eq!(log.events, ["long", "cancel"]);
+    }
+
+    // --- Long-press window position and scroll veto -----------------------------
+
+    #[test]
+    fn follow_up_details_report_the_window_position_under_nested_offsets() {
+        use PointerPhase::{Down, Move, Up};
+        type Nested = crate::PaddingView<PressLog>;
+        fn nested(_: &mut PressLog) -> Nested {
+            crate::Padding(
+                crate::EdgeInsets::all(20.0),
+                crate::Padding(crate::EdgeInsets::all(30.0), follow_detector(Blank)),
+            )
+        }
+        let mut root: RenderRoot<PressLog, Nested> = RenderRoot::new();
+        let mut log = PressLog::default();
+        root.rebuild(&mut { nested }, &mut log);
+        root.layout(Size::new(400.0, 400.0));
+        let frame = |root: &mut RenderRoot<PressLog, Nested>, log: &mut PressLog, ms: f64| {
+            root.rebuild(&mut { nested }, log);
+            root.paint(&mut NullScene, ft(ms));
+        };
+        frame(&mut root, &mut log, 0.0);
+        root.event(&mut log, &touch(0, Down, 100.0, 100.0));
+        for ms in [16.0, 600.0, 616.0] {
+            frame(&mut root, &mut log, ms);
+        }
+        root.event(&mut log, &touch(0, Move, 150.0, 160.0));
+        root.event(&mut log, &touch(0, Up, 160.0, 170.0));
+        assert_eq!(
+            log.events,
+            [
+                "long",
+                "move 100 110 g150 160 o50 60",
+                "end 110 120 g160 170"
+            ]
+        );
+    }
+
+    /// Records the ambient scroll veto on the `Down` and resets it on every
+    /// `Move`, as a multi-contact recognizer does on its own events.
+    struct VetoReset;
+    struct VetoResetWidget(Option<Rc<Cell<bool>>>);
+    impl<State: 'static> View<State> for VetoReset {
+        type Element = VetoResetWidget;
+        fn build(&self, _ctx: &mut BuildCtx<'_>) -> VetoResetWidget {
+            VetoResetWidget(None)
+        }
+        fn rebuild(
+            &self,
+            _prev: &Self,
+            _element: &mut VetoResetWidget,
+            _ctx: &mut BuildCtx<'_>,
+        ) -> ChangeFlags {
+            ChangeFlags::NONE
+        }
+    }
+    impl Widget for VetoResetWidget {
+        fn layout(&mut self, _ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
+            bc.max()
+        }
+        fn paint(&mut self, _ctx: &mut PaintCtx, _scene: &mut dyn PaintScene) {}
+        fn event(&mut self, _ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
+            if let InputEvent::PointerContact { event: p, .. } = event {
+                match p.phase {
+                    PointerPhase::Down => self.0 = crate::scroll::ambient_scroll_veto(),
+                    PointerPhase::Move => {
+                        if let Some(cell) = &self.0 {
+                            cell.set(false);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            EventResult::Handled
+        }
+    }
+
+    fn veto_logic(_: &mut PressLog) -> PressView {
+        follow_detector(Blank)
+    }
+
+    fn veto_reset_logic(_: &mut PressLog) -> PressView {
+        GestureDetector::<PressLog, _>(VetoReset)
+            .on_long_press_move_update(|s: &mut PressLog, _| s.events.push("move".into()))
+    }
+
+    fn pinch_follow_logic(_: &mut PressLog) -> PressView {
+        GestureDetector::<PressLog, _>(
+            crate::pinch::pinch_detector(Blank)
+                .on_scale(|_: &mut PressLog, _: frust_core::event::ScaleEvent| {}),
+        )
+        .on_long_press_end(|s: &mut PressLog, _| s.events.push("end".into()))
+        .on_long_press_cancel(|s: &mut PressLog| s.events.push("cancel".into()))
+    }
+
+    /// Press at (100, 100) inside a scroll surface whose veto is `cell`, then
+    /// run the frames that fire the long-press.
+    fn fire_under_veto(
+        logic: fn(&mut PressLog) -> PressView,
+        cell: &Rc<Cell<bool>>,
+    ) -> (RenderRoot<PressLog, PressView>, PressLog) {
+        let mut root = contact_root(logic);
+        let mut log = PressLog::default();
+        contact_frame(&mut root, logic, &mut log, 0.0);
+        crate::scroll::with_scroll_veto(cell, || {
+            root.event(&mut log, &touch(0, PointerPhase::Down, 100.0, 100.0))
+        });
+        for ms in [16.0, 600.0, 616.0] {
+            contact_frame(&mut root, logic, &mut log, ms);
+        }
+        (root, log)
+    }
+
+    #[test]
+    fn the_veto_is_raised_at_the_fire_and_lowered_after_up() {
+        let cell = Rc::new(Cell::new(false));
+        let logic = veto_logic;
+        let (mut root, mut log) = fire_under_veto(logic, &cell);
+        assert!(cell.get(), "raised once the long-press fired");
+        root.event(&mut log, &touch(0, PointerPhase::Up, 100.0, 100.0));
+        assert!(!cell.get(), "lowered by the press's own Up");
+    }
+
+    #[test]
+    fn the_veto_is_lowered_after_cancel() {
+        let cell = Rc::new(Cell::new(false));
+        let (mut root, mut log) = fire_under_veto(veto_logic, &cell);
+        assert!(cell.get());
+        root.event(&mut log, &touch(0, PointerPhase::Cancel, 100.0, 100.0));
+        assert!(!cell.get(), "lowered by the press's own Cancel");
+    }
+
+    #[test]
+    fn the_veto_is_lowered_once_a_second_contact_has_come_and_gone() {
+        use PointerPhase::{Down, Up};
+        let cell = Rc::new(Cell::new(false));
+        let (mut root, mut log) = fire_under_veto(pinch_follow_logic, &cell);
+        assert!(cell.get());
+        root.event(&mut log, &touch(1, Down, 120.0, 100.0));
+        root.event(&mut log, &touch(1, Up, 120.0, 100.0));
+        root.event(&mut log, &touch(0, Up, 100.0, 100.0));
+        assert_eq!(log.events, ["cancel"]);
+        assert!(!cell.get());
+    }
+
+    #[test]
+    fn a_press_that_never_fires_leaves_a_raised_veto_untouched() {
+        let cell = Rc::new(Cell::new(true));
+        let logic = veto_logic;
+        let mut root = contact_root(logic);
+        let mut log = PressLog::default();
+        contact_frame(&mut root, logic, &mut log, 0.0);
+        crate::scroll::with_scroll_veto(&cell, || {
+            root.event(&mut log, &touch(0, PointerPhase::Down, 100.0, 100.0))
+        });
+        root.event(&mut log, &touch(0, PointerPhase::Up, 100.0, 100.0));
+        assert!(cell.get(), "an early Up writes no cell");
+        crate::scroll::with_scroll_veto(&cell, || {
+            root.event(&mut log, &touch(0, PointerPhase::Down, 100.0, 100.0))
+        });
+        root.event(&mut log, &touch(0, PointerPhase::Cancel, 100.0, 100.0));
+        assert!(cell.get(), "an early Cancel writes no cell");
+    }
+
+    #[test]
+    fn a_detector_torn_down_mid_press_leaves_no_veto_raised() {
+        let cell = Rc::new(Cell::new(false));
+        let view = follow_detector(Blank);
+        let mut counter = 0u64;
+        let mut w: GestureDetectorWidget =
+            View::<PressLog>::build(&view, &mut BuildCtx::new(&mut counter));
+        let mut log = PressLog::default();
+        let state_any: &mut dyn Any = &mut log;
+        let mut ctx = EventCtx::new(state_any, Point::ZERO, Size::new(100.0, 100.0));
+        crate::scroll::with_scroll_veto(&cell, || {
+            w.event(&mut ctx, &ev(PointerPhase::Down, 10.0, 10.0));
+        });
+        w.begin_long_press_tracking(Point::new(10.0, 10.0));
+        assert!(cell.get());
+        View::<PressLog>::teardown(&view, &mut w, &mut BuildCtx::new(&mut counter));
+        assert!(!cell.get(), "teardown lowers the veto the press raised");
+        assert!(
+            log.events.is_empty(),
+            "teardown delivers no terminal callback"
+        );
+    }
+
+    #[test]
+    fn the_veto_survives_a_recognizer_that_resets_it_between_moves() {
+        use PointerPhase::{Move, Up};
+        let cell = Rc::new(Cell::new(false));
+        let (mut root, mut log) = fire_under_veto(veto_reset_logic, &cell);
+        assert!(cell.get());
+        for x in [105.0, 110.0, 115.0] {
+            root.event(&mut log, &touch(0, Move, x, 100.0));
+            assert!(
+                cell.get(),
+                "the scroll surface sees the veto at the next Move"
+            );
+        }
+        root.event(&mut log, &touch(0, Up, 115.0, 100.0));
+        assert!(!cell.get());
+    }
+
+    #[test]
+    fn a_fired_long_press_with_a_follow_up_callback_does_not_fall_back_to_tap() {
+        fn logic(_: &mut PressLog) -> PressView {
+            GestureDetector::<PressLog, _>(Blank)
+                .on_tap(|s: &mut PressLog| s.events.push("tap".into()))
+                .on_long_press_end(|s: &mut PressLog, _| s.events.push("end".into()))
+        }
+        let mut root = contact_root(logic);
+        let mut log = PressLog::default();
+        contact_frame(&mut root, logic, &mut log, 0.0);
+        root.event(&mut log, &touch(0, PointerPhase::Down, 100.0, 100.0));
+        for ms in [16.0, 600.0, 616.0] {
+            contact_frame(&mut root, logic, &mut log, ms);
+        }
+        root.event(&mut log, &touch(0, PointerPhase::Up, 100.0, 100.0));
+        assert_eq!(log.events, ["end"], "no on_tap after the fired long-press");
     }
 }

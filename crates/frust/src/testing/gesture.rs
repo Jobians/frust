@@ -904,4 +904,54 @@ mod tests {
         assert_eq!(tester.state().events, ["long"]);
         assert!(controller.offset() > 0.0, "the scroll view took the drag");
     }
+
+    #[test]
+    fn a_long_press_in_a_scrolled_view_reports_the_window_position_it_was_sent() {
+        #[derive(Default)]
+        struct Globals {
+            moves: Vec<Point>,
+            end: Option<Point>,
+        }
+        let controller = ScrollController::new();
+        let ctl = controller.clone();
+        let mut tester = Tester::new(
+            Globals::default(),
+            move |_: &mut Globals| {
+                let detector = crate::GestureDetector(pad(200.0))
+                    .on_long_press_move_update(|s: &mut Globals, d: LongPressMoveDetails| {
+                        s.moves.push(d.global_position)
+                    })
+                    .on_long_press_end(|s: &mut Globals, d: LongPressEndDetails| {
+                        s.end = Some(d.global_position)
+                    });
+                scroll_view(
+                    crate::column()
+                        .child(pad(200.0))
+                        .child(detector)
+                        .child(pad(200.0)),
+                )
+                .controller(ctl.clone())
+            },
+            SIZE,
+        );
+        controller.jump_to(120.0);
+        tester.pump(FRAME);
+        assert_eq!(controller.offset(), 120.0);
+        // The detector sits at window y = 200 - 120 = 80.
+        let mut gesture = tester.start_gesture(Point::new(60.0, 100.0));
+        let threshold = Duration::from_millis(LONG_PRESS_MS) + FRAME;
+        let start = tester.frame_time();
+        while tester.frame_time().saturating_sub(start) < threshold {
+            tester.pump(FRAME);
+        }
+        tester.pump(FRAME);
+        tester.move_to(&mut gesture, Point::new(70.0, 150.0));
+        tester.move_to(&mut gesture, Point::new(90.0, 170.0));
+        tester.up(gesture);
+        assert_eq!(
+            tester.state().moves,
+            [Point::new(70.0, 150.0), Point::new(90.0, 170.0)]
+        );
+        assert_eq!(tester.state().end, Some(Point::new(90.0, 170.0)));
+    }
 }
