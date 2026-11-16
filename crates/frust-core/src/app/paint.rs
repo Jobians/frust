@@ -126,9 +126,10 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         }
         self.focus_handles = bound;
         self.handles_synced = None;
-        self.focus_handles
-            .iter()
-            .any(|bound| bound.handle.has_pending())
+        for bound in &self.focus_handles {
+            bound.handle.note_painted();
+        }
+        self.focus_request_waiting()
     }
 
     /// Diff this paint's focus-return scopes, the widget registrations then every trapping overlay

@@ -3,25 +3,23 @@
 //! handle is attached); the last call wins. A focusable widget binds the handle every paint with
 //! [`PaintCtx::bind_focus_handle`](crate::widget::PaintCtx::bind_focus_handle); the root takes
 //! the stop from the pod that painted it. An unbound handle is inert and keeps its request.
-//! After a paint that leaves a bound handle with a request, and after any app call that records
-//! one, the root grants the stop focus at the next rebuild or end of an event pass (the points a
-//! focus return runs at) and asks for the frame to get there. The grant is one traversal pass: a
-//! stop the walk does not reach (outside a trapping modal, disabled) refuses it and the request
-//! is dropped, never retried. It clears the keyboard flag, replaces another stop's live session
-//! as a structural release, and beats an owed focus return. `release` ends the session only if
-//! its stop holds it. [`FocusHandle::is_focused`] follows the session however it changed.
+//! The root grants a request at the next rebuild or end of an event pass (where a focus return
+//! runs) and asks for the frame to get there. The grant is one traversal pass: a stop the walk
+//! does not reach (outside a trapping modal, disabled) refuses it. A request made in an event
+//! handler is judged against the tree its state produces: the pass end keeps it while the stop
+//! is out of reach, and it is dropped if still out of reach at the first rebuild after a paint.
+//! Any other request is dropped at once. A grant clears the keyboard flag, replaces another
+//! stop's live session as a structural release, and beats an owed focus return. `release` ends
+//! the session only if its stop holds it. [`FocusHandle::is_focused`] follows the session.
 //! Focus-keeping: [`EventCtx::keep_focus`](crate::event::EventCtx::keep_focus) on a pointer
-//! `Down` arms no blur and makes the root ignore any `request_focus` on that press path, so the
-//! live holder and its IME state stay as they were. Call it before forwarding the press; it does
-//! nothing without a live session. Notification: when a bound handle's state differs from the
-//! one the root last saw, the root records the stop and raises `mark_pending_result_flush`. The
-//! next rebuild's housekeeping broadcast then reports
-//! [`EventCtx::focus_changed`](crate::event::EventCtx::focus_changed) to that stop's widget, with
-//! `has_focus()` read from the live session and `&mut State` in scope, for an app callback. A
-//! widget compares with the value it last reported: its own pass's changes are announced too.
-//! A handle's stop holds the session only when it is the holder itself, not an ancestor of it.
-//! The notice needs every ancestor to forward the broadcast; a handle bound from a pod that is no
-//! traversal stop makes its requests no-ops.
+//! `Down` arms no blur and makes the root ignore any `request_focus` on that press path; call it
+//! before forwarding the press. Notification: when a bound handle's state differs from the
+//! one the root last saw, the next rebuild's housekeeping broadcast reports
+//! [`EventCtx::focus_changed`](crate::event::EventCtx::focus_changed) to that stop's widget,
+//! with `has_focus()` read from the live session and `&mut State` in scope. The notice needs
+//! every ancestor to forward the broadcast, and a floated surface's owner to forward it inward
+//! while [`EventCtx::focus_notice_open`](crate::event::EventCtx::focus_notice_open). A handle's
+//! stop holds the session only when it is the holder itself, not an ancestor of it.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -36,15 +34,33 @@ pub(crate) enum Intent {
     Release,
 }
 
+/// How far a request made in an event pass has got toward its final judgement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Deferral {
+    /// Not deferred: an unreachable stop drops the request at a rebuild.
+    #[default]
+    Fresh,
+    /// The stop was out of reach at an event pass end; no paint has followed.
+    Awaiting,
+    /// A paint followed the deferral; the next unreachable verdict drops the request.
+    Painted,
+}
+
 #[derive(Debug, Default)]
 struct HandleState {
     intent: Cell<Intent>,
+    deferral: Cell<Deferral>,
     focused: Cell<bool>,
     /// The `focused` value last compared; a difference owes a notification.
     seen: Cell<bool>,
 }
 
 /// A shared token for taking, releasing and observing one control's focus (see the module docs).
+///
+/// One handle addresses one field in one root. A request on a handle that is never bound stays
+/// pending until a field binds it, so release it when it is no longer wanted. A focus callback
+/// must not unconditionally request focus on another handle. The root processes handles in bind
+/// order, so a later grant can replace an earlier one in the same pass.
 #[derive(Clone, Debug, Default)]
 pub struct FocusHandle(Rc<HandleState>);
 
@@ -56,12 +72,14 @@ impl FocusHandle {
     /// Ask for focus on the bound control; applied at the root's next rebuild or event pass end.
     pub fn request(&self) {
         self.0.intent.set(Intent::Request);
+        self.0.deferral.set(Deferral::Fresh);
         crate::event::mark_pending_result_flush();
     }
 
     /// Ask to give focus up, honoured only if the bound control holds the live session.
     pub fn release(&self) {
         self.0.intent.set(Intent::Release);
+        self.0.deferral.set(Deferral::Fresh);
         crate::event::mark_pending_result_flush();
     }
 
@@ -71,7 +89,26 @@ impl FocusHandle {
     }
 
     pub(crate) fn take_intent(&self) -> Intent {
+        self.0.deferral.set(Deferral::Fresh);
         self.0.intent.replace(Intent::None)
+    }
+
+    pub(crate) fn deferral(&self) -> Deferral {
+        self.0.deferral.get()
+    }
+
+    /// Keep the pending intent past an event pass end whose walk did not reach the stop.
+    pub(crate) fn defer(&self) {
+        if self.0.deferral.get() == Deferral::Fresh {
+            self.0.deferral.set(Deferral::Awaiting);
+        }
+    }
+
+    /// A paint ran with the intent still pending.
+    pub(crate) fn note_painted(&self) {
+        if self.0.deferral.get() == Deferral::Awaiting {
+            self.0.deferral.set(Deferral::Painted);
+        }
     }
 
     pub(crate) fn has_pending(&self) -> bool {
@@ -108,8 +145,16 @@ thread_local! {
     static BIND_PASS_OPEN: Cell<bool> = const { Cell::new(false) };
     /// The stops named by the open notification broadcast.
     static NOTICE: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-    /// `0` no armed press, `1` a pointer `Down` with a live session, `2` that press kept focus.
-    static PRESS: Cell<u8> = const { Cell::new(0) };
+    static PRESS: Cell<Press> = const { Cell::new(Press::Idle) };
+}
+
+/// The keep-focus state of the pointer `Down` being dispatched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Press {
+    Idle,
+    /// A pointer `Down` with a live session: a keep may land.
+    Armed,
+    Kept,
 }
 
 pub(crate) struct FocusBindPass(PassBracket<Vec<Binding>>);
@@ -194,25 +239,43 @@ pub(crate) fn notice_names(stop: u64) -> bool {
     NOTICE.with(|slot| slot.borrow().contains(&stop))
 }
 
-pub(crate) fn open_press(armed: bool) {
-    PRESS.with(|state| state.set(u8::from(armed)));
+/// Brackets one root dispatch's press state; dropping it disarms the press.
+pub(crate) struct PressPass(());
+
+impl PressPass {
+    pub(crate) fn open(armed: bool) -> Self {
+        PRESS.with(|state| state.set(if armed { Press::Armed } else { Press::Idle }));
+        PressPass(())
+    }
+
+    /// Whether the press kept focus, read before the guard drops.
+    pub(crate) fn kept(&self) -> bool {
+        press_kept()
+    }
+}
+
+impl Drop for PressPass {
+    fn drop(&mut self) {
+        PRESS.with(|state| state.set(Press::Idle));
+    }
 }
 
 /// Behind `EventCtx::keep_focus`.
 pub(crate) fn note_keep_focus() {
     PRESS.with(|state| {
-        if state.get() == 1 {
-            state.set(2);
+        if state.get() == Press::Armed {
+            state.set(Press::Kept);
         }
     });
 }
 
 pub(crate) fn press_kept() -> bool {
-    PRESS.with(|state| state.get() == 2)
+    PRESS.with(|state| state.get() == Press::Kept)
 }
 
-pub(crate) fn close_press() -> bool {
-    PRESS.with(|state| state.replace(0) == 2)
+/// Whether a deferred focus notice is open (see `FocusNoticePass`).
+pub(crate) fn notice_open() -> bool {
+    NOTICE.with(|slot| !slot.borrow().is_empty())
 }
 
 #[cfg(test)]
@@ -250,14 +313,16 @@ mod tests {
 
     #[test]
     fn a_press_keeps_focus_only_when_armed() {
-        open_press(false);
+        {
+            let press = PressPass::open(false);
+            note_keep_focus();
+            assert!(!press.kept());
+        }
+        let press = PressPass::open(true);
+        assert!(!press.kept());
         note_keep_focus();
-        assert!(!close_press());
-        open_press(true);
-        assert!(!press_kept());
-        note_keep_focus();
-        assert!(press_kept());
-        assert!(close_press());
-        assert!(!press_kept());
+        assert!(press.kept());
+        drop(press);
+        assert!(!press_kept(), "dropping the guard disarms the press");
     }
 }

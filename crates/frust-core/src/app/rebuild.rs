@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use kurbo::Rect;
 
-use super::{MAX_PENDING_RESULT_FLUSH_PASSES, RenderRoot};
+use super::{FocusRun, MAX_PENDING_RESULT_FLUSH_PASSES, RenderRoot};
 use crate::event::InputEvent;
 use crate::focus_handle::FocusNoticePass;
 use crate::tree::{InspectNode, WidgetPod, WidgetTree};
@@ -135,8 +135,13 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
 
         // After the diff, the broadcasts and the orphan release: a popped page routes input again.
         // An explicit handle request wins over an owed return (`crate::focus_handle`).
-        if self.run_focus_handles(state) || self.run_focus_return(state) {
+        if self.run_focus_handles(state, FocusRun::Rebuild) || self.run_focus_return(state) {
             flags |= ChangeFlags::PAINT;
+        }
+        // A request kept until a paint has followed needs that frame, then the next rebuild.
+        if self.focus_request_waiting() {
+            flags |= ChangeFlags::PAINT;
+            self.deferred_frame = true;
         }
         // A change this rebuild made owes its widget a broadcast on the next frame.
         if self.refresh_focus_handles() {

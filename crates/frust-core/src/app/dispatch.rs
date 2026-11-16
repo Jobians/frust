@@ -7,13 +7,13 @@ use std::rc::Weak;
 
 use kurbo::Point;
 
-use super::{OverlayRoute, RenderRoot, advance_focus_epoch_past};
+use super::{FocusRun, OverlayRoute, RenderRoot, advance_focus_epoch_past};
 use crate::event::{
     ContactFrame, ContactPass, EventCtx, EventOutcome, EventResult, FileDropEvent, FileDropPhase,
     ImeState, InputEvent, Key, KeyEvent, Modifiers, NamedKey, OverlayEvent, OverlayEventKind,
     PointerButton, PointerId, PointerPhase, PointerSource, RequestPass,
 };
-use crate::focus_handle::Intent;
+use crate::focus_handle::{Deferral, Intent, PressPass};
 use crate::focus_scope::FocusTarget;
 use crate::input::{MOUSE_SLOP, TOUCH_SLOP};
 use crate::overlay::{OutsideTap, OverlayHit, OverlayInput, OverlayKey, OverlayPod};
@@ -174,7 +174,11 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         // reaches the restored control; nested deliveries call `dispatch_pass`, never this.
         if !matches!(event, InputEvent::Housekeeping) {
             // An explicit handle request wins over an owed return (`crate::focus_handle`).
-            if self.run_focus_handles(state) || self.run_focus_return(state) {
+            if self.run_focus_handles(state, FocusRun::EventEnd) || self.run_focus_return(state) {
+                outcome.needs_redraw = true;
+            }
+            // A request kept for the rebuild needs that frame.
+            if self.focus_request_waiting() {
                 outcome.needs_redraw = true;
             }
             if self.refresh_focus_handles() {
@@ -340,7 +344,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         // The claimant pod this dispatch records, if any (see `hover_link`).
         crate::widget::clear_hover_claimant();
         crate::widget::clear_focus_req_from_live();
-        crate::focus_handle::open_press(frame.press_down && frame.focus_active_before);
+        let press = PressPass::open(frame.press_down && frame.focus_active_before);
         let state_any: &mut dyn Any = state;
         let mut ctx = EventCtx::new(state_any, pod.origin(), pod.size());
         // Seed the root widget's focus and hover state; deeper pods thread their own.
@@ -374,7 +378,8 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             pod.widget_mut().event(&mut ctx, event)
         };
         let root_opted_in = contact_frame.close().0;
-        let kept_focus = crate::focus_handle::close_press();
+        let kept_focus = press.kept();
+        drop(press);
         let handled = matches!(result, EventResult::Handled);
         // Fold every dirtying channel into `LAYOUT` (mirror of `paint_main_tree`'s
         // fold); the root sits in no pod, so its own consumption counts too.
@@ -849,31 +854,38 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         }
     }
 
-    /// Honour the intents the bound focus handles recorded (`crate::focus_handle`), each at most
-    /// once: a request grants its stop focus through one grant pass, replacing a live session
-    /// held elsewhere, and is dropped when the walk does not reach the stop; a release ends the
-    /// session only if its stop holds it. A grant clears the keyboard flag and discards a focus
-    /// return owed in the same pass. Returns whether focus moved or ended.
-    pub(super) fn run_focus_handles(&mut self, state: &mut State) -> bool {
-        if !self
-            .focus_handles
-            .iter()
-            .any(|bound| bound.handle.has_pending())
-        {
+    /// Honour the intents the bound focus handles recorded (`crate::focus_handle`): a request
+    /// grants its stop focus through one grant pass, replacing a live session held elsewhere; a
+    /// release ends the session only if its stop holds it. A grant clears the keyboard flag and
+    /// discards a focus return owed in the same pass. A stop the walk does not reach keeps its
+    /// intent at an event pass end and when it was deferred there, until a paint has followed;
+    /// otherwise the intent is dropped. Returns whether focus moved or ended.
+    pub(super) fn run_focus_handles(&mut self, state: &mut State, run: FocusRun) -> bool {
+        if !self.focus_request_waiting() {
             return false;
         }
         let mut moved = false;
         for index in 0..self.focus_handles.len() {
             let handle = self.focus_handles[index].handle.clone();
             let stop_id = self.focus_handles[index].stop;
-            let intent = handle.take_intent();
-            if intent == Intent::None {
+            if !handle.has_pending() {
                 continue;
             }
             let stops = self.focus_stops();
             let Some(stop) = stops.iter().find(|stop| stop.id == stop_id) else {
+                let keep = match (run, handle.deferral()) {
+                    (_, Deferral::Painted) => false,
+                    (FocusRun::EventEnd, _) | (FocusRun::Rebuild, Deferral::Awaiting) => true,
+                    (FocusRun::Rebuild, Deferral::Fresh) => false,
+                };
+                if keep {
+                    handle.defer();
+                } else {
+                    handle.take_intent();
+                }
                 continue;
             };
+            let intent = handle.take_intent();
             let holds = self.focus_active && stop.holder;
             match intent {
                 Intent::Request if !holds && self.grant_focus(state, stop) => {
@@ -893,6 +905,13 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             let _ = self.focus_returns.take_pending();
         }
         moved
+    }
+
+    /// Whether a bound handle still holds an intent: one the next rebuild must judge.
+    pub(super) fn focus_request_waiting(&self) -> bool {
+        self.focus_handles
+            .iter()
+            .any(|bound| bound.handle.has_pending())
     }
 
     /// Refresh every bound handle's `is_focused` when the session or the surfaces moved since the

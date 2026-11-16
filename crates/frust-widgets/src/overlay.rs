@@ -978,6 +978,12 @@ impl<PodState: 'static> OverlaySlot<PodState> {
             event if event.is_focus_routed() && self.pod_has_focus() => {
                 Some(self.forward(ctx, event, substitute))
             }
+            // A deferred focus notice may name a stop inside the surface; only then does the
+            // broadcast walk it. The owner's own tree still gets it, so nothing is claimed.
+            InputEvent::Housekeeping if ctx.focus_notice_open() => {
+                self.forward(ctx, event, substitute);
+                None
+            }
             _ => None,
         }
     }

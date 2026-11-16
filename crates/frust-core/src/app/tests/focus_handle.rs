@@ -27,6 +27,14 @@ struct Log {
     claim: HashSet<&'static str>,
     /// Button name to the handle it requests on a press.
     asks: HashMap<&'static str, &'static str>,
+    /// Button name to the modal its press closes.
+    closes: HashMap<&'static str, &'static str>,
+    /// Button name to the field its press enables at the next rebuild.
+    enables: HashMap<&'static str, &'static str>,
+    /// Fields that are no traversal stop.
+    disabled: HashSet<&'static str>,
+    /// Fields the next rebuild enables.
+    enabling: Vec<&'static str>,
     /// `(widget, has_focus)` for each deferred focus-change delivery.
     notices: Vec<(&'static str, bool)>,
 }
@@ -83,7 +91,7 @@ impl Widget for Field {
         }
     }
     fn is_focusable(&self) -> bool {
-        true
+        !self.log.borrow().disabled.contains(self.name)
     }
 }
 
@@ -150,6 +158,18 @@ impl Widget for Button {
                 }
                 if let Some(handle) = log.asks.get(self.name).and_then(|n| log.handles.get(n)) {
                     handle.request();
+                }
+                let (closes, enables) = (
+                    log.closes.get(self.name).copied(),
+                    log.enables.get(self.name).copied(),
+                );
+                drop(log);
+                let mut log = self.log.borrow_mut();
+                if let Some(name) = closes {
+                    log.open.remove(name);
+                }
+                if let Some(name) = enables {
+                    log.enabling.push(name);
                 }
                 EventResult::Handled
             }
@@ -311,6 +331,10 @@ impl Widget for ModalHost {
             event if event.is_focus_routed() && pod.holds_live_focus() => {
                 pod.event_child(ctx, event)
             }
+            InputEvent::Housekeeping if ctx.focus_notice_open() => {
+                pod.event_child(ctx, event);
+                EventResult::Ignored
+            }
             _ => EventResult::Ignored,
         }
     }
@@ -320,6 +344,10 @@ fn modal(name: &'static str, fields: &[&'static str], log: &Shared) -> ChildPod 
     let column = Column {
         children: fields.iter().map(|name| field(name, log)).collect(),
     };
+    modal_of(name, column, log)
+}
+
+fn modal_of(name: &'static str, column: Column, log: &Shared) -> ChildPod {
     ChildPod::new(Box::new(ModalHost {
         name,
         key: OverlayKey::next(),
@@ -339,8 +367,13 @@ impl View<()> for TreeView {
         (self.make)(&self.log)
     }
     fn rebuild(&self, _prev: &Self, element: &mut Column, _ctx: &mut BuildCtx<'_>) -> ChangeFlags {
-        let log = self.log.borrow();
+        let mut log = self.log.borrow_mut();
         let mut flags = ChangeFlags::NONE;
+        let enabling = std::mem::take(&mut log.enabling);
+        if !enabling.is_empty() {
+            log.disabled.retain(|name| !enabling.contains(name));
+            flags = ChangeFlags::LAYOUT | ChangeFlags::PAINT;
+        }
         let before = element.children.len();
         element.children.retain(|pod| {
             !pod.debug_label()
@@ -513,6 +546,16 @@ fn field_and_modal(log: &Shared) -> Column {
         field("b", log),
         modal("m", &["m1"], log),
     ])
+}
+
+/// Fields `a` and `b`, then buttons, and a modal `m` holding a button `closer`.
+fn field_and_closer_modal(log: &Shared) -> Column {
+    let mut children = two_fields(log).children;
+    let closer = Column {
+        children: vec![button("closer", log)],
+    };
+    children.push(modal_of("m", closer, log));
+    column(children)
 }
 
 fn nested(log: &Shared) -> Column {
@@ -736,24 +779,78 @@ fn a_press_that_does_not_keep_focus_still_blurs_at_up() {
 #[test]
 fn an_explicit_request_wins_over_an_owed_focus_return() {
     let log = log_with_handles(&["b"]);
-    let mut h = Harness::with_log(log, field_and_modal);
+    log.borrow_mut().asks.insert("closer", "b");
+    log.borrow_mut().closes.insert("closer", "m");
+    let mut h = Harness::with_log(log, field_and_closer_modal);
     h.tap(5.0, row(0));
     assert_eq!(h.focused(), Some("a"));
     h.open("m");
     assert!(!h.root.is_focus_active(), "the trap ended the session");
 
-    h.log.borrow_mut().open.remove("m");
-    h.frame();
+    // One handler closes the modal that owes a return to `a` and asks for `b`.
+    h.tap(MODAL_RECT.x0 + 5.0, MODAL_RECT.y0 + 10.0);
+    assert!(h.handle("b").is_focused());
+    assert_eq!(h.focused(), Some("b"), "the return to a never ran");
+}
+
+#[test]
+fn a_request_for_a_stop_a_rebuild_enables_is_granted_after_that_rebuild() {
+    let log = log_with_handles(&["b"]);
+    log.borrow_mut().asks.insert("asker", "b");
+    log.borrow_mut().enables.insert("asker", "b");
+    log.borrow_mut().disabled.insert("b");
+    let mut h = Harness::with_log(log, two_fields);
+
+    h.send(&pointer(PointerPhase::Down, 5.0, row(3)));
+    assert!(
+        h.handle("b").is_focused(),
+        "judged against the rebuilt tree"
+    );
+    assert_eq!(h.focused(), Some("b"));
+}
+
+#[test]
+fn a_request_for_a_stop_that_stays_unreachable_is_dropped_and_never_applied_later() {
+    let log = log_with_handles(&["a"]);
+    log.borrow_mut().asks.insert("closer", "a");
+    let mut h = Harness::with_log(log, field_and_closer_modal);
+    h.open("m");
+
+    h.tap(MODAL_RECT.x0 + 5.0, MODAL_RECT.y0 + 10.0);
     assert!(
         !h.root.is_focus_active(),
-        "the return to a is owed, not run"
+        "the trap refuses a field behind it"
     );
-    h.handle("b").request();
-    h.rebuild();
-    assert!(h.handle("b").is_focused());
+    assert!(
+        !h.handle("a").has_pending(),
+        "judged after the rebuild and paint"
+    );
+
+    h.log.borrow_mut().open.remove("m");
     h.asked = true;
     h.pump();
-    assert_eq!(h.focused(), Some("b"), "the return to a never ran");
+    assert!(
+        !h.root.is_focus_active(),
+        "the dropped request did not wait"
+    );
+    assert!(!h.handle("a").is_focused());
+}
+
+#[test]
+fn a_floated_stop_gets_the_notice_on_a_grant_and_on_a_structural_end() {
+    let log = log_with_handles(&["m1"]);
+    let mut h = Harness::with_log(log, field_and_modal);
+    h.open("m");
+    h.notices();
+
+    h.handle("m1").request();
+    h.pump();
+    assert_eq!(h.focused(), Some("m1"));
+    assert_eq!(h.notices(), vec![("m1", true)]);
+
+    h.send(&key(NamedKey::Escape));
+    assert!(!h.handle("m1").is_focused());
+    assert_eq!(h.notices(), vec![("m1", false)]);
 }
 
 #[test]

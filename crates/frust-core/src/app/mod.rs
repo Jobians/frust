@@ -60,6 +60,13 @@ fn advance_focus_epoch_past(epoch: u64, burned: u64) -> u64 {
     advance_focus_epoch(epoch.max(burned))
 }
 
+/// Where `run_focus_handles` runs: the end of an event pass, or a rebuild.
+#[derive(Clone, Copy)]
+enum FocusRun {
+    EventEnd,
+    Rebuild,
+}
+
 /// What [`RenderRoot::event`]'s overlay pre-pass decided about one incoming event.
 enum OverlayRoute {
     /// The overlay layer consumed the event; return this outcome unchanged.
