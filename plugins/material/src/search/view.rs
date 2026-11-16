@@ -1094,7 +1094,12 @@ mod tests {
             .expect("the docked panel paints its own container");
         assert_eq!(panel.3, theme.scheme().surface_container_high);
         assert_eq!(panel.2.top_left, theme.shape.extra_large);
-        assert!(!rec.clips.is_empty(), "…and clips its content to it");
+        // The search field clips its own text in both modes, so look for the
+        // panel's clip by its rect.
+        assert!(
+            rec.clips.contains(&(panel.0, panel.1)),
+            "…and clips its content to it"
+        );
 
         let full: SearchViewContentView<()> = content(SearchViewMode::FullScreen, None, "");
         let mut w = build_content(&full);
@@ -1103,7 +1108,7 @@ mod tests {
         let mut pctx = PaintCtx::for_test(Point::ZERO, size, ft(0)).with_theme(&theme);
         w.paint(&mut pctx, &mut rec);
         assert!(
-            rec.clips.is_empty(),
+            !rec.clips.contains(&(Point::ZERO, size)),
             "the modal host already clipped the full-screen panel"
         );
     }
