@@ -51,7 +51,7 @@ surface-loss transition is legal.
 over a real `RenderRoot`: it owns the view state and a manual clock, so a test drives gestures and
 frames without a window or GPU. It is the T1 tool for "does this tap/drag/long-press do the right
 thing". Build one with `Tester::new(state, build, size)`, `with_options` (`TesterOptions`: theme,
-scale, insets, start time), or `new_with(size, &options, setup)`, whose `setup` closure runs inside
+scale, insets, start time, `allow_refused_frames`), or `new_with(size, &options, setup)`, whose `setup` closure runs inside
 the Tester's owner so signals and contexts it creates belong to that Tester.
 
 | Flutter | Tester |
@@ -93,6 +93,13 @@ the Tester's owner so signals and contexts it creates belong to that Tester.
   `Finder` or a `NodeId` is accepted by `perform_action` (the root honours Click and Focus) and as a
   gesture `Target`; `set_metrics` / `resize` support rotation tests; `scene`, `semantics`,
   `inspect`, `send` expose the raw surfaces.
+- A frame the engine would refuse fails the test. Every frame the Tester paints (`new`, `pump`, `scene`) is checked with
+  `frust_render::validate_scene` at the extent a shell hands the renderer, the logical size times the scale: the target size,
+  non-finite transforms and geometry, and the per-frame backdrop-blur cap (a process-wide limit, not per Tester). A refusal
+  panics at the call that painted the frame, naming the frame and the engine's error, which names the command. A test that
+  produces one on purpose sets `TesterOptions::allow_refused_frames(true)`; the frames are then kept in
+  `Tester::refused_frames()` as `RefusedFrame { frame, error }`, the construction frame being `0`. What only a renderer can
+  know (GPU failures, retained pages) is not checked here.
 - Ownership: each Tester owns a child `Owner` of the ambient owner (if the test set one) or of the
   runtime root, and disposes its signals and contexts on drop. There is no process-wide lock, so
   Tester tests run in parallel like any other; construct and pump a Tester on one thread.
@@ -107,7 +114,7 @@ the Tester's owner so signals and contexts it creates belong to that Tester.
   slivers, pan/zoom, the navigator) bounds what is visible: a run it hides entirely is `hidden` and
   never an overflow, so a tall scrolled screen passes; a run it hides in part is `clipped` and is
   still judged on its own flags and on the containment of its visible part. A clip pushed by any
-  other widget is not consulted, and `TextInput` contents are not covered
+  other widget is not consulted, and `TextInput` reports its clip but its own text runs are not listed
   (`testing-text-runs-engine-clips` in [LIMITATIONS.md](LIMITATIONS.md)).
 
 Run: `cargo test -p frust-ui --features test-support --lib`.
@@ -139,8 +146,30 @@ follows.
 
 An integration test file that uses `frust::testing` must start with `#![cfg(feature =
 "test-support")]` and be run with `--features test-support`; without the feature the module does
-not exist. Under `test-support` a lifecycle or memory-pressure push reaches only the listeners created on the pushing thread, so parallel tests do not see each other's pushes. `tester.semantics().focus_id()` reports focus only for widgets that publish it
+not exist. Under `test-support` a lifecycle or memory-pressure push reaches only the listeners created on the pushing thread, so parallel tests do not see each other's pushes. The same holds for a Back press: `push_back_press` and the
+handles-back flag are per thread for the whole build, so a press reaches only the Testers on the pushing thread (two Testers on
+one thread still share it, `testing-back-press-shared-per-thread` in [LIMITATIONS.md](LIMITATIONS.md)). `tester.semantics().focus_id()` reports focus only for widgets that publish it
 (`TextInput` today); for anything else it returns the root node.
+
+### Reading the current route in a test
+
+A test reads where a router-driven app is with what exists today, no helper needed. With the `RouterDeepLinks` the component
+keeps in its state (built in `init`, as in the router docs), the navigator controller's published stack gives the topmost page
+that has a route, and the observer wired to the navigator gives the same path as a tracked read:
+
+```rust
+// `state` holds the app's `RouterDeepLinks` as `router_links`; `build` is the component's build.
+let mut tester = Tester::new(state, build, Size::new(390.0, 844.0));
+tester.pump_and_settle();
+let links = &tester.state().router_links;
+let stack = links.router().controller().route_stack();
+assert_eq!(stack.current_route().map(|l| l.path.as_str()), Some("/"));
+assert_eq!(links.routes().path(), "/"); // "" before the first publish
+```
+
+`current_route` skips a route-less overlay or dialog page on top, so a dialog never changes the answer; `route_stack().entries()`
+shows every page. After a tap or deep link that navigates, `pump_and_settle()` before reading so the rebuild that publishes
+the stack has run.
 
 ### Host-dependent tests
 
