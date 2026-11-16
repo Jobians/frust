@@ -28,7 +28,21 @@
 //!   options, their remove buttons, the search field, the chevrons, and the
 //!   window-rect capture the panel is placed against.
 //! * [`multi_select`] — the filtered panel, whose rows *toggle* rather than
-//!   commit, so it stays open across a change.
+//!   commit, so it stays open across a change. It floats in the render root's
+//!   overlay layer through [`crate::overlay::anchored`](mod@crate::overlay::anchored)'s floating host,
+//!   so it can be mounted anywhere under the token field's ancestors and
+//!   takes no room where it is mounted.
+//!
+//! # Inside a modal
+//!
+//! The same as [`crate::components::select`]'s: mounted beside the token field
+//! in a modal's content, the panel leaves the modal its own size, paints above
+//! the modal surface and takes presses wherever it lands. An outside press
+//! closes only the panel, and so does the first Escape: the editable declines
+//! a bare Escape, and the token field closes its open panel on it before the
+//! key can reach the modal host, whose dismiss veto is therefore not asked.
+//! The floated panel's own costs — no row hover wash, accessibility nodes at
+//! the host's position — are the select's, recorded there.
 //!
 //! # Where the field chrome comes from
 //!
@@ -313,9 +327,10 @@ impl<State: 'static> MultiSelectTriggerView<State> {
         self
     }
 
-    /// Set the open-request callback: a press inside the field reports `true`.
+    /// Set the open-request callback: a press inside the field reports `true`,
+    /// and an Escape while the panel is open reports `false`.
     ///
-    /// Only ever `true` — a *close* comes from the overlay seam's dismissal.
+    /// Every other close comes from the overlay seam's dismissal.
     pub fn on_open_change<F: Fn(&mut State, bool) + 'static>(mut self, on_open_change: F) -> Self {
         self.on_open_change = Rc::new(on_open_change);
         self
@@ -775,6 +790,16 @@ impl Widget for MultiSelectTriggerWidget {
         if routed == EventResult::Handled {
             return routed;
         }
+        // An Escape the editable declined (it blurs and passes a bare one up)
+        // closes an open panel and stops here, so it never reaches an
+        // enclosing modal host (see the module docs).
+        if let InputEvent::Key(key) = event {
+            if self.open && !self.disabled && select::is_bare_escape(key) {
+                (self.on_open_change)(ctx, false);
+                return EventResult::Handled;
+            }
+            return routed;
+        }
         let InputEvent::Pointer(p) = event else {
             return routed;
         };
@@ -795,6 +820,12 @@ impl Widget for MultiSelectTriggerWidget {
                     return EventResult::Handled;
                 }
                 if !self.open && inside_inclusive(p.position, ctx.size()) {
+                    // The opening press claims focus for the token field, so
+                    // the Escape that closes the panel lands here rather than
+                    // on whatever held focus around it — an enclosing modal
+                    // host, which would close instead. A press on the editable
+                    // never gets here: the editable claims its own focus.
+                    ctx.request_focus();
                     (self.on_open_change)(ctx, true);
                     return EventResult::Handled;
                 }
@@ -930,7 +961,7 @@ pub fn multi_select<State: 'static, F: Fn(&mut State, usize) + 'static>(
         .align(OverlayAlign::Start)
         .offset(combobox::PANEL_OFFSET);
     MultiSelectView {
-        inner: anchored(content).placement(placement),
+        inner: anchored(content).placement(placement).floating(),
         config,
         placement,
     }
@@ -1959,5 +1990,118 @@ mod tests {
             search_slot_view,
             PROBE_WINDOW,
         );
+    }
+
+    // ---- Inside a centre-morph modal --------------------------------------
+
+    /// The multi-select pair mounted inside a centre-morph modal, through the
+    /// select's own modal, frame-gated driver and paint-order recorder.
+    mod in_a_modal {
+        use super::*;
+        use crate::components::select::tests::in_a_modal::{
+            Driver, ModalApp, form_column, hugged, in_modal,
+        };
+        use frust::authoring::{AnyView, DismissCause};
+
+        /// The token field in the modal's form column, the panel stacked over
+        /// that column.
+        fn multi_in_modal(s: &mut ModalApp) -> AnyView<ModalApp> {
+            let trigger = multi_select_trigger(
+                &s.anchor,
+                options(),
+                s.selected.clone(),
+                "",
+                |_: &mut ModalApp, _| {},
+            )
+            .open(s.list_open)
+            .on_open_change(|s: &mut ModalApp, open| s.list_open = open);
+            let panel = multi_select(
+                options(),
+                s.selected.clone(),
+                "",
+                |s: &mut ModalApp, index| {
+                    if let Some(at) = s.selected.iter().position(|i| *i == index) {
+                        s.selected.remove(at);
+                    } else {
+                        s.selected.push(index);
+                    }
+                },
+            )
+            .anchor(&s.anchor)
+            .open(s.list_open)
+            .on_open_change(|s: &mut ModalApp, open| s.list_open = open);
+            in_modal(
+                s,
+                frust::stack()
+                    .child(form_column(trigger, None))
+                    .child(panel),
+            )
+        }
+
+        /// Where a press opens the panel: the chevrons, clear of the editable.
+        fn opener(d: &Driver) -> Point {
+            let trigger = d.trigger();
+            Point::new(
+                trigger.x1 - TRIGGER_PADDING_X - select::CHEVRON_BOX / 2.0,
+                trigger.center().y,
+            )
+        }
+
+        /// Row `index`'s centre on a panel painted at `panel`.
+        fn row_centre(panel: Rect, index: usize) -> Point {
+            Point::new(
+                panel.center().x,
+                panel.y0 + combobox::LIST_PADDING + combobox::ITEM_HEIGHT * (index as f64 + 0.5),
+            )
+        }
+
+        #[test]
+        fn the_panel_floats_above_the_modal_and_leaves_it_its_own_size() {
+            let mut d = Driver::new(multi_in_modal);
+            let closed = d.modal_panel();
+            assert_eq!(closed.size(), hugged(d.trigger().height()));
+            assert!(d.option_panel().is_none(), "a closed panel paints nothing");
+
+            d.tap(opener(&d));
+            assert!(d.state.list_open, "the token field opened it");
+            assert_eq!(d.modal_panel(), closed, "and opening it moved nothing");
+            d.assert_floats_above_the_modal();
+        }
+
+        #[test]
+        fn a_row_press_inside_the_modal_toggles_it_and_keeps_the_panel_open() {
+            let mut d = Driver::new(multi_in_modal);
+            d.tap(opener(&d));
+            let (_, panel) = d.option_panel().expect("the open panel");
+            d.tap(row_centre(panel.rect, 1));
+            assert_eq!(d.state.selected, vec![1]);
+            assert!(d.state.list_open, "a toggle keeps the panel open");
+            assert!(d.state.modal_open);
+        }
+
+        #[test]
+        fn the_first_escape_and_an_outside_press_close_only_the_panel() {
+            let mut d = Driver::new(multi_in_modal);
+            d.tap(opener(&d));
+            d.escape();
+            assert!(!d.state.list_open, "the first Escape closed the panel");
+            assert!(d.state.modal_open, "the modal stays open");
+            assert!(d.state.veto_asked.is_empty(), "the veto was not asked");
+            assert!(
+                d.option_panel().is_none(),
+                "the panel's exit ran to the end"
+            );
+
+            d.tap(opener(&d));
+            d.tap(Point::new(4.0, 4.0));
+            assert!(!d.state.list_open, "a backdrop press closed the panel");
+            assert!(d.state.modal_open, "and only the panel");
+            assert!(d.state.veto_asked.is_empty());
+
+            // With the panel closed, Escape is the modal's own.
+            d.escape();
+            assert!(!d.state.modal_open);
+            assert_eq!(d.state.veto_asked, vec![DismissCause::Escape]);
+        }
     }
 }
