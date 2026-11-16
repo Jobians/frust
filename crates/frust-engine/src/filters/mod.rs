@@ -327,7 +327,10 @@ impl LayerFilter {
     /// both.
     pub fn filter_data(self, transform: Affine) -> Result<FilterData, EngineError> {
         if !transform.as_coeffs().iter().all(|coeff| coeff.is_finite()) {
-            return Err(EngineError::InvalidTransform);
+            return Err(EngineError::InvalidTransform {
+                command: None,
+                kind: "PushLayer",
+            });
         }
 
         match self {
@@ -337,7 +340,10 @@ impl LayerFilter {
                 // transform, and only the recorded half of that is visible
                 // here without asking.
                 if !served_sigmas(sigma, transform) {
-                    return Err(EngineError::InvalidGeometry);
+                    return Err(EngineError::InvalidGeometry {
+                        command: 0,
+                        kind: "PushLayer",
+                    });
                 }
 
                 let filter = Filter::from_primitive(FilterPrimitive::GaussianBlur {
@@ -353,7 +359,10 @@ impl LayerFilter {
                 color,
             } => {
                 if !served_sigmas(sigma, transform) || !dx.is_finite() || !dy.is_finite() {
-                    return Err(EngineError::InvalidGeometry);
+                    return Err(EngineError::InvalidGeometry {
+                        command: 0,
+                        kind: "PushLayer",
+                    });
                 }
 
                 // `DropShadowOnly`, never `DropShadow`: the shadow-only shape
