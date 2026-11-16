@@ -99,7 +99,7 @@ use kurbo::{Arc, Vec2};
 use crate::motion::{PointerTracker, Ramp};
 use crate::press::{Lane, presses};
 use crate::style::{self, scale_alpha, with_alpha};
-use crate::text::{Label, LabelRun, ThemeTextType};
+use crate::text::{Label, LabelRun, ThemeTextType, scaled_style};
 use crate::tokens::motion::{EASE_IN_OUT, EASE_OUT, SPRING_PRESS};
 use crate::tokens::{BEUI_LIGHT, BeuiPalette, mono_family, sans_family};
 
@@ -953,7 +953,10 @@ impl Widget for ImageGenerationWidget {
             } + measured.height;
         }
         if let Some(resolution) = &mut self.resolution {
-            resolution.layout(ctx, &badge_style(Color::BLACK));
+            // Mono, so no role carries it: scaled once here. The badge box is
+            // sized from the measured run at paint, so it grows with the text.
+            let badge = scaled_style(badge_style(Color::BLACK), Theme::from_layout_ctx(ctx));
+            resolution.layout(ctx, &badge);
         }
 
         self.retry.layout_themed(ctx, &status_style, STATUS_ROLE);
@@ -1801,5 +1804,27 @@ mod tests {
             GENERATING_MONO_RUNS,
         );
         assert_follows_a_live_family_swap("the failed card", failed_probe, ROW);
+    }
+
+    // ---- The OS text scale ---------------------------------------------------
+
+    /// The mono resolution badge grows with the text scale, and at `1.0` every
+    /// measure is today's.
+    #[test]
+    fn the_resolution_badge_follows_the_text_scale() {
+        use crate::agents::code_block::scale_test::{assert_scaled, layout_under, theme_at};
+
+        let make = || build(&image_generation::<Retried>());
+        let mut base = make();
+        let base_size = layout_under(&mut base, None, 320.0);
+        let mut unit = make();
+        let unit_theme = theme_at(1.0);
+        assert_eq!(layout_under(&mut unit, Some(&unit_theme), 320.0), base_size);
+
+        let mut big = make();
+        let big_theme = theme_at(1.5);
+        layout_under(&mut big, Some(&big_theme), 320.0);
+        let badge = |w: &ImageGenerationWidget| w.resolution.as_ref().unwrap().size().height;
+        assert_scaled("badge", badge(&base), badge(&big), 1.5);
     }
 }

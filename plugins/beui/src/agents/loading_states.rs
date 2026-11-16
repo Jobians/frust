@@ -85,7 +85,7 @@ use peniko::{Brush, Color, ColorStop, Gradient};
 
 use crate::press::keyframes_at;
 use crate::style::{self, scale_alpha};
-use crate::text::{ThemeTextType, paint_glyph_run, themed_style};
+use crate::text::{ThemeTextType, paint_glyph_run, scaled_style, themed_style};
 use crate::tokens::motion::{EASE_IN_OUT, EASE_OUT};
 use crate::tokens::{BEUI_LIGHT, mono_family};
 
@@ -523,10 +523,12 @@ impl LoadingStatesWidget {
 
     /// The timer's style: `font-mono tabular-nums`, one alpha step dimmer than
     /// the label (`text-muted-foreground/70`).
-    fn timer_style(&self, ink: Color) -> TextStyle {
-        TextStyle::new(style::TEXT_SM as f32, scale_alpha(ink, 0.7))
+    fn timer_style(&self, theme: Option<&Theme>, ink: Color) -> TextStyle {
+        let style = TextStyle::new(style::TEXT_SM as f32, scale_alpha(ink, 0.7))
             // Explicit: `TypeScale` has no monospace role to take this from.
-            .with_family(mono_family())
+            .with_family(mono_family());
+        // Mono, so it never passed through `themed_style`: scaled here, once.
+        scaled_style(style, theme)
     }
 
     /// The settled ink: the theme's dimmed on-surface role, else the beUI-light
@@ -723,7 +725,7 @@ impl Widget for LoadingStatesWidget {
         let theme = Theme::from_layout_ctx(ctx);
         let ink = self.ink(theme);
         let style = self.text_style(theme, ink);
-        let timer_style = self.timer_style(ink);
+        let timer_style = self.timer_style(theme, ink);
 
         let mut text_size = Size::ZERO;
         if self.variant.has_text() {
@@ -1408,5 +1410,35 @@ mod tests {
             BOX,
             PROGRESS_MONO_RUNS,
         );
+    }
+
+    // ---- The OS text scale ---------------------------------------------------
+
+    /// The mono timer grows with the text scale beside the label, and at `1.0`
+    /// every measure is today's.
+    #[test]
+    fn the_timer_follows_the_text_scale() {
+        use crate::agents::code_block::scale_test::{assert_scaled, layout_under, theme_at};
+
+        let make = || {
+            let mut next_id = 0u64;
+            View::<()>::build(
+                &loading_states().variant(LoadingStatesVariant::Progress),
+                &mut BuildCtx::new(&mut next_id),
+            )
+        };
+        let mut base = make();
+        let base_size = layout_under(&mut base, None, 320.0);
+        let mut unit = make();
+        let unit_theme = theme_at(1.0);
+        assert_eq!(layout_under(&mut unit, Some(&unit_theme), 320.0), base_size);
+
+        let mut big = make();
+        let big_theme = theme_at(1.5);
+        layout_under(&mut big, Some(&big_theme), 320.0);
+        let timer = |w: &LoadingStatesWidget| w.timer.as_ref().unwrap().size().height;
+        assert_scaled("timer", timer(&base), timer(&big), 1.5);
+        let label = |w: &LoadingStatesWidget| w.run.as_ref().unwrap().size().height;
+        assert_scaled("label", label(&base), label(&big), 1.5);
     }
 }

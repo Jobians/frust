@@ -68,7 +68,7 @@ use frust::authoring::{
 };
 use frust::{FrameTime, Theme};
 
-use crate::agents::code_block::{code_palette, code_style, draw_chevron};
+use crate::agents::code_block::{code_palette, draw_chevron, scaled_code_style, text_factor};
 use crate::agents::tool_approval::{WrappedRun, prose_style, strong_style};
 use crate::motion::{Ramp, Stagger};
 use crate::overlay::OverlayAnchor;
@@ -289,6 +289,9 @@ pub struct CitationsWidget {
     boxes: Vec<Rect>,
     width: f64,
     height: f64,
+    /// The chip height layout resolved: [`CITATION_CHIP_HEIGHT`] grown with
+    /// the OS text scale, so a scaled number stays inside its chip.
+    chip_height: f64,
     /// The frame the entrance cascade started on, while one runs.
     entrance: Option<FrameTime>,
     /// Raised when `paint` self-corrected the hover away, so the next event
@@ -315,6 +318,7 @@ impl<State: 'static> View<State> for CitationsView<State> {
             boxes: Vec::new(),
             width: 0.0,
             height: 0.0,
+            chip_height: CITATION_CHIP_HEIGHT,
             entrance: None,
             hover_lost: false,
             focused: 0,
@@ -454,6 +458,9 @@ impl Widget for CitationsWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
         self.width = bc.max().width;
         let style = strong_style(CITATION_CHIP_SIZE);
+        // The chip text follows the text scale through `layout_themed`; the
+        // chip's box grows by the same factor.
+        self.chip_height = CITATION_CHIP_HEIGHT * text_factor(Theme::from_layout_ctx(ctx));
         self.boxes.clear();
         let mut x = 0.0;
         let mut y = 0.0;
@@ -463,18 +470,18 @@ impl Widget for CitationsWidget {
                 (measured.width + CITATION_CHIP_PADDING_X * 2.0).max(CITATION_CHIP_MIN_WIDTH);
             if x > 0.0 && x + width > self.width {
                 x = 0.0;
-                y += CITATION_CHIP_HEIGHT + CITATION_CHIP_ROW_GAP;
+                y += self.chip_height + CITATION_CHIP_ROW_GAP;
             }
             self.boxes.push(Rect::from_origin_size(
                 Point::new(x, y),
-                Size::new(width, CITATION_CHIP_HEIGHT),
+                Size::new(width, self.chip_height),
             ));
             x += width + CITATION_CHIP_GAP;
         }
         self.height = if self.chips.is_empty() {
             0.0
         } else {
-            y + CITATION_CHIP_HEIGHT
+            y + self.chip_height
         };
         bc.constrain(Size::new(self.width, self.height))
     }
@@ -535,7 +542,7 @@ impl Widget for CitationsWidget {
             chip.paint(
                 Point::new(
                     at.x + (rect.width() - measured.width) / 2.0,
-                    at.y + (CITATION_CHIP_HEIGHT - measured.height) / 2.0,
+                    at.y + (rect.height() - measured.height) / 2.0,
                 ),
                 if hovered {
                     palette.plain
@@ -684,6 +691,8 @@ pub struct CitationPreviewWidget {
     url: Option<WrappedRun>,
     title_height: f64,
     url_height: f64,
+    /// The OS text scale layout resolved: it sizes the domain line.
+    scale: f64,
 }
 
 impl<State: 'static> View<State> for CitationPreviewView {
@@ -698,6 +707,7 @@ impl<State: 'static> View<State> for CitationPreviewView {
             citation: self.citation.clone(),
             title_height: 0.0,
             url_height: 0.0,
+            scale: 1.0,
         }
     }
 
@@ -724,11 +734,10 @@ impl Widget for CitationPreviewWidget {
         let width = bc.max().width.min(CITATION_PREVIEW_WIDTH);
         let inner =
             (width - CITATION_PREVIEW_PADDING * 2.0 - CITATION_GLYPH_BOX - style::GAP_MD).max(0.0);
-        let title = themed_style(
-            strong_style(style::TEXT_SM),
-            TITLE_ROLE,
-            Theme::from_layout_ctx(ctx),
-        );
+        let theme = Theme::from_layout_ctx(ctx);
+        self.scale = text_factor(theme);
+        let title = themed_style(strong_style(style::TEXT_SM), TITLE_ROLE, theme);
+        let url_style = scaled_code_style(CITATION_CHIP_SIZE, theme);
         self.title_height = self.title.layout(ctx, &title, inner).height;
         if let Some(domain) = &mut self.domain {
             domain.layout_themed(ctx, &prose_style(style::TEXT_XS), DOMAIN_ROLE);
@@ -736,10 +745,7 @@ impl Widget for CitationPreviewWidget {
         self.url_height = match &mut self.url {
             // Explicit: the URL is set in the mono stack, and `TypeScale` has
             // no monospace role to take it from.
-            Some(url) => {
-                url.layout(ctx, &code_style(CITATION_CHIP_SIZE), inner)
-                    .height
-            }
+            Some(url) => url.layout(ctx, &url_style, inner).height,
             None => 0.0,
         };
         self.index
@@ -747,7 +753,7 @@ impl Widget for CitationPreviewWidget {
 
         let mut height = CITATION_PREVIEW_PADDING * 2.0 + self.title_height;
         if self.domain.is_some() {
-            height += style::spacing(0.5) + CITATION_CHIP_SIZE + 4.0;
+            height += style::spacing(0.5) + (CITATION_CHIP_SIZE + 4.0) * self.scale;
         }
         if self.url_height > 0.0 {
             height += style::spacing(1.0) + self.url_height;
@@ -784,7 +790,7 @@ impl Widget for CitationPreviewWidget {
         if let Some(domain) = &self.domain {
             y += style::spacing(0.5);
             domain.paint(Point::new(column_x, y), chrome.dim_ink, scene);
-            y += CITATION_CHIP_SIZE + 4.0;
+            y += (CITATION_CHIP_SIZE + 4.0) * self.scale;
         }
         if let Some(url) = &self.url {
             y += style::spacing(1.0);
@@ -1984,5 +1990,52 @@ mod tests {
             faces.iter().all(|f| *f != Face::Other),
             "every run is a bundled face: {faces:?}"
         );
+    }
+
+    // ---- The OS text scale ---------------------------------------------------
+
+    /// The chip box and the preview's mono URL grow with the text scale, and at
+    /// `1.0` every measure is today's.
+    #[test]
+    fn chips_and_the_preview_url_follow_the_text_scale() {
+        use crate::agents::code_block::scale_test::{assert_scaled, layout_under, theme_at};
+
+        let anchor = OverlayAnchor::new();
+        let hover = CitationHover::new();
+        let unit_theme = theme_at(1.0);
+        let big_theme = theme_at(1.5);
+
+        let mut base = build_chips(&chips_view(&anchor, &hover));
+        let base_size = layout_under(&mut base, None, 300.0);
+        let mut unit = build_chips(&chips_view(&anchor, &hover));
+        assert_eq!(layout_under(&mut unit, Some(&unit_theme), 300.0), base_size);
+        assert_eq!(base.chip_height, CITATION_CHIP_HEIGHT);
+        let mut big = build_chips(&chips_view(&anchor, &hover));
+        layout_under(&mut big, Some(&big_theme), 300.0);
+        assert_scaled("chip box", base.chip_height, big.chip_height, 1.5);
+        assert!(big.chips[0].size().height <= big.chip_height);
+        assert!(big.boxes.iter().all(|r| r.height() == big.chip_height));
+
+        let preview = |theme: Option<&Theme>| {
+            let mut counter = 0u64;
+            let mut w = View::<()>::build(
+                &citation_preview(items()[0].clone(), 1),
+                &mut BuildCtx::new(&mut counter),
+            );
+            let size = layout_under(&mut w, theme, 260.0);
+            (w, size)
+        };
+        let (base_preview, base_size) = preview(None);
+        let (unit_preview, unit_size) = preview(Some(&unit_theme));
+        assert_eq!(unit_size, base_size);
+        assert_eq!(unit_preview.url_height, base_preview.url_height);
+        let (big_preview, _) = preview(Some(&big_theme));
+        assert_scaled(
+            "preview url",
+            base_preview.url.as_ref().unwrap().size().height,
+            big_preview.url.as_ref().unwrap().size().height,
+            1.5,
+        );
+        assert_scaled("domain line", 14.0, 14.0 * big_preview.scale, 1.5);
     }
 }
