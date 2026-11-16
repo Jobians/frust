@@ -1604,7 +1604,19 @@ mod tests {
         // Mid-wipe it is clipped from its leading edge, and it still paints.
         paint_at(&mut w, size, 0.0);
         let rec = paint_at(&mut w, size, 60.0);
-        let (clip_origin, clip_size) = rec.clips[0];
+        // The embedded field clips its own content too; the wipe is the clip
+        // that lies inside the leaving chip.
+        let (clip_origin, clip_size) = rec
+            .clips
+            .iter()
+            .copied()
+            .find(|(o, s)| {
+                o.y == leaving_rect.y0
+                    && s.height == leaving_rect.height()
+                    && o.x >= leaving_rect.x0
+                    && o.x + s.width <= leaving_rect.x1
+            })
+            .expect("the leaving chip is clipped");
         assert!(
             clip_origin.x > leaving_rect.x0,
             "the wipe eats the leading edge: {clip_origin:?}"
