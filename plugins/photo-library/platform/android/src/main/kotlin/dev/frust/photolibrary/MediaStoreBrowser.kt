@@ -136,10 +136,11 @@ internal object MediaStoreBrowser {
         MediaStore.MediaColumns.DATE_MODIFIED,
     )
 
-    /** Projected only when the query asks for details: the file name and the MIME type. */
+    /** Projected only when the query asks for details: the file name, the MIME type and the size. */
     private val DETAIL_COLUMNS = arrayOf(
         MediaStore.MediaColumns.DISPLAY_NAME,
         MediaStore.MediaColumns.MIME_TYPE,
+        MediaStore.MediaColumns.SIZE,
     )
 
     /**
@@ -248,7 +249,7 @@ internal object MediaStoreBrowser {
     private fun assetsFailed(code: Int, total: Long = 0) =
         AssetsResult(
             code, total, emptyArray(), IntArray(0), IntArray(0), IntArray(0), LongArray(0), LongArray(0),
-            LongArray(0), IntArray(0), emptyArray(), emptyArray(),
+            LongArray(0), IntArray(0), emptyArray(), emptyArray(), LongArray(0),
         )
 
     private fun assetsAfterFailed(code: Int) = AssetsAfterResult(code, assetsFailed(code), 0, 0, false)
@@ -316,6 +317,8 @@ internal object MediaStoreBrowser {
         val favorite: Int,
         val name: String?,
         val type: String?,
+        /** `SIZE` in bytes; -1 when null, zero, negative or not asked for. */
+        val size: Long,
     )
 
     /**
@@ -509,6 +512,7 @@ internal object MediaStoreBrowser {
         val favoriteAt = cursor.getColumnIndex(MediaStore.MediaColumns.IS_FAVORITE)
         val nameAt = if (details) cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME) else -1
         val typeAt = if (details) cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE) else -1
+        val sizeAt = if (details) cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE) else -1
         do {
             val video = cursor.getInt(1) == MEDIA_TYPE_VIDEO
             val base = if (video) MediaStore.Video.Media.EXTERNAL_CONTENT_URI else MediaStore.Images.Media.EXTERNAL_CONTENT_URI
@@ -530,6 +534,7 @@ internal object MediaStoreBrowser {
                     favorite = if (favoriteAt < 0) FAVORITE_UNKNOWN else cursor.getInt(favoriteAt).coerceIn(0, 1),
                     name = if (nameAt < 0) null else cursor.getString(nameAt),
                     type = if (typeAt < 0) null else cursor.getString(typeAt),
+                    size = if (sizeAt < 0 || cursor.isNull(sizeAt)) -1 else cursor.getLong(sizeAt).takeIf { it > 0 } ?: -1,
                 ),
             )
         } while (rows.size < limit && cursor.moveToNext())
@@ -553,6 +558,7 @@ internal object MediaStoreBrowser {
         IntArray(rows.size) { rows[it].favorite },
         Array(rows.size) { rows[it].name },
         Array(rows.size) { rows[it].type },
+        LongArray(rows.size) { rows[it].size },
     )
 
     /** The signal of each running [thumbnail], by request id, until it returns. */
