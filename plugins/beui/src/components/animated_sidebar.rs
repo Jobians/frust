@@ -766,12 +766,24 @@ impl Widget for AnimatedSidebarWidget {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let origin = ctx.origin().to_vec2();
         ctx.push_container(
             Role::Navigation,
             |node| node.set_expanded(self.open),
             |ctx| {
-                for entry in &self.entries {
+                for (index, entry) in self.entries.iter().enumerate() {
+                    // Each item at its own row, not the whole rail's rect: an
+                    // assistive `Click` presses at a node's centre.
+                    let bounds = self.item_rect(index).map(|rect| rect + origin);
                     ctx.push_node(Role::Button, |node| {
+                        if let Some(rect) = bounds {
+                            node.set_bounds(frust::accesskit::Rect {
+                                x0: rect.x0,
+                                y0: rect.y0,
+                                x1: rect.x1,
+                                y1: rect.y1,
+                            });
+                        }
                         // The label is the accessible name in both states: a
                         // collapsed rail clips the painting, not the name.
                         node.set_label(entry.name.as_str());
@@ -901,6 +913,37 @@ mod tests {
     fn dispatch(w: &mut AnimatedSidebarWidget, size: Size, event: &InputEvent, state: &mut Picked) {
         let mut ctx = EventCtx::new(state as &mut dyn Any, Point::ZERO, size);
         w.event(&mut ctx, event);
+    }
+
+    /// A press at the centre of each item's published bounds picks that item, in
+    /// both the open and the collapsed rail: what an assistive `Click` does.
+    #[test]
+    fn each_items_published_bounds_are_its_own_row() {
+        for open in [true, false] {
+            let mut root = frust_core::RenderRoot::new();
+            let mut state = Picked::default();
+            let mut tcx = TextContext::new();
+            let mut logic = move |_: &mut Picked| view(open, 0);
+            root.rebuild(&mut logic, &mut state);
+            root.layout_with_text(Size::new(400.0, 600.0), &mut tcx as &mut dyn Any);
+            let update = root.semantics();
+            let centres: Vec<Point> = update
+                .nodes
+                .iter()
+                .filter(|(_, n)| n.role() == Role::Button)
+                .map(|(_, n)| {
+                    let b = n.bounds().expect("an item node has bounds");
+                    Point::new((b.x0 + b.x1) / 2.0, (b.y0 + b.y1) / 2.0)
+                })
+                .collect();
+            assert_eq!(centres.len(), 4, "open {open}: {centres:?}");
+            // The fourth item is disabled: it has bounds and takes no press.
+            for (index, centre) in centres.iter().enumerate().take(3) {
+                root.event(&mut state, &pointer(PointerPhase::Down, *centre));
+                root.event(&mut state, &pointer(PointerPhase::Up, *centre));
+                assert_eq!(state.last, Some(index), "open {open}: item {index}");
+            }
+        }
     }
 
     /// The two resting widths are upstream's own two CSS variables.
