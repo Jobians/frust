@@ -284,7 +284,7 @@ fn a_nan_std_dev_is_refused_rather_than_rasterized() {
 
     assert!(matches!(
         compiler().compile(&scene, Affine::IDENTITY, VIEWPORT),
-        Err(EngineError::InvalidGeometry)
+        Err(EngineError::InvalidGeometry { .. })
     ));
 }
 
@@ -301,7 +301,7 @@ fn a_nan_radius_is_refused_rather_than_rasterized() {
 
     assert!(matches!(
         compiler().compile(&scene, Affine::IDENTITY, VIEWPORT),
-        Err(EngineError::InvalidGeometry)
+        Err(EngineError::InvalidGeometry { .. })
     ));
 }
 
@@ -313,7 +313,7 @@ fn an_infinite_rect_is_refused_rather_than_rasterized() {
 
     assert!(matches!(
         compiler().compile(&scene, Affine::IDENTITY, VIEWPORT),
-        Err(EngineError::InvalidGeometry)
+        Err(EngineError::InvalidGeometry { .. })
     ));
 }
 
