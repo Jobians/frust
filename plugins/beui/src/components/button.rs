@@ -68,12 +68,11 @@ use peniko::{ColorStop, Gradient, color::DynamicColor};
 use crate::motion::{PointerTracker, Ramp};
 use crate::press::{SpringScalar, inside, presses, stroke_outline};
 use crate::style::{
-    ACTIVE_CURSOR, DISABLED_OPACITY, GAP_MD, GAP_SM, HEIGHT_LG, HEIGHT_MD, HEIGHT_SM, HOVER_SCALE,
-    HOVER_SOLID_ALPHA, HOVER_WASH_ALPHA, ICON_SIZE, PADDING_X_LG, PADDING_X_MD, PADDING_X_SM,
-    PRESS_SCALE, RADIUS_CONTROL, RADIUS_ICON_BUTTON, SIZE_ICON_BUTTON, TEXT_BASE, TEXT_SM, TEXT_XS,
-    disabled_tint, resolve_radius, scale_alpha, with_alpha,
+    ACTIVE_CURSOR, DISABLED_OPACITY, HOVER_SCALE, HOVER_SOLID_ALPHA, HOVER_WASH_ALPHA, ICON_SIZE,
+    PRESS_SCALE, disabled_tint, resolve_radius, scale_alpha, with_alpha,
 };
 use crate::text::{LabelRun, ThemeTextType, label_style};
+use crate::tokens::BeuiMetrics;
 use crate::tokens::color_scheme_light;
 use crate::tokens::motion::{EASE_IN_OUT, EASE_OUT, SPRING_MOUSE, SPRING_PRESS, SPRING_SWAP};
 
@@ -110,6 +109,11 @@ pub enum ButtonTone {
     Ghost,
     /// `border border-border bg-transparent hover:bg-primary/5`.
     Outline,
+    /// A destructive action: fill from the palette's `destructive` role
+    /// (the danger red, the scheme's `error`) with white ink, in both
+    /// brightnesses; hover and press take the solid-hover alpha like
+    /// [`Primary`](Self::Primary).
+    Destructive,
 }
 
 /// The base's `size` prop.
@@ -127,48 +131,48 @@ pub enum ButtonSize {
 }
 
 impl ButtonSize {
-    /// The control's height, in logical px.
-    fn height(self) -> f64 {
+    /// The painted control's height, in logical px, under `m`.
+    fn height(self, m: &BeuiMetrics) -> f64 {
         match self {
-            ButtonSize::Sm => HEIGHT_SM,
-            ButtonSize::Md => HEIGHT_MD,
-            ButtonSize::Lg => HEIGHT_LG,
-            ButtonSize::Icon => SIZE_ICON_BUTTON,
+            ButtonSize::Sm => m.height_sm,
+            ButtonSize::Md => m.height_md,
+            ButtonSize::Lg => m.height_lg,
+            ButtonSize::Icon => m.size_icon_button,
         }
     }
 
     /// Horizontal padding around the content — none on the fixed square.
-    fn pad_x(self) -> f64 {
+    fn pad_x(self, m: &BeuiMetrics) -> f64 {
         match self {
-            ButtonSize::Sm => PADDING_X_SM,
-            ButtonSize::Md => PADDING_X_MD,
-            ButtonSize::Lg => PADDING_X_LG,
+            ButtonSize::Sm => m.padding_x_sm,
+            ButtonSize::Md => m.padding_x_md,
+            ButtonSize::Lg => m.padding_x_lg,
             ButtonSize::Icon => 0.0,
         }
     }
 
     /// Gap between the icon slot and the label.
-    fn gap(self) -> f64 {
+    fn gap(self, m: &BeuiMetrics) -> f64 {
         match self {
-            ButtonSize::Sm => GAP_SM,
-            _ => GAP_MD,
+            ButtonSize::Sm => m.gap_sm,
+            _ => m.gap_md,
         }
     }
 
     /// Label type size.
-    fn font_size(self) -> f64 {
+    fn font_size(self, m: &BeuiMetrics) -> f64 {
         match self {
-            ButtonSize::Sm | ButtonSize::Icon => TEXT_XS,
-            ButtonSize::Md => TEXT_SM,
-            ButtonSize::Lg => TEXT_BASE,
+            ButtonSize::Sm | ButtonSize::Icon => m.text_xs,
+            ButtonSize::Md => m.text_sm,
+            ButtonSize::Lg => m.text_base,
         }
     }
 
     /// The corner radius: a pill everywhere but the square icon size.
-    fn radius(self) -> f64 {
+    fn radius(self, m: &BeuiMetrics) -> f64 {
         match self {
-            ButtonSize::Icon => RADIUS_ICON_BUTTON,
-            _ => RADIUS_CONTROL,
+            ButtonSize::Icon => m.radius_icon_button,
+            _ => m.radius_control,
         }
     }
 }
@@ -359,6 +363,12 @@ impl ButtonTone {
                 border: Some(role!(outline_variant)),
                 active: (wash, role!(on_surface)),
             },
+            ButtonTone::Destructive => TonePaint {
+                fill: role!(error),
+                ink: role!(on_error),
+                border: None,
+                active: (with_alpha(role!(error), HOVER_SOLID_ALPHA), role!(on_error)),
+            },
         }
     }
 }
@@ -516,6 +526,11 @@ pub struct ButtonWidget {
     sheen_started: Option<FrameTime>,
     /// The content box measured at layout, reused while painting.
     content: Size,
+    /// The painted pill's size, centred inside the laid-out hit area (equal to
+    /// it unless a touch density grew the hit area).
+    pill: Size,
+    /// The metrics resolved at the last layout.
+    metrics: BeuiMetrics,
 }
 
 impl ButtonWidget {
@@ -572,6 +587,8 @@ impl<State: 'static> View<State> for ButtonView<State> {
             drift_started: None,
             sheen_started: None,
             content: Size::ZERO,
+            pill: Size::ZERO,
+            metrics: BeuiMetrics::comfortable(),
         }
     }
 
@@ -638,7 +655,9 @@ impl<State: 'static> View<State> for ButtonView<State> {
 
 impl Widget for ButtonWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        let style = label_style(self.size.font_size());
+        let m = BeuiMetrics::resolve(Theme::from_layout_ctx(ctx));
+        self.metrics = m;
+        let style = label_style(self.size.font_size(&m));
         let mut content =
             self.labels[ButtonState::Idle as usize].layout_themed(ctx, &style, LABEL_ROLE);
 
@@ -654,15 +673,24 @@ impl Widget for ButtonWidget {
                 content.width = content.width.max(size.width);
                 content.height = content.height.max(size.height);
             }
-            content.width += ICON_SLOT_WIDTH + self.size.gap();
+            content.width += ICON_SLOT_WIDTH + self.size.gap(&m);
         }
         self.content = content;
 
-        let height = self.size.height();
-        if self.size == ButtonSize::Icon {
-            return bc.constrain(Size::new(height, height));
-        }
-        bc.constrain(Size::new(content.width + self.size.pad_x() * 2.0, height))
+        let height = self.size.height(&m);
+        let width = if self.size == ButtonSize::Icon {
+            height
+        } else {
+            content.width + self.size.pad_x(&m) * 2.0
+        };
+        // The painted pill keeps its own size; under a touch density the hit
+        // area (the laid-out box) grows around it to the platform minimum.
+        let pill = bc.constrain(Size::new(width, height));
+        self.pill = pill;
+        bc.constrain(Size::new(
+            pill.width.max(m.min_touch_target),
+            pill.height.max(m.min_touch_target),
+        ))
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
@@ -673,8 +701,18 @@ impl Widget for ButtonWidget {
         let tone = self.tone.resolve(theme);
         let metallic = MetallicPaint::resolve(theme);
         let now = ctx.frame_time();
-        let size = ctx.size();
-        let origin = ctx.origin();
+        let hit = ctx.size();
+        // The pill is centred in the hit area; with no touch growth they match.
+        let size = Size::new(
+            self.pill.width.min(hit.width).max(0.0),
+            self.pill.height.min(hit.height).max(0.0),
+        );
+        let size = if self.pill == Size::ZERO { hit } else { size };
+        let origin = ctx.origin()
+            + Vec2::new(
+                (hit.width - size.width) / 2.0,
+                (hit.height - size.height) / 2.0,
+            );
         let disabled = self.disabled;
 
         // The authoritative hover read — except while this widget holds the
@@ -684,7 +722,7 @@ impl Widget for ButtonWidget {
             self.hovered = ctx.is_hovered();
             self.tracker.sync_hovered(self.hovered);
         }
-        self.tracker.set_size(size);
+        self.tracker.set_size(hit);
 
         // The press/hover scale. Upstream applies the hover lift only on a
         // hover-capable pointer and never under reduced motion; a pressed
@@ -729,7 +767,7 @@ impl Widget for ButtonWidget {
             );
         }
 
-        let radius = resolve_radius(self.size.radius(), size.width, size.height);
+        let radius = resolve_radius(self.size.radius(&self.metrics), size.width, size.height);
         let ink = if self.variant == ButtonVariant::Metallic {
             self.paint_metallic(ctx, scene, metallic, reduce, now, origin, size, radius)
         } else {
@@ -1010,7 +1048,7 @@ impl ButtonWidget {
         // both centred as one group inside the reserved content box.
         let label = self.label(shown);
         let label_size = label.size();
-        let gap = self.size.gap();
+        let gap = self.size.gap(&self.metrics);
         let slot = if shown.has_icon() {
             ICON_SLOT_WIDTH + gap
         } else {
@@ -1102,6 +1140,7 @@ fn paint_state_icon(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::style::{HEIGHT_LG, HEIGHT_MD, HEIGHT_SM, PADDING_X_MD, SIZE_ICON_BUTTON};
     use frust::authoring::scene::GlyphRun;
     use frust::authoring::text::TextContext;
     use frust::authoring::{PointerButton, PointerEvent};
@@ -1273,6 +1312,89 @@ mod tests {
         let mut theme = crate::theme();
         theme.motion.reduce_motion = true;
         theme
+    }
+
+    // ---- Density and the touch minimum ---------------------------------------
+
+    /// Lay `w` out under `theme`.
+    fn layout_in(w: &mut ButtonWidget, theme: &Theme) -> Size {
+        let mut text_ctx = TextContext::new();
+        let mut ctx =
+            LayoutCtx::with_resources(Some(&mut text_ctx as &mut dyn Any), Some(theme as &dyn Any));
+        w.layout(&mut ctx, &BoxConstraints::loose(Size::new(400.0, 200.0)))
+    }
+
+    #[test]
+    fn a_comfortable_theme_lays_out_at_the_style_constants() {
+        let theme = crate::tokens::theme_with_density(crate::tokens::Density::Comfortable);
+        for (size, height) in [
+            (ButtonSize::Sm, crate::style::HEIGHT_SM),
+            (ButtonSize::Md, crate::style::HEIGHT_MD),
+            (ButtonSize::Lg, crate::style::HEIGHT_LG),
+            (ButtonSize::Icon, crate::style::SIZE_ICON_BUTTON),
+        ] {
+            let mut w = build(&button::<Counter>("Ship", |_| {}).size(size));
+            assert_eq!(layout_in(&mut w, &theme).height, height, "{size:?}");
+        }
+    }
+
+    #[test]
+    fn under_touch_every_size_has_a_hit_area_of_the_minimum() {
+        let theme = crate::tokens::theme_with_density(crate::tokens::Density::Touch);
+        let floor = BeuiMetrics::resolve(Some(&theme)).min_touch_target;
+        assert!(floor >= 44.0);
+        for size in [
+            ButtonSize::Sm,
+            ButtonSize::Md,
+            ButtonSize::Lg,
+            ButtonSize::Icon,
+        ] {
+            for label in ["I", "Ship it"] {
+                let mut w = build(&button::<Counter>(label, |_| {}).size(size));
+                let laid = layout_in(&mut w, &theme);
+                assert!(laid.width >= floor, "{size:?} width {}", laid.width);
+                assert!(laid.height >= floor, "{size:?} height {}", laid.height);
+            }
+        }
+    }
+
+    #[test]
+    fn a_press_in_the_enlarged_margin_of_an_sm_button_fires_it() {
+        // A metric set whose `sm` pill sits below the floor, as a custom one
+        // may: the pill stays, the hit area grows around it.
+        let mut m = BeuiMetrics::touch();
+        m.height_sm = 32.0;
+        let theme = Theme::builder(crate::theme()).extension(m).build();
+        let mut w = build(&button::<Counter>("I", |c| c.presses += 1).size(ButtonSize::Sm));
+        let laid = layout_in(&mut w, &theme);
+        assert!(laid.height >= m.min_touch_target);
+        assert_eq!(w.pill.height, 32.0);
+        let mut state = Counter::default();
+        // Inside the box but above the 32 px pill.
+        let y = 2.0;
+        dispatch(&mut w, &mut state, laid, &ev(PointerPhase::Down, 5.0, y));
+        dispatch(&mut w, &mut state, laid, &ev(PointerPhase::Up, 5.0, y));
+        assert_eq!(state.presses, 1);
+        // The pill is painted centred in the hit area.
+        let rec = paint(&mut w, laid, Some(&theme));
+        assert_eq!(rec.rrects[0].1.height, 32.0);
+    }
+
+    #[test]
+    fn a_destructive_button_builds_in_both_brightnesses_and_differs_from_primary() {
+        for brightness in [frust::Brightness::Light, frust::Brightness::Dark] {
+            let theme = Theme::builder(crate::theme())
+                .brightness(brightness)
+                .build();
+            let fill_of = |tone| {
+                let mut w = build(&button::<Counter>("Go", |_| {}).tone(tone));
+                let size = layout(&mut w);
+                paint(&mut w, size, Some(&theme)).rrects[0].3
+            };
+            let destructive = fill_of(ButtonTone::Destructive);
+            assert_ne!(destructive, fill_of(ButtonTone::Primary), "{brightness:?}");
+            assert_eq!(destructive, theme.scheme().error, "{brightness:?}");
+        }
     }
 
     // ---- Sizes and construction --------------------------------------------

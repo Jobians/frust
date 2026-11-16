@@ -89,7 +89,7 @@ use crate::motion::Ramp;
 use crate::press::{Lane, inside_inclusive as inside, keyframes_at, lerp_color};
 use crate::style;
 use crate::text::{Label as ShapedText, ThemeTextType};
-use crate::tokens::{BeuiTokens, sans_family};
+use crate::tokens::{BeuiMetrics, BeuiTokens, sans_family};
 
 /// Field width used when the incoming constraints are horizontally unbounded —
 /// upstream's field is `w-full`, which has no intrinsic width, and the baseline
@@ -384,7 +384,12 @@ impl<State: 'static> InputView<State> {
     }
 
     /// The wrapped baseline field, configured with its own chrome suppressed.
-    fn control(&self) -> impl View<State> + use<State> {
+    ///
+    /// `m` is the metric set the field's baked chrome (horizontal padding and
+    /// corner radius) is built from. A view has no theme at build time, so
+    /// `build` passes the comfortable set and a later `rebuild` passes the set
+    /// the widget last resolved in layout.
+    fn control(&self, m: &BeuiMetrics) -> impl View<State> + use<State> {
         let on_change = self.on_change.clone();
         let mut field = text_input(self.value.clone(), move |state: &mut State, text| {
             on_change(state, text)
@@ -393,9 +398,12 @@ impl<State: 'static> InputView<State> {
         .themed_family(FIELD_ROLE)
         .enabled(!self.disabled)
         .obscured(self.password)
-        .padding(style::PADDING_X_INPUT, FIELD_PADDING_Y)
+        .padding(
+            m.padding_x_input,
+            (m.height_input - m.line_height_input) / 2.0,
+        )
         .border_width(0.0)
-        .corner_radius(style::HEIGHT_INPUT / 2.0);
+        .corner_radius(m.height_input / 2.0);
         if let Some(on_submit) = self.on_submit.clone() {
             field = field.on_submit(move |state: &mut State, text| on_submit(state, text));
         }
@@ -415,20 +423,20 @@ const FIELD_ROLE: ThemeTextType = ThemeTextType::BodyMedium;
 
 /// The label's text style: `text-sm font-medium text-foreground`. The family
 /// here is the unthemed base; `layout` shapes in [`LABEL_ROLE`]'s family.
-fn label_style(color: Color) -> TextStyle {
+fn label_style(color: Color, m: &BeuiMetrics) -> TextStyle {
     TextStyle::default()
         .with_family(sans_family())
         .with_weight(FontWeight::MEDIUM)
-        .with_size(style::TEXT_SM as f32)
+        .with_size(m.text_sm as f32)
         .with_color(color)
 }
 
 /// The message's text style: `text-xs text-destructive`. The family here is
 /// the unthemed base; `layout` shapes in [`MESSAGE_ROLE`]'s family.
-fn message_style(color: Color) -> TextStyle {
+fn message_style(color: Color, m: &BeuiMetrics) -> TextStyle {
     TextStyle::default()
         .with_family(sans_family())
-        .with_size(style::TEXT_XS as f32)
+        .with_size(m.text_xs as f32)
         .with_color(color)
 }
 
@@ -469,6 +477,10 @@ pub struct InputWidget {
     /// Whether the wrapped field held focus on the last paint, so the crossfade
     /// can be retargeted from `paint` (focus is only observable there).
     was_focused: bool,
+    /// The metrics the last `layout` resolved from the live theme.
+    metrics: BeuiMetrics,
+    /// The metrics the wrapped field's baked chrome was last built from.
+    built_metrics: BeuiMetrics,
 }
 
 impl<State: 'static> View<State> for InputView<State> {
@@ -477,7 +489,7 @@ impl<State: 'static> View<State> for InputView<State> {
     fn build(&self, ctx: &mut BuildCtx<'_>) -> InputWidget {
         let error = self.error_flag;
         InputWidget {
-            child: build_child(&self.control(), ctx),
+            child: build_child(&self.control(&BeuiMetrics::comfortable()), ctx),
             label: self.label.as_ref().map(ShapedText::new),
             message: self.error.as_ref().map(ShapedText::new),
             message_leaving: false,
@@ -500,6 +512,8 @@ impl<State: 'static> View<State> for InputView<State> {
             field: Rect::ZERO,
             was_focused: false,
             laid_message_height: 0.0,
+            metrics: BeuiMetrics::comfortable(),
+            built_metrics: BeuiMetrics::comfortable(),
         }
     }
 
@@ -509,7 +523,13 @@ impl<State: 'static> View<State> for InputView<State> {
         element: &mut InputWidget,
         ctx: &mut BuildCtx<'_>,
     ) -> ChangeFlags {
-        let mut flags = rebuild_child(&prev.control(), &self.control(), &mut element.child, ctx);
+        let mut flags = rebuild_child(
+            &prev.control(&element.built_metrics),
+            &self.control(&element.metrics),
+            &mut element.child,
+            ctx,
+        );
+        element.built_metrics = element.metrics;
 
         if prev.label != self.label {
             match (&mut element.label, &self.label) {
@@ -574,7 +594,11 @@ impl<State: 'static> View<State> for InputView<State> {
     }
 
     fn teardown(&self, element: &mut InputWidget, ctx: &mut BuildCtx<'_>) {
-        teardown_child(&self.control(), &mut element.child, ctx);
+        teardown_child(
+            &self.control(&element.built_metrics),
+            &mut element.child,
+            ctx,
+        );
     }
 }
 
@@ -629,6 +653,8 @@ impl InputWidget {
 impl Widget for InputWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
         let theme = Theme::from_layout_ctx(ctx);
+        let m = BeuiMetrics::resolve(theme);
+        self.metrics = m;
         let (ink, destructive) = match theme {
             Some(theme) => (theme.scheme().on_surface, theme.scheme().error),
             None => (FALLBACK_FOREGROUND, FALLBACK_DESTRUCTIVE),
@@ -636,11 +662,11 @@ impl Widget for InputWidget {
         let tint = |color: Color| style::disabled_tint(color, self.disabled, DISABLED_OPACITY);
 
         let label_size = match &mut self.label {
-            Some(label) => label.layout_themed(ctx, &label_style(tint(ink)), LABEL_ROLE),
+            Some(label) => label.layout_themed(ctx, &label_style(tint(ink), &m), LABEL_ROLE),
             None => Size::ZERO,
         };
         if let Some(message) = &mut self.message {
-            message.layout_themed(ctx, &message_style(destructive), MESSAGE_ROLE);
+            message.layout_themed(ctx, &message_style(destructive, &m), MESSAGE_ROLE);
         }
 
         let width = if bc.max().width.is_finite() {
@@ -653,15 +679,14 @@ impl Widget for InputWidget {
         if self.label.is_some() {
             y += label_size.height + ROW_GAP;
         }
-        self.field =
-            Rect::from_origin_size(Point::new(0.0, y), Size::new(width, style::HEIGHT_INPUT));
+        self.field = Rect::from_origin_size(Point::new(0.0, y), Size::new(width, m.height_input));
         // Tight constraints are what pin the wrapped field to `h-11`: the
         // baseline would otherwise report its own text-derived height, leaving
         // its opaque background smaller than this field's border box.
         self.child
             .layout_child(ctx, &BoxConstraints::tight(self.field.size()));
         self.child.set_origin(self.field.origin());
-        y += style::HEIGHT_INPUT;
+        y += m.height_input;
 
         let message_height = self.message_height();
         self.laid_message_height = message_height;
@@ -749,15 +774,16 @@ impl Widget for InputWidget {
         paint_field_frame(scene, field_origin, self.field.size(), paint);
 
         if self.success && drawn > 0.0 {
-            let path = mark_path(&SUCCESS_POINTS, SUCCESS_ICON_SIZE, drawn);
+            let icon_size = self.metrics.icon_size_lg;
+            let path = mark_path(&SUCCESS_POINTS, icon_size, drawn);
             let icon = Point::new(
-                field_origin.x + self.field.width() - SUCCESS_ICON_INSET - SUCCESS_ICON_SIZE,
-                field_origin.y + (style::HEIGHT_INPUT - SUCCESS_ICON_SIZE) / 2.0,
+                field_origin.x + self.field.width() - self.metrics.padding_x_input - icon_size,
+                field_origin.y + (self.field.height() - icon_size) / 2.0,
             );
             scene.stroke_path(
                 icon,
                 &path,
-                SUCCESS_STROKE_VIEWBOX * SUCCESS_ICON_SIZE / ICON_VIEWBOX,
+                SUCCESS_STROKE_VIEWBOX * icon_size / ICON_VIEWBOX,
                 &Brush::Solid(success_color),
             );
         }
@@ -1012,6 +1038,21 @@ mod tests {
     }
 
     // ---- Layout -----------------------------------------------------------
+
+    #[test]
+    fn under_touch_the_field_lays_out_from_the_metrics() {
+        use crate::tokens::{Density, theme_with_density};
+        let theme = theme_with_density(Density::Touch);
+        let m = BeuiMetrics::resolve(Some(&theme));
+        let view: InputView<String> = input("hi", |_s: &mut String, _t| {});
+        let mut w = build(&view);
+        let mut tcx = TextContext::new();
+        let mut lctx =
+            LayoutCtx::with_resources(Some(&mut tcx as &mut dyn Any), Some(&theme as &dyn Any));
+        let size = w.layout(&mut lctx, &BoxConstraints::loose(Size::new(200.0, 400.0)));
+        assert_eq!(size.height, m.height_input);
+        assert!(size.height >= 44.0 && size.width >= 44.0);
+    }
 
     #[test]
     fn a_bare_field_is_h11_and_the_wrapped_control_fills_it() {
