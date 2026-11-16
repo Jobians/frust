@@ -86,14 +86,19 @@ pub trait ProcessRunner {
     /// returning stderr in [`Output::stderr`] once the child exits. Use it
     /// for a child whose console output lands on both streams
     /// (`devicectl device process launch --console`). `Output::stderr` still
-    /// holds the full stderr text afterwards. Both callbacks run on the
+    /// holds the full stderr text afterwards: the lines
+    /// joined with newlines, with no trailing newline. Every stderr line is
+    /// retained for the life of the process, so a very chatty child grows
+    /// memory until it exits. Both callbacks run on the
     /// calling thread; the relative order of stdout and stderr lines is not
     /// guaranteed, only the order within each stream.
     ///
     /// **The default implementation never calls `on_stderr_line`** and
     /// forwards to [`run_streaming`](ProcessRunner::run_streaming), which
     /// keeps the crate's small in-test runner doubles source-compatible. Any
-    /// implementation that spawns a real process must override it.
+    /// implementation that spawns a real process must override it, and a
+    /// wrapper runner that delegates to an inner runner must forward this
+    /// method too, because the default drops the stderr callback.
     fn run_streaming_with_stderr(
         &self,
         cmd: &str,
@@ -1444,30 +1449,41 @@ mod tests {
     #[test]
     fn run_streaming_with_stderr_delivers_stderr_before_the_child_exits() {
         let runner = RealProcessRunner;
-        let started = std::time::Instant::now();
+        // The child prints a first stderr line, then waits for a marker file
+        // that only the stderr callback creates, then prints a second line.
+        // The second line only appears once the callback has seen the first
+        // while the child is still running; a bounded wait keeps a broken
+        // implementation from hanging the test.
+        let marker =
+            std::env::temp_dir().join(format!("frust-drive-stderr-marker-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "echo out; echo err 1>&2; i=0; \
+             while [ ! -f '{m}' ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; \
+             if [ -f '{m}' ]; then echo err2 1>&2; else echo timed-out 1>&2; fi",
+            m = marker.display()
+        );
         let mut out_lines = Vec::new();
-        let mut err_lines: Vec<(String, std::time::Duration)> = Vec::new();
+        let mut err_lines: Vec<String> = Vec::new();
         let out = runner
             .run_streaming_with_stderr(
                 "/bin/sh",
-                &["-c", STDERR_SCRIPT],
+                &["-c", &script],
                 None,
                 &[],
                 &mut |line| out_lines.push(line.to_string()),
-                &mut |line| err_lines.push((line.to_string(), started.elapsed())),
+                &mut |line| {
+                    if err_lines.is_empty() {
+                        std::fs::write(&marker, "seen").unwrap();
+                    }
+                    err_lines.push(line.to_string());
+                },
             )
             .unwrap();
-        let total = started.elapsed();
+        let _ = std::fs::remove_file(&marker);
         assert!(out.success);
         assert_eq!(out_lines, vec!["out"]);
-        let names: Vec<&str> = err_lines.iter().map(|(l, _)| l.as_str()).collect();
-        assert_eq!(names, vec!["err", "err2"]);
-        // The first stderr line arrived while the child was still sleeping.
-        assert!(
-            err_lines[0].1 + std::time::Duration::from_millis(100) < total,
-            "first stderr line should arrive well before exit: {:?} vs {total:?}",
-            err_lines[0].1
-        );
+        assert_eq!(err_lines, vec!["err", "err2"]);
         assert_eq!(out.stdout, "out");
         assert_eq!(out.stderr, "err\nerr2");
     }
