@@ -90,7 +90,7 @@ use crate::press::{
     Lane, SpringScalar, draw_focus_ring, inside, is_activation_key, press_scale, presses,
 };
 use crate::style::{self, with_alpha};
-use crate::text::{LabelRun, SHAPING_INK, ThemeTextType};
+use crate::text::{LabelRun, SHAPING_INK, ThemeTextType, scaled_style};
 use crate::tokens::motion::{SPRING_PANEL, SPRING_PRESS};
 use crate::tokens::{BEUI_LIGHT, BeuiTokens};
 
@@ -348,6 +348,67 @@ pub fn code_style(size: f64) -> TextStyle {
         .with_family(crate::tokens::mono_family())
 }
 
+/// The live theme's OS text scale as a geometry factor (`1.0` with no theme).
+/// The same clamped factor [`scaled_style`] multiplies a text style by, so a
+/// row sized with it grows in step with the text inside it.
+pub(crate) fn text_factor(theme: Option<&Theme>) -> f64 {
+    f64::from(theme.map_or(1.0, Theme::text_scale))
+}
+
+/// [`code_style`] at `size`, multiplied by the live theme's OS text scale
+/// ([`scaled_style`]). The family stays the explicit mono stack; only the size,
+/// absolute line height and tracking follow the scale. Shape every code,
+/// diff and tool-output run through this once, never through a style that
+/// already passed through `themed_style`.
+pub(crate) fn scaled_code_style(size: f64, theme: Option<&Theme>) -> TextStyle {
+    scaled_style(code_style(size), theme)
+}
+
+/// Shared helpers for the text-scale tests of the agents parts.
+#[cfg(test)]
+pub(crate) mod scale_test {
+    use std::any::Any;
+
+    use frust::Theme;
+    use frust::authoring::text::TextContext;
+    use frust::authoring::{BoxConstraints, LayoutCtx, Size, Widget};
+
+    /// beUI's theme with the OS text scale set to `factor`.
+    pub(crate) fn theme_at(factor: f32) -> Theme {
+        let theme = crate::theme();
+        let authored = theme.type_scale.clone();
+        theme.with_text_scale(&authored, factor)
+    }
+
+    /// Lay `widget` out into a `width` x 900 box with `theme` threaded the way
+    /// the render root does (`None` is the unthemed layout every existing test
+    /// uses).
+    pub(crate) fn layout_under<W: Widget>(
+        widget: &mut W,
+        theme: Option<&Theme>,
+        width: f64,
+    ) -> Size {
+        let mut tcx = TextContext::new();
+        let mut ctx =
+            LayoutCtx::with_resources(Some(&mut tcx as &mut dyn Any), theme.map(|t| t as &dyn Any));
+        widget.layout(
+            &mut ctx,
+            &BoxConstraints::new(Size::ZERO, Size::new(width, 900.0)),
+        )
+    }
+
+    /// `scaled` is `factor` times `base`, within shaping rounding.
+    #[track_caller]
+    pub(crate) fn assert_scaled(what: &str, base: f64, scaled: f64, factor: f64) {
+        assert!(base > 0.0, "{what}: the unscaled run measured nothing");
+        let ratio = scaled / base;
+        assert!(
+            (ratio - factor).abs() < 0.03,
+            "{what}: {base} -> {scaled} is x{ratio}, expected x{factor}"
+        );
+    }
+}
+
 /// The type-scale role the chrome labels (language tag, status) take their
 /// family from at layout.
 const CHROME_ROLE: ThemeTextType = ThemeTextType::LabelSmall;
@@ -553,6 +614,8 @@ pub struct CodeBlockWidget {
     width: f64,
     /// The natural (uncapped) height of the code body.
     natural_height: f64,
+    /// The OS text scale layout resolved: it sizes the row pitch and the gutter.
+    scale: f64,
     /// The roving keyboard cursor.
     focused: CodeBlockTarget,
     /// The latched hovered affordance, self-corrected from `PaintCtx::is_hovered`.
@@ -619,6 +682,7 @@ impl<State: 'static> View<State> for CodeBlockView<State> {
             copied_since: None,
             width: 0.0,
             natural_height: 0.0,
+            scale: 1.0,
             focused: CodeBlockTarget::default(),
             hovered: None,
             captured: None,
@@ -687,7 +751,19 @@ impl<State: 'static> View<State> for CodeBlockView<State> {
 impl CodeBlockWidget {
     /// The code body's natural height: every line plus the viewport padding.
     fn natural_body_height(&self) -> f64 {
-        self.lines.len() as f64 * CODE_LINE_HEIGHT + CODE_PADDING_Y * 2.0
+        self.lines.len() as f64 * self.line_height() + CODE_PADDING_Y * 2.0
+    }
+
+    /// One code row's pitch: [`CODE_LINE_HEIGHT`] grown with the text scale so
+    /// consecutive scaled lines never overlap.
+    fn line_height(&self) -> f64 {
+        CODE_LINE_HEIGHT * self.scale
+    }
+
+    /// The line-number gutter's width, grown with the text scale so a scaled
+    /// number keeps its padding.
+    fn gutter_width(&self) -> f64 {
+        CODE_GUTTER_WIDTH * self.scale
     }
 
     /// The height the body settles at when expanded — its natural height,
@@ -698,7 +774,7 @@ impl CodeBlockWidget {
 
     /// The height the body settles at when collapsed.
     fn collapsed_height(&self) -> f64 {
-        (CODE_BLOCK_COLLAPSED_LINES as f64 * CODE_LINE_HEIGHT + CODE_PADDING_Y * 2.0)
+        (CODE_BLOCK_COLLAPSED_LINES as f64 * self.line_height() + CODE_PADDING_Y * 2.0)
             .min(self.expanded_height())
     }
 
@@ -761,7 +837,7 @@ impl CodeBlockWidget {
         if !self.follow {
             return 0;
         }
-        let rows = ((band - CODE_PADDING_Y * 2.0) / CODE_LINE_HEIGHT)
+        let rows = ((band - CODE_PADDING_Y * 2.0) / self.line_height())
             .floor()
             .max(0.0) as usize;
         self.lines.len().saturating_sub(rows)
@@ -925,8 +1001,12 @@ impl Widget for CodeBlockWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
         self.width = bc.max().width;
         // The code, its line numbers and the filename keep the mono family
-        // `code_style` names; only the chrome labels follow the theme.
-        let code = code_style(CODE_TEXT_SIZE);
+        // `code_style` names; the chrome labels take their family from the
+        // theme. Both follow the OS text scale, once each: the mono style
+        // through `scaled_code_style`, the chrome through `layout_themed`.
+        let theme = Theme::from_layout_ctx(ctx);
+        self.scale = text_factor(theme);
+        let code = scaled_code_style(CODE_TEXT_SIZE, theme);
         for line in &mut self.lines {
             for span in &mut line.spans {
                 span.run.layout(ctx, &code);
@@ -1118,19 +1198,21 @@ impl Widget for CodeBlockWidget {
             scene.push_clip(Point::new(origin.x, body_top), Size::new(size.width, band));
             let first = self.first_visible_line(band);
             let code_x = if self.line_numbers {
-                origin.x + CODE_GUTTER_WIDTH + CODE_GUTTER_GAP
+                origin.x + self.gutter_width() + CODE_GUTTER_GAP
             } else {
                 origin.x + CODE_PADDING_X
             };
+            let line_height = self.line_height();
+            let gutter = self.gutter_width();
             for (index, line) in self.lines.iter().enumerate().skip(first) {
-                let row_top = body_top + CODE_PADDING_Y + (index - first) as f64 * CODE_LINE_HEIGHT;
+                let row_top = body_top + CODE_PADDING_Y + (index - first) as f64 * line_height;
                 if row_top >= body_top + band {
                     break;
                 }
                 if self.highlight_lines.contains(&(index + 1)) {
                     scene.fill_rect(
                         Point::new(origin.x, row_top),
-                        Size::new(size.width, CODE_LINE_HEIGHT),
+                        Size::new(size.width, line_height),
                         with_alpha(palette.function, CODE_HIGHLIGHT_ALPHA),
                     );
                 }
@@ -1138,8 +1220,8 @@ impl Widget for CodeBlockWidget {
                     let measured = line.number.size();
                     line.number.paint(
                         Point::new(
-                            origin.x + CODE_GUTTER_WIDTH - CODE_GUTTER_PADDING - measured.width,
-                            row_top + (CODE_LINE_HEIGHT - measured.height) / 2.0,
+                            origin.x + gutter - CODE_GUTTER_PADDING * self.scale - measured.width,
+                            row_top + (line_height - measured.height) / 2.0,
                         ),
                         with_alpha(palette.comment, CODE_GUTTER_ALPHA),
                         scene,
@@ -1149,7 +1231,7 @@ impl Widget for CodeBlockWidget {
                 for span in &line.spans {
                     let measured = span.run.size();
                     span.run.paint(
-                        Point::new(span_x, row_top + (CODE_LINE_HEIGHT - measured.height) / 2.0),
+                        Point::new(span_x, row_top + (line_height - measured.height) / 2.0),
                         palette.ink(span.class),
                         scene,
                     );
@@ -1871,5 +1953,43 @@ mod tests {
             PROBE_WINDOW,
             PROBE_MONO_RUNS,
         );
+    }
+
+    // ---- The OS text scale ---------------------------------------------------
+
+    /// The code, its numbers and the filename grow with the text scale; the row
+    /// pitch grows with them so consecutive lines never overlap, and at `1.0`
+    /// every measure is today's.
+    #[test]
+    fn code_text_follows_the_text_scale_without_overlapping_lines() {
+        use super::scale_test::{assert_scaled, layout_under, theme_at};
+
+        let mut base = build(&view(false));
+        let base_size = layout_under(&mut base, None, 420.0);
+        let mut unit = build(&view(false));
+        let unit_theme = theme_at(1.0);
+        assert_eq!(layout_under(&mut unit, Some(&unit_theme), 420.0), base_size);
+        assert_eq!(base.line_height(), CODE_LINE_HEIGHT);
+        assert_eq!(base.gutter_width(), CODE_GUTTER_WIDTH);
+        assert_eq!(
+            base.natural_height,
+            6.0 * CODE_LINE_HEIGHT + CODE_PADDING_Y * 2.0
+        );
+
+        let mut big = build(&view(false));
+        let big_theme = theme_at(1.5);
+        layout_under(&mut big, Some(&big_theme), 420.0);
+        let code_height = |w: &CodeBlockWidget| w.lines[1].spans[0].run.size().height;
+        assert_scaled("code", code_height(&base), code_height(&big), 1.5);
+        let number = |w: &CodeBlockWidget| w.lines[1].number.size().height;
+        assert_scaled("line number", number(&base), number(&big), 1.5);
+        let filename = |w: &CodeBlockWidget| w.filename.as_ref().unwrap().size().height;
+        assert_scaled("filename", filename(&base), filename(&big), 1.5);
+        assert!(
+            big.line_height() >= code_height(&big),
+            "the row pitch holds a scaled line"
+        );
+        assert_scaled("row pitch", base.line_height(), big.line_height(), 1.5);
+        assert!(big.natural_height > base.natural_height);
     }
 }

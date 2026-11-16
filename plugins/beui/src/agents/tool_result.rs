@@ -66,7 +66,8 @@ use frust::authoring::{
 };
 
 use crate::agents::code_block::{
-    code_palette, code_style, draw_check, draw_chevron, draw_cross, draw_spinner, spinner_angle,
+    code_palette, draw_check, draw_chevron, draw_cross, draw_spinner, scaled_code_style,
+    spinner_angle,
 };
 use crate::motion::Ramp;
 use crate::press::{inside, is_activation_key, presses};
@@ -706,10 +707,13 @@ impl Widget for ToolResultWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
         self.width = bc.max().width;
         let theme = Theme::from_layout_ctx(ctx);
-        self.title.layout(ctx, &title_style(theme));
+        let title = title_style(theme);
+        let mono = scaled_code_style(TOOL_RESULT_META_SIZE, theme);
+        self.title.layout(ctx, &title);
         // The tool name, the status word and the meta keep the mono family
-        // `code_style` names explicitly.
-        let mono = code_style(TOOL_RESULT_META_SIZE);
+        // `code_style` names explicitly, and follow the OS text scale once
+        // (the title above already did through `themed_style`). The header row
+        // is a fixed 36 px strip of icon-sized parts; it holds the scaled runs.
         self.tool.layout(ctx, &mono);
         self.status_label.layout(ctx, &mono);
         if let Some(meta) = &mut self.meta {
@@ -1610,5 +1614,47 @@ mod tests {
             PROBE_WINDOW,
             PROBE_MONO_RUNS,
         );
+    }
+
+    // ---- The OS text scale ---------------------------------------------------
+
+    /// The mono tool name, status word and meta grow with the text scale, still
+    /// fit the header strip, and at `1.0` every measure is today's.
+    #[test]
+    fn tool_output_text_follows_the_text_scale() {
+        use crate::agents::code_block::scale_test::{assert_scaled, layout_under, theme_at};
+
+        let make = || build(&view(true, ToolResultStatus::Success).meta("exit 0"));
+        let mut base = make();
+        let base_size = layout_under(&mut base, None, 460.0);
+        let mut unit = make();
+        let unit_theme = theme_at(1.0);
+        assert_eq!(layout_under(&mut unit, Some(&unit_theme), 460.0), base_size);
+
+        let mut big = make();
+        let big_theme = theme_at(1.5);
+        layout_under(&mut big, Some(&big_theme), 460.0);
+        assert_scaled(
+            "tool name",
+            base.tool.size().height,
+            big.tool.size().height,
+            1.5,
+        );
+        assert_scaled(
+            "status word",
+            base.status_label.size().height,
+            big.status_label.size().height,
+            1.5,
+        );
+        let meta = |w: &ToolResultWidget| w.meta.as_ref().unwrap().size().height;
+        assert_scaled("meta", meta(&base), meta(&big), 1.5);
+        assert_scaled(
+            "title",
+            base.title.size().height,
+            big.title.size().height,
+            1.5,
+        );
+        assert!(big.tool.size().height <= TOOL_RESULT_HEADER_HEIGHT);
+        assert!(big.title.size().height <= TOOL_RESULT_HEADER_HEIGHT);
     }
 }

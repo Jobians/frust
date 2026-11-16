@@ -107,8 +107,8 @@ use frust::authoring::{
 };
 
 use crate::agents::code_block::{
-    CODE_TEXT_SIZE, code_palette, code_style, draw_check, draw_chevron, draw_cross, draw_spinner,
-    spinner_angle,
+    CODE_TEXT_SIZE, code_palette, draw_check, draw_chevron, draw_cross, draw_spinner,
+    scaled_code_style, spinner_angle,
 };
 use crate::motion::Ramp;
 use crate::press::{Lane, draw_focus_ring, inside, is_activation_key, presses};
@@ -1140,6 +1140,9 @@ impl Widget for ToolApprovalWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
         self.width = bc.max().width;
         let column = self.column_width();
+        let theme = Theme::from_layout_ctx(ctx);
+        let tool_style = scaled_code_style(CODE_TEXT_SIZE, theme);
+        let value_style = scaled_code_style(style::TEXT_XS, theme);
 
         // The chip is shaped first because its box is reserved out of the head
         // column: the head is bounded by what is left, so it cannot be laid
@@ -1153,10 +1156,9 @@ impl Widget for ToolApprovalWidget {
             .layout_themed(ctx, &title_style, TITLE_ROLE, head_column);
         self.title_truncated = self.title.overflowed();
         // The tool name and the parameter values keep the mono family
-        // `code_style` names explicitly.
-        let tool_size = self
-            .tool
-            .layout(ctx, &code_style(CODE_TEXT_SIZE), head_column);
+        // `code_style` names explicitly, and follow the OS text scale once
+        // through `scaled_code_style`.
+        let tool_size = self.tool.layout(ctx, &tool_style, head_column);
         self.tool_truncated = self.tool.overflowed();
         if self.title_truncated || self.tool_truncated {
             self.head_marker
@@ -1181,7 +1183,6 @@ impl Widget for ToolApprovalWidget {
             - TOOL_APPROVAL_PARAM_GAP)
             .max(0.0);
         let label_style = prose_style(style::TEXT_XS);
-        let value_style = code_style(style::TEXT_XS);
         for row in &mut self.params {
             let label = row.label.layout_themed(
                 ctx,
@@ -2596,6 +2597,45 @@ mod tests {
             probe_view,
             PROBE_WINDOW,
             PROBE_MONO_RUNS,
+        );
+    }
+
+    // ---- The OS text scale ---------------------------------------------------
+
+    /// The mono tool name and parameter values grow with the text scale, each
+    /// parameter row grows to hold its scaled value, and at `1.0` every measure
+    /// is today's.
+    #[test]
+    fn mono_text_follows_the_text_scale_without_overlapping_rows() {
+        use crate::agents::code_block::scale_test::{assert_scaled, layout_under, theme_at};
+
+        let make = || build(&view(ToolApprovalStatus::Pending, true));
+        let mut base = make();
+        let base_size = layout_under(&mut base, None, 900.0);
+        let mut unit = make();
+        let unit_theme = theme_at(1.0);
+        assert_eq!(layout_under(&mut unit, Some(&unit_theme), 900.0), base_size);
+
+        let mut big = make();
+        let big_theme = theme_at(1.5);
+        layout_under(&mut big, Some(&big_theme), 900.0);
+        assert_scaled(
+            "tool name",
+            base.tool.size().height,
+            big.tool.size().height,
+            1.5,
+        );
+        for index in 0..2 {
+            let value = |w: &ToolApprovalWidget| w.params[index].value.size().height;
+            assert_scaled("parameter value", value(&base), value(&big), 1.5);
+            assert!(
+                big.params[index].height >= value(&big),
+                "a parameter row holds its scaled value"
+            );
+        }
+        assert!(
+            big.params_height > base.params_height,
+            "the rows grew with the text"
         );
     }
 }
