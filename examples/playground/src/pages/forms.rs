@@ -410,7 +410,7 @@ pub fn page(state: &PlaygroundState) -> impl View<PlaygroundState> {
                             origin.0 + details.local_position.x,
                             origin.1 + details.local_position.y,
                         );
-                        // The first segment starts where the long press fired, so a fast
+                        // The first segment starts where the press began, so a fast
                         // first move does not skip the cells in between.
                         let fired = (
                             here.0 - details.offset_from_origin.x,
@@ -729,7 +729,7 @@ mod tests {
         assert_eq!(
             h.selected(),
             vec![0, 1, 2, 3],
-            "the first segment is swept from where the long press fired"
+            "the first segment is swept from where the press began"
         );
     }
 

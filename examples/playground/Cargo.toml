@@ -88,7 +88,7 @@ frust-shared-preferences = { path = "../../plugins/shared-preferences" }
 # own tokio is dev-only, so this row is the playground's. Matches the root's `version = "1"` row.
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "io-util"] }
 
-# Headless test harnesses only (`tests/` and the `#[cfg(test)]` module in `src/pages/forms.rs`):
+# Headless test harnesses only (`tests/` and the `#[cfg(test)]` modules under `src/`):
 # `RenderRoot` is deliberately not in `frust::authoring` (shell-owned), so they name these crates
 # directly; production code names none of them.
 [dev-dependencies]
