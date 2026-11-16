@@ -12,7 +12,8 @@ use std::time::Duration;
 
 use frust::testing::Tester;
 use frust::{
-    Component, FocusHandle, View, button, column, component, either, keep_focus, text_input,
+    Component, FocusHandle, View, button, column, component, either, keep_focus, overlay_portal,
+    text, text_input,
 };
 use kurbo::{Point, Size};
 
@@ -251,4 +252,126 @@ fn a_field_that_mounts_later_takes_a_pending_handle_request() {
     );
     assert!(handle.is_focused());
     assert_eq!(model.borrow().focus_log, [true]);
+}
+
+/// An autofocus field floated in an `overlay_portal` surface, reporting to `focus_log`.
+struct PortalPage {
+    model: Shared,
+    handle: FocusHandle,
+}
+
+impl Component for PortalPage {
+    type State = Shared;
+
+    fn init(&self) -> Shared {
+        self.model.clone()
+    }
+
+    fn build(&self, _model: &mut Shared) -> impl View<Shared> {
+        overlay_portal(text("anchor")).overlay(Some(
+            text_input(String::new(), |_: &mut Shared, _: String| {})
+                .focus_handle(self.handle.clone())
+                .autofocus(true)
+                .on_focus_change(|model: &mut Shared, focused: bool| {
+                    model.borrow_mut().focus_log.push(focused);
+                }),
+        ))
+    }
+}
+
+#[test]
+fn an_autofocus_field_inside_overlay_content_reports_its_gain_and_its_release() {
+    let (model, handle) = (model(Tap::Count), FocusHandle::new());
+    let (m, h) = (model.clone(), handle.clone());
+    let mut tester = Tester::new(
+        (),
+        move |_: &mut ()| {
+            component(PortalPage {
+                model: m.clone(),
+                handle: h.clone(),
+            })
+        },
+        Size::new(400.0, 300.0),
+    );
+    tester.pump(FRAME);
+    settle(&mut tester);
+    assert!(handle.is_focused(), "the floated field took focus");
+    assert_eq!(model.borrow().focus_log, [true]);
+
+    handle.release();
+    settle(&mut tester);
+    assert!(!handle.is_focused());
+    assert_eq!(model.borrow().focus_log, [true, false]);
+}
+
+/// A field, then a second field inside `keep_focus`, each reporting to its own log.
+struct KeptPage {
+    model: Shared,
+    kept_log: Rc<RefCell<Vec<bool>>>,
+}
+
+impl Component for KeptPage {
+    type State = Shared;
+
+    fn init(&self) -> Shared {
+        self.model.clone()
+    }
+
+    fn build(&self, _model: &mut Shared) -> impl View<Shared> {
+        let kept_log = self.kept_log.clone();
+        column()
+            .child(
+                text_input(String::new(), |_: &mut Shared, _: String| {}).on_focus_change(
+                    |model: &mut Shared, focused: bool| model.borrow_mut().focus_log.push(focused),
+                ),
+            )
+            .child(keep_focus(
+                text_input(String::new(), |_: &mut Shared, _: String| {}).on_focus_change(
+                    move |_: &mut Shared, focused: bool| kept_log.borrow_mut().push(focused),
+                ),
+            ))
+    }
+}
+
+#[test]
+fn a_field_pressed_inside_keep_focus_neither_takes_nor_reports_focus() {
+    let model = model(Tap::Count);
+    let kept_log = Rc::new(RefCell::new(Vec::new()));
+    let (m, k) = (model.clone(), kept_log.clone());
+    let mut tester = Tester::new(
+        (),
+        move |_: &mut ()| {
+            component(KeptPage {
+                model: m.clone(),
+                kept_log: k.clone(),
+            })
+        },
+        Size::new(400.0, 300.0),
+    );
+    settle(&mut tester);
+    let fields: Vec<Point> = tester
+        .inspect()
+        .into_iter()
+        .filter(|node| node.type_name.ends_with("TextInputWidget"))
+        .map(|node| node.bounds.center())
+        .collect();
+    assert_eq!(fields.len(), 2);
+    tester.tap(fields[0]);
+    settle(&mut tester);
+    let first = tester.focus_info().expect("the tap focused the first").node;
+    assert_eq!(model.borrow().focus_log, [true]);
+
+    tester.tap(fields[1]);
+    settle(&mut tester);
+
+    assert_eq!(
+        tester.focus_info().map(|info| info.node),
+        Some(first),
+        "the first field kept the session"
+    );
+    assert_eq!(model.borrow().focus_log, [true], "and was not told it lost");
+    assert!(
+        kept_log.borrow().is_empty(),
+        "the kept field reported nothing"
+    );
 }

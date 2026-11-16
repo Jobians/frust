@@ -2207,18 +2207,18 @@ impl ChildPod {
                 crate::shortcuts::note_handled();
             }
             let (opted_in, opted_in_at_or_below) = frame.close();
+            // A press that keeps focus ignores every claim on its path; later pods see the flag.
+            let mut fold = child_ctx.fold();
+            if crate::focus_handle::press_kept() {
+                fold.focus_requested = false;
+            }
             (
                 (opted_in, opted_in_at_or_below),
-                child_ctx.fold(),
+                fold,
                 (child_ctx.needs_layout(), child_ctx.is_layout_path_dirty()),
                 result,
             )
         };
-        let mut fold = fold;
-        // A press that keeps focus ignores every claim on its path; later pods see the same flag.
-        if crate::focus_handle::press_kept() {
-            fold.focus_requested = false;
-        }
         let (captured, hover_claimed) = (fold.captured, fold.hover_claimed);
         let (focus_req, focus_rel, redraw) =
             (fold.focus_requested, fold.focus_released, fold.needs_redraw);

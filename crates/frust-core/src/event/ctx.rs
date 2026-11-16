@@ -273,6 +273,16 @@ impl<'a> EventCtx<'a> {
         self.focus_changed
     }
 
+    /// Whether the broadcast carries focus notices (see [`crate::focus_handle`]).
+    pub fn focus_notice_open(&self) -> bool {
+        crate::focus_handle::notice_open()
+    }
+
+    /// Whether the `Down` being handled keeps focus: the root ignores a claim made now.
+    pub fn press_keeps_focus(&self) -> bool {
+        crate::focus_handle::press_kept()
+    }
+
     pub(crate) fn set_focus_changed(&mut self, changed: bool) {
         self.focus_changed = changed;
     }

@@ -3466,6 +3466,11 @@ impl TextInputWidget {
             InputEvent::Pointer(p) => match p.phase {
                 PointerPhase::Down => {
                     if inside(p.position, ctx.size()) {
+                        // The root ignores a claim on a press that keeps focus, so the field
+                        // takes no focus, caret or IME surface of its own from it.
+                        if ctx.press_keeps_focus() {
+                            return EventResult::Handled;
+                        }
                         // A secondary press is the desktop context-menu gesture
                         // (no mobile shell delivers one): it claims focus —
                         // *starting* a session when there was none, which is
