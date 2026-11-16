@@ -53,8 +53,10 @@
 //! - a plain `frust::text(..)` child calls `.themed_family(role)`, the
 //!   framework's own opt-in on the same enum.
 //!
-//! Only the family is taken from the role; size, weight, tracking and ink stay
-//! the style's own. beUI's type scale ([`crate::tokens::type_scale`]) puts the
+//! Only the family is taken from the role; weight, tracking and ink stay the
+//! style's own, and the size (with an absolute line height and the tracking)
+//! is multiplied by the theme's OS text scale. A text that must not scale uses
+//! [`themed_style_fixed`] / `layout_themed_fixed`. beUI's type scale ([`crate::tokens::type_scale`]) puts the
 //! same Geist stack in every slot, so the role is a semantic choice (a control
 //! label is `LabelLarge`, a caption `LabelSmall`, a heading a title role) and
 //! never changes what the catalog's own theme renders. With no theme threaded
@@ -67,7 +69,7 @@
 
 use frust::Theme;
 use frust::authoring::text::{
-    FontFamily, FontWeight, LocaleStamp, TextContext, TextLayout, TextStyle,
+    FontFamily, FontWeight, LineHeight, LocaleStamp, TextContext, TextLayout, TextStyle,
 };
 use frust::authoring::{Brush, Color, LayoutCtx, PaintScene, Point, Size};
 
@@ -85,15 +87,48 @@ pub(crate) fn role_family(role: ThemeTextType, theme: Option<&Theme>) -> FontFam
     })
 }
 
-/// `style` with its family replaced by [`role_family`]`(role, theme)`, and
-/// every other field kept. Call it in `layout` with
-/// `Theme::from_layout_ctx(ctx)` and shape with the result.
+/// `style` with its family replaced by [`role_family`]`(role, theme)` and its
+/// size scaled by the live theme's OS text scale ([`scaled_style`]); every
+/// other field is kept. Call it in `layout` with `Theme::from_layout_ctx(ctx)`
+/// and shape with the result.
+///
+/// Text that must not follow the OS text size (a numeric ticker, a label in
+/// fixed geometry) calls [`themed_style_fixed`] instead.
 pub(crate) fn themed_style(
     style: TextStyle,
     role: ThemeTextType,
     theme: Option<&Theme>,
 ) -> TextStyle {
+    scaled_style(themed_style_fixed(style, role, theme), theme)
+}
+
+/// [`themed_style`] without the text scale: only the family is taken from the
+/// theme. The opt-out for text whose size must stay fixed.
+pub(crate) fn themed_style_fixed(
+    style: TextStyle,
+    role: ThemeTextType,
+    theme: Option<&Theme>,
+) -> TextStyle {
     style.with_family(role_family(role, theme))
+}
+
+/// `style` with its size, absolute line height and letter spacing multiplied
+/// by the live theme's text scale. `Theme::text_scale` is already clamped to
+/// the body range, the clamp the baseline text widget applies to default-sized
+/// text. With no theme, or a factor of exactly `1.0`, the style is returned
+/// unchanged. Mirrors `frust_theme::scale_style`, which the facade does not
+/// re-export.
+pub(crate) fn scaled_style(style: TextStyle, theme: Option<&Theme>) -> TextStyle {
+    let factor = theme.map_or(1.0, Theme::text_scale);
+    if factor == 1.0 {
+        return style;
+    }
+    let mut out = style.clone().with_size(style.size * factor);
+    out.letter_spacing = style.letter_spacing * factor;
+    if let LineHeight::Absolute(px) = style.line_height {
+        out.line_height = LineHeight::Absolute(px * factor);
+    }
+    out
 }
 
 /// The ink [`LabelRun`] shapes with. Never painted — keeping it constant keeps
@@ -167,6 +202,21 @@ impl Label {
         role: ThemeTextType,
     ) -> Size {
         let style = themed_style(style.clone(), role, Theme::from_layout_ctx(ctx));
+        self.layout(ctx, &style)
+    }
+
+    /// [`Self::layout_themed`] without the text scale ([`themed_style_fixed`]).
+    #[allow(
+        dead_code,
+        reason = "the opt-out for fixed-geometry text; no caller adopts it yet"
+    )]
+    pub(crate) fn layout_themed_fixed(
+        &mut self,
+        ctx: &mut LayoutCtx,
+        style: &TextStyle,
+        role: ThemeTextType,
+    ) -> Size {
+        let style = themed_style_fixed(style.clone(), role, Theme::from_layout_ctx(ctx));
         self.layout(ctx, &style)
     }
 
@@ -259,6 +309,21 @@ impl LabelRun {
         role: ThemeTextType,
     ) -> Size {
         let style = themed_style(style.clone(), role, Theme::from_layout_ctx(ctx));
+        self.layout(ctx, &style)
+    }
+
+    /// [`Self::layout_themed`] without the text scale ([`themed_style_fixed`]).
+    #[allow(
+        dead_code,
+        reason = "the opt-out for fixed-geometry text; no caller adopts it yet"
+    )]
+    pub(crate) fn layout_themed_fixed(
+        &mut self,
+        ctx: &mut LayoutCtx,
+        style: &TextStyle,
+        role: ThemeTextType,
+    ) -> Size {
+        let style = themed_style_fixed(style.clone(), role, Theme::from_layout_ctx(ctx));
         self.layout(ctx, &style)
     }
 
@@ -582,6 +647,59 @@ mod tests {
         let mut rec = typeface_probe::FaceRecorder::default();
         label.paint(Point::ZERO, &mut rec);
         assert_eq!(rec.faces, vec![Face::GeistMono]);
+    }
+
+    // ---- The OS text scale ------------------------------------------------
+
+    fn scaled_theme(factor: f32) -> Theme {
+        let theme = crate::theme();
+        let authored = theme.type_scale.clone();
+        theme.with_text_scale(&authored, factor)
+    }
+
+    #[test]
+    fn the_default_scale_leaves_the_size_unchanged() {
+        let base = label_style(14.0);
+        let role = ThemeTextType::LabelLarge;
+        assert_eq!(themed_style(base.clone(), role, None).size, 14.0);
+        let plain = crate::theme();
+        assert_eq!(themed_style(base.clone(), role, Some(&plain)).size, 14.0);
+        let unit = scaled_theme(1.0);
+        assert_eq!(themed_style(base, role, Some(&unit)).size, 14.0);
+    }
+
+    #[test]
+    fn a_text_scale_multiplies_size_and_absolute_line_height() {
+        let theme = scaled_theme(1.5);
+        let mut base = label_style(14.0);
+        base.line_height = LineHeight::Absolute(20.0);
+        let out = themed_style(base, ThemeTextType::LabelLarge, Some(&theme));
+        assert_eq!(out.size, 21.0);
+        assert_eq!(out.line_height, LineHeight::Absolute(30.0));
+    }
+
+    #[test]
+    fn a_scale_above_the_body_maximum_is_clamped_like_the_baseline() {
+        let theme = scaled_theme(3.0);
+        let out = themed_style(label_style(10.0), ThemeTextType::LabelLarge, Some(&theme));
+        assert_eq!(out.size, 10.0 * 2.0);
+    }
+
+    #[test]
+    fn the_fixed_opt_out_keeps_the_size() {
+        let theme = scaled_theme(1.5);
+        let base = label_style(14.0);
+        let out = themed_style_fixed(base.clone(), ThemeTextType::LabelLarge, Some(&theme));
+        assert_eq!(out.size, 14.0);
+        let mut run = LabelRun::new("Ship");
+        let scaled = with_theme(&mut TextContext::new(), Some(&theme), |ctx| {
+            run.layout_themed(ctx, &base, ThemeTextType::LabelLarge)
+        });
+        let mut fixed_run = LabelRun::new("Ship");
+        let fixed = with_theme(&mut TextContext::new(), Some(&theme), |ctx| {
+            fixed_run.layout_themed_fixed(ctx, &base, ThemeTextType::LabelLarge)
+        });
+        assert!(scaled.height > fixed.height, "scaled text is taller");
     }
 
     #[test]
