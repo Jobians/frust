@@ -308,8 +308,8 @@ The sections, in order:
       underlined and no after the commit.
     - **Long-press drag.** A 260 px tall scroll view over a grid of 60 numbered cells (six
       columns, ten rows, about three viewports tall), with a status line (selected count,
-      dragging yes/no, last offset from the press point). Steps: drag a finger or the mouse
-      quickly inside the grid (it scrolls, nothing is selected); press one cell and hold about
+      dragging yes/no, last offset from the press point, last window position). Steps: drag
+      a finger or the mouse quickly inside the grid (it scrolls, nothing is selected); press one cell and hold about
       half a second (it turns selected, count 1, dragging yes); without lifting, drag across
       other cells (every crossed cell is selected, the offset follows the pointer, and the
       grid does not scroll even when the pointer is dragged vertically); release (dragging
