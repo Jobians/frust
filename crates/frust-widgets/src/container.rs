@@ -221,7 +221,9 @@ impl<State: 'static> ContainerView<State> {
     /// per-corner case (a bottom-anchored sheet with only its top corners
     /// rounded, a segmented control's end caps) for free — one method, no
     /// ergonomics lost either way. Square corners
-    /// (`CornerRadii::default()`) by default.
+    /// (`CornerRadii::default()`) by default. Each corner paints clamped to
+    /// half the shorter side, so `f64::INFINITY` is a capsule and an oversized
+    /// radius never reaches the engine raw; NaN and negative paint square.
     pub fn radius(mut self, radius: impl Into<CornerRadii>) -> Self {
         self.radius = radius.into();
         self
@@ -424,6 +426,28 @@ fn inset_radii(radii: CornerRadii, inset: f64) -> CornerRadii {
     )
 }
 
+/// Resolves each corner of `radii` against a box of `size`, giving the radius
+/// a painted corner actually shows: NaN and negative become `0.0`, and
+/// anything above half the shorter side (including `f64::INFINITY`, the
+/// capsule spelling) becomes half the shorter side. Finite radii at or below
+/// that cap pass through unchanged.
+pub(crate) fn resolve_corner_radii(radii: CornerRadii, size: Size) -> CornerRadii {
+    let cap = (size.width.min(size.height) / 2.0).max(0.0);
+    let resolve = |radius: f64| {
+        if radius.is_nan() || radius < 0.0 {
+            0.0
+        } else {
+            radius.min(cap)
+        }
+    };
+    CornerRadii::new(
+        resolve(radii.top_left),
+        resolve(radii.top_right),
+        resolve(radii.bottom_right),
+        resolve(radii.bottom_left),
+    )
+}
+
 /// One axis of a childless `.expand()`ed container's intrinsic size: `max`
 /// when it is a real bound, else `min` — the fallback for an unbounded axis
 /// (`max == f64::INFINITY`), where `BoxConstraints::constrain`'s clamp is a
@@ -484,6 +508,7 @@ impl Widget for ContainerWidget {
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
         let origin = ctx.origin();
         let size = ctx.size();
+        let resolved = resolve_corner_radii(self.radius, size);
         // Glow paints first — an elevation-style shadow reads from beneath
         // the shape it casts (see the module docs' "Paint discipline"
         // section).
@@ -505,21 +530,23 @@ impl Widget for ContainerWidget {
             // this mirrors grows the caster's own corner, so a circular fill
             // keeps a circular halo instead of the shadow's roundness being
             // capped by its own inflated box.
-            let clamped_fill_radius = self.radius.largest().min(size.width.min(size.height) / 2.0);
+            let clamped_fill_radius = resolved.largest();
             let shadow_radius = clamped_fill_radius + spread.max(0.0);
             scene.draw_shadow(shadow_origin, shadow_size, shadow_radius, std_dev, color);
         }
         if let Some(fill) = self.fill {
-            scene.fill_rounded_rect_radii(origin, size, self.radius, fill);
+            scene.fill_rounded_rect_radii(origin, size, resolved, fill);
         }
         if let Some((color, width)) = self.border {
             // Inset by half the stroke width so the border paints fully
             // inside the container's own bounds (a stroke is centered on its
             // path) — mirrors `Button`'s/`material::card`'s outlined-variant
             // precedent, generalized per corner via `inset_radii` so the
-            // border agrees with a per-corner fill.
+            // border agrees with a per-corner fill. The inset runs on the
+            // resolved radii, so an infinite or oversized radius is capped
+            // before it is inset.
             let half = width / 2.0;
-            let radii = inset_radii(self.radius, half);
+            let radii = inset_radii(resolved, half);
             let rr = RoundedRect::new(
                 half,
                 half,
@@ -567,4 +594,43 @@ impl Widget for ContainerWidget {
     }
 
     crate::authoring::visit_children!(child);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_corner_radii;
+    use frust_core::CornerRadii;
+    use kurbo::Size;
+
+    #[test]
+    fn infinite_radius_resolves_to_half_the_shorter_side() {
+        let resolved =
+            resolve_corner_radii(CornerRadii::uniform(f64::INFINITY), Size::new(100.0, 40.0));
+        assert_eq!(resolved, CornerRadii::uniform(20.0));
+    }
+
+    #[test]
+    fn nan_and_negative_radii_resolve_to_square() {
+        let resolved = resolve_corner_radii(
+            CornerRadii::new(f64::NAN, -3.0, 4.0, f64::NEG_INFINITY),
+            Size::new(100.0, 100.0),
+        );
+        assert_eq!(resolved, CornerRadii::new(0.0, 0.0, 4.0, 0.0));
+    }
+
+    #[test]
+    fn finite_radius_at_or_below_the_cap_is_unchanged() {
+        let size = Size::new(30.0, 50.0);
+        let radii = CornerRadii::new(0.0, 7.5, 15.0, 2.0);
+        assert_eq!(resolve_corner_radii(radii, size), radii);
+    }
+
+    #[test]
+    fn oversized_finite_radius_clamps_per_corner() {
+        let resolved = resolve_corner_radii(
+            CornerRadii::new(999.0, 5.0, 16.0, 0.0),
+            Size::new(30.0, 50.0),
+        );
+        assert_eq!(resolved, CornerRadii::new(15.0, 5.0, 15.0, 0.0));
+    }
 }

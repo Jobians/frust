@@ -629,7 +629,7 @@ fn a_non_finite_clip_rectangle_refuses_the_frame() {
         assert!(
             matches!(
                 compiler().compile(&scene, Affine::IDENTITY, VIEWPORT),
-                Err(EngineError::InvalidGeometry)
+                Err(EngineError::InvalidGeometry { .. })
             ),
             "a clip is lowered now, so {rect:?} is geometry the frame is refused for"
         );
@@ -646,7 +646,7 @@ fn a_non_finite_clip_radius_refuses_the_frame() {
 
     assert!(matches!(
         compiler().compile(&scene, Affine::IDENTITY, VIEWPORT),
-        Err(EngineError::InvalidGeometry)
+        Err(EngineError::InvalidGeometry { .. })
     ));
 }
 
@@ -661,7 +661,7 @@ fn a_non_finite_clip_transform_still_refuses_the_frame() {
 
     assert!(matches!(
         compiler().compile(&scene, Affine::IDENTITY, VIEWPORT),
-        Err(EngineError::InvalidTransform)
+        Err(EngineError::InvalidTransform { .. })
     ));
 }
 
@@ -859,6 +859,6 @@ fn a_non_finite_clip_path_refuses_the_frame() {
 
     assert!(matches!(
         compiler().compile(&scene, Affine::IDENTITY, VIEWPORT),
-        Err(EngineError::InvalidGeometry)
+        Err(EngineError::InvalidGeometry { .. })
     ));
 }

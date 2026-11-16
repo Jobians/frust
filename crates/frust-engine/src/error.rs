@@ -22,8 +22,21 @@ pub enum EngineError {
     #[error("target exceeds u16 ceiling (65,535 pixels)")]
     TargetTooLarge,
 
-    #[error("non-finite transform refused")]
-    InvalidTransform,
+    /// A transform maps geometry off the finite device grid.
+    ///
+    /// `command` is the index of the offending command in the scene's command
+    /// order, or `None` when the refusal was raised where the index is not
+    /// known: the root transform (kind `"root"`) or a filter being recorded
+    /// (kind `"PushLayer"`); `kind` is otherwise that command's variant name
+    /// (for example `"RoundedRect"`).
+    #[error("non-finite transform refused ({})", describe_site(*command, kind))]
+    InvalidTransform {
+        /// Index of the offending command, `None` when it is not known (the
+        /// root transform, or filter recording).
+        command: Option<usize>,
+        /// The command's variant name, or `"root"`.
+        kind: &'static str,
+    },
 
     /// A command's own geometry — a rectangle's extents, a corner radius, a
     /// path point, a stroke width, a dash length or phase — is non-finite.
@@ -33,8 +46,20 @@ pub enum EngineError {
     /// onto the device grid, while this is the geometry itself, and a caller
     /// chasing a blank frame needs to know which of the two it recorded wrong.
     /// Both are refused by the same up-front walk, before any lowering runs.
-    #[error("non-finite geometry refused")]
-    InvalidGeometry,
+    ///
+    /// `command` is the index of the offending command in the scene's command
+    /// order and `kind` its variant name (for example `"RoundedRect"`), so a
+    /// caller can find the draw that blanked the frame. `command` is `None`
+    /// when the refusal was raised where the index is not known: a filter
+    /// refused while it is being recorded (before it is part of any scene)
+    /// reports `None` and kind `"PushLayer"`.
+    #[error("non-finite geometry refused ({})", describe_site(*command, kind))]
+    InvalidGeometry {
+        /// Index of the offending command, `None` when it is not known.
+        command: Option<usize>,
+        /// The command's variant name.
+        kind: &'static str,
+    },
 
     /// A frame's layer shape is outside what the engine's scheduler serves.
     ///
@@ -111,4 +136,13 @@ pub enum EngineError {
 
     #[error("encoded-paint capacity exhausted")]
     PaintCapacity,
+}
+
+/// The parenthesised site of a transform refusal: the command it names, or the
+/// root transform.
+fn describe_site(command: Option<usize>, kind: &str) -> String {
+    match command {
+        Some(index) => format!("command {index}, {kind}"),
+        None => kind.to_owned(),
+    }
 }

@@ -8,13 +8,14 @@ use std::time::{Duration, Instant};
 
 use frust_core::accesskit::{Action, NodeId};
 use frust_core::{
-    DiscardScene, EventOutcome, FocusInfo, FrameTime, InputEvent, InspectNode, PaintOutcome,
-    PaintScene, RenderRoot, SemanticsUpdate, View, WindowInsets, WindowMetrics,
+    EventOutcome, FocusInfo, FrameTime, InputEvent, InspectNode, PaintOutcome, RenderRoot,
+    SemanticsUpdate, View, WindowInsets, WindowMetrics,
 };
 use frust_reactive::time::test_support::{VirtualClockGuard, install_virtual_clock};
 use frust_reactive::{Owner, ReactiveRuntime, provide_context};
+use frust_render::{EngineError, validate_scene};
 use frust_scene::{Scene, SceneBuilder};
-use kurbo::Size;
+use kurbo::{Affine, Size};
 
 use crate::Theme;
 
@@ -68,6 +69,7 @@ pub struct TesterOptions {
     scale: f64,
     insets: WindowInsets,
     start_time: FrameTime,
+    allow_refused_frames: bool,
 }
 
 impl Default for TesterOptions {
@@ -77,6 +79,7 @@ impl Default for TesterOptions {
             scale: 1.0,
             insets: WindowInsets::default(),
             start_time: FrameTime::ZERO,
+            allow_refused_frames: false,
         }
     }
 }
@@ -109,6 +112,27 @@ impl TesterOptions {
         self.start_time = start_time;
         self
     }
+
+    /// Record frames the engine would refuse in [`Tester::refused_frames`] instead of panicking.
+    ///
+    /// The default is `false`: a frame whose scene fails the engine's own validation fails the
+    /// test at the call that produced it.
+    #[must_use]
+    pub fn allow_refused_frames(mut self, allow: bool) -> Self {
+        self.allow_refused_frames = allow;
+        self
+    }
+}
+
+/// One frame the engine's scene validation refused, kept when
+/// [`TesterOptions::allow_refused_frames`] is set.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct RefusedFrame {
+    /// The frame's ordinal: `0` for the construction frame, then one per frame the Tester paints.
+    pub frame: u64,
+    /// Why the engine refused the frame's scene.
+    pub error: EngineError,
 }
 
 /// What one [`Tester::pump`] reports.
@@ -131,6 +155,15 @@ pub struct PumpOutcome {
 /// Every Tester makes the thread's virtual `frust::time` clock available before user code runs.
 /// Testers on one thread share that clock, so a pump on either advances it for both; the last
 /// Tester dropped uninstalls it, and the next starts again from zero.
+///
+/// Every frame is also recorded into a scene and checked with the engine's up-front scene
+/// validation ([`validate_scene`]: target size, transforms, command geometry and the per-frame
+/// backdrop cap), at the physical extent and scale root a shell hands the renderer. A frame it
+/// would refuse (non-finite geometry or too many glass surfaces on screen, say, which is a blank
+/// screen on a device) panics with the engine's error, or is collected in
+/// [`refused_frames`](Self::refused_frames) under [`TesterOptions::allow_refused_frames`]. This
+/// is not everything the renderer can refuse: refusals raised later in compilation or by the GPU
+/// path are out of its reach.
 pub struct Tester<S: 'static, V: View<S>> {
     root: RenderRoot<S, V>,
     state: S,
@@ -140,6 +173,9 @@ pub struct Tester<S: 'static, V: View<S>> {
     clock: FrameTime,
     runtime: &'static ReactiveRuntime,
     owner: Owner,
+    allow_refused_frames: bool,
+    frames: u64,
+    refused: Vec<RefusedFrame>,
     /// Declared last: released after `Drop::drop` has cleaned the owner up, so a cancelled
     /// timer's teardown still sees a live clock.
     _clock: ClockRef,
@@ -149,6 +185,7 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
     /// Build `state` with `build` in a `size` window under default options and run one frame,
     /// so layout, overlay hits, [`semantics`](Self::semantics) and [`inspect`](Self::inspect)
     /// are valid on return.
+    #[track_caller]
     pub fn new<F>(state: S, build: F, size: Size) -> Self
     where
         F: FnMut(&mut S) -> V + 'static,
@@ -157,6 +194,7 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
     }
 
     /// [`new`](Self::new) under `options`.
+    #[track_caller]
     pub fn with_options<F>(state: S, build: F, size: Size, options: &TesterOptions) -> Self
     where
         F: FnMut(&mut S) -> V + 'static,
@@ -172,6 +210,7 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
     /// from `use_context` inside the build closure and event handlers. This is the recommended
     /// form for an app with injected dependencies; contexts provided on an ambient owner set
     /// before construction also resolve, through the parent walk.
+    #[track_caller]
     pub fn new_with<F>(size: Size, options: &TesterOptions, setup: impl FnOnce() -> (S, F)) -> Self
     where
         F: FnMut(&mut S) -> V + 'static,
@@ -204,9 +243,12 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
             clock: options.start_time,
             runtime,
             owner,
+            allow_refused_frames: options.allow_refused_frames,
+            frames: 0,
+            refused: Vec::new(),
             _clock: clock,
         };
-        let _outcome = tester.frame(&mut DiscardScene);
+        let _outcome = tester.frame();
         tester
     }
 
@@ -229,13 +271,14 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
     /// run elsewhere and stay on wall time.
     ///
     /// `needs_frame` folds the paint's request with a still-pending deferred-callback flush.
+    #[track_caller]
     pub fn pump(&mut self, dt: Duration) -> PumpOutcome {
         let dt = u64::try_from(dt.as_nanos()).unwrap_or(u64::MAX);
         self.clock = FrameTime::from_nanos(self.clock.as_nanos().saturating_add(dt));
         self.runtime.pump_local();
         frust_reactive::time::test_support::advance(Duration::from_nanos(dt));
         self.runtime.pump_local();
-        let outcome = self.frame(&mut DiscardScene);
+        let outcome = self.frame();
         PumpOutcome {
             needs_frame: outcome.needs_frame || frust_core::has_pending_result_flush(),
         }
@@ -249,6 +292,7 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
     /// # Panics
     ///
     /// When 600 frames (9.6 s of virtual time) pass and the tree still requests frames.
+    #[track_caller]
     pub fn pump_and_settle(&mut self) -> usize {
         let mut idle_streak = 0;
         for frames in 1..=SETTLE_FRAME_CAP {
@@ -278,6 +322,7 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
     /// # Panics
     ///
     /// When `timeout` of real time passes with `predicate` still false.
+    #[track_caller]
     pub fn pump_until(
         &mut self,
         what: &str,
@@ -339,13 +384,18 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
     }
 
     /// Rebuild, lay out and record one paint at the current clock, without advancing it.
+    ///
+    /// The recorded frame is validated like every pumped one: it panics, or is collected under
+    /// [`TesterOptions::allow_refused_frames`], when the engine would refuse it.
+    #[track_caller]
     pub fn scene(&mut self) -> Scene {
-        let mut scene = Scene::new();
-        {
-            let mut builder = SceneBuilder::new(&mut scene);
-            let _outcome = self.frame(&mut builder);
-        }
-        scene
+        self.frame_recorded().1
+    }
+
+    /// The frames the engine's scene validation refused, in order. Always empty unless
+    /// [`TesterOptions::allow_refused_frames`] was set.
+    pub fn refused_frames(&self) -> &[RefusedFrame] {
+        &self.refused
     }
 
     /// The accessibility tree as of the last layout.
@@ -369,6 +419,7 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
     ///
     /// Events carry no clock: pump between events whose meaning depends on elapsed time (a long
     /// press, a fling). The change an event makes shows from the next pump.
+    #[track_caller]
     pub fn send(&mut self, event: &InputEvent) -> EventOutcome {
         let Self {
             root, state, owner, ..
@@ -388,6 +439,7 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
     /// # Panics
     ///
     /// When a finder matches nothing or is a type finder, which matches widgets, not nodes.
+    #[track_caller]
     pub fn perform_action(
         &mut self,
         target: impl Into<super::find::ActionTarget>,
@@ -400,8 +452,40 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
         owner.with(|| root.perform_accessibility_action(state, node, action))
     }
 
-    /// One frame at the current clock: rebuild under the owner, lay out, paint into `scene`.
-    fn frame(&mut self, scene: &mut dyn PaintScene) -> PaintOutcome {
+    /// One frame at the current clock, recorded and checked.
+    #[track_caller]
+    fn frame(&mut self) -> PaintOutcome {
+        self.frame_recorded().0
+    }
+
+    /// One frame at the current clock: rebuild under the owner, lay out, paint into a recorded
+    /// scene, then run the engine's validation on it.
+    #[track_caller]
+    fn frame_recorded(&mut self) -> (PaintOutcome, Scene) {
+        let (outcome, scene) = self.paint_frame();
+        let ordinal = self.frames;
+        self.frames += 1;
+        // What a shell hands the renderer: it pushes `Affine::scale(scale)` over the logical
+        // paint and the renderer compiles at the identity root against the physical surface, so
+        // the scale transform is the root and the extent is the logical size times the scale.
+        let scale = self.metrics.scale;
+        let size = (
+            surface_extent(self.metrics.size.width * scale),
+            surface_extent(self.metrics.size.height * scale),
+        );
+        if let Err(error) = validate_scene(&scene, Affine::scale(scale), size) {
+            if !self.allow_refused_frames {
+                panic!("Tester: the engine would refuse frame {ordinal} \u{2014} {error}");
+            }
+            self.refused.push(RefusedFrame {
+                frame: ordinal,
+                error,
+            });
+        }
+        (outcome, scene)
+    }
+
+    fn paint_frame(&mut self) -> (PaintOutcome, Scene) {
         let Self {
             root,
             state,
@@ -417,8 +501,18 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
         });
         let _flags = root.take_change_flags();
         root.layout_with_text(metrics.size, text_ctx as &mut dyn Any);
-        root.paint(scene, *clock)
+        let mut scene = Scene::new();
+        let outcome = {
+            let mut builder = SceneBuilder::new(&mut scene);
+            root.paint(&mut builder, *clock)
+        };
+        (outcome, scene)
     }
+}
+
+/// A window extent as the engine's `u16` surface extent, rounded up and saturating.
+fn surface_extent(extent: f64) -> u16 {
+    extent.max(0.0).ceil().min(f64::from(u16::MAX)) as u16
 }
 
 impl<S: 'static, V: View<S>> Drop for Tester<S, V> {
