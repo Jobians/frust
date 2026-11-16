@@ -55,6 +55,15 @@ fn advance_focus_epoch(epoch: u64) -> u64 {
     }
 }
 
+/// [`advance_focus_epoch`], stepping over `burned`: an epoch a press that kept focus may have
+/// stamped on pods without committing it, so no session ever takes that value.
+fn advance_focus_epoch_past(epoch: u64, burned: u64) -> u64 {
+    match advance_focus_epoch(epoch) {
+        next if next == burned => advance_focus_epoch(next),
+        next => next,
+    }
+}
+
 /// What [`RenderRoot::event`]'s overlay pre-pass decided about one incoming event.
 enum OverlayRoute {
     /// The overlay layer consumed the event; return this outcome unchanged.
@@ -95,6 +104,14 @@ pub struct RenderRoot<State: 'static, V: View<State>> {
     /// Whether traversal granted the live focus; any other claim, a release or a `Down` clears it.
     keyboard_focus: bool,
     focus_ring_policy: FocusRingPolicy,
+    /// The handles the last paint bound, each with the stop it addresses (`crate::focus_handle`).
+    focus_handles: Vec<crate::focus_handle::BoundHandle>,
+    /// The stops whose focus state changed and are owed a deferred notification.
+    focus_notice: Vec<u64>,
+    /// `(focus_epoch, focus_active, overlay count)` as the handles were last refreshed; `None` forces a refresh.
+    handles_synced: Option<(u64, bool, usize)>,
+    /// A claim epoch stamped on pods by a press that kept focus; never handed to a session.
+    burned_epoch: u64,
     /// The last committed focus target and the open focus-return scopes (`crate::focus_scope`).
     focus_returns: FocusReturns,
     /// Whether a declined bare Tab/Shift+Tab runs traversal ([`RenderRoot::set_tab_traversal`]).
@@ -187,6 +204,10 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             focus_grant: ShortcutId::next(),
             keyboard_focus: false,
             focus_ring_policy: FocusRingPolicy::KeyboardOnly,
+            focus_handles: Vec::new(),
+            focus_notice: Vec::new(),
+            handles_synced: None,
+            burned_epoch: 0,
             focus_returns: FocusReturns::default(),
             tab_traversal: true,
             hover_active: false,

@@ -7,6 +7,7 @@ use kurbo::Rect;
 
 use super::{MAX_PENDING_RESULT_FLUSH_PASSES, RenderRoot};
 use crate::event::InputEvent;
+use crate::focus_handle::FocusNoticePass;
 use crate::tree::{InspectNode, WidgetPod, WidgetTree};
 use crate::view::{BuildCtx, ChangeFlags, View, WidgetId};
 use crate::widget::PlatformViewFrame;
@@ -77,7 +78,8 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
     /// While a structural op has raised `mark_pending_result_flush`, each pass dispatches one
     /// [`InputEvent::Housekeeping`] broadcast (where `&mut State` is in scope) and re-diffs, capped
     /// by `MAX_PENDING_RESULT_FLUSH_PASSES`: past it the mark stays raised and one more frame is
-    /// requested. A broadcast's `needs_redraw` requests that frame too.
+    /// requested. A broadcast's `needs_redraw` requests that frame too. The same broadcast carries
+    /// the deferred focus-change notifications of `crate::focus_handle`.
     pub fn rebuild(
         &mut self,
         build: &mut impl FnMut(&mut State) -> V,
@@ -89,7 +91,12 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         let mut flags = self.rebuild_view(view);
 
         let mut passes = 0usize;
-        while crate::event::take_pending_result_flush() {
+        loop {
+            // A focus change owed to a bound widget rides the same deferred broadcast.
+            let owed = crate::event::take_pending_result_flush() | !self.focus_notice.is_empty();
+            if !owed {
+                break;
+            }
             if passes >= MAX_PENDING_RESULT_FLUSH_PASSES {
                 // The work is still owed: re-mark it and request a frame instead of spinning.
                 crate::event::mark_pending_result_flush();
@@ -98,7 +105,10 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
                 break;
             }
             // A redraw-only callback re-diffs to `NONE`, so its outcome must raise the wake itself.
-            let outcome = self.event(state, &InputEvent::Housekeeping);
+            let outcome = {
+                let _notice = FocusNoticePass::enter(std::mem::take(&mut self.focus_notice));
+                self.event(state, &InputEvent::Housekeeping)
+            };
             if outcome.needs_redraw {
                 flags |= ChangeFlags::PAINT;
                 self.deferred_frame = true;
@@ -124,8 +134,14 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         }
 
         // After the diff, the broadcasts and the orphan release: a popped page routes input again.
-        if self.run_focus_return(state) {
+        // An explicit handle request wins over an owed return (`crate::focus_handle`).
+        if self.run_focus_handles(state) || self.run_focus_return(state) {
             flags |= ChangeFlags::PAINT;
+        }
+        // A change this rebuild made owes its widget a broadcast on the next frame.
+        if self.refresh_focus_handles() {
+            flags |= ChangeFlags::PAINT;
+            self.deferred_frame = true;
         }
 
         self.pending |= flags;

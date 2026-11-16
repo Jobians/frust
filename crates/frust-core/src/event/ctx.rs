@@ -101,6 +101,7 @@ pub struct EventCtx<'a> {
     focus_requested: bool,
     focus_released: bool,
     has_focus: bool,
+    focus_changed: bool,
     hovered: bool,
     hover_claimed: bool,
     /// Whether a claim records anything: set only for an uncaptured `Move`, and narrowed per pod so
@@ -131,6 +132,7 @@ impl<'a> EventCtx<'a> {
             focus_requested: false,
             focus_released: false,
             has_focus: false,
+            focus_changed: false,
             hovered: false,
             hover_claimed: false,
             hover_eligible: false,
@@ -253,6 +255,26 @@ impl<'a> EventCtx<'a> {
     /// Release focus: drop the recorded focus path (e.g. Escape / blur).
     pub fn release_focus(&mut self) {
         self.focus_released = true;
+    }
+
+    /// Mark the pointer `Down` being handled as one that keeps the live focus session as it is:
+    /// no blur is armed for the press and a `request_focus` from any widget on its path is
+    /// ignored, so the holder and its IME state are untouched. Call it before forwarding the
+    /// press to children. Does nothing when no session is live or for any other event (see
+    /// [`crate::focus_handle`]).
+    pub fn keep_focus(&mut self) {
+        crate::focus_handle::note_keep_focus();
+    }
+
+    /// Whether this is a deferred broadcast delivering a focus change to the receiving widget,
+    /// which bound a [`FocusHandle`](crate::focus_handle::FocusHandle); [`EventCtx::has_focus`]
+    /// then reads the live session (see [`crate::focus_handle`]).
+    pub fn focus_changed(&self) -> bool {
+        self.focus_changed
+    }
+
+    pub(crate) fn set_focus_changed(&mut self, changed: bool) {
+        self.focus_changed = changed;
     }
 
     /// Whether the receiving widget holds the focus path (always, for a focus-routed event).
@@ -463,6 +485,7 @@ impl<'a> EventCtx<'a> {
             focus_requested: false,
             focus_released: false,
             has_focus: focused,
+            focus_changed: false,
             hovered,
             hover_claimed: false,
             hover_eligible,

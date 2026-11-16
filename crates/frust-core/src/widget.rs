@@ -1051,6 +1051,16 @@ impl<'a> PaintCtx<'a> {
         crate::focus_scope::register(key, self.has_focus);
     }
 
+    /// Bind `handle` to the pod painting this widget for this frame (see [`crate::focus_handle`]).
+    /// The widget must be a focusable one ([`Widget::is_focusable`]); it binds every paint it is
+    /// mounted, and a handle no paint binds is inert. A pending
+    /// [`FocusHandle::request`](crate::focus_handle::FocusHandle::request) is granted to this
+    /// widget's stop at the next rebuild or end of an event pass.
+    pub fn bind_focus_handle(&mut self, handle: &crate::focus_handle::FocusHandle) {
+        self.note_publication();
+        crate::focus_handle::bind(handle);
+    }
+
     /// Publish this frame's focused-field verbs and menu anchor for the
     /// platform edit menu. A focused field publishes every paint, so hardware
     /// shortcuts stay answerable; no publish means nothing is focused.
@@ -2012,7 +2022,9 @@ impl ChildPod {
         // Hover likewise; the chain keeps a bare context's `0` from matching.
         child_ctx.set_hover_epoch(ctx.hover_epoch());
         child_ctx.set_hovered(self.hover_epoch == ctx.hover_epoch() && ctx.is_hovered());
+        let bind_mark = crate::focus_handle::bind_mark();
         self.widget.paint(&mut child_ctx, scene);
+        crate::focus_handle::resolve_binds(bind_mark, || self.inspect_id().0);
         ctx.paint_publications = ctx
             .paint_publications
             .saturating_add(child_ctx.paint_publications);
@@ -2173,6 +2185,16 @@ impl ChildPod {
                 hovered,
                 hover_eligible,
             );
+            // A deferred focus change: the live session decides, not a link a release left behind.
+            if matches!(local, InputEvent::Housekeeping)
+                && self
+                    .inspect_id
+                    .get()
+                    .is_some_and(|id| crate::focus_handle::notice_names(id.get()))
+            {
+                child_ctx.set_focus_changed(true);
+                child_ctx.set_has_focus(self.holds_live_focus());
+            }
             if let InputEvent::Shortcut(id) = local
                 && self.takes_focus_grant(*id)
             {
@@ -2192,6 +2214,11 @@ impl ChildPod {
                 result,
             )
         };
+        let mut fold = fold;
+        // A press that keeps focus ignores every claim on its path; later pods see the same flag.
+        if crate::focus_handle::press_kept() {
+            fold.focus_requested = false;
+        }
         let (captured, hover_claimed) = (fold.captured, fold.hover_claimed);
         let (focus_req, focus_rel, redraw) =
             (fold.focus_requested, fold.focus_released, fold.needs_redraw);
