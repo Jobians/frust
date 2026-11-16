@@ -7,12 +7,13 @@ use std::rc::Weak;
 
 use kurbo::Point;
 
-use super::{OverlayRoute, RenderRoot, advance_focus_epoch};
+use super::{OverlayRoute, RenderRoot, advance_focus_epoch_past};
 use crate::event::{
     ContactFrame, ContactPass, EventCtx, EventOutcome, EventResult, FileDropEvent, FileDropPhase,
     ImeState, InputEvent, Key, KeyEvent, Modifiers, NamedKey, OverlayEvent, OverlayEventKind,
     PointerButton, PointerId, PointerPhase, PointerSource, RequestPass,
 };
+use crate::focus_handle::Intent;
 use crate::focus_scope::FocusTarget;
 use crate::input::{MOUSE_SLOP, TOUCH_SLOP};
 use crate::overlay::{OutsideTap, OverlayHit, OverlayInput, OverlayKey, OverlayPod};
@@ -40,6 +41,8 @@ struct DispatchFrame {
     cursor_pass: bool,
     /// The root widget itself holds the live contacts opt-in, rather than a pod below it.
     contacts_captor_is_root: bool,
+    /// A pointer `Down`, bare or routed to a floated surface.
+    press_down: bool,
     /// A traversal grant pass (`traverse_focus`); `root_grant` when the root widget is its target.
     grant: bool,
     root_grant: bool,
@@ -55,6 +58,8 @@ struct RootDispatch {
     /// The claim came from a pod already on the live focus chain.
     focus_req_from_live: bool,
     focus_rel: bool,
+    /// A pointer `Down` that kept the live session (`EventCtx::keep_focus`).
+    kept_focus: bool,
     ime: Option<ImeState>,
     ime_published: bool,
     /// The root widget opted into the other contacts during this dispatch.
@@ -72,6 +77,8 @@ struct FocusStop {
     surface: Option<OverlayKey>,
     /// Whether the pod and every ancestor hold live focus links.
     current: bool,
+    /// Whether this stop is the session's holder: the deepest `current` stop of the walk.
+    holder: bool,
 }
 
 /// The traversal walk's state: the floated pods the last paint drew, and the stops so far.
@@ -102,6 +109,7 @@ impl FocusWalk<'_> {
                 id,
                 surface,
                 current: chain,
+                holder: false,
             });
         }
         widget.visit_focus_children(&mut |child| self.visit(child, chain, surface));
@@ -164,8 +172,14 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         let mut outcome = self.dispatch_pass(state, event, None).0;
         // A return owed when an event beats the rebuild runs after it, so that event never
         // reaches the restored control; nested deliveries call `dispatch_pass`, never this.
-        if !matches!(event, InputEvent::Housekeeping) && self.run_focus_return(state) {
-            outcome.needs_redraw = true;
+        if !matches!(event, InputEvent::Housekeeping) {
+            // An explicit handle request wins over an owed return (`crate::focus_handle`).
+            if self.run_focus_handles(state) || self.run_focus_return(state) {
+                outcome.needs_redraw = true;
+            }
+            if self.refresh_focus_handles() {
+                outcome.needs_redraw = true;
+            }
         }
         outcome
     }
@@ -219,6 +233,10 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         if frame.grant && root.focus_req {
             self.release_focus_session();
         }
+        if root.kept_focus {
+            // Pods may have stamped the candidate epoch for a claim that was then ignored.
+            self.burned_epoch = self.burned_epoch.max(frame.candidate_focus_epoch);
+        }
         root.ime_published = root.ime.is_some();
         self.publish_ime(event, root.focus_req, root.ime.take());
         let focus_claim_honoured = self.commit_event(event, &frame, &root, &contact_pass);
@@ -267,9 +285,10 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         grant: Option<bool>,
     ) -> DispatchFrame {
         let live_focus_epoch = self.focus_epoch;
-        let mut candidate_focus_epoch = advance_focus_epoch(live_focus_epoch);
+        let burned = self.burned_epoch;
+        let mut candidate_focus_epoch = advance_focus_epoch_past(live_focus_epoch, burned);
         if grant.is_some() && (self.focus_active || self.ime_state.is_some()) {
-            candidate_focus_epoch = advance_focus_epoch(candidate_focus_epoch);
+            candidate_focus_epoch = advance_focus_epoch_past(candidate_focus_epoch, burned);
         }
         crate::widget::set_live_focus_session(
             self.root_identity,
@@ -302,6 +321,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             contacts_captor_is_root: self.capture_claimant.is_some()
                 && self.capture_contacts
                 && self.contacts_captor_is_root,
+            press_down: is_pointer_down(event),
             grant: grant.is_some(),
             root_grant: grant == Some(true),
         }
@@ -320,6 +340,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         // The claimant pod this dispatch records, if any (see `hover_link`).
         crate::widget::clear_hover_claimant();
         crate::widget::clear_focus_req_from_live();
+        crate::focus_handle::open_press(frame.press_down && frame.focus_active_before);
         let state_any: &mut dyn Any = state;
         let mut ctx = EventCtx::new(state_any, pod.origin(), pod.size());
         // Seed the root widget's focus and hover state; deeper pods thread their own.
@@ -331,6 +352,10 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         ctx.set_hover_root(frame.root_identity);
         if frame.root_grant {
             ctx.request_focus();
+        }
+        if matches!(event, InputEvent::Housekeeping) && crate::focus_handle::notice_names(ROOT_STOP)
+        {
+            ctx.set_focus_changed(true);
         }
         // Attributes a `capture_contacts` made by the root widget itself to the root.
         let contact_frame = ContactFrame::enter(frame.contacts_captor_is_root);
@@ -349,6 +374,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             pod.widget_mut().event(&mut ctx, event)
         };
         let root_opted_in = contact_frame.close().0;
+        let kept_focus = crate::focus_handle::close_press();
         let handled = matches!(result, EventResult::Handled);
         // Fold every dirtying channel into `LAYOUT` (mirror of `paint_main_tree`'s
         // fold); the root sits in no pod, so its own consumption counts too.
@@ -360,12 +386,14 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             needs_redraw: ctx.needs_redraw() || handled,
             captured: ctx.is_pointer_captured(),
             hover_claimed: ctx.is_hover_claimed(),
-            focus_req: ctx.is_focus_requested(),
+            focus_req: ctx.is_focus_requested() && !kept_focus,
             // A root-widget claim (no pod) re-claims whenever a session stands.
             focus_req_from_live: crate::widget::take_focus_req_from_live()
                 .unwrap_or(frame.focus_active_before),
             focus_rel: ctx.is_focus_released(),
-            ime: ctx.take_ime_state(),
+            kept_focus,
+            // A kept press leaves the holder's surface exactly as it was.
+            ime: ctx.take_ime_state().filter(|_| !kept_focus),
             ime_published: false,
             root_opted_in,
         }
@@ -557,7 +585,10 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
                     // Until then the focused pod keeps its link (the routers clear none on an
                     // unclaimed press), so the field keeps its caret, IME and keys; the tap's
                     // release strands that link by epoch.
-                    self.pending_blur = Some((pointer_id, position));
+                    // A press that kept the live session arms none.
+                    if !root.kept_focus {
+                        self.pending_blur = Some((pointer_id, position));
+                    }
                     false
                 }
             }
@@ -678,7 +709,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         }
         let session_ended = frame.focus_active_before && !self.focus_active;
         self.focus_epoch = if session_ended {
-            advance_focus_epoch(frame.candidate_focus_epoch)
+            advance_focus_epoch_past(frame.candidate_focus_epoch, self.burned_epoch)
         } else if focus_claim_honoured {
             frame.candidate_focus_epoch
         } else {
@@ -818,6 +849,83 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         }
     }
 
+    /// Honour the intents the bound focus handles recorded (`crate::focus_handle`), each at most
+    /// once: a request grants its stop focus through one grant pass, replacing a live session
+    /// held elsewhere, and is dropped when the walk does not reach the stop; a release ends the
+    /// session only if its stop holds it. A grant clears the keyboard flag and discards a focus
+    /// return owed in the same pass. Returns whether focus moved or ended.
+    pub(super) fn run_focus_handles(&mut self, state: &mut State) -> bool {
+        if !self
+            .focus_handles
+            .iter()
+            .any(|bound| bound.handle.has_pending())
+        {
+            return false;
+        }
+        let mut moved = false;
+        for index in 0..self.focus_handles.len() {
+            let handle = self.focus_handles[index].handle.clone();
+            let stop_id = self.focus_handles[index].stop;
+            let intent = handle.take_intent();
+            if intent == Intent::None {
+                continue;
+            }
+            let stops = self.focus_stops();
+            let Some(stop) = stops.iter().find(|stop| stop.id == stop_id) else {
+                continue;
+            };
+            let holds = self.focus_active && stop.holder;
+            match intent {
+                Intent::Request if !holds && self.grant_focus(state, stop) => {
+                    self.set_keyboard_focus(false);
+                    self.focus_returns.set_keyboard(false);
+                    moved = true;
+                }
+                Intent::Release if holds => {
+                    self.release_focus_session();
+                    self.focus_returns.forget();
+                    moved = true;
+                }
+                _ => {}
+            }
+        }
+        if moved {
+            let _ = self.focus_returns.take_pending();
+        }
+        moved
+    }
+
+    /// Refresh every bound handle's `is_focused` when the session or the surfaces moved since the
+    /// last refresh, and owe the stops whose value changed a deferred notification (see
+    /// `crate::focus_handle`). Returns whether a notification became owed.
+    pub(super) fn refresh_focus_handles(&mut self) -> bool {
+        if self.focus_handles.is_empty() {
+            self.handles_synced = None;
+            return false;
+        }
+        let key = (self.focus_epoch, self.focus_active, self.overlay_hits.len());
+        if self.handles_synced == Some(key) {
+            return false;
+        }
+        self.handles_synced = Some(key);
+        let stops = self.focus_stops();
+        let mut changed = false;
+        for bound in &self.focus_handles {
+            let held = self.focus_active && stops.iter().any(|s| s.id == bound.stop && s.holder);
+            bound.handle.set_focused(held);
+            if bound.handle.note_seen(held) {
+                changed = true;
+                if !self.focus_notice.contains(&bound.stop) {
+                    self.focus_notice.push(bound.stop);
+                }
+            }
+        }
+        if changed {
+            crate::event::mark_pending_result_flush();
+        }
+        changed
+    }
+
     /// One grant pass to `stop` (see `traverse_focus`); whether its claim was honoured.
     fn grant_focus(&mut self, state: &mut State, stop: &FocusStop) -> bool {
         let carrier = self.focus_grant;
@@ -863,10 +971,14 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
                     id: ROOT_STOP,
                     surface: None,
                     current: chain,
+                    holder: false,
                 });
             }
             root.widget()
                 .visit_focus_children(&mut |pod| walk.visit(pod, chain, None));
+        }
+        if let Some(last) = walk.stops.iter_mut().rfind(|stop| stop.current) {
+            last.holder = true;
         }
         walk.stops
     }
