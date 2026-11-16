@@ -47,7 +47,7 @@ pub mod text;
 
 pub use find::{ActionTarget, Finder, Match};
 pub use gesture::{Gesture, Target};
-pub use tester::{PumpOutcome, Tester, TesterOptions};
+pub use tester::{PumpOutcome, RefusedFrame, Tester, TesterOptions};
 pub use text::TextRun;
 
 /// Run a closure with the animation time scale overridden on this thread only.
