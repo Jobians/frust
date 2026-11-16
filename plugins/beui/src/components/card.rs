@@ -18,18 +18,27 @@
 //!   at the label's end. It fills a bounded width, so a 2-column grid cell sizes it.
 //!
 //! A hero card or stat tile fills a bounded maximum width; a plain card always shrinks to its
-//! content. All text goes through the catalog's themed text helpers, so it follows the theme
-//! family and the OS text scale. Nothing here animates: the pressed wash is a plain paint
-//! state, so reduce-motion has nothing to honour.
+//! content. Every text line is one line cut to the content width with an ellipsis, so a long
+//! title never paints past the card's edge. All text goes through the catalog's themed text
+//! helpers, so it follows the theme family and the OS text scale. Nothing here animates: the
+//! pressed wash is a plain paint state, so reduce-motion has nothing to honour.
+//!
+//! The child and the second slot receive events ahead of the card itself: a control inside a
+//! pressable card (an action button, a text field) takes its own press, and only a press on the
+//! card's surface outside every child presses the card. Keys follow the focus path, so Enter on a
+//! focused child reaches the child, and the card activates only while it holds focus itself.
 
 use std::rc::Rc;
 
 use frust::Theme;
-use frust::authoring::text::{FontWeight, TextStyle};
+use frust::authoring::text::{
+    FontWeight, LocaleStamp, TextContext, TextLayout, TextOverflow, TextStyle,
+};
 use frust::authoring::{
-    AnyView, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, ErasedCallback, EventCtx,
+    AnyView, BoxConstraints, Brush, BuildCtx, ChangeFlags, ChildPod, ErasedCallback, EventCtx,
     EventResult, InputEvent, LayoutCtx, PaintCtx, PaintScene, Point, PointerPhase, Role,
-    SemanticsCtx, Size, View, Widget, any, build_child, erase_callback, rebuild_child,
+    SemanticsCtx, Size, View, Widget, any, build_child, erase_callback,
+    event_child_reporting_claim, rebuild_child, retire_stale_focus_links, route_event_single,
     teardown_child,
 };
 use frust::{ViewSeq, wrap};
@@ -40,7 +49,7 @@ use crate::press::{
     draw_focus_ring, inside, is_activation_key, lerp_color, presses, stroke_outline,
 };
 use crate::style::{ACTIVE_CURSOR, SPACING_UNIT, resolve_radius, with_alpha};
-use crate::text::{LabelRun, ThemeTextType, label_style};
+use crate::text::{ThemeTextType, label_style, themed_style};
 use crate::tokens::{BeuiMetrics, BeuiTokens, color_scheme_light};
 
 /// The default padding around a card's content: `p-4`.
@@ -123,9 +132,135 @@ impl<State: 'static> Chrome<State> {
         if element.on_press.is_some() != self.on_press.is_some() {
             flags |= ChangeFlags::LAYOUT | ChangeFlags::PAINT;
         }
+        // A card that stops being pressable mid-press drops the press: no wash survives
+        // into a later `on_press`, and the gesture it held no longer belongs to it.
+        if self.on_press.is_none() && (element.pressed || element.captured) {
+            element.pressed = false;
+            element.captured = false;
+            flags |= ChangeFlags::PAINT;
+        }
         element.on_press = self.on_press.as_ref().map(erase_callback);
         flags
     }
+}
+
+/// A cached one-line text run whose ink is applied at paint time and which cuts itself to a
+/// width with an ellipsis. Private copy: `LabelRun` has no bound.
+struct EllipsisRun {
+    content: String,
+    layout: Option<TextLayout>,
+    key: Option<(TextStyle, Option<u32>)>,
+    locale: LocaleStamp,
+}
+
+impl EllipsisRun {
+    fn new(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            layout: None,
+            key: None,
+            locale: LocaleStamp::default(),
+        }
+    }
+
+    fn content(&self) -> &str {
+        &self.content
+    }
+
+    fn set_content(&mut self, content: String) -> bool {
+        if self.content == content {
+            return false;
+        }
+        self.content = content;
+        self.layout = None;
+        true
+    }
+
+    /// Shape at `max_width` (unbounded for `None`), one line, ellipsis on overflow.
+    fn layout(&mut self, ctx: &mut LayoutCtx, style: &TextStyle, max_width: Option<f64>) -> Size {
+        let width = max_width.map(|w| w.max(0.0) as f32);
+        let key = (style.clone(), width.map(f32::to_bits));
+        if let Some(cached) = &self.layout
+            && self.key.as_ref() == Some(&key)
+            && self.locale.is_current(style.locale.as_deref())
+        {
+            return cached.size();
+        }
+        let stamp = LocaleStamp::for_style(style.locale.as_deref());
+        let laid = ctx.text_context::<TextContext>().layout_bounded(
+            &self.content,
+            style,
+            width,
+            Some(1),
+            TextOverflow::Ellipsis,
+        );
+        let size = laid.size();
+        self.layout = Some(laid);
+        self.key = Some(key);
+        self.locale = stamp;
+        size
+    }
+
+    fn paint(&self, origin: Point, color: Color, scene: &mut dyn PaintScene) {
+        if let Some(layout) = &self.layout {
+            for mut run in layout.to_scene_runs(origin) {
+                run.brush = Brush::Solid(color);
+                scene.draw_glyph_run(run);
+            }
+        }
+    }
+}
+
+/// `route_event` over the card's separately held child pods, given in paint order, under
+/// its focus-link rule: a claim recorded through one pod ends the other's link in the same
+/// pass, and a dispatch that claims nothing leaves every link to the root's session. A link
+/// the session already stranded is retired before anything is dispatched, and a captured
+/// gesture goes through `route_event_single`, which releases the capture at its end.
+fn route_pods(
+    pods: &mut [&mut ChildPod],
+    ctx: &mut EventCtx<'_>,
+    event: &InputEvent,
+) -> EventResult {
+    retire_stale_focus_links(pods.iter_mut().map(|pod| &mut **pod));
+    if event.is_broadcast() {
+        for pod in pods.iter_mut() {
+            pod.event_child(ctx, event);
+        }
+        return EventResult::Ignored;
+    }
+    if event.is_focus_routed() {
+        return match pods.iter_mut().find(|pod| pod.holds_live_focus()) {
+            Some(pod) => pod.event_child(ctx, event),
+            None => EventResult::Ignored,
+        };
+    }
+    if let Some(pod) = pods.iter_mut().find(|pod| pod.is_active()) {
+        return route_event_single(pod, ctx, event);
+    }
+    let position = event.position();
+    let mut handled = EventResult::Ignored;
+    let mut claimants: Vec<usize> = Vec::new();
+    for (i, pod) in pods.iter_mut().enumerate().rev() {
+        if !pod.contains(position) {
+            continue;
+        }
+        let (result, claimed) = event_child_reporting_claim(pod, ctx, event);
+        if claimed {
+            claimants.push(i);
+        }
+        if result == EventResult::Handled {
+            handled = EventResult::Handled;
+            break;
+        }
+    }
+    if !claimants.is_empty() {
+        for (i, pod) in pods.iter_mut().enumerate() {
+            if !claimants.contains(&i) && pod.is_focused() {
+                pod.set_focused(false);
+            }
+        }
+    }
+    handled
 }
 
 /// The builder methods every card view shares.
@@ -203,7 +338,7 @@ fn rebuild_slot<State: 'static>(
 /// and an optional second slot (a hero card's action row, a stat tile's trailing view).
 pub struct CardWidget {
     kind: Kind,
-    lines: Vec<LabelRun>,
+    lines: Vec<EllipsisRun>,
     line_pos: Vec<Point>,
     child: Option<ChildPod>,
     extra: Option<ChildPod>,
@@ -220,7 +355,7 @@ impl CardWidget {
     fn new(kind: Kind, lines: Vec<String>) -> Self {
         Self {
             kind,
-            lines: lines.into_iter().map(LabelRun::new).collect(),
+            lines: lines.into_iter().map(EllipsisRun::new).collect(),
             line_pos: Vec::new(),
             child: None,
             extra: None,
@@ -236,13 +371,13 @@ impl CardWidget {
 
     /// The text lines this widget carries, top to bottom.
     pub fn lines(&self) -> Vec<&str> {
-        self.lines.iter().map(LabelRun::content).collect()
+        self.lines.iter().map(EllipsisRun::content).collect()
     }
 
     fn set_lines(&mut self, lines: Vec<String>) -> ChangeFlags {
         let mut flags = ChangeFlags::NONE;
         if self.lines.len() != lines.len() {
-            self.lines = lines.into_iter().map(LabelRun::new).collect();
+            self.lines = lines.into_iter().map(EllipsisRun::new).collect();
             return ChangeFlags::LAYOUT | ChangeFlags::PAINT;
         }
         for (run, text) in self.lines.iter_mut().zip(lines) {
@@ -293,10 +428,105 @@ impl CardWidget {
             .unwrap_or_else(|| self.lines().join(", "))
     }
 
-    fn lay_line(&mut self, ctx: &mut LayoutCtx, index: usize, m: &BeuiMetrics) -> Size {
+    /// Shape line `index` on one line, cut to `max_width` (unbounded for `None`).
+    fn lay_line(
+        &mut self,
+        ctx: &mut LayoutCtx,
+        index: usize,
+        m: &BeuiMetrics,
+        max_width: Option<f64>,
+    ) -> Size {
         let look = self.look(index, m);
-        let style: TextStyle = label_style(look.size).with_weight(look.weight);
-        self.lines[index].layout_themed(ctx, &style, look.role)
+        let base: TextStyle = label_style(look.size).with_weight(look.weight);
+        let style = themed_style(base, look.role, Theme::from_layout_ctx(ctx));
+        self.lines[index].layout(ctx, &style, max_width)
+    }
+
+    /// The child pods, in paint order.
+    fn pods_mut(&mut self) -> Vec<&mut ChildPod> {
+        [&mut self.child, &mut self.extra]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// The card's own handling, after its children declined the event.
+    fn own_event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
+        if self.on_press.is_none() {
+            return EventResult::Ignored;
+        }
+        match event {
+            InputEvent::Key(key) => {
+                // Only reached when no child holds the focus: the card is the target.
+                if !ctx.has_focus() || !is_activation_key(key) {
+                    return EventResult::Ignored;
+                }
+                if let Some(on_press) = &mut self.on_press {
+                    on_press(ctx);
+                }
+                EventResult::Handled
+            }
+            InputEvent::Pointer(p) => {
+                let size = ctx.size();
+                match p.phase {
+                    PointerPhase::Down => {
+                        if !presses(p) || !inside(p.position, size) {
+                            return EventResult::Ignored;
+                        }
+                        self.pressed = true;
+                        self.captured = true;
+                        ctx.capture_pointer();
+                        ctx.request_focus();
+                        // The card's own claim: a child's link ends with it.
+                        for pod in self.pods_mut() {
+                            if pod.is_focused() {
+                                pod.set_focused(false);
+                            }
+                        }
+                        ctx.request_redraw();
+                        EventResult::Handled
+                    }
+                    PointerPhase::Move => {
+                        let over = inside(p.position, size);
+                        if self.captured {
+                            if self.pressed != over {
+                                self.pressed = over;
+                                ctx.request_redraw();
+                            }
+                            ctx.set_cursor(ACTIVE_CURSOR);
+                            return EventResult::Handled;
+                        }
+                        if over {
+                            ctx.claim_hover();
+                        }
+                        EventResult::Ignored
+                    }
+                    PointerPhase::Up => {
+                        if !self.captured {
+                            return EventResult::Ignored;
+                        }
+                        let fire = inside(p.position, size);
+                        self.pressed = false;
+                        self.captured = false;
+                        if fire && let Some(on_press) = &mut self.on_press {
+                            on_press(ctx);
+                        }
+                        ctx.request_redraw();
+                        EventResult::Handled
+                    }
+                    PointerPhase::Cancel => {
+                        if !self.captured {
+                            return EventResult::Ignored;
+                        }
+                        self.pressed = false;
+                        self.captured = false;
+                        ctx.request_redraw();
+                        EventResult::Handled
+                    }
+                }
+            }
+            _ => EventResult::Ignored,
+        }
     }
 }
 
@@ -312,6 +542,8 @@ impl Widget for CardWidget {
             f64::INFINITY
         };
         let inner = BoxConstraints::loose(Size::new(inner_w, f64::INFINITY));
+        // Every text line is cut to the content width when the card has one.
+        let line_w = bounded.then_some(inner_w);
         let mut content_w = 0.0_f64;
         let mut y = pad;
         self.line_pos.clear();
@@ -333,7 +565,7 @@ impl Widget for CardWidget {
                     if i > 0 {
                         y += LINE_GAP;
                     }
-                    let size = self.lay_line(ctx, i, &m);
+                    let size = self.lay_line(ctx, i, &m, line_w);
                     self.line_pos.push(Point::new(pad, y));
                     content_w = content_w.max(size.width);
                     y += size.height;
@@ -347,11 +579,16 @@ impl Widget for CardWidget {
                 }
             }
             Kind::Stat => {
-                let label = self.lay_line(ctx, 0, &m);
+                // The trailing view keeps its width; the label takes what is left of the row.
+                let trailing_size = self.extra.as_mut().map(|pod| pod.layout_child(ctx, &inner));
+                let label_w = match trailing_size {
+                    Some(size) => line_w.map(|w| (w - TRAILING_GAP - size.width).max(0.0)),
+                    None => line_w,
+                };
+                let label = self.lay_line(ctx, 0, &m, label_w);
                 let mut row_h = label.height;
                 let mut row_w = label.width;
-                if let Some(pod) = &mut self.extra {
-                    let size = pod.layout_child(ctx, &inner);
+                if let (Some(size), Some(pod)) = (trailing_size, &mut self.extra) {
                     row_h = row_h.max(size.height);
                     row_w += TRAILING_GAP + size.width;
                     trailing = Some((size.width, size.height));
@@ -360,7 +597,7 @@ impl Widget for CardWidget {
                 self.line_pos
                     .push(Point::new(pad, y + (row_h - label.height) / 2.0));
                 y += row_h + LINE_GAP;
-                let value = self.lay_line(ctx, 1, &m);
+                let value = self.lay_line(ctx, 1, &m, line_w);
                 self.line_pos.push(Point::new(pad, y));
                 y += value.height;
                 content_w = row_w.max(value.width);
@@ -447,75 +684,30 @@ impl Widget for CardWidget {
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
-        if self.on_press.is_none() {
-            return EventResult::Ignored;
+        // A pressable card's surface asks for the press cursor first, so a child asking for
+        // its own afterwards (a text field's caret) wins over it.
+        if self.pressable()
+            && !self.captured
+            && let InputEvent::Pointer(p) = event
+            && p.phase == PointerPhase::Move
+            && inside(p.position, ctx.size())
+        {
+            ctx.set_cursor(ACTIVE_CURSOR);
         }
-        match event {
-            InputEvent::Key(key) => {
-                if !is_activation_key(key) {
-                    return EventResult::Ignored;
-                }
-                if let Some(on_press) = &mut self.on_press {
-                    on_press(ctx);
-                }
-                EventResult::Handled
+        // The children come first unless the card itself holds the gesture.
+        if !self.captured {
+            let mut pods = self.pods_mut();
+            // A gesture a child captured, or a key on a child's focus path, is the child's
+            // alone: the card neither presses nor activates on what the child declines.
+            let child_holds = pods
+                .iter()
+                .any(|pod| pod.is_active() || (event.is_focus_routed() && pod.holds_live_focus()));
+            let routed = route_pods(&mut pods, ctx, event);
+            if routed == EventResult::Handled || child_holds || event.is_broadcast() {
+                return routed;
             }
-            InputEvent::Pointer(p) => {
-                let size = ctx.size();
-                match p.phase {
-                    PointerPhase::Down => {
-                        if !presses(p) || !inside(p.position, size) {
-                            return EventResult::Ignored;
-                        }
-                        self.pressed = true;
-                        self.captured = true;
-                        ctx.capture_pointer();
-                        ctx.request_focus();
-                        ctx.request_redraw();
-                        EventResult::Handled
-                    }
-                    PointerPhase::Move => {
-                        let over = inside(p.position, size);
-                        if self.captured {
-                            if self.pressed != over {
-                                self.pressed = over;
-                                ctx.request_redraw();
-                            }
-                            ctx.set_cursor(ACTIVE_CURSOR);
-                            return EventResult::Handled;
-                        }
-                        if over {
-                            ctx.claim_hover();
-                            ctx.set_cursor(ACTIVE_CURSOR);
-                        }
-                        EventResult::Ignored
-                    }
-                    PointerPhase::Up => {
-                        if !self.captured {
-                            return EventResult::Ignored;
-                        }
-                        let fire = inside(p.position, size);
-                        self.pressed = false;
-                        self.captured = false;
-                        if fire && let Some(on_press) = &mut self.on_press {
-                            on_press(ctx);
-                        }
-                        ctx.request_redraw();
-                        EventResult::Handled
-                    }
-                    PointerPhase::Cancel => {
-                        if !self.captured {
-                            return EventResult::Ignored;
-                        }
-                        self.pressed = false;
-                        self.captured = false;
-                        ctx.request_redraw();
-                        EventResult::Handled
-                    }
-                }
-            }
-            _ => EventResult::Ignored,
         }
+        self.own_event(ctx, event)
     }
 
     fn is_focusable(&self) -> bool {
@@ -750,11 +942,12 @@ impl<State: 'static> View<State> for StatTileView<State> {
 mod tests {
     use super::*;
     use crate::components::button::button;
+    use crate::components::input::input;
     use crate::tokens::{Density, theme_with_density};
     use frust::Brightness;
     use frust::FrameTime;
-    use frust::authoring::text::TextContext;
-    use frust::authoring::{PointerButton, PointerEvent};
+    use frust::authoring::scene::GlyphRun;
+    use frust::authoring::{Key, KeyEvent, Modifiers, NamedKey, PointerButton, PointerEvent};
     use std::any::Any;
     use std::cell::Cell;
 
@@ -1076,5 +1269,305 @@ mod tests {
             narrow.iter().all(|r| r.x1 <= 200.0 - CARD_PADDING + 1e-6),
             "{narrow:?}"
         );
+    }
+
+    // ---- Routing: the children receive events ahead of the card ------------
+
+    /// The state the routed tests drive: what fired, in order, and a field's text.
+    #[derive(Default)]
+    struct App {
+        log: Vec<&'static str>,
+        text: String,
+        pressable: bool,
+    }
+
+    /// A card tree mounted on a real `RenderRoot`, 320 px wide.
+    struct Rig<V: View<App>> {
+        root: frust_core::RenderRoot<App, V>,
+        state: App,
+        tcx: TextContext,
+        logic: fn(&mut App) -> V,
+    }
+
+    impl<V: View<App>> Rig<V> {
+        fn mount(logic: fn(&mut App) -> V, state: App) -> Self {
+            let mut rig = Rig {
+                root: frust_core::RenderRoot::new(),
+                state,
+                tcx: TextContext::new(),
+                logic,
+            };
+            rig.root
+                .set_theme(Box::new(theme_with_density(Density::Comfortable)));
+            rig.frame();
+            rig
+        }
+
+        /// One frame: rebuild, lay out and paint, answering the fills painted.
+        fn frame(&mut self) -> Fills {
+            self.root.rebuild(&mut self.logic, &mut self.state);
+            self.root
+                .layout_with_text(Size::new(320.0, 800.0), &mut self.tcx as &mut dyn Any);
+            let mut fills = Fills::default();
+            self.root.paint(&mut fills, FrameTime::from_nanos(0));
+            fills
+        }
+
+        fn pointer(&mut self, phase: PointerPhase, at: Point) {
+            self.root.event(&mut self.state, &ev(phase, at.x, at.y));
+        }
+
+        fn tap(&mut self, at: Point) {
+            self.pointer(PointerPhase::Down, at);
+            self.pointer(PointerPhase::Up, at);
+        }
+
+        fn key(&mut self, key: Key) {
+            self.root.event(
+                &mut self.state,
+                &InputEvent::Key(KeyEvent {
+                    key,
+                    modifiers: Modifiers::default(),
+                    repeat: false,
+                }),
+            );
+        }
+
+        /// The centres of every widget whose type name ends with `suffix`, left to right.
+        fn centres(&self, suffix: &str) -> Vec<Point> {
+            let mut found: Vec<_> = self
+                .root
+                .inspect()
+                .into_iter()
+                .filter(|n| n.type_name.ends_with(suffix))
+                .map(|n| n.bounds)
+                .collect();
+            found.sort_by(|a, b| a.x0.total_cmp(&b.x0).then(a.y0.total_cmp(&b.y0)));
+            found.into_iter().map(|r| r.center()).collect()
+        }
+
+        fn card(&self) -> &CardWidget {
+            let id = self.root.root_id().expect("root built");
+            let w = self.root.tree().pod(id).expect("root pod").widget();
+            (w as &dyn Any)
+                .downcast_ref::<CardWidget>()
+                .expect("root is a CardWidget")
+        }
+    }
+
+    /// A point on a card's own surface: inside its padding, outside every child.
+    const SURFACE: Point = Point::new(4.0, 4.0);
+
+    fn two_actions(_: &mut App) -> HeroCardView<App> {
+        hero_card::<App, _>("Plan", SizedChip).actions((
+            button::<App>("Approve", |s: &mut App| s.log.push("approve")),
+            button::<App>("Decline", |s: &mut App| s.log.push("decline")),
+        ))
+    }
+
+    #[test]
+    fn each_hero_action_fires_its_own_handler_once() {
+        let mut rig = Rig::mount(two_actions, App::default());
+        let buttons = rig.centres("::ButtonWidget");
+        assert_eq!(buttons.len(), 2);
+        rig.tap(buttons[0]);
+        assert_eq!(rig.state.log, vec!["approve"]);
+        rig.tap(buttons[1]);
+        assert_eq!(rig.state.log, vec!["approve", "decline"]);
+    }
+
+    #[test]
+    fn a_stat_tiles_trailing_button_fires() {
+        fn tile(_: &mut App) -> StatTileView<App> {
+            stat_tile::<App>("Open", "12")
+                .trailing(button::<App>("+", |s: &mut App| s.log.push("plus")))
+        }
+        let mut rig = Rig::mount(tile, App::default());
+        let buttons = rig.centres("::ButtonWidget");
+        assert_eq!(buttons.len(), 1);
+        rig.tap(buttons[0]);
+        assert_eq!(rig.state.log, vec!["plus"]);
+    }
+
+    #[test]
+    fn a_text_input_inside_a_card_takes_focus_and_typed_text() {
+        fn field(s: &mut App) -> CardView<App> {
+            card::<App, _>(input::<App, _>(s.text.clone(), |s: &mut App, t| {
+                s.text = t;
+            }))
+        }
+        let mut rig = Rig::mount(field, App::default());
+        let fields = rig.centres("::InputWidget");
+        assert_eq!(fields.len(), 1);
+        rig.tap(fields[0]);
+        rig.frame();
+        assert!(rig.root.is_focus_active(), "the field took focus");
+        rig.key(Key::Character("a".into()));
+        rig.key(Key::Character("b".into()));
+        assert_eq!(rig.state.text, "ab");
+    }
+
+    #[test]
+    fn in_a_pressable_card_a_child_button_wins_over_the_card() {
+        fn view(_: &mut App) -> CardView<App> {
+            card::<App, _>(button::<App>("Go", |s: &mut App| s.log.push("button")))
+                .on_press(|s: &mut App| s.log.push("card"))
+        }
+        let mut rig = Rig::mount(view, App::default());
+        let buttons = rig.centres("::ButtonWidget");
+        assert_eq!(buttons.len(), 1);
+        rig.tap(buttons[0]);
+        assert_eq!(rig.state.log, vec!["button"], "the button, not the card");
+        rig.tap(SURFACE);
+        assert_eq!(
+            rig.state.log,
+            vec!["button", "card"],
+            "the surface presses the card"
+        );
+    }
+
+    #[test]
+    fn enter_activates_whichever_of_child_and_card_holds_focus() {
+        // The baseline button activates on Enter while focused; a mouse press focuses it.
+        fn view(_: &mut App) -> CardView<App> {
+            card::<App, _>(frust::button::<App, _>("Go", |s: &mut App| {
+                s.log.push("button");
+            }))
+            .on_press(|s: &mut App| s.log.push("card"))
+        }
+        let mut rig = Rig::mount(view, App::default());
+        let buttons = rig.centres("::ButtonWidget");
+        assert_eq!(buttons.len(), 1);
+        rig.tap(buttons[0]);
+        rig.frame();
+        assert_eq!(rig.state.log, vec!["button"]);
+        rig.key(Key::Named(NamedKey::Enter));
+        assert_eq!(
+            rig.state.log,
+            vec!["button", "button"],
+            "Enter on the focused button fires the button, not the card"
+        );
+
+        rig.tap(SURFACE);
+        rig.frame();
+        assert_eq!(rig.state.log, vec!["button", "button", "card"]);
+        rig.key(Key::Named(NamedKey::Enter));
+        assert_eq!(
+            rig.state.log,
+            vec!["button", "button", "card", "card"],
+            "Enter on the focused card fires the card"
+        );
+    }
+
+    #[test]
+    fn a_released_child_press_leaves_no_stale_capture() {
+        fn view(s: &mut App) -> HeroCardView<App> {
+            two_actions(s).on_press(|s: &mut App| s.log.push("card"))
+        }
+        let mut rig = Rig::mount(view, App::default());
+        let buttons = rig.centres("::ButtonWidget");
+        assert_eq!(buttons.len(), 2);
+        rig.tap(buttons[0]);
+        assert_eq!(rig.state.log, vec!["approve"]);
+        let actions = rig.card().extra.as_ref().expect("an action row");
+        assert!(!actions.is_active(), "the action row's capture ended at Up");
+        // A press on the surface (the title sits on it) is the card's, not the old captor's.
+        rig.tap(SURFACE);
+        assert_eq!(rig.state.log, vec!["approve", "card"]);
+        rig.tap(buttons[1]);
+        assert_eq!(rig.state.log, vec!["approve", "card", "decline"]);
+    }
+
+    #[test]
+    fn removing_on_press_during_a_hold_clears_the_press() {
+        fn view(s: &mut App) -> CardView<App> {
+            let card = card::<App, _>(SizedChip);
+            if s.pressable {
+                card.on_press(|s: &mut App| s.log.push("card"))
+            } else {
+                card
+            }
+        }
+        let mut rig = Rig::mount(
+            view,
+            App {
+                pressable: true,
+                ..App::default()
+            },
+        );
+        let rest = rig.frame().0[0].1;
+        rig.pointer(PointerPhase::Down, SURFACE);
+        assert!(rig.card().pressed, "the hold presses the card");
+
+        rig.state.pressable = false;
+        rig.frame();
+        assert!(
+            !rig.card().pressed && !rig.card().captured,
+            "no press survives the rebuild"
+        );
+        rig.pointer(PointerPhase::Up, SURFACE);
+
+        // Pressable again: the fill is the resting one, with no stale wash.
+        rig.state.pressable = true;
+        let fill = rig.frame().0[0].1;
+        assert_eq!(fill, rest);
+        assert!(
+            rig.state.log.is_empty(),
+            "the abandoned press fired nothing"
+        );
+    }
+
+    /// The rightmost glyph origin painted.
+    #[derive(Default)]
+    struct GlyphReach(f64);
+
+    impl PaintScene for GlyphReach {
+        fn fill_rect(&mut self, _o: Point, _s: Size, _c: Color) {}
+        fn draw_text(&mut self, _o: Point, _t: &str) {}
+        fn fill_rounded_rect(&mut self, _o: Point, _s: Size, _r: f64, _c: Color) {}
+        fn draw_glyph_run(&mut self, run: GlyphRun) {
+            for g in &run.glyphs {
+                let at = run.transform * Point::new(f64::from(g.x), f64::from(g.y));
+                self.0 = self.0.max(at.x);
+            }
+        }
+    }
+
+    #[test]
+    fn long_text_stays_inside_the_cards_content_box() {
+        let theme = theme_with_density(Density::Comfortable);
+        let long = "A title far too long to sit on one line of a phone card ".repeat(3);
+        let content_right = 320.0 - CARD_PADDING;
+        let line_end = |w: &CardWidget, i: usize| {
+            let width = w.lines[i].layout.as_ref().expect("shaped").size().width;
+            w.line_pos[i].x + width
+        };
+
+        let mut hero = build(&hero_card::<(), _>(long.clone(), SizedChip).subtitle(long.clone()));
+        let size = layout_at(&mut hero, &theme, 320.0);
+        assert_eq!(size.width, 320.0);
+        for i in 0..2 {
+            assert!(line_end(&hero, i) <= content_right + 1e-6, "hero line {i}");
+        }
+        let mut reach = GlyphReach::default();
+        let mut ctx =
+            PaintCtx::for_test(Point::ORIGIN, size, FrameTime::from_nanos(0)).with_theme(&theme);
+        hero.paint(&mut ctx, &mut reach);
+        assert!(reach.0 > CARD_PADDING, "the title painted");
+        assert!(
+            reach.0 < content_right,
+            "the title's glyphs end at {} past the content edge {content_right}",
+            reach.0
+        );
+
+        let mut tile =
+            build(&stat_tile::<()>(long.clone(), long.clone()).trailing(button::<()>("+", |_| {})));
+        layout_at(&mut tile, &theme, 320.0);
+        let trailing_x = tile.extra.as_ref().expect("trailing").origin().x;
+        assert!(
+            line_end(&tile, 0) <= trailing_x - TRAILING_GAP + 1e-6,
+            "the label stops before the trailing view"
+        );
+        assert!(line_end(&tile, 1) <= content_right + 1e-6, "the value");
     }
 }
