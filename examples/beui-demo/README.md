@@ -167,6 +167,23 @@ run on the build named below, not a standing guarantee.
 | 8. Navigation | Pixel 5, Android 14 | PASS | All 20 pages open. Back closes the page list; with the list closed it leaves the app from any page. Pages are wider than the phone in places, as listed under "Phones". |
 | 9. Draft dialog on Overlays | Pixel 5, Android 14 | PASS | Veto on: back keeps the dialog. Veto off: back closes it with its exit animation. Focus return on: focus goes back to Composer (the keyboard reopens after Discard, not after back). Off: neither returns. |
 
+2026-11-16, iOS: iPhone 13 mini, iOS 27.2, 375×812 pt at 3×, 60 Hz;
+`frust build ios --profile` at `4f82ba9a`, driven by an XCUITest runner. The
+generated Xcode project built and signed unchanged. `cargo check --target
+aarch64-apple-ios` and `--target aarch64-apple-ios-sim` both pass.
+
+| Check | Device and OS | Result | Note |
+|-------|---------------|--------|------|
+| 1. Touch targets on Content | iPhone 13 mini, iOS 27.2 | PASS | Small button 66×44 pt, list row 58 pt tall, other buttons 44 to 52 pt. Below 44 pt: the page's inline theme toggle (32 pt) and the select (40 pt). |
+| 2. Text size, default and largest standard | iPhone 13 mini, iOS 27.2 | PASS | Largest standard size set with the content-size launch argument. beUI text grows and rows wrap, nothing overlaps; three labels end in an ellipsis (the card's date line, the "Orders" tile label, a list row's email). The gallery's own headings and descriptions keep their size. |
+| 3. Notch and home indicator | iPhone 13 mini, iOS 27.2 | PASS | Portrait and landscape; landscape uses the rail shell. |
+| 4. Keyboard | iPhone 13 mini, iOS 27.2 | FAIL | Same as Android: the Content field stays visible, the Chat composer is revealed only to its caret line and its send button sits under the keyboard until the page is scrolled. |
+| 5. Toast | iPhone 13 mini, iOS 27.2 | PASS | Appears above the content and the home indicator; closes from its button. |
+| 6. Scrolling Content | iPhone 13 mini, iOS 27.2 | PASS | Trace over eight flings: frames paced at the 60 Hz period (p95 17 to 18 ms including the wait for the drawable), no skipped frame; scene encode p95 2 ms. |
+| 7. Log | iPhone 13 mini, iOS 27.2 | PASS | Device console: no panic and no GPU-effects warning. |
+| 8. Navigation | iPhone 13 mini, iOS 27.2 | PASS | All 20 pages open; the page list closes on a backdrop tap and on choosing a page. |
+| 9. Draft dialog on Overlays | iPhone 13 mini, iOS 27.2 | PASS | Veto on: a backdrop tap keeps the dialog. Veto off: it closes. Focus return on: focus and the keyboard go back to Composer. Off: neither returns. |
+
 ## GPU Effects
 
 ```bash
