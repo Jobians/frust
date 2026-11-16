@@ -2935,11 +2935,16 @@ seam declines six things, each named in its own source:
    owner asked for the focus session's declined keys (`EventCtx::forward_declined_keys_to`) or, for
    an Escape, when the pod is modal; IME and edit commands are never re-offered, and PageUp/PageDown
    cannot be forwarded at all because `NamedKey` has no such keys.
-3. **The catalogs' own hosts are not on it.** All six `overlay::anchored`/`overlay::modal` hosts
-   across `frust_shadcn`, `frust_material` and `frust_beui` still place and paint their surfaces
-   in-tree; `frust_shadcn::tooltip`/`hover_card`, `frust_beui::tooltip`, and
-   `frust_material::tooltip`/`rich_tooltip` are the catalogs' only components riding the portal so
-   far.
+3. **The catalogs' own hosts are not on it by default.** All six `overlay::anchored`/`overlay::modal`
+   hosts across `frust_shadcn`, `frust_material` and `frust_beui` place and paint their surfaces
+   in-tree, except that `frust_beui`'s anchored host floats its content onto the portal when a
+   caller opts in (`AnchoredOverlayView::floating`, which `select`/`multi_select`'s `.floating(true)`
+   sets); `frust_shadcn::tooltip`/`hover_card`, `frust_beui::tooltip`, and
+   `frust_material::tooltip`/`rich_tooltip` are the catalogs' only components riding the portal
+   unconditionally. A floated beUI panel pays named costs: no row hover highlight inside it; while it
+   is open, main-tree shortcuts are masked and Tab only closes the panel (its consuming outside-tap
+   registration scopes keys to it); and the host publishes the panel's accessibility nodes itself,
+   at the painted rect, since the portal walks none (item 4).
 4. **A pod is invisible to inspection and to assistive technology.** It is not reached by
    `Widget::visit_children` unless its owner chooses to visit it, so `RenderRoot::inspect` — the
    devtools widget tree — sees the owner and not the floated surface; and the portal publishes no
@@ -2999,7 +3004,9 @@ own "Not in v1" section (semantics, hover, IME); `crates/frust-core/src/event/in
 `InputEvent::Overlay` routing contract (the broadcast); `plugins/shadcn/src/components/tooltip.rs`,
 `plugins/beui/src/components/tooltip.rs`, and `plugins/material/src/tooltip.rs` module docs (all
 titled "Riding the framework portal") against the six unported
-`plugins/{shadcn,material,beui}/src/overlay/{anchored,modal}.rs` hosts;
+`plugins/{shadcn,material,beui}/src/overlay/{anchored,modal}.rs` hosts (beUI's `anchored.rs` module
+docs: "Floating in the root overlay layer", "Accessibility of a floated panel", "What floating still
+costs");
 `plugins/material/src/tooltip.rs`'s `TooltipWidget`/`RichTooltipWidget` `semantics` methods and
 their pre-port use of `crate::overlay::anchored` (for item (4)'s regression above).
 
@@ -3943,12 +3950,15 @@ boundary (`beui-3d-degradations` above), not an independent gap.
 **Observed**: `overlay::anchored`, beUI's non-modal trigger-relative host (see
 PLUGINS_ARCHITECTURE.md's Design-System Plugins for the seam itself, and
 `shadcn-anchored-exit-needs-kept-mounted` for its kept-mounted exit ramp, which beUI's anchored host
-shares), fills whatever area it is given and expects bounded constraints, so it cannot sit inside a
+shares), in its default inline mode fills whatever area it is given and expects bounded constraints, so it cannot sit inside a
 `frust::scroll_view` (whose child gets an unbounded max on the scroll axis) — the `beui-demo` gallery
 hits this directly: `citations`' hover preview is documented to mount through `overlay::anchored`,
 but the gallery's page slot is itself a scroll view, so the demo instead reads the hover through
 `on_hover_change` and paints the same preview panel inline, in a page-owned slot the caption names
-as the workaround.
+as the workaround. The same inline host is why a `select` or `multi_select` inside a modal (such as
+`center_morph_modal`) needs `.floating(true)`: without it the open panel enlarges the modal to its
+whole maximum height and paints under the modal's clip. Floating lifts the contract at the costs
+`overlay-portal-v1-scope` item 3 names.
 
 **Applies to**: every component still mounted through `overlay::anchored` — popover, context menu,
 the dropdown panels of select/combobox/multi_select, citations' preview. `tooltip` no longer mounts
@@ -3961,6 +3971,7 @@ all three catalogs) — the remedy is at the mount site, not the host, and the g
 correct workaround rather than avoiding the case.
 
 **Evidence**: `plugins/beui/src/overlay/mod.rs` ("The scroll-view trap");
+`plugins/beui/src/components/select.rs` module docs ("Floating", "Inside a modal");
 `plugins/beui/src/agents/citations.rs` module docs (the `overlay::anchored` mounting sequence);
 `examples/beui-demo/src/pages/agents/panels.rs`'s `citation_panel` (the inline workaround and its
 caption); `plugins/beui/src/components/tooltip.rs` module docs ("Riding the framework portal" — the
@@ -3998,8 +4009,8 @@ section documenting `tooltip`'s move off this host onto the framework overlay po
    carries none either. The app owns the schedule (its own `Timer` or signal drops the entry, and
    the exit plays from there).
 5. **No Tab stops.** The framework's root Tab/Shift+Tab traversal exists, but no beUI control
-   answers `Widget::is_focusable`, so Tab never stops anywhere in the catalog and no control
-   activates from the keyboard through it.
+   answers `Widget::is_focusable` except a pressable `card`, `chip` or `grouped_list` row, so Tab
+   stops nowhere else in the catalog and no other control activates from the keyboard through it.
 
 **Applies to**: `frust_beui::components::select`/`combobox`/`multi_select`,
 `frust_beui::blocks::feedback_widget`, `frust_beui::components::expanding_arrow_button` (both
@@ -4018,7 +4029,8 @@ gaps with no plugin-tier fix available, already accepted for their originating c
 field", "It reserves its open box and paints inside it" — the morph is pure paint, no rebuild);
 `plugins/beui/src/components/expanding_arrow_button.rs` module docs ("fires on the next
 event pass", "Keyboard activation is not ported"); `plugins/beui/src/components/animated_toast_stack.rs`
-module docs ("No timer"); no `is_focusable` implementation under `plugins/beui/src` (for item 5).
+module docs ("No timer"); no `is_focusable` implementation under `plugins/beui/src` outside
+`components/card.rs`, `chip.rs` and `grouped_list.rs` (for item 5).
 
 ---
 
@@ -4150,6 +4162,90 @@ its own module doc, not a regression found later.
 `expandable_tabs.rs`, `morphing_tabs.rs`, `plugins/beui/src/components/marquee.rs`, `theme_toggle.rs`
 — each module's own "Premise correction"/"Degradations" sections; no `PointerSource` use under
 `plugins/beui/src`.
+
+---
+
+### `beui-density-partial-coverage` — `Density::Touch` resizes only the parts that read `BeuiMetrics`, and beUI on phones is not yet device-tested
+
+**Observed**: `frust_beui::theme_with_density(Density::Touch)` and `install_with_density` attach a
+`BeuiMetrics` touch set (a 44 px minimum target on Apple targets, 48 px elsewhere, and larger type
+steps), but only the parts that resolve it follow the density: the components `alert`,
+`animated_badge`, `animated_toast_stack`, `button`, `card`, `chip`, `grouped_list`, `input` and
+`key_value`, and the agents `message`, `message_bubble` and `prompt_input`. Every other beUI part
+lays out from `frust_beui::style`'s constants and keeps the comfortable sizes under a touch theme.
+Two narrower gaps sit beside that list: the button follows the density but still paints its
+stateful variant's state icon (spinner, check, cross) at the fixed `ICON_SIZE`, and `theme_toggle`
+keeps its fixed `SIZE_ICON_BUTTON` edge — it carries the live density across a light/dark flip but
+does not size itself from it. No Android or iOS device gate has yet run the touch set, beUI's OS
+text-scale scaling or `examples/beui-demo`'s phone shell.
+
+**Applies to**: `frust_beui` under `Density::Touch` — every part not listed above, the button's state
+icon and `theme_toggle`; the device-test half to the catalog and `examples/beui-demo` on Android and
+iOS.
+
+**Why accepted**: moving a part onto the metrics is per-part opt-in work (`style.rs`'s "Density"
+section: a part still reading a constant paints the comfortable size), and the listed parts are the
+ones a phone content screen is built from; the device gates follow this change rather than
+precede it.
+
+**Evidence**: `plugins/beui/src/tokens/metrics.rs` module docs ("Only the parts that read it follow
+the density"; its own list omits the toast, badge and agents parts) and every
+`BeuiMetrics::resolve` call site outside a test module under `plugins/beui/src`;
+`plugins/beui/src/components/button.rs`'s `paint_state_icon` (`ICON_SIZE`);
+`plugins/beui/src/components/theme_toggle.rs` (`SIZE_ICON_BUTTON`, `theme_with_metrics`);
+`examples/beui-demo/README.md` ("Phones").
+
+**Trigger for removal**: each part leaves the list as it moves onto `BeuiMetrics`; the device-test
+half is deleted once the Android and iOS device gates record a pass of `examples/beui-demo`.
+
+---
+
+### `beui-sidebar-no-mobile-drawer` — `animated_sidebar` ports the desktop panel only; a phone navigation layout is the app's
+
+**Observed**: upstream's animated sidebar carries a portalled mobile drawer behind a
+`(max-width: 767px)` media query; `frust_beui::components::animated_sidebar` ports the desktop panel
+and its menu only, so a narrow window keeps the rail. An app that wants a phone layout builds it
+from `components::drawer` (or another `overlay::modal` part) and its own layout-width decision.
+`examples/beui-demo`'s phone shell — a top bar and the page list in a beUI `drawer` below 720
+logical px of layout width — is that app-side code, not a catalog part.
+
+**Applies to**: `frust_beui::components::animated_sidebar` used as an app's navigation on a phone.
+
+**Why accepted**: the drawer is `overlay::modal` plus a `WindowMetrics`-driven choice that belongs
+to the app — an app picks a sidebar or a drawer rather than handing one widget both.
+
+**Evidence**: `plugins/beui/src/components/animated_sidebar.rs` module docs ("The mobile drawer");
+`examples/beui-demo/src/nav.rs` (`COMPACT_BREAKPOINT`, the phone shell); `examples/beui-demo/README.md`
+("Phones").
+
+**Trigger for removal**: a catalog drawer mode for `animated_sidebar`; none planned.
+
+---
+
+### `beui-stack-modal-no-back-press` — a beUI modal, drawer or sheet mounted in a `Stack` does not receive the system back press
+
+**Observed**: beUI's `overlay::modal` host answers a system back press only when `show_modal`
+pushed it as a navigator page (the page carries `BackPolicy::DismissAnimated`, or `BackPolicy::Veto`
+for a non-dismissable modal). Mounted in the app's own `Stack` instead — the kept-mounted shape —
+a modal, `drawer` or `bottom_sheet` has no page for the navigator to consult, so the back press
+passes it by and acts on whatever is underneath. The app wires the press itself with a
+`frust::BackFallback` (`frust::back_fallback`) that claims it while the overlay is open and runs
+the app's own close; `examples/beui-demo` does this for its phone page list and its Overlays page.
+
+**Applies to**: every `frust_beui` part hosted by `overlay::modal` (`morphing_modal`,
+`center_morph_modal`, `blocks::command_palette`, `drawer`, `animated_sidebar`'s edge mount,
+`bottom_sheet`) when mounted in a `Stack` rather than through `show_modal`.
+
+**Why accepted**: the back press is a navigator signal, and a `Stack`-mounted host is not a
+navigator page; `BackFallback` is the framework's app-level seam for exactly this, and the app is
+the only party that knows which overlay a press should close.
+
+**Evidence**: `plugins/beui/src/overlay/modal.rs` module docs ("Dismissal, and the navigator seam":
+"A back press, when pushed by `show_modal`"); `crates/frust/src/back_glue.rs` (`BackFallback`,
+`back_fallback`); `examples/beui-demo/src/lib.rs` and `src/pages/motion/overlays.rs` (the two
+`BackFallback`s).
+
+**Trigger for removal**: a modal host that registers its own back interest while open.
 
 ---
 

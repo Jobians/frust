@@ -89,6 +89,9 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   and then pops, where it used to pop at once; a non-dismissable host ignores the back press.
   Migration: code or tests that expect the page to be gone on the back press itself must wait for
   the exit to settle.
+- `frust-beui`'s `ButtonTone` gains a `Destructive` variant (a fill from the palette's destructive
+  role with white ink, in both brightnesses). `ButtonTone` is an exhaustive enum. Migration: a
+  `match` over `ButtonTone` adds a `ButtonTone::Destructive` arm.
 
 ### Added
 
@@ -261,6 +264,31 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   `SemanticsCtx::has_focus` tells a widget's `semantics` whether it holds it.
 - `frust::authoring::{DismissCause, DismissDecision, mark_pending_result_flush}`.
 - The baseline `Button`, `Checkbox`, `Radio` and `Slider` publish their focused semantics node.
+- `frust-beui` density: `BeuiMetrics`, a theme extension of size tokens selected by `Density`
+  (`Comfortable`, the default and the sizes beUI had, or `Touch`: a 44 px minimum target on Apple
+  targets, 48 px elsewhere, and larger type steps), through `theme_with_density(Density)` and
+  `install_with_density(Density)`. `theme()` and `install()` are unchanged. Only the parts listed
+  under Changed follow it (`beui-density-partial-coverage` in docs/LIMITATIONS.md).
+- `frust-beui` parts for phone content under `frust_beui::components`, authored in this repository
+  rather than ported: `card` (`card`, `hero_card`, `stat_tile`), `grouped_list` (`grouped_list`,
+  `list_row`, `section_header`), `chip` (`chip`, `status_badge`, `StatusBadgeTone`), `avatar`
+  (`avatar`, `AvatarSize`, `AvatarTone`), `alert` (`alert`, `AlertTone`) and `key_value`
+  (`key_value_row`, `timeline`, `TimelineStep`, `TimelineStepState`). A pressable card, chip or list
+  row is a Tab stop and activates with Enter or Space.
+- `frust-beui` `select` / `multi_select`: `.floating(bool)` (default `false`, the inline panel as
+  before). Floating paints the option panel in the root overlay layer, so a select works inside a
+  modal or a clipping container. While a floated panel is open it shows no row hover highlight,
+  main-tree shortcuts are masked and Tab closes it. The anchored host carries the same switch
+  (`anchored(..).floating(bool)`), and `OverlayAnchor::floats_open()` reports an open floated panel.
+- Baseline icons `frust::icons::WARNING`, `SHIELD` and `INFO`.
+- Plugin registry: a `beui` entry (`frust plugin add beui`, a single Cargo dependency; the app still
+  calls `frust_beui::install()` or `install_with_density` in its `app!` setup). The registry has
+  twenty-nine entries.
+- `examples/beui-demo` gains Android and iOS host projects (`frust run -d <device>` from its
+  directory), a Content page for the new parts (20 pages in all) and a phone shell below 720 px of
+  layout width: a top bar, the page list in a beUI drawer, the system back press through an app-side
+  `BackFallback`, safe-area and keyboard insets, and `Density::Touch` at start-up on Android and iOS.
+  It has not yet been run on a device.
 
 ### Changed
 
@@ -269,6 +297,18 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 - accesskit 0.25, `accesskit_winit` 0.34, `accesskit_android` 0.9, `accesskit_ios` 0.2.2.
 - The plugin registry's `photo-library` `library` option now also links `ImageIO` on iOS, which
   `asset_metadata` reads through; a project that also enables `decode` links it once.
+- `frust-beui` text follows the OS text scale, including the code, diff and tool output in the
+  agents parts. This changes what a phone with a non-default text size shows; nothing changes where
+  the scale is 1.0.
+- `frust-beui` parts that read `BeuiMetrics` and so follow `Density::Touch`: the components `alert`,
+  `animated_badge`, `animated_toast_stack`, `button`, `card`, `chip`, `grouped_list`, `input` and
+  `key_value`, and the agents `message`, `message_bubble` and `prompt_input`. Under the default
+  density their sizes are unchanged.
+- The chat message avatar's initials are upper-cased.
+- `examples/beui-demo` is a standalone workspace (its own `Cargo.lock`, excluded from the root
+  workspace) with the package `beuidemo` and the Android and iOS identifier `it.f0x.beuidemo`. Run it
+  with `cargo run` from `examples/beui-demo`; the root workspace no longer has a `beui-demo`
+  package, so `cargo run -p beui-demo` fails.
 
 ### Fixed
 
@@ -284,6 +324,10 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   Before, a screen reader or UI automation could read the text of the focused field, a password
   included, from that view even though the field's own accessibility node was masked. This is a
   privacy fix. An app has nothing to change: update to this version.
+- A `frust-beui` `select` or `multi_select` inside a `center_morph_modal` works with
+  `.floating(true)`: the option panel paints above the modal instead of growing it and painting
+  under its clip.
+- `frust-beui`'s `theme_toggle` keeps the live density when it flips light and dark.
 
 ## 0.6.6 — 2026-11-11
 
