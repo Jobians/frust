@@ -100,7 +100,8 @@ pub struct Asset {
     pub content_type: Option<String>,
     /// The original's size in bytes. Filled only when the query set
     /// [`AssetQuery::with_details`] (and by a fetch by id that asks for details); `None` when
-    /// the platform does not report it. Android fills it; iOS returns `None`.
+    /// the platform does not report it; a size the platform reports as zero is treated as unknown.
+    /// Android fills it; iOS returns `None`.
     pub size_bytes: Option<u64>,
 }
 
@@ -180,9 +181,9 @@ impl AssetQuery {
         self
     }
 
-    /// Also fills [`Asset::file_name`], [`Asset::content_type`] and [`Asset::size_bytes`]. On Android these ride the
-    /// same query at no extra round trip; on iOS they need a per-asset resource lookup, so a
-    /// page can cost noticeably more per row.
+    /// Also fills [`Asset::file_name`], [`Asset::content_type`] and [`Asset::size_bytes`]. On
+    /// Android these ride the same query at no extra round trip; on iOS they need a per-asset
+    /// resource lookup, so a page can cost noticeably more per row.
     pub fn with_details(mut self) -> Self {
         self.details = true;
         self

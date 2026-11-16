@@ -11,6 +11,16 @@
 //! and the `frust` facade is the only crate that wires this source to a
 //! `NavigatorController` (see `frust::back_glue`).
 //!
+//! # Process-wide vs per-thread (`test-support`)
+//!
+//! Without the `test-support` feature, the press counter and the handles-back
+//! flag are process-wide: a press or flag set on one thread is seen on every
+//! thread. With `test-support` they are per thread, so a press or a flag set
+//! on one thread is **not** seen on another (parallel tests stay isolated).
+//! The feature is meant for `dev-dependencies` only: Cargo unifies features,
+//! so enabling it on a normal dependency changes Back semantics for every
+//! crate in the build.
+//!
 //! # A counter, not a boolean
 //!
 //! Each back press is an *event*, so the source is a monotonically increasing
@@ -24,7 +34,8 @@
 //!
 //! [`handles_back`] backs a shell's `setFrameworkHandlesBack`-style decision:
 //! the framework pre-registers whether it will consume the next
-//! back. It is a process-global [`AtomicBool`] (the `theme_override` polling
+//! back. Without `test-support` it is a process-global [`AtomicBool`] (per
+//! thread with the feature; see above) (the `theme_override` polling
 //! precedent — a plain flag a shell reads, no reactive tracking), and it
 //! **defaults to `false`**: an app with no navigator (nothing to pop) must let
 //! a back press exit, matching Flutter's "no routes to pop → bubble →
@@ -58,8 +69,9 @@
 //! thread, so an off-thread call is a wiring bug and panics. A press that
 //! races ahead of [`ReactiveRuntime::init`] is dropped with a logged warning
 //! rather than panicking or buffering (the same rationale as the deep-link
-//! source). [`set_handles_back`]/[`handles_back`], like `theme_override`, carry
-//! no thread constraint — a shell polls `handles_back` from its own frame loop.
+//! source). Without the `test-support` feature, [`set_handles_back`]/[`handles_back`],
+//! like `theme_override`, carry no thread constraint — a shell polls
+//! `handles_back` from its own frame loop.
 //! The **live provider** slot ([`set_can_pop_provider`]/[`clear_can_pop_provider`])
 //! is the exception: its closure captures an `Rc`-backed `NavigatorController`
 //! (`!Send`), so it lives in UI-thread-affine `thread_local` storage and
@@ -247,7 +259,11 @@ pub fn back_presses() -> BackPresses {
 /// [`handles_back`].
 ///
 /// Unlike [`push_back_press`], this carries no thread constraint (it is a plain
-/// atomic store — the `theme_override` precedent).
+/// atomic store — the `theme_override` precedent). With the `test-support`
+/// feature the flag is per thread instead: a value set here is not seen by
+/// [`handles_back`] on another thread. The feature is meant for
+/// dev-dependencies; enabling it on a normal dependency changes Back semantics
+/// for every crate in the build.
 pub fn set_handles_back(handles: bool) {
     #[cfg(not(feature = "test-support"))]
     HANDLES_BACK.store(handles, Ordering::Relaxed);
@@ -320,7 +336,9 @@ pub fn clear_can_pop_provider() {
 /// A live provider (see [`set_can_pop_provider`]), when registered, wins: it is
 /// queried against the navigator's CURRENT depth so a press is never mis-decided
 /// against a stale rebuild-time snapshot. Otherwise this returns the polled
-/// [`set_handles_back`] flag.
+/// [`set_handles_back`] flag. That flag is process-wide, or per thread when the
+/// `test-support` feature is enabled (a dev-dependency feature; enabling it on a
+/// normal dependency changes Back semantics for every crate in the build).
 pub fn handles_back() -> bool {
     // A live provider reads the navigator's current stack depth at call time —
     // the whole point of the slot is to bypass the polled flag's one-frame lag.

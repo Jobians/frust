@@ -47,7 +47,8 @@ Add Plugin `library` option) the crate also lists the user's photos: `PhotoLibra
   `thumbnail`.
 - Every `Asset` carries `modified_unix_ms`, `is_favorite` and `burst_id`. `is_favorite` is `None` below
   Android API 30 and `burst_id` is always `None` on Android (`photo-library-android-asset-fields`).
-  `AssetQuery::with_details()` also fills `file_name` (untrusted, display only), `size_bytes` (the original's size; Android fills it, iOS returns `None`) and `content_type`, which is
+  `AssetQuery::with_details()` also fills `file_name` (untrusted, display only), `size_bytes` (the
+  original's size; Android fills it, iOS returns `None`) and `content_type`, which is
   platform-shaped: a MIME type on Android, a uniform type identifier on iOS
   (`photo-library-content-type-platform-shaped`). `Asset::mime_type()` gives a MIME type on both phones: it maps the
   iOS identifiers in a fixed table and returns `None` for an identifier it does not know rather than guessing. They are off by default because on iOS each row then costs

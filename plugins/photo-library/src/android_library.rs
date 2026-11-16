@@ -386,7 +386,9 @@ fn assets_from(
             file_name: if details { names[index].take() } else { None },
             content_type: if details { types[index].take() } else { None },
             size_bytes: if details {
-                u64::try_from(columns.sizes[index]).ok()
+                u64::try_from(columns.sizes[index])
+                    .ok()
+                    .filter(|&size| size > 0)
             } else {
                 None
             },
@@ -666,12 +668,12 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_size_is_none() {
+    fn an_unknown_or_zero_size_is_none() {
         let mut c = columns(2);
         c.sizes = vec![-1, 0];
         let page = assets_from(c, 2, true).unwrap();
         assert_eq!(page.items[0].size_bytes, None);
-        assert_eq!(page.items[1].size_bytes, Some(0));
+        assert_eq!(page.items[1].size_bytes, None);
     }
 
     #[test]

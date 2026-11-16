@@ -305,8 +305,8 @@ impl PhotoLibrary {
     /// does not exist, was deleted, is not visible to the app (it is outside a limited
     /// selection), or is not a library id at all; a duplicate id in the input gives a duplicate
     /// entry. A `Some` asset is the row [`assets`](Self::assets) lists for that id, including
-    /// its [`id`](Asset::id). With `details` the call fills [`Asset::file_name`] and
-    /// [`Asset::content_type`], as [`AssetQuery::with_details`] does for a listing.
+    /// its [`id`](Asset::id). With `details` the call fills [`Asset::file_name`],
+    /// [`Asset::content_type`] and [`Asset::size_bytes`], as [`AssetQuery::with_details`] does for a listing.
     ///
     /// An empty `ids` returns an empty `Vec` at once, without a platform call, so neither the
     /// thread nor the access is checked for it. Otherwise the call refuses the mobile UI thread
