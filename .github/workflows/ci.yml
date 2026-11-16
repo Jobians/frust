@@ -170,6 +170,8 @@ jobs:
             gate: cargo test --locked && cargo clippy --all-targets --locked -- -D warnings && cargo fmt --check
           - dir: examples/material3-demo
             gate: cargo test --locked && cargo clippy --all-targets --locked -- -D warnings && cargo fmt --check
+          - dir: examples/beui-demo
+            gate: cargo test --locked && cargo clippy --all-targets --locked -- -D warnings && cargo fmt --check
           - dir: examples/native-widgets-demo
             gate: cargo test --locked && cargo clippy --all-targets --locked -- -D warnings && cargo fmt --check
           - dir: examples/web-gallery

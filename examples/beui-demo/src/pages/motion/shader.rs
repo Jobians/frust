@@ -17,7 +17,7 @@
 //!
 //! # Page-local state
 //!
-//! `pages::motion::shader::page()` takes no state — `main.rs`'s `page_body`
+//! `pages::motion::shader::page()` takes no state — `lib.rs`'s `page_body`
 //! calls it with nothing, and this page may not add a field to
 //! [`crate::AppState`]. Its four controls therefore live in self-healing
 //! `thread_local!` [`RwSignal`]s cached across rebuilds, the same screen-local

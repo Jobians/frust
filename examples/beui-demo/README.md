@@ -1,47 +1,54 @@
 # beui-demo
 
-The `frust-beui` design-system plugin's desktop gallery: nineteen pages that
-show every ported component interactively — a home page with the upstream
-attribution, nine Motion pages (text effects, buttons, controls, selection,
+The `frust-beui` design-system plugin's gallery: twenty pages that show
+every ported component interactively — a home page with the upstream
+attribution, a Content page for the phone-shaped parts, nine Motion pages (text effects, buttons, controls, selection,
 overlays, navigation, surfaces, data, and the WGSL shader backgrounds), three
 Agents pages (chat primitives, agent-output panels, the assembled chat app
 over a mock streaming driver), four Blocks pages (command surfaces, morphing
 tabs and stacks, forms and upload, showcase blocks), a Theming page, and a
 GPU Effects page.
 
-Root-workspace member (covered by the `examples/*` glob in the root
-`Cargo.toml`, not standalone) — desktop-only, no Android/iOS output. Mirrors
-`examples/shadcn-demo`'s manifest shape closely, with one addition: a single
-non-default `gpu-effects` feature row (see "GPU Effects" below) forwarding to
-`frust-beui/gpu-effects`; the default build carries none of it.
+A **standalone workspace** (its own `[workspace]` root and `Cargo.lock`,
+excluded from the root one — see `Cargo.toml`'s header), shaped like
+`examples/material3-demo`: one tree drives the desktop preview and the
+generated `android/` and `ios/` host projects. The package is `beuidemo` (no
+hyphen) even though the directory keeps one: the crate name is the `.so`/`.a`
+leaf the Android and iOS shells load by identifier. The manifest adds a
+single non-default `gpu-effects` feature row (see "GPU Effects" below)
+forwarding to `frust-beui/gpu-effects`; the default build carries none of it.
 
 ## Run
 
+```bash
+cd examples/beui-demo
+cargo run                # desktop preview
+frust run -d <device>    # Android / iOS device or simulator
 ```
-cargo run -p beui-demo
+
+The desktop preview opens a real winit window titled "beUI Gallery".
+`frust_beui::install_with_density` runs in `frust::app!`'s `setup` block, so
+the app starts themed with beUI's own token tables rather than the
+framework's neutral fallback (see "Phones" below for the density). The
+window opens at the desktop shell's own default size (800×600 logical px);
+set `FRUST_WINDOW_SIZE=<width>x<height>` before running for a roomier
+gallery view of the sidebar-plus-content shell, or a width under 720 for the
+phone shell.
+
+It gates from its own directory rather than with `-p` from the repo root:
+
+```bash
+cd examples/beui-demo
+cargo test \
+  && cargo clippy --all-targets -- -D warnings \
+  && cargo clippy --features gpu-effects --all-targets -- -D warnings \
+  && cargo fmt --check
 ```
-
-Opens a real winit window titled "beUI Gallery". `frust_beui::install()` runs
-in `frust::app!`'s `setup` block, so the app starts themed with beUI's own
-token tables (`frust_beui::theme()`) rather than the framework's neutral
-fallback.
-
-The window opens at the desktop shell's own default size (800×600 logical
-px); set `FRUST_WINDOW_SIZE=<width>x<height>` before running for a roomier
-gallery view of the sidebar-plus-content shell.
-
-### The `frust run` device gotcha
-
-If an Android device is attached, the workspace-root `frust run` auto-targets
-it instead of a desktop window — this crate has no Android/iOS build output at
-all, so that auto-target would fail or pick the wrong app. Use
-`cargo run -p beui-demo` (or run `frust run --watch` from *inside* this
-directory, which is desktop-only and has nothing else to prefer) for the
-desktop preview.
 
 ## Nav shell
 
-The rail is `frust_beui::components::animated_sidebar` — the catalog's own
+This section is the wide shell, at a layout width of 720 logical px or more;
+"Phones" below covers the narrower one. The rail is `frust_beui::components::animated_sidebar` — the catalog's own
 motion-driven sidebar, collapsible via the top bar's
 Collapse/Expand button. `animated_sidebar` ports upstream's panel-and-menu,
 not a labelled-group header slot (see that module's own doc comment), so this
@@ -51,11 +58,21 @@ rather than inventing a group-header widget here. `nav.rs`'s module docs carry
 the same note; the upgrade to a genuinely grouped rail is future work for
 whichever task next touches `animated_sidebar` itself.
 
-Nineteen pages, in nav order:
+Twenty pages, in nav order:
 
 - **Home** — title, upstream attribution (MIT, rev
   `10c283e433a8f4f0ac0736684d4426ab612b9f55`), and a category-overview card
   per section, each linking straight into that section's first page.
+- **Content** — the parts a phone screen is built from, in one column at most
+  480 logical px wide and centred on a wider window: a hero card over a 2×2
+  grid of stat tiles, a grouped list (avatar rows, a pressable counter row, a
+  destructive row), chips and every status-badge tone, avatars in three sizes,
+  every alert tone (a banner and a dismissible one among them), key-value rows
+  and a three-step timeline, every button tone and size, a text field, a
+  floating select and a toast trigger. Two chips at the top switch the
+  density between Comfortable and Touch (`frust_beui::theme_with_density`,
+  pushed through `frust::set_app_theme` with the current brightness kept);
+  the light/dark toggle keeps the chosen density.
 - **Motion** (9 pages: `text`, `buttons`, `controls`, `selection`, `overlays`,
   `navigation`, `surfaces`, `data`, `shader`) — the 41 motion components with
   every registry variant, plus the five `shader_background` variants on the
@@ -85,9 +102,10 @@ Theming) alongside the active page's title.
 
 ## Theming today vs. TODO
 
-- **Wired today:** `frust_beui::install()` seeds the beUI theme as the app
-  default; both `theme_toggle` instances (top bar, Theming page) flip
-  brightness live through `frust::set_app_theme`; every swatch, button, and
+- **Wired today:** `frust_beui::install_with_density` seeds the beUI theme
+  as the app default; every `theme_toggle` instance (top bar, Theming and Content pages)
+  flips brightness live through `frust::set_app_theme`, keeping the density
+  the Content page's chips chose; every swatch, button, and
   text run on Home/Theming resolves through beUI's own tokens
   (`frust_beui::palette`/`sans_family`/`mono_family`) rather than a literal
   color authored in this crate.
@@ -96,17 +114,51 @@ Theming) alongside the active page's title.
   one (see "Nav shell" above); every section page hosts its state in a
   page-local component, so a page starts fresh each time it is opened.
 
+## Phones
+
+The shell follows the layout width, not the target OS: below 720 logical px
+(`nav::COMPACT_BREAKPOINT`) a phone shell replaces the rail, so a narrow
+desktop window shows it too.
+
+- **Top bar:** a Menu button, the page title and the light/dark toggle, each
+  control at least the touch minimum (44 px on Apple targets, 48 px
+  elsewhere) in either density.
+- **Page list:** the Menu button opens every page in a left `drawer`, grouped
+  under the Motion, Agents and Blocks headers as beUI list rows. Choosing a
+  page shows it and closes the list; a backdrop tap, Escape and the Android
+  back press close it too. The drawer is mounted in the shell's stack, so the
+  back press reaches it through a `frust::BackFallback` that claims the press
+  only while the list is open; with the list closed, back leaves the app as
+  usual.
+- **Safe area and keyboard:** the whole shell sits in a `frust::safe_area`
+  with `.keyboard(true)`, so the top bar starts below the status bar or notch
+  and the page ends above the home indicator, or above the soft keyboard
+  while it is open. The page's scroll view then keeps a focused field's caret
+  in view, which is what keeps the Chat page's composer and the Content
+  page's text field above the keyboard.
+- **Density:** Android and iOS start under `Density::Touch`
+  (`frust_beui::install_with_density`), every other target under
+  `Density::Comfortable`. The Content page's density chips read the live
+  theme rather than a state of their own, so they open on whichever density
+  the app started with.
+
+Fifteen of the twenty pages still lay out wider than a 390 px phone in
+places (fixed-width stages, rows that do not wrap, wide specimens); the
+shell's own test records which ones. Content, Agents · Primitives,
+Agents · Panels, Blocks · Morph and Theming fit.
+
 ## GPU Effects
 
-```
-cargo run -p beui-demo --features gpu-effects
+```bash
+cd examples/beui-demo
+cargo run --features gpu-effects
 ```
 
 Compiles the catalog's `gpu_fx` substrate in and turns on the five true-3D
 opt-ins the GPU Effects page pairs against their 2D path
 (`TiltCardView::gpu_face`, `WalletCardView::gpu_fan`, `WheelPicker::gpu_drum`,
 `CylinderCarouselView::gpu_cylinder`, `ProjectFolderView::gpu_fan`). The
-default build (`cargo run -p beui-demo`, no flag) never compiles `gpu_fx` at
+default build (`cargo run`, no flag) never compiles `gpu_fx` at
 all — the page still shows, with a placeholder in every 3D pane naming this
 command.
 
@@ -114,7 +166,8 @@ Compiling the feature in is not the same as rendering 3D: a device is only
 reachable once the desktop shell has opened its first surface (beUI keeps the
 3D path off on Android and iOS), and `FRUST_BEUI_NO_GPU_FX=1` turns the whole path back off
 regardless of the build. Every component already carries that degrade in its
-own contract, so a `--features gpu-effects` build with no reachable device
+own contract (so a phone, where beUI keeps the 3D path off, renders every
+variant's 2D path), so a `--features gpu-effects` build with no reachable device
 renders exactly the default build's 2D panes — the GPU Effects page states
 which of the three cases the current run is in.
 
@@ -129,9 +182,9 @@ backend-specific code of its own — but that run is owed too.
 
 ## Verifying it
 
-This dev rig is headless — the binary is never run here. `cargo build -p
-beui-demo` is the runtime check, and `cargo check -p beui-demo --features
-gpu-effects` covers the feature-gated build compiling; a desktop container
-(dockur linux-native, `run-on-desktop.sh`) runs `cargo run -p beui-demo` (and,
-for the GPU Effects page, `cargo run -p beui-demo --features gpu-effects`)
-and captures the screenshot separately.
+This dev rig is headless — the binary is never run here. `cargo build` (from
+this directory) is the runtime check, `cargo check --features gpu-effects`
+covers the feature-gated build compiling, and `cargo ndk -t arm64-v8a check`
+covers the Android compile; a desktop container (dockur linux-native,
+`run-on-desktop.sh`) runs `cargo run` (and, for the GPU Effects page,
+`cargo run --features gpu-effects`) and captures the screenshot separately.

@@ -44,13 +44,13 @@ cargo build --workspace --locked
 ```
 
 `--locked` must always pass — it is part of the verify gate below and is how manifest/lockfile drift
-is caught. It is not this workspace's rule alone: fourteen lockfiles are held to it — this root plus
-the thirteen standalone workspaces (`benchmarks/frust_bench`, `testing/hotpatch-canary`, `plugins/clean-signals-frust`, and ten under `examples/`: `design-system-sample`, `glyph-catalog`, `hotpatch-spike`, `huddle`, `material3-demo`, `native-widgets-demo`, `playground`, `shadertoy`, `web-gallery`, `web-spike`) a pin move keeps current — and such a move regenerates all fourteen lockfiles
+is caught. It is not this workspace's rule alone: fifteen lockfiles are held to it — this root plus
+the fourteen standalone workspaces (`benchmarks/frust_bench`, `testing/hotpatch-canary`, `plugins/clean-signals-frust`, and eleven under `examples/`: `beui-demo`, `design-system-sample`, `glyph-catalog`, `hotpatch-spike`, `huddle`, `material3-demo`, `native-widgets-demo`, `playground`, `shadertoy`, `web-gallery`, `web-spike`) a pin move keeps current — and such a move regenerates all fifteen lockfiles
 with targeted per-crate updates rather than a blind re-resolve (see *Version-Pin Policy*). **Dev-profile
-shader-stack overrides.** The five manifests the `profile_sync` tripwire checks (root `Cargo.toml`,
+shader-stack overrides.** Six of the manifests the `profile_sync` tripwire checks (root `Cargo.toml`,
 `crates/frust-drive/templates/app/Cargo.toml.tmpl`, `examples/huddle/Cargo.toml`, `examples/glyph-catalog/Cargo.toml`,
-`examples/material3-demo/Cargo.toml`) each carry a `[profile.dev.package.*]` override (`opt-level =
-2`) for the shader/render crates: debug-profile (`opt-level = 0`) shader compilation/translation is
+`examples/material3-demo/Cargo.toml`, `examples/beui-demo/Cargo.toml`) each carry a `[profile.dev.package.*]`
+override (`opt-level = 2`) for the shader/render crates: debug-profile (`opt-level = 0`) shader compilation/translation is
 slow enough on mobile CPUs to trip the iOS launch watchdog. They stay hand-synced via that tripwire
 (`cargo test -p frust-cli --test profile_sync`); a `[profile.dev.package."*"]` wildcard (`opt-level
 = 1`) widens every other dependency's debug optimization the same way. Release-profile hardening, Android link flags, the paired Frust-vs-Flutter benchmark suite and the recorded size/build-time baselines live in [PERFORMANCE_BASELINES.md](PERFORMANCE_BASELINES.md).
@@ -87,7 +87,6 @@ Under an override, `build/rust` stays empty by design — every Frust tool resol
 ## Run
 
 ```bash
-# Huddle, the sole example: own [workspace]/Cargo.lock, so gate from its dir, not `-p`.
 (cd examples/huddle && cargo run)
 ```
 
@@ -101,9 +100,9 @@ exists for either. A shell with no design system installed falls back to `Theme:
 
 **shadcn gallery.** `cargo run -p shadcn-demo` (a root-workspace member, so no standalone gate)
 opens the `frust-shadcn` catalog's desktop gallery, the same manual-visual-gate shape as huddle's.
-**material3 gallery.** `cd examples/material3-demo && cargo run` (standalone workspace — no `-p`)
-opens `frust-material`'s; `frust run -d <device-id>` from there builds/installs/launches it on
-Android or iOS.
+**material3 and beUI galleries.** `cd examples/material3-demo && cargo run` (standalone workspace —
+no `-p`) opens `frust-material`'s, and `cd examples/beui-demo && cargo run` opens `frust-beui`'s;
+`frust run -d <device-id>` from either directory builds/installs/launches it on Android or iOS.
 
 `examples/huddle` additionally builds and runs on Android and iOS, from its own directory (its own
 `frust.toml`, package `it.f0x.huddle`):
@@ -261,10 +260,12 @@ Additionally run:
         && cargo clippy --all-targets -- -D warnings && cargo fmt --check) \
   && (cd examples/material3-demo && cargo test \
         && cargo clippy --all-targets -- -D warnings && cargo fmt --check) \
+  && (cd examples/beui-demo && cargo test \
+        && cargo clippy --all-targets -- -D warnings && cargo fmt --check) \
   && (cd plugins/clean-signals-frust && cargo test && cargo clippy --all-targets -- -D warnings)
 ```
 
-All six gate from their own directory rather than `-p` from the repo root, being standalone
+All seven gate from their own directory rather than `-p` from the repo root, being standalone
 workspaces excluded from the root one (*Version-Pin Policy*) — the same shape `examples/shadertoy`,
 `examples/glyph-catalog`, `examples/web-gallery` and `examples/web-spike` gate under, per their own
 READMEs (the latter two against the wasm32 target). `huddle` and `clean-signals-frust` take
@@ -470,7 +471,7 @@ The rules below bind every pin, wherever its row lives:
   **Carve-out for a duplicate-collapsing bump.** When a pin moves specifically to collapse a
   duplicate (e.g. `parley_engine` aligning `skrifa`/`read-fonts` onto `glifo`'s copies),
   `cargo generate-lockfile` is the wrong tool — it re-resolves unrelated crates. Run `cargo update
-  -p <crate> --precise <version>` from inside each of the fourteen workspaces, then a plain
+  -p <crate> --precise <version>` from inside each of the fifteen workspaces, then a plain
   `cargo metadata` there to pick up missing path-dep edges, and audit every lock diff's
   `name`/`version` lines.
 - **wgpu's GPU backends route per target; the `30.0.1` pin stays workspace-owned.** The
@@ -573,13 +574,12 @@ physical device, or boot with `-gpu swiftshader` (software Vulkan; slower but co
 
 ### iOS Simulator uniform-buffer alignment clamp
 
-The Simulator's GPU (Apple2 Metal feature family) renders correctly under `frust-engine`, which
-requires neither `COMPUTE_SHADERS` nor `INDIRECT_EXECUTION` (`ENGINE_REQUIRED_DOWNLEVEL_FLAGS` is
-deliberately empty). One residue remains: the Simulator's Metal validation misreports its own
-uniform-buffer offset alignment, so a device request there is forced back up to 256 bytes
-(`frust-gpu::context`'s `effective_limits`), kept until upstream
-[gfx-rs/wgpu#10189](https://github.com/gfx-rs/wgpu/pull/10189) ships (iPhone 13 mini and SE, like
-every physical device, are unaffected).
+The Simulator's GPU (Apple2 Metal feature family) renders correctly under `frust-engine`, which requires
+neither `COMPUTE_SHADERS` nor `INDIRECT_EXECUTION` (`ENGINE_REQUIRED_DOWNLEVEL_FLAGS` is deliberately
+empty). One residue remains: the Simulator's Metal validation misreports its own uniform-buffer offset
+alignment, so a device request there is forced back up to 256 bytes (`frust-gpu::context`'s
+`effective_limits`), kept until upstream [gfx-rs/wgpu#10189](https://github.com/gfx-rs/wgpu/pull/10189)
+ships (iPhone 13 mini and SE, like every physical device, are unaffected).
 
 ### Android release build may not pick up `--define`
 

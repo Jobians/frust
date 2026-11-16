@@ -21,10 +21,13 @@
 //! [`frust::component`], as on every Motion page (see
 //! `crate::pages::motion::text`).
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use frust::authoring::{DismissCause, DismissDecision};
 use frust::{
-    Component, CrossAxisAlignment, EdgeInsets, Padding, Row, SizedBox, View, ViewSeq, column,
-    component, row, stack, text,
+    BackFallback, Component, CrossAxisAlignment, EdgeInsets, Get, Padding, Row, RwSignal, Set,
+    SizedBox, View, ViewSeq, back_fallback, column, component, row, stack, text,
 };
 use frust_beui::components::bottom_sheet::bottom_sheet;
 use frust_beui::components::button::{ButtonSize, ButtonTone, button};
@@ -80,10 +83,20 @@ pub struct State {
     return_focus: bool,
     /// The last dismiss attempt, as the readout prints it.
     last_dismiss: String,
+    /// Claims the system back press while the draft dialog is up: a modal
+    /// mounted in a stack never sees one itself (see [`draft_section`]).
+    draft_back: BackFallback,
+    /// Whether the dialog is up, for the back fallback's interest probe.
+    draft_up: Rc<Cell<bool>>,
+    /// Set by the back fallback, answered by [`draft_section`] with the state.
+    back_asked: RwSignal<bool>,
 }
 
 impl Default for State {
     fn default() -> Self {
+        let draft_up = Rc::new(Cell::new(false));
+        let probe = draft_up.clone();
+        let back_asked = RwSignal::new(false);
         Self {
             tooltips: Default::default(),
             popover_anchor: OverlayAnchor::new(),
@@ -112,6 +125,9 @@ impl Default for State {
             escape_first: false,
             return_focus: true,
             last_dismiss: "last: none yet".to_string(),
+            draft_back: BackFallback::new(move || probe.get(), move || back_asked.set(true)),
+            draft_up,
+            back_asked,
         }
     }
 }
@@ -583,6 +599,39 @@ fn toggle(
         .cross_axis(CrossAxisAlignment::Center)
 }
 
+/// Answer a back press the draft dialog's fallback recorded: the same veto
+/// Escape and the backdrop ask, under [`DismissCause::Back`].
+fn answer_back(state: &mut State) {
+    if !state.back_asked.get() {
+        return;
+    }
+    state.back_asked.set(false);
+    if !state.draft_open {
+        return;
+    }
+    let decision = draft_decision(state.veto_on, &state.draft);
+    state.last_dismiss = dismiss_readout(DismissCause::Back, decision);
+    if decision != DismissDecision::Keep {
+        state.draft_open = false;
+    }
+}
+
+/// The draft dialog's section, wired to the system back press.
+///
+/// The dialog is mounted in its stage's stack, and the modal host sees a back
+/// press only as a page pushed with `show_modal` (`frust_beui::overlay::modal`'s
+/// "Dismissal" docs), so this section claims the press itself while the dialog
+/// is up and asks the dialog's own veto.
+fn draft_section(state: &mut State) -> impl View<State> {
+    answer_back(state);
+    state.draft_up.set(state.draft_open);
+    back_fallback(&state.draft_back, draft_dialog(state))
+}
+
+/// The widest the draft stage lays out, in logical px; a narrower page
+/// shrinks it to fit.
+const DRAFT_STAGE_WIDTH: f64 = 420.0;
+
 /// A dialog that holds a draft: the dismiss veto, the Escape-leaves-field
 /// opt-in and focus return, each driven by a toggle read when the dialog is
 /// built.
@@ -590,16 +639,13 @@ fn draft_dialog(state: &State) -> impl View<State> {
     let content = column()
         .child(text("Draft").size(16.0))
         .child(gap(8.0))
-        .child(
-            SizedBox(Some(260.0), None)
-                .child(input(state.draft.clone(), |s: &mut State, v| s.draft = v).label("Draft")),
-        )
+        .child(input(state.draft.clone(), |s: &mut State, v| s.draft = v).label("Draft"))
         .child(gap(16.0))
-        .child(trigger("Discard", |s: &mut State| {
+        .child(row().child(trigger("Discard", |s: &mut State| {
             s.draft.clear();
             s.draft_open = false;
-        }))
-        .cross_axis(CrossAxisAlignment::Start);
+        })))
+        .cross_axis(CrossAxisAlignment::Stretch);
 
     let host = center_morph_modal(content)
         .label("Draft dialog")
@@ -613,24 +659,27 @@ fn draft_dialog(state: &State) -> impl View<State> {
         .escape_leaves_field_first(state.escape_first)
         .return_focus(state.return_focus);
 
-    let composer = row()
-        .child(SizedBox(Some(220.0), None).child(
-            input(state.composer.clone(), |s: &mut State, v| s.composer = v).label("Composer"),
-        ))
-        .child(hgap(12.0))
+    let composer = column()
+        .child(input(state.composer.clone(), |s: &mut State, v| s.composer = v).label("Composer"))
+        .child(gap(8.0))
         .child(
-            button("Open dialog", |s: &mut State| s.draft_open = true)
-                .tone(ButtonTone::Primary)
-                .size(ButtonSize::Sm),
+            row().child(
+                button("Open dialog", |s: &mut State| s.draft_open = true)
+                    .tone(ButtonTone::Primary)
+                    .size(ButtonSize::Sm),
+            ),
         )
-        .cross_axis(CrossAxisAlignment::Start);
+        .cross_axis(CrossAxisAlignment::Stretch);
 
     demo(
         "Draft dialog",
         "Type in Composer, Tab to the button and press Enter, then type a draft. \
-         With the veto on, Escape, a backdrop press and a back press keep the \
-         dialog while the draft has text; Discard always closes it. The toggles \
-         are read when the dialog is built.",
+         With the veto on, Escape and a backdrop press keep the dialog while \
+         the draft has text; Discard always closes it. On Android the system \
+         back press is a dismiss attempt too: the dialog is mounted in this \
+         page, so the page claims the press while the dialog is up and asks \
+         the same veto, which can keep it. The toggles are read when the \
+         dialog is built.",
         (
             toggle("Veto while draft is non-empty", state.veto_on, |s, on| {
                 s.veto_on = on
@@ -647,10 +696,10 @@ fn draft_dialog(state: &State) -> impl View<State> {
             }),
             gap(12.0),
             stage(
-                (420.0, 300.0),
+                (DRAFT_STAGE_WIDTH, 300.0),
                 (0.0, 0.0),
                 column()
-                    .child(composer)
+                    .child(SizedBox(Some(DRAFT_STAGE_WIDTH), None).child(composer))
                     .child(gap(8.0))
                     .child(caption(state.last_dismiss.clone()))
                     .cross_axis(CrossAxisAlignment::Start),
@@ -770,7 +819,7 @@ impl Component for OverlaysPage {
             .child(context_menus(state))
             .child(morphing_modals(state))
             .child(center_modals(state))
-            .child(draft_dialog(state))
+            .child(draft_section(state))
             .child(panels(state))
             .cross_axis(CrossAxisAlignment::Start)
     }
@@ -817,7 +866,108 @@ mod tests {
 
     #[test]
     fn the_toggles_default_to_veto_on_escape_first_off_return_on() {
-        let state = State::default();
+        let tester = draft_tester();
+        let state = tester.state();
         assert!(state.veto_on && !state.escape_first && state.return_focus);
+    }
+
+    use std::time::Duration;
+
+    use frust::authoring::{Point, Role, Size};
+    use frust::push_back_press;
+    use frust::testing::{Tester, TesterOptions, find};
+    use frust_beui::{Density, theme_with_density};
+
+    const PHONE: Size = Size::new(390.0, 844.0);
+    const EPSILON: f64 = 0.5;
+
+    /// The draft section alone in a phone-width page slot, its state built
+    /// inside the Tester, which owns the runtime its back fallback reads.
+    fn draft_tester() -> Tester<State, impl View<State>> {
+        let options = TesterOptions::default().theme(theme_with_density(Density::Touch));
+        Tester::new_with(PHONE, &options, || {
+            let build = |s: &mut State| {
+                frust::scroll_view(Padding(
+                    EdgeInsets::all(16.0),
+                    column()
+                        .child(draft_section(s))
+                        .cross_axis(CrossAxisAlignment::Start),
+                ))
+            };
+            (State::default(), build)
+        })
+    }
+
+    fn run(tester: &mut Tester<State, impl View<State>>) {
+        for _ in 0..60 {
+            tester.pump(Duration::from_millis(16));
+        }
+    }
+
+    fn fits(tester: &Tester<State, impl View<State>>) -> Vec<String> {
+        tester
+            .inspect()
+            .into_iter()
+            .filter(|n| n.bounds.x0 < -EPSILON || n.bounds.x1 > PHONE.width + EPSILON)
+            .map(|n| format!("{} {:?}", n.type_name, n.bounds))
+            .collect()
+    }
+
+    fn dialog_up(tester: &Tester<State, impl View<State>>) -> bool {
+        !tester
+            .find(&find::label(Role::Button, "Discard"))
+            .is_empty()
+    }
+
+    #[test]
+    fn the_draft_dialog_fits_a_phone_and_opens_and_closes() {
+        let _slot = crate::BACK_PRESS_SLOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut tester = draft_tester();
+        assert!(fits(&tester).is_empty(), "{:#?}", fits(&tester));
+        // The composer is the only field until the dialog opens.
+        let composer = tester.bounds(&find::role(Role::TextInput));
+        let backdrop = Point::new(composer.x0 + 4.0, composer.y0 + 4.0);
+
+        tester.tap(find::label(Role::Button, "Open dialog"));
+        run(&mut tester);
+        assert!(dialog_up(&tester));
+        assert!(fits(&tester).is_empty(), "{:#?}", fits(&tester));
+
+        tester.state_mut().draft = "hi".to_string();
+        run(&mut tester);
+        push_back_press();
+        run(&mut tester);
+        assert!(dialog_up(&tester), "the veto kept a non-empty draft");
+        assert_eq!(tester.state().last_dismiss, "last: Back, kept");
+
+        tester.tap(backdrop);
+        run(&mut tester);
+        assert!(dialog_up(&tester));
+        assert_eq!(tester.state().last_dismiss, "last: Backdrop, kept");
+
+        tester.state_mut().draft.clear();
+        run(&mut tester);
+        push_back_press();
+        run(&mut tester);
+        assert!(!dialog_up(&tester), "an empty draft closes on back");
+        let readout = tester.bounds(&find::value("last: Back, dismissed"));
+        assert!(
+            readout.x1 <= PHONE.width && readout.y1 <= PHONE.height,
+            "{readout:?}"
+        );
+
+        tester.tap(find::label(Role::Button, "Open dialog"));
+        run(&mut tester);
+        assert!(dialog_up(&tester));
+        tester.tap(backdrop);
+        run(&mut tester);
+        assert!(!dialog_up(&tester), "the backdrop closes an empty draft");
+        assert!(
+            !tester
+                .find(&find::value("last: Backdrop, dismissed"))
+                .is_empty()
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! The static plugin registry (v1) — twenty-eight entries mirroring `plugins/`:
+//! The static plugin registry (v1) — twenty-nine entries mirroring `plugins/`:
 //! `shared-preferences` (dependency only), `secure-storage` (dependency plus
 //! an optional `biometric-gate` feature wiring in the plugin's own Android
 //! library module and the iOS plist key its README documents),
@@ -55,7 +55,8 @@
 //! app's active theme is left to the app, the same way `frust create`'s own
 //! scaffold does it), and `shadcn` (dependency only, the same shape as the
 //! three built-ins above — the tier's first *external-origin* catalog,
-//! ported from shadcn/ui rather than authored in this repo), and
+//! ported from shadcn/ui rather than authored in this repo), `beui`
+//! (dependency only, the same shape again), and
 //! `video-player` (dependency plus the plugin's own Android library
 //! module — the exact `native-widgets` two-contribution shape; no plist
 //! key, no manifest permission, no Swift package, no app-crate macro, and
@@ -620,6 +621,19 @@ const SHADCN: PluginSpec = PluginSpec {
     base: &[Contribution::CargoDep {
         name: "frust-shadcn",
     }],
+    optional_features: &[],
+    requires_sibling: None,
+};
+
+/// `beui`'s single base contribution — see [`GLYPH`]'s doc comment for the
+/// shape and the same install-call caveat: a pure Cargo dependency, with
+/// `frust_beui::install()` left to the app's own `app!(setup = {..})` block.
+const BEUI: PluginSpec = PluginSpec {
+    id: "beui",
+    summary: "beUI catalog; needs frust_beui::install() in app! setup \
+              (widgets + tokens, density-aware metrics).",
+    crate_dir: "beui",
+    base: &[Contribution::CargoDep { name: "frust-beui" }],
     optional_features: &[],
     requires_sibling: None,
 };
@@ -1309,6 +1323,7 @@ pub fn known_plugins() -> Vec<PluginSpec> {
         MATERIAL,
         CUPERTINO,
         SHADCN,
+        BEUI,
         NETWORK_IMAGE,
         SHARE,
         CONNECTIVITY,
@@ -1338,7 +1353,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
-    fn registry_lists_the_twenty_eight_v1_plugins() {
+    fn registry_lists_the_twenty_nine_v1_plugins() {
         let ids: Vec<&str> = known_plugins().iter().map(|p| p.id).collect();
         assert_eq!(
             ids,
@@ -1361,6 +1376,7 @@ mod tests {
                 "material",
                 "cupertino",
                 "shadcn",
+                "beui",
                 "network-image",
                 "share",
                 "connectivity",
@@ -1397,7 +1413,7 @@ mod tests {
         ));
     }
 
-    /// The `glyph`/`material`/`cupertino`/`shadcn` entries are each exactly
+    /// The `glyph`/`material`/`cupertino`/`shadcn`/`beui` entries are each exactly
     /// one `CargoDep` and nothing else — no manifest permission, plist key,
     /// Gradle module, or Swift package, since these are pure-Rust design
     /// systems built on `frust::authoring` alone (see `GLYPH`'s doc
@@ -1417,6 +1433,7 @@ mod tests {
             ("material", "frust-material"),
             ("cupertino", "frust-cupertino"),
             ("shadcn", "frust-shadcn"),
+            ("beui", "frust-beui"),
             ("url-launcher", "frust-url-launcher"),
         ] {
             let spec = find_plugin(id).unwrap();
