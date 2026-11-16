@@ -41,10 +41,12 @@
 
 use frust_core::accesskit::Role;
 use frust_core::{
-    BoxConstraints, BuildCtx, ChangeFlags, LayoutCtx, PaintCtx, PaintScene, SemanticsCtx, View,
-    Widget,
+    BoxConstraints, BuildCtx, ChangeFlags, CornerRadii, LayoutCtx, PaintCtx, PaintScene,
+    SemanticsCtx, View, Widget,
 };
 use kurbo::{Rect, Size};
+
+use crate::container::resolve_corner_radii;
 
 /// How a [`TextureView`] places its texture in the widget's box.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -158,6 +160,8 @@ impl TextureView {
     }
 
     /// Clip the box to corners of `radius`; `0.0` (the default) is square.
+    /// The radius clamps to half the shorter side at paint time, so
+    /// `f64::INFINITY` is a capsule.
     #[must_use]
     pub fn corner_radius(mut self, radius: f64) -> Self {
         self.corner_radius = radius.max(0.0);
@@ -229,7 +233,9 @@ impl Widget for TextureWidget {
         let overflows =
             local.x0 < 0.0 || local.y0 < 0.0 || local.x1 > size.width || local.y1 > size.height;
         let clip = if self.view.corner_radius > 0.0 {
-            scene.push_clip_rounded(origin, size, self.view.corner_radius);
+            let radius =
+                resolve_corner_radii(CornerRadii::uniform(self.view.corner_radius), size).largest();
+            scene.push_clip_rounded(origin, size, radius);
             true
         } else if overflows {
             scene.push_clip(origin, size);

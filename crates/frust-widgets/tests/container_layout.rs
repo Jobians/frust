@@ -481,8 +481,9 @@ fn per_corner_radii_forward_to_the_fill_call_uncollapsed() {
 #[test]
 fn a_bare_f64_radius_still_builds_a_uniform_corner_radii() {
     // `.radius(impl Into<CornerRadii>)`'s uniform ergonomics: `.radius(6.0)`
-    // must still forward `CornerRadii::uniform(6.0)`, matching the pre-existing
-    // `.radius(f64)` call shape exactly.
+    // must still build `CornerRadii::uniform(6.0)`. The fill paints that
+    // radius clamped to half the 10px shorter side, so the recorded corner is
+    // 5.0 — the painted value, not the raw builder value.
     let view: frust_widgets::ContainerView<()> = colored_box()
         .fill(Color::WHITE)
         .radius(6.0)
@@ -494,7 +495,7 @@ fn a_bare_f64_radius_still_builds_a_uniform_corner_radii() {
     assert_eq!(
         rec.calls,
         vec![PaintCall::Fill {
-            radii: CornerRadii::uniform(6.0),
+            radii: CornerRadii::uniform(5.0),
             color: Color::WHITE
         }]
     );
@@ -762,6 +763,104 @@ fn glow_zero_spread_keeps_the_clamped_fill_radius() {
             std_dev: 1.0,
             color: Color::BLACK,
         }]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Non-finite / oversized corner radius — clamped to half the shorter side
+// before it reaches the engine (an unclamped infinity refuses the frame).
+// ---------------------------------------------------------------------------
+
+fn painted_fill_radii(view: &frust_widgets::ContainerView<()>, size: Size) -> CornerRadii {
+    let mut w = build(view);
+    let mut lctx = LayoutCtx::new();
+    w.layout(&mut lctx, &BoxConstraints::loose(Size::new(500.0, 500.0)));
+    let rec = paint_at(&mut w, size);
+    match rec.calls.first() {
+        Some(PaintCall::Fill { radii, .. }) => *radii,
+        other => panic!("expected a leading fill call, got {other:?}"),
+    }
+}
+
+#[test]
+fn infinite_radius_fill_is_a_capsule_of_half_the_shorter_side() {
+    let view: frust_widgets::ContainerView<()> = colored_box()
+        .fill(Color::BLACK)
+        .radius(f64::INFINITY)
+        .size(100.0, 40.0);
+    assert_eq!(
+        painted_fill_radii(&view, Size::new(100.0, 40.0)),
+        CornerRadii::uniform(20.0),
+        "f64::INFINITY paints as a capsule: every corner is half the shorter side"
+    );
+}
+
+#[test]
+fn infinite_radius_border_stays_finite_and_inside_the_box() {
+    let view: frust_widgets::ContainerView<()> = colored_box()
+        .fill(Color::BLACK)
+        .radius(f64::INFINITY)
+        .border(Color::from_rgb8(0x00, 0x00, 0x00), 2.0)
+        .size(100.0, 40.0);
+    let mut w = build(&view);
+    let mut lctx = LayoutCtx::new();
+    w.layout(&mut lctx, &BoxConstraints::loose(Size::new(500.0, 500.0)));
+    let rec = paint_at(&mut w, Size::new(100.0, 40.0));
+    assert_eq!(
+        rec.calls.first(),
+        Some(&PaintCall::Fill {
+            radii: CornerRadii::uniform(20.0),
+            color: Color::BLACK,
+        }),
+        "the fill paints the capsule before the border"
+    );
+    assert_eq!(rec.border_paths.len(), 1, "one border stroke is recorded");
+    let path = &rec.border_paths[0];
+    let bounds = path.bounding_box();
+    assert!(
+        bounds.x0.is_finite()
+            && bounds.y0.is_finite()
+            && bounds.x1.is_finite()
+            && bounds.y1.is_finite(),
+        "the border path has no non-finite coordinates: {bounds:?}"
+    );
+    // Stroke centered on the path, inset by half the 2px width. The path is
+    // flattened, so allow the flattening tolerance on the curved extremes.
+    let expected = kurbo::Rect::new(1.0, 1.0, 99.0, 39.0);
+    for (got, want) in [
+        (bounds.x0, expected.x0),
+        (bounds.y0, expected.y0),
+        (bounds.x1, expected.x1),
+        (bounds.y1, expected.y1),
+    ] {
+        assert!(
+            (got - want).abs() < 0.2,
+            "border bounds {bounds:?} should match {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn nan_radius_paints_square() {
+    let view: frust_widgets::ContainerView<()> = colored_box()
+        .fill(Color::BLACK)
+        .radius(f64::NAN)
+        .size(100.0, 40.0);
+    assert_eq!(
+        painted_fill_radii(&view, Size::new(100.0, 40.0)),
+        CornerRadii::uniform(0.0)
+    );
+}
+
+#[test]
+fn finite_radius_below_the_cap_is_unchanged() {
+    let view: frust_widgets::ContainerView<()> = colored_box()
+        .fill(Color::BLACK)
+        .radius(8.0)
+        .size(100.0, 40.0);
+    assert_eq!(
+        painted_fill_radii(&view, Size::new(100.0, 40.0)),
+        CornerRadii::uniform(8.0)
     );
 }
 
