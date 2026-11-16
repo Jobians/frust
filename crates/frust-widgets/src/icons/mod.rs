@@ -354,6 +354,24 @@ pub const CONTENT_COPY: IconSource = IconSource {
     design: D,
 };
 
+/// `warning`
+pub const WARNING: IconSource = IconSource {
+    d: "m 1 21 11 -19 11 19 H 1 Z m 3.45 -2 h 15.1 L 12 6 4.45 19 Z m 7.55 -1 q 0.425 0 0.7125 -0.2875 T 13 17 q 0 -0.425 -0.2875 -0.7125 T 12 16 q -0.425 0 -0.7125 0.2875 T 11 17 q 0 0.425 0.2875 0.7125 T 12 18 Z m -1 -3 h 2 v -5 h -2 v 5 Z m 1 -2.5 Z",
+    design: D,
+};
+
+/// `shield`
+pub const SHIELD: IconSource = IconSource {
+    d: "M 12 22 q -3.475 -0.875 -5.7375 -3.9875 T 4 11.1 v -6.1 l 8 -3 8 3 v 6.1 q 0 3.8 -2.2625 6.9125 T 12 22 Z m 0 -2.1 q 2.6 -0.825 4.3 -3.3 t 1.7 -5.5 v -4.725 l -6 -2.25 -6 2.25 v 4.725 q 0 3.025 1.7 5.5 t 4.3 3.3 Z m 0 -7.9 Z",
+    design: D,
+};
+
+/// `info`
+pub const INFO: IconSource = IconSource {
+    d: "M 11 17 h 2 v -6 h -2 v 6 Z m 1 -8 q 0.425 0 0.7125 -0.2875 T 13 8 q 0 -0.425 -0.2875 -0.7125 T 12 7 q -0.425 0 -0.7125 0.2875 T 11 8 q 0 0.425 0.2875 0.7125 T 12 9 Z m 0 13 q -2.075 0 -3.9 -0.7875 T 4.925 19.075 q -1.35 -1.35 -2.1375 -3.175 T 2 12 q 0 -2.075 0.7875 -3.9 T 4.925 4.925 q 1.35 -1.35 3.175 -2.1375 T 12 2 q 2.075 0 3.9 0.7875 T 19.075 4.925 q 1.35 1.35 2.1375 3.175 T 22 12 q 0 2.075 -0.7875 3.9 T 19.075 19.075 q -1.35 1.35 -3.175 2.1375 T 12 22 Z m 0 -2 q 3.35 0 5.675 -2.325 t 2.325 -5.675 q 0 -3.35 -2.325 -5.675 t -5.675 -2.325 q -3.35 0 -5.675 2.325 t -2.325 5.675 q 0 3.35 2.325 5.675 t 5.675 2.325 Z m 0 -8 Z",
+    design: D,
+};
+
 /// Every generated [`IconSource`] in this module, for exhaustive
 /// iteration (e.g. a parse-validation test, or a picker gallery).
 pub const ALL: &[IconSource] = &[
@@ -410,4 +428,7 @@ pub const ALL: &[IconSource] = &[
     ARROW_DOWNWARD,
     ARROW_FORWARD,
     CONTENT_COPY,
+    WARNING,
+    SHIELD,
+    INFO,
 ];
