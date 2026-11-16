@@ -1226,6 +1226,10 @@ impl Widget for ModalWidget {
         self.fire_staged_close(ctx);
         if self.return_focus && (was_visible || self.is_visible()) {
             ctx.register_focus_scope(self.scope_key);
+            if !self.is_visible() {
+                // The scope closes on the paint after this one, and nothing else asks for it.
+                ctx.request_frame();
+            }
         }
         if self.escape_armed && self.dismissable() {
             ctx.register_shortcut(ShortcutDecl {
@@ -3234,7 +3238,11 @@ mod tests {
                         s.dismissed += 1;
                         s.open = false;
                     });
-                frust::stack().child(field("below")).child(host)
+                let opener = crate::components::button::button("Open", |s: &mut FieldState| {
+                    s.open = true;
+                });
+                let page = frust::column().child(field("below")).child(opener);
+                frust::stack().child(page).child(host)
             };
             self.root.rebuild(&mut logic, &mut self.state);
             self.root
@@ -3323,6 +3331,77 @@ mod tests {
             None,
             "return_focus(false)"
         );
+    }
+
+    /// A beUI button takes focus on its press without being a traversal stop;
+    /// the dialog it opens still returns focus to the field the user left.
+    #[test]
+    fn a_host_opened_by_pressing_a_button_returns_focus_to_the_field_before_it() {
+        for press_inside in [false, true] {
+            let mut h = FieldStack::new(true);
+            h.click(Point::new(10.0, 10.0));
+            h.frame(10);
+            assert_eq!(focused_label(&h.root).as_deref(), Some("below"));
+            let mut y = 12.0;
+            while !h.state.open {
+                y += 6.0;
+                assert!(y < 200.0, "the button is under the field");
+                h.click(Point::new(20.0, y));
+            }
+            h.frame(20);
+            assert_eq!(typed_into(&mut h.root, &mut h.state), None, "it left");
+            h.frame(SETTLED);
+            if press_inside {
+                h.click(centred_rect().center());
+                h.frame(SETTLED + 1);
+                h.escape();
+                assert_eq!(h.state.dismissed, 1);
+            } else {
+                // No Escape reaches a host that never took the session: the
+                // app closes it, with the button's session still live.
+                assert!(h.root.is_focus_active());
+                h.state.open = false;
+            }
+            h.frame(SETTLED + 2);
+            h.frame(SETTLED + EXIT_SPAN);
+            h.frame(SETTLED + EXIT_SPAN * 2);
+            h.pass();
+            assert_eq!(
+                typed_into(&mut h.root, &mut h.state),
+                Some("below"),
+                "press inside: {press_inside}"
+            );
+        }
+    }
+
+    /// A shell paints only the frames something asked for: the host asks for
+    /// the one after its exit settles, the paint that closes its scope.
+    #[test]
+    fn the_host_asks_for_the_paint_that_closes_its_scope() {
+        let mut h = FieldStack::new(true);
+        h.click(Point::new(10.0, 10.0));
+        h.frame(10);
+        let mut y = 12.0;
+        while !h.state.open {
+            y += 6.0;
+            assert!(y < 200.0, "the button is under the field");
+            h.click(Point::new(20.0, y));
+        }
+        h.frame(SETTLED);
+        h.state.open = false;
+        let mut ms = SETTLED + 2;
+        for painted in 0.. {
+            assert!(painted < 1000, "the exit settles");
+            h.pass();
+            let at = FrameTime::from_nanos(ms * 1_000_000);
+            let outcome = h.root.paint(&mut Recorder::default(), at);
+            if !outcome.needs_frame || typed_into(&mut h.root, &mut h.state).is_some() {
+                break;
+            }
+            ms += 16;
+        }
+        h.pass();
+        assert_eq!(typed_into(&mut h.root, &mut h.state), Some("below"));
     }
 
     /// A press the panel takes on the frame before its exit settles is still

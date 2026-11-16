@@ -266,6 +266,39 @@ fn scope_host(name: &'static str, spec: ScopeSpec, log: &Shared) -> ChildPod {
     }))
 }
 
+/// A control that takes focus on a press without being a traversal stop, as most design-system
+/// controls do; the press opens the scope named `opens`, if any.
+struct Opener {
+    opens: Option<&'static str>,
+    log: Shared,
+}
+
+impl Widget for Opener {
+    fn layout(&mut self, _ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
+        bc.constrain(Size::new(40.0, 20.0))
+    }
+    fn paint(&mut self, _ctx: &mut PaintCtx, _scene: &mut dyn PaintScene) {}
+    fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
+        match event {
+            InputEvent::Pointer(p) if p.phase == PointerPhase::Down => {
+                ctx.request_focus();
+                if let Some(name) = self.opens {
+                    self.log.borrow_mut().open.insert(name);
+                }
+                EventResult::Handled
+            }
+            _ => EventResult::Ignored,
+        }
+    }
+}
+
+fn opener(opens: Option<&'static str>, log: &Shared) -> ChildPod {
+    ChildPod::new(Box::new(Opener {
+        opens,
+        log: Rc::clone(log),
+    }))
+}
+
 struct TreeView {
     make: fn(&Shared) -> Column,
     log: Shared,
@@ -782,4 +815,142 @@ fn a_key_that_beats_the_rebuild_never_reaches_the_restored_control() {
     h.paint();
     assert_eq!(h.focused(), Some("field"));
     assert_eq!(h.ringed(), ["field"]);
+}
+
+/// Rows: the field, the control that opens `dialog` (at `y` 25), the dialog's host (at `y` 45).
+fn field_opener_and_dialog(log: &Shared, spec: ScopeSpec) -> Column {
+    column(vec![
+        field("field", log),
+        opener(Some("dialog"), log),
+        scope_host("dialog", spec, log),
+    ])
+}
+
+#[test]
+fn a_scope_opened_by_a_control_that_is_no_stop_returns_focus_to_the_stop_before_it() {
+    let mut h = Harness::new(|log| field_opener_and_dialog(log, ScopeSpec::default()));
+    h.tap(5.0, 5.0);
+    h.tap(5.0, 25.0);
+    assert!(h.root.is_focus_active(), "the control holds the session");
+    assert_eq!(h.focused(), None, "and the field lost it");
+    assert_eq!(h.root.focus_returns.stack().len(), 1, "its press opened");
+
+    h.close("dialog");
+    h.rebuild();
+    h.paint();
+    assert_eq!(h.focused(), Some("field"), "the control's session gave way");
+    assert!(h.ringed().is_empty());
+}
+
+#[test]
+fn a_scope_that_took_the_session_from_a_control_that_is_no_stop_returns_it_too() {
+    let mut h = Harness::new(|log| {
+        let spec = ScopeSpec {
+            claims: true,
+            lingers: true,
+            ..ScopeSpec::default()
+        };
+        field_opener_and_dialog(log, spec)
+    });
+    h.tap(5.0, 5.0);
+    h.tap(5.0, 25.0);
+    h.tap(5.0, 45.0);
+    h.escape();
+    assert!(h.root.is_focus_active(), "the host still holds it");
+    h.frame();
+    h.rebuild();
+    h.paint();
+    assert_eq!(h.focused(), Some("field"));
+}
+
+#[test]
+fn a_modal_overlay_opened_by_a_control_that_is_no_stop_returns_focus_too() {
+    let mut h = Harness::new(|log| {
+        column(vec![
+            field("field", log),
+            opener(Some("modal"), log),
+            modal("modal", &["m1"], log),
+        ])
+    });
+    h.tap(5.0, 5.0);
+    h.tap(5.0, 25.0);
+    assert!(!h.root.is_focus_active(), "the trap ended the control's");
+
+    h.close("modal");
+    h.rebuild();
+    h.paint();
+    assert_eq!(h.focused(), Some("field"));
+}
+
+#[test]
+fn a_press_on_another_control_while_the_scope_is_open_keeps_its_session() {
+    let mut h = Harness::new(|log| {
+        let mut tree = field_opener_and_dialog(log, ScopeSpec::default());
+        tree.children.push(opener(None, log));
+        tree
+    });
+    h.tap(5.0, 5.0);
+    h.tap(5.0, 25.0);
+    h.tap(5.0, 65.0);
+    assert!(h.root.is_focus_active(), "a session started since the open");
+
+    h.close("dialog");
+    h.rebuild();
+    h.paint();
+    assert!(h.root.is_focus_active());
+    assert_eq!(h.focused(), None, "it is not the invoker's: left alone");
+}
+
+#[test]
+fn a_control_pressed_inside_an_open_scope_does_not_carry_a_stop_from_below_it() {
+    let mut h = Harness::new(|log| {
+        let outer = ScopeSpec {
+            claims: true,
+            ..ScopeSpec::default()
+        };
+        column(vec![
+            field("field", log),
+            scope_host("outer", outer, log),
+            scope_host("inner", ScopeSpec::default(), log),
+        ])
+    });
+    h.tap(5.0, 5.0);
+    h.open("outer");
+    h.tap(5.0, 25.0);
+    h.open("inner");
+    assert_eq!(h.root.focus_returns.stack()[1].target, None);
+
+    h.close("inner");
+    h.rebuild();
+    h.paint();
+    assert_eq!(h.focused(), None, "the field under the outer scope stays");
+    assert!(h.root.is_focus_active(), "the outer host keeps its session");
+}
+
+#[test]
+fn a_control_that_is_no_stop_does_not_revive_a_target_the_user_blurred() {
+    let mut h = Harness::new(|log| field_opener_and_dialog(log, ScopeSpec::default()));
+    h.tap(5.0, 5.0);
+    h.escape();
+    h.tap(5.0, 25.0);
+    h.close("dialog");
+    h.rebuild();
+    h.paint();
+    assert_eq!(h.focused(), None);
+}
+
+#[test]
+fn a_target_kept_through_a_pointer_press_comes_back_without_the_keyboard_ring() {
+    let mut h = Harness::new(|log| field_opener_and_dialog(log, ScopeSpec::default()));
+    h.tab();
+    assert_eq!(h.ringed(), vec!["field"]);
+    h.tap(5.0, 25.0);
+    h.close("dialog");
+    h.rebuild();
+    h.paint();
+    assert_eq!(h.focused(), Some("field"));
+    assert!(
+        h.ringed().is_empty(),
+        "the press that opened it was a pointer"
+    );
 }

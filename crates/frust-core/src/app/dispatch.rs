@@ -459,7 +459,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
 
     /// Record the deepest traversal stop on the session a claim just committed, with the keyboard
     /// flag as it stands (a landing Tab step sets it after): the target a scope opening returns to.
-    /// The floated surface `event` was routed through goes with it, so a scope closing before the
+    /// A claimant that is no stop records none (`FocusReturns::commit`). The floated surface `event` was routed through goes with it, so a scope closing before the
     /// next paint still knows the session is its own.
     fn commit_focus_target(&mut self, event: &InputEvent) {
         let surface = match event {
@@ -474,13 +474,18 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             keyboard,
         });
         self.focus_returns.commit(target);
+        if target.is_none() {
+            // A kept target comes back with this claim's origin, not the one it was reached with.
+            self.focus_returns.set_keyboard(keyboard);
+        }
     }
 
     /// Grant the return a closed focus-return scope owes, consuming it (`crate::focus_scope`):
     /// a session still held inside the scope as it closed is ended first (a structural release),
-    /// any other live session is never taken over, and only a stop the walk the root would use now
-    /// reaches is granted, with the keyboard flag it was committed with. Returns whether focus
-    /// moved.
+    /// and so is the invoker's own, unchanged since the scope opened, when it sits on no traversal
+    /// stop and the target is in the walk; any other live session is never taken over. Only a
+    /// stop the walk the root would use now reaches is granted, with the keyboard flag it was
+    /// committed with. Returns whether focus moved.
     pub(super) fn run_focus_return(&mut self, state: &mut State) -> bool {
         let Some(owed) = self.focus_returns.take_pending() else {
             return false;
@@ -488,19 +493,25 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
         let Some(target) = owed.target else {
             return false;
         };
-        let held_inside = self.focus_active && owed.held == Some(self.focus_epoch);
-        if self.focus_active && !held_inside {
-            return false;
+        let ended = self.focus_active;
+        if ended && owed.held != Some(self.focus_epoch) {
+            let stops = self.focus_stops();
+            let invoker_off_stop = owed.opened == Some(self.focus_epoch)
+                && !stops.iter().any(|stop| stop.current)
+                && stops.iter().any(|stop| stop.id == target.stop);
+            if !invoker_off_stop {
+                return false;
+            }
         }
-        if held_inside {
+        if ended {
             self.release_focus_session();
         }
         let stops = self.focus_stops();
         let Some(stop) = stops.iter().find(|stop| stop.id == target.stop) else {
-            return held_inside;
+            return ended;
         };
         if !self.grant_focus(state, stop) {
-            return held_inside;
+            return ended;
         }
         self.set_keyboard_focus(target.keyboard);
         self.focus_returns.set_keyboard(target.keyboard);

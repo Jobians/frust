@@ -1038,9 +1038,11 @@ impl<'a> PaintCtx<'a> {
     /// Hold the focus-return scope `key` open for this frame (see [`crate::focus_scope`]). A
     /// widget that owns focus while visible, such as a modal host, allocates one key per instance
     /// and must register it every paint while open; the paint in which it stops is its close,
-    /// after which focus returns to the control that held it as the scope opened. A session this
-    /// widget or a descendant still holds as it closes is ended and replaced by the return; one
-    /// started outside the scope after the close is never taken over. Held is read from this
+    /// after which focus returns to the control that held it as the scope opened, or, when that
+    /// control takes focus on a press without being a traversal stop, to the last stop before it.
+    /// A session this widget or a descendant still holds as it closes is ended and replaced by
+    /// the return, and so is such an invoker's own; any other session live outside the scope is
+    /// never taken over. Held is read from this
     /// widget's focus path at its last registered paint: a host that a control inside can close
     /// registers once more in the paint that closes it, or releases focus itself. An Interactive
     /// `OverlayKeys::Modal` overlay entry is a scope already, so its owner needs no key.

@@ -254,7 +254,9 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 - Core focus-return scopes: `PaintCtx::register_focus_scope` and `FocusScopeKey` let a widget host
   that owns focus while visible return it to the invoker when it closes; an Interactive
   `OverlayKeys::Modal` overlay entry is a scope already. A custom host that a control inside can
-  close registers once more in the paint that closes it, or releases focus itself.
+  close registers once more in the paint that closes it, or releases focus itself. When the
+  invoker takes focus on a press without being a Tab stop (the beUI controls and most shadcn ones), focus
+  returns to the last Tab stop that held it before the press.
 - `RenderRoot::focus_info` / `FocusInfo` and `Tester::focus_info` report the live focus, and
   `SemanticsCtx::has_focus` tells a widget's `semantics` whether it holds it.
 - `frust::authoring::{DismissCause, DismissDecision, mark_pending_result_flush}`.

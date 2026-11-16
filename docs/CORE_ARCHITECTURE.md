@@ -423,10 +423,11 @@ registers an Interactive `OverlayKeys::Modal` pod ends a main-tree session at on
 so a field behind the modal takes no more keys. Focus returns when a focus-return scope (`focus_scope`) closes: an
 Interactive `Modal` entry is one implicitly, a widget opts in with `PaintCtx::register_focus_scope(FocusScopeKey)`
 every paint it is open. The root records the deepest traversal stop of the last committed claim or Tab grant with its
-keyboard flag (a user blur forgets it, a structural release keeps it); the return runs at the end of
-`RenderRoot::event` (after the event that beat the rebuild is routed) and in `rebuild`, granting that stop once if it
-is still in the current walk. A session started elsewhere is never taken over; one still held inside the closing scope
-is ended and replaced.
+keyboard flag (a user blur forgets it; a structural release keeps it, and so does a claim by a control that is no
+stop, made under the same innermost open scope); the return runs at the end of `RenderRoot::event` (after the event that beat
+the rebuild is routed) and in `rebuild`, granting that stop once if it is still in the current walk. A session
+started elsewhere is never taken over; one still held inside the closing scope is ended and replaced, and so is the
+invoker's own (unchanged since the open) when it sits on no stop.
 
 **Focus ring.** `PaintCtx::is_focused_for_ring()` is `has_focus` gated by the root's `FocusRingPolicy` (`Never`,
 `KeyboardOnly` by default, `Always`; `RenderRoot::set_focus_ring_policy`). Under `KeyboardOnly` it holds while the
