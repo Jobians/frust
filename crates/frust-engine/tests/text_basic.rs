@@ -355,7 +355,10 @@ fn a_non_finite_font_size_refuses_the_frame() {
 
     assert!(matches!(
         compiler().compile(&scene, Affine::IDENTITY, VIEWPORT),
-        Err(EngineError::InvalidGeometry)
+        Err(EngineError::InvalidGeometry {
+            command: 0,
+            kind: "GlyphRun",
+        })
     ));
 }
 
@@ -369,7 +372,7 @@ fn a_non_finite_glyph_position_refuses_the_frame() {
 
     assert!(matches!(
         compiler().compile(&scene, Affine::IDENTITY, VIEWPORT),
-        Err(EngineError::InvalidGeometry)
+        Err(EngineError::InvalidGeometry { .. })
     ));
 }
 
@@ -386,7 +389,7 @@ fn a_non_finite_run_transform_refuses_the_frame() {
 
     assert!(matches!(
         compiler().compile(&scene, Affine::IDENTITY, VIEWPORT),
-        Err(EngineError::InvalidTransform)
+        Err(EngineError::InvalidTransform { .. })
     ));
 }
 

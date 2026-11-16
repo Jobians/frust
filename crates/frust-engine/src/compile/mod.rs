@@ -1367,10 +1367,8 @@ impl SceneCompiler {
         // composes ahead of a command that this loop does not.
         let mut bracket_depth = 0_usize;
         let mut bracket_rescales = false;
-        for command in scene.commands() {
-            if let Some(transform) = command_transform(command) {
-                check_finite(root * transform)?;
-            }
+        for (index, command) in scene.commands().iter().enumerate() {
+            check_command_transform(index, command, root)?;
             if let Command::DrawRetained { key, .. } = command
                 && !self.retain
             {
@@ -1382,7 +1380,7 @@ impl SceneCompiler {
                 // the renderer's store's to answer, after the walk.
                 return Err(EngineError::RetainedKeyMissing { key: *key });
             }
-            check_geometry(command)?;
+            check_geometry(index, command)?;
             match command {
                 Command::PushRetained { scale, .. } => {
                     if bracket_depth == 0 {
@@ -1778,7 +1776,7 @@ impl SceneCompiler {
                     // the layer it opens, so the transform is recomposed here
                     // rather than reusing `combined` from before the entry.
                     let corrected = root * self.retained_stack.correction() * *transform;
-                    if check_finite(corrected).is_ok() {
+                    if transform_is_finite(corrected) {
                         if self.retain {
                             self.open_retained(frame, *key, *rect, *alpha, corrected);
                             listed = true;
@@ -2531,7 +2529,7 @@ impl SceneCompiler {
         alpha: f32,
         mapped: Affine,
     ) {
-        if check_finite(mapped).is_err() {
+        if !transform_is_finite(mapped) {
             return;
         }
         let window = quad_window(&self.generator, &self.groups);
@@ -3202,7 +3200,7 @@ fn command_transform(command: &Command) -> Option<Affine> {
 /// A command carrying no transform of its own is on the grid trivially: there
 /// is nothing to compose.
 fn command_on_grid(command: &Command, combined: Affine) -> bool {
-    command_transform(command).is_none_or(|transform| check_finite(combined * transform).is_ok())
+    command_transform(command).is_none_or(|transform| transform_is_finite(combined * transform))
 }
 
 /// The presentation scale and transform a `PushRetained` bracket is entered
@@ -3246,12 +3244,94 @@ fn check_tile_addressable(width: u16, height: u16) -> Result<(), EngineError> {
 /// pixel range the strip pipeline addresses, so the frame is refused rather
 /// than rasterized into whatever the downstream float-to-integer conversions
 /// happen to saturate to.
-fn check_finite(transform: Affine) -> Result<(), EngineError> {
-    if transform.as_coeffs().iter().all(|c| c.is_finite()) {
+/// Whether every coefficient of `transform` is finite.
+fn transform_is_finite(transform: Affine) -> bool {
+    transform.as_coeffs().iter().all(|c| c.is_finite())
+}
+
+fn check_finite_at(
+    transform: Affine,
+    command: Option<usize>,
+    kind: &'static str,
+) -> Result<(), EngineError> {
+    if transform_is_finite(transform) {
         Ok(())
     } else {
-        Err(EngineError::InvalidTransform)
+        Err(EngineError::InvalidTransform { command, kind })
     }
+}
+
+/// [`check_finite_at`] for a transform with no command to name, which is the
+/// root transform.
+fn check_finite(transform: Affine) -> Result<(), EngineError> {
+    check_finite_at(transform, None, "root")
+}
+
+/// Refuse a command whose own transform, composed under `root`, is non-finite.
+///
+/// The per-command half of the transform check [`SceneCompiler::compile`] and
+/// [`validate_scene`] share; a command carrying no transform passes.
+fn check_command_transform(
+    index: usize,
+    command: &Command,
+    root: Affine,
+) -> Result<(), EngineError> {
+    match command_transform(command) {
+        Some(transform) => check_finite_at(root * transform, Some(index), command_kind(command)),
+        None => Ok(()),
+    }
+}
+
+/// The variant name of a scene command, as an error names it.
+fn command_kind(command: &Command) -> &'static str {
+    match command {
+        Command::FillRect { .. } => "FillRect",
+        Command::RoundedRect { .. } => "RoundedRect",
+        Command::Line { .. } => "Line",
+        Command::Path { .. } => "Path",
+        Command::PushClip { .. } => "PushClip",
+        Command::PushClipRounded { .. } => "PushClipRounded",
+        Command::PushClipPath { .. } => "PushClipPath",
+        Command::PushLayer { .. } => "PushLayer",
+        Command::ClearRect { .. } => "ClearRect",
+        Command::PushRetained { .. } => "PushRetained",
+        Command::DrawRetained { .. } => "DrawRetained",
+        Command::Image { .. } => "Image",
+        Command::SceneTexture { .. } => "SceneTexture",
+        Command::ShaderQuad { .. } => "ShaderQuad",
+        Command::BlurredRoundedRect { .. } => "BlurredRoundedRect",
+        Command::GlyphRun(_) => "GlyphRun",
+        Command::BackdropBlur { .. } => "BackdropBlur",
+        Command::PopClip => "PopClip",
+        Command::PopLayer => "PopLayer",
+        Command::PopRetained => "PopRetained",
+    }
+}
+
+/// Run the up-front refusals [`SceneCompiler::compile`] runs on a scene, and
+/// nothing else.
+///
+/// Checks the target size, the root transform, and for every command its
+/// transform and its own geometry, in the order `compile` does; it generates
+/// no strips, allocates nothing proportional to coverage and touches no GPU,
+/// so a headless caller can run it on every frame it records. `compile` calls
+/// the same checks, so the two cannot disagree on what they refuse.
+///
+/// # Errors
+///
+/// [`EngineError::TargetTooLarge`] for a size whose tile-snapped extent does
+/// not fit `u16`; [`EngineError::InvalidTransform`] for a non-finite root or
+/// command transform; [`EngineError::InvalidGeometry`] for non-finite command
+/// geometry, each naming the offending command and its variant.
+pub fn validate_scene(scene: &Scene, root: Affine, size: (u16, u16)) -> Result<(), EngineError> {
+    let (width, height) = size;
+    check_tile_addressable(width, height)?;
+    check_finite(root)?;
+    for (index, command) in scene.commands().iter().enumerate() {
+        check_command_transform(index, command, root)?;
+        check_geometry(index, command)?;
+    }
+    Ok(())
 }
 
 /// Refuse a command whose own geometry is non-finite.
@@ -3306,7 +3386,7 @@ fn check_finite(transform: Affine) -> Result<(), EngineError> {
 /// Moving a variant *between* those two groups is not itself compiler-enforced
 /// — the match stays exhaustive either way — so that half of the discipline
 /// still has to be kept by hand alongside `compile_command`.
-fn check_geometry(command: &Command) -> Result<(), EngineError> {
+fn check_geometry(index: usize, command: &Command) -> Result<(), EngineError> {
     let finite = match command {
         Command::FillRect { rect, .. } => rect.is_finite(),
         Command::RoundedRect { rect, radii, .. } => rect.is_finite() && radii_are_finite(*radii),
@@ -3353,7 +3433,10 @@ fn check_geometry(command: &Command) -> Result<(), EngineError> {
     if finite {
         Ok(())
     } else {
-        Err(EngineError::InvalidGeometry)
+        Err(EngineError::InvalidGeometry {
+            command: index,
+            kind: command_kind(command),
+        })
     }
 }
 
@@ -3970,7 +4053,10 @@ mod tests {
                     },
                 );
                 assert!(
-                    matches!(strips_with(&scene, 1), Err(EngineError::InvalidGeometry)),
+                    matches!(
+                        strips_with(&scene, 1),
+                        Err(EngineError::InvalidGeometry { .. })
+                    ),
                     "miter limit {limit} under {join:?} is refused"
                 );
             }

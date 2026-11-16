@@ -416,7 +416,10 @@ fn a_nan_command_transform_is_refused_rather_than_rasterized() {
 
     assert!(matches!(
         compiler().compile(&scene, Affine::IDENTITY, VIEWPORT),
-        Err(EngineError::InvalidTransform)
+        Err(EngineError::InvalidTransform {
+            command: Some(0),
+            kind: "FillRect",
+        })
     ));
 }
 
@@ -426,7 +429,10 @@ fn a_nan_root_transform_is_refused_rather_than_rasterized() {
 
     assert!(matches!(
         compiler().compile(&scene, Affine::translate((f64::NAN, 0.0)), VIEWPORT),
-        Err(EngineError::InvalidTransform)
+        Err(EngineError::InvalidTransform {
+            command: None,
+            kind: "root",
+        })
     ));
 }
 
@@ -436,7 +442,7 @@ fn an_infinite_transform_is_refused_rather_than_rasterized() {
 
     assert!(matches!(
         compiler().compile(&scene, Affine::scale(f64::INFINITY), VIEWPORT),
-        Err(EngineError::InvalidTransform)
+        Err(EngineError::InvalidTransform { .. })
     ));
 }
 

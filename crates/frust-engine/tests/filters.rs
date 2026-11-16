@@ -925,7 +925,7 @@ fn a_sigma_that_is_not_a_standard_deviation_is_refused_at_the_recorder() {
         );
 
         assert!(
-            matches!(refusal, Err(EngineError::InvalidGeometry)),
+            matches!(refusal, Err(EngineError::InvalidGeometry { .. })),
             "σ {sigma} recorded as {refusal:?}"
         );
         assert!(
@@ -947,7 +947,7 @@ fn a_non_finite_transform_is_refused_at_the_recorder() {
         Affine::translate((f64::NAN, 0.0)),
     );
 
-    assert!(matches!(refusal, Err(EngineError::InvalidTransform)));
+    assert!(matches!(refusal, Err(EngineError::InvalidTransform { .. })));
     assert!(recorder.layers.is_empty());
 }
 
@@ -1033,7 +1033,7 @@ fn a_drop_shadow_with_a_non_finite_sigma_or_offset_is_refused_at_the_recorder() 
         );
 
         assert!(
-            matches!(refusal, Err(EngineError::InvalidGeometry)),
+            matches!(refusal, Err(EngineError::InvalidGeometry { .. })),
             "σ {sigma}, offset ({dx}, {dy}) recorded as {refusal:?}"
         );
         assert!(
@@ -1645,7 +1645,7 @@ fn a_finite_transform_that_scales_sigma_past_the_ceiling_is_refused() {
             LayerFilter::Blur { sigma: 8.0 },
             transform,
         ),
-        Err(EngineError::InvalidGeometry)
+        Err(EngineError::InvalidGeometry { .. })
     ));
     assert!(recorder.layers.is_empty());
 }
@@ -3746,7 +3746,7 @@ mod backdrop {
         ] {
             let refused = compile(&scene_of(|builder| builder.backdrop_blur(rect, radius)));
             assert!(
-                matches!(refused, Err(EngineError::InvalidGeometry)),
+                matches!(refused, Err(EngineError::InvalidGeometry { .. })),
                 "{rect:?} at {radius}: {refused:?}"
             );
         }
