@@ -1276,7 +1276,7 @@ impl NotFoundWidget {
         // from `self.elapsed` before every paint that could read it). The
         // caret's blink alone still reads the live `elapsed` below: it never
         // changes what is shaped, only whether the same rect is drawn.
-        for index in 0..TERMINAL_LINES.len() {
+        for (index, typed) in self.typed.iter().enumerate().take(TERMINAL_LINES.len()) {
             let line_at = Point::new(
                 at.x + FLAP_DOT_INSET,
                 at.y + TERMINAL_BAR_HEIGHT + style::GAP_MD + index as f64 * TERMINAL_LINE_HEIGHT,
@@ -1286,10 +1286,10 @@ impl NotFoundWidget {
             } else {
                 style::with_alpha(Color::WHITE, TERMINAL_TEXT_ALPHA)
             };
-            self.typed[index].paint(line_at, ink, scene);
+            typed.paint(line_at, ink, scene);
             if index == 2 && terminal_caret_lit(elapsed) {
                 scene.fill_rect(
-                    Point::new(line_at.x + self.typed[index].size().width + 2.0, line_at.y),
+                    Point::new(line_at.x + typed.size().width + 2.0, line_at.y),
                     Size::new(TERMINAL_CARET_WIDTH, TERMINAL_LINE_HEIGHT * 0.8),
                     style::with_alpha(Color::WHITE, TERMINAL_TEXT_ALPHA),
                 );

@@ -719,8 +719,8 @@ impl Widget for OverflowActionsWidget {
             .map(|slot| stagger.revealed(elapsed, slot, count))
             .collect();
 
-        for index in 0..self.fitted {
-            paint_action(scene, origin, &self.primary[index], chrome, surface, 1.0);
+        for action in self.primary.iter().take(self.fitted) {
+            paint_action(scene, origin, action, chrome, surface, 1.0);
         }
         for slot in 0..count {
             let reveal = self.reveal(slot).clamp(0.0, 1.0);

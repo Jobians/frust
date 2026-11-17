@@ -1147,8 +1147,8 @@ impl Widget for WalletCardWidget {
 
         // The four actions, evenly spread across the card.
         let slot = inner / 4.0;
-        for index in 0..4 {
-            self.actions[index] = Rect::from_origin_size(
+        for (index, action) in self.actions.iter_mut().enumerate().take(4) {
+            *action = Rect::from_origin_size(
                 Point::new(
                     WALLET_PADDING + slot * index as f64 + (slot - WALLET_ACTION_SIZE) / 2.0,
                     actions_y,
