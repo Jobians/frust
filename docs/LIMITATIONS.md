@@ -4155,7 +4155,7 @@ its own module doc, not a regression found later.
 
 ---
 
-### `beui-density-partial-coverage` — `Density::Touch` resizes only the parts that read `BeuiMetrics`, and beUI on phones is not yet device-tested
+### `beui-density-partial-coverage` — `Density::Touch` resizes only the parts that read `BeuiMetrics`
 
 **Observed**: `frust_beui::theme_with_density(Density::Touch)` and `install_with_density` attach a
 `BeuiMetrics` touch set (a 44 px minimum target on Apple targets, 48 px elsewhere, and larger type
@@ -4166,27 +4166,25 @@ lays out from `frust_beui::style`'s constants and keeps the comfortable sizes un
 Two narrower gaps sit beside that list: the button follows the density but still paints its
 stateful variant's state icon (spinner, check, cross) at the fixed `ICON_SIZE`, and `theme_toggle`
 keeps its fixed `SIZE_ICON_BUTTON` edge — it carries the live density across a light/dark flip but
-does not size itself from it. No Android or iOS device gate has yet run the touch set, beUI's OS
-text-scale scaling or `examples/beui-demo`'s phone shell.
+does not size itself from it. The device gates of `examples/beui-demo` (2026-11-16 and 2026-11-17, a
+Pixel 5 on Android 14 and an iPhone 13 mini on iOS 27.2) passed and saw this gap: a `select` at
+40 px and an inline toggle at 32 px under the touch theme.
 
 **Applies to**: `frust_beui` under `Density::Touch` — every part not listed above, the button's state
-icon and `theme_toggle`; the device-test half to the catalog and `examples/beui-demo` on Android and
-iOS.
+icon and `theme_toggle`.
 
 **Why accepted**: moving a part onto the metrics is per-part opt-in work (`style.rs`'s "Density"
 section: a part still reading a constant paints the comfortable size), and the listed parts are the
-ones a phone content screen is built from; the device gates follow this change rather than
-precede it.
+ones a phone content screen is built from.
 
 **Evidence**: `plugins/beui/src/tokens/metrics.rs` module docs ("Only the parts that read it follow
 the density"; its own list omits the toast, badge and agents parts) and every
 `BeuiMetrics::resolve` call site outside a test module under `plugins/beui/src`;
 `plugins/beui/src/components/button.rs`'s `paint_state_icon` (`ICON_SIZE`);
 `plugins/beui/src/components/theme_toggle.rs` (`SIZE_ICON_BUTTON`, `theme_with_metrics`);
-`examples/beui-demo/README.md` ("Phones").
+`examples/beui-demo/README.md` ("Phones", "Device gates").
 
-**Trigger for removal**: each part leaves the list as it moves onto `BeuiMetrics`; the device-test
-half is deleted once the Android and iOS device gates record a pass of `examples/beui-demo`.
+**Trigger for removal**: each part leaves the list as it moves onto `BeuiMetrics`.
 
 ---
 
