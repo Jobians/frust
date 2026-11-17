@@ -112,7 +112,8 @@ sanctioned leaf) plus `rmcp`/`axum`/`tokio`/`tokio-util`/`base64`/`serde`/`log` 
 this widens is [ARCHITECTURE.md](ARCHITECTURE.md)'s). Trust model: bound to `127.0.0.1` only,
 guarded by rmcp's default Host-header check and an Origin allowlist (a foreign browser Origin gets
 403), with **no MCP-level authentication** — any local process that can reach the port can connect
-and drive apps through it, a deliberate v1 stance ported from fdemon-pro (the devtools handshake token still protects the app-side service itself;
+and drive apps through it, a deliberate v1 stance ported from fdemon-pro (the devtools handshake
+token still protects the app-side service itself;
 see [DEVTOOLS_ARCHITECTURE.md](DEVTOOLS_ARCHITECTURE.md)).
 
 `frust-dap` is this unit's fourth tool surface, and — like `frust-tui` — depends on the `frust-mcp`
