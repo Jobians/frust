@@ -212,9 +212,9 @@ iana-time-zone = "0.1.65"
 reactive_graph = "0.2"
 any_spawner = "0.3"
 tokio = { version = "1", default-features = false }
-# 2.2: 2.0.0 is the first release fixing the Streamable-HTTP session-table leak (GHSA-9pj6-vhgr-3mwh);
-# 3.x is the sessionless protocol rewrite. The server binds loopback only (docs/CLI_ARCHITECTURE.md).
-rmcp = { version = "2.2", default-features = false, features = [
+# 3.10: 3.x serves the sessionless 2026-07-28 protocol beside legacy sessions, and 3.9.0 is the first
+# release clear of RUSTSEC-2026-0457/-0462. The server binds loopback only (docs/CLI_ARCHITECTURE.md).
+rmcp = { version = "3.10", default-features = false, features = [
     "server",
     "transport-streamable-http-server",
     "macros",

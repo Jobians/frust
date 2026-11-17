@@ -1,7 +1,8 @@
 //! rmcp `ServerHandler` implementation.
 //!
 //! The streamable-HTTP transport's service factory (`server.rs`) constructs
-//! one [`McpHandler`] per MCP session, each holding a clone of the one
+//! one [`McpHandler`] per MCP session (and per sessionless 2026-07-28
+//! request), each holding a clone of the one
 //! process-wide [`SharedBackend`] — MCP sessions are connections, not app
 //! sessions, and every one of them drives the same supervised apps. The
 //! backend is held as `Arc<dyn SessionBackend>`, never as a concrete engine:
@@ -19,7 +20,7 @@ use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::schemars::{self, JsonSchema};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use serde::Serialize;
@@ -243,8 +244,8 @@ impl McpHandler {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpHandler {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("frust-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(SERVER_INSTRUCTIONS)
     }
