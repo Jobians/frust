@@ -463,6 +463,48 @@ mod shell_tests {
         }
     }
 
+    /// The Chat page rebuilds on every event, which lays the transcript out
+    /// again between the moves of a drag; the drag still scrolls it.
+    #[test]
+    fn a_touch_drag_scrolls_the_chat_transcript() {
+        let _slot = slot();
+        let mut app = app(PHONE, WindowInsets::default(), Page::AgentsChat);
+        run(&mut app, 30);
+        let transcript = find::by_type::<MessageScrollerWidget>();
+        let first_row = |app: &Tester<AppState, _>| {
+            let nodes = app.inspect();
+            let scroller = nodes
+                .iter()
+                .find(|n| n.type_name.ends_with("MessageScrollerWidget"))
+                .expect("the transcript")
+                .id;
+            nodes
+                .iter()
+                .find(|n| n.parent == Some(scroller))
+                .expect("a row")
+                .bounds
+                .y0
+        };
+        let viewport = app.bounds(&transcript);
+        let start = first_row(&app);
+        assert!(start < viewport.y0, "the transcript opens on its last turn");
+
+        app.drag(viewport.center(), (0.0, 150.0).into());
+        run(&mut app, 60);
+        let pulled = first_row(&app);
+        assert!(
+            pulled - start >= 150.0 - EPSILON,
+            "the drag showed earlier turns: {start} to {pulled}"
+        );
+
+        app.drag(viewport.center(), (0.0, -400.0).into());
+        run(&mut app, 60);
+        assert!(
+            (first_row(&app) - start).abs() < EPSILON,
+            "and dragging back returns to the last turn"
+        );
+    }
+
     /// The pages whose content runs past a 390 px window's right edge in the
     /// phone shell: fixed-width stages, rows that do not wrap and wide
     /// specimens. Recorded rather than fixed here; a page that stops
