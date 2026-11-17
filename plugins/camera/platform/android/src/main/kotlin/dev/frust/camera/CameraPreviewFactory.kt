@@ -506,7 +506,14 @@ internal class CameraPreviewView(context: Context) : FrameLayout(context), Previ
         // `displayListener`, which is what covers a slot whose bounds never
         // change size on a rotation (a square slot).
         maybeSyncTargetRotation()
-        updatePreviewLayout()
+        // Re-fit after this layout pass, not inside it. `onSizeChanged` runs
+        // from `layout()`, after this FrameLayout has already measured the
+        // inner view with its old layout params: a size set here is laid out
+        // stale, and the inner view's `requestLayout` is lost when its own
+        // `layout()` clears `PFLAG_FORCE_LAYOUT`. When the new rotation's
+        // `TransformationInfo` arrives before the resize (landscape back to
+        // portrait), the inner view then kept the fit of the previous slot.
+        post { updatePreviewLayout() }
     }
 
     override fun onAttachedToWindow() {
@@ -628,6 +635,13 @@ internal class CameraPreviewView(context: Context) : FrameLayout(context), Previ
             // Assigning is what schedules the layout pass; the compare above is
             // what keeps a steady preview free of one.
             surfaceView.layoutParams = lp
+            // A request made during a layout pass is dropped once the inner
+            // view's own `layout()` clears `PFLAG_FORCE_LAYOUT`, and the
+            // compare above then never repeats it. `onSizeChanged` posts its
+            // own call, but a `TransformationInfo` that CameraX delivers
+            // inline from `maybeSyncTargetRotation` still lands here inside
+            // the pass, so ask again once it is over.
+            if (isInLayout) post { surfaceView.requestLayout() }
         }
     }
 
