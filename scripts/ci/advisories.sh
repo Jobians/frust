@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Run `cargo deny check advisories` against every tracked Cargo.lock, using the
-# root deny.toml for all of them. The root workspace and each standalone
+# root deny.toml for all of them: cargo-deny reads <cwd>/deny.toml by default and
+# this script runs from the repository root. No `--config` flag is passed because
+# its position differs between cargo-deny releases (after `check` up to 0.19,
+# before it from 0.20). The root workspace and each standalone
 # workspace (excluded from the root Cargo.toml) have their own lockfile, so a
 # single run from the root would miss the standalone ones.
 #
@@ -30,7 +33,7 @@ for lock in "${lockfiles[@]}"; do
     continue
   fi
   echo "=== advisories: $dir ==="
-  if ! cargo deny --manifest-path "$dir/Cargo.toml" check advisories --config deny.toml; then
+  if ! cargo deny --manifest-path "$dir/Cargo.toml" check advisories; then
     failed+=("$dir")
   fi
 done
