@@ -8,6 +8,14 @@
 //! `agent_activity` and `image_generation` ride along as host-owned rows, which
 //! is the seam the port offers for upstream's inline cards.
 //!
+//! In the phone shell the page is the workspace alone: the shell hands it the
+//! whole slot rather than a scroll view (`Page::fills_phone_slot`), the
+//! workspace fills it, and the gallery's captions and the reset row are left
+//! out. `chat_app` lays its composer out from the bottom of the box it is
+//! given, so the composer, send button included, ends where the shell's safe
+//! area ends: above the soft keyboard while it is open, with the transcript
+//! scrolling in what is left above it.
+//!
 //! See [`crate::pages::agents::primitives`] for the component boundary and the
 //! frame pump that steps [`ChatModel::advance`] — beUI's model is stepped "from
 //! the host's own frame loop", and a frust app has no ambient tick.
@@ -15,7 +23,8 @@
 use std::time::Duration;
 
 use frust::{
-    Color, Component, CrossAxisAlignment, SizedBox, View, colored_box, column, component, row, text,
+    Color, Component, CrossAxisAlignment, Either, SizedBox, View, WindowMetrics, colored_box,
+    column, component, row, text, use_context,
 };
 use frust_beui::agents::agent_activity::{
     AgentActivityStatus, AgentStepStatus, activity_search, activity_step, activity_text,
@@ -37,7 +46,7 @@ use frust_beui::components::button::{ButtonSize, ButtonTone, button};
 
 use super::primitives::{BLOCK_GAP, FrameClock, heading};
 use crate::AppState;
-use crate::nav::caption;
+use crate::nav::{self, caption};
 
 // ---- Sample data -----------------------------------------------------------
 
@@ -364,7 +373,19 @@ impl Component for Chat {
             .clone()
             .unwrap_or_else(|| "No move requested yet.".to_string());
 
-        column()
+        let compact = use_context::<WindowMetrics>().is_some_and(|m| nav::is_compact(m.size.width));
+        if compact {
+            // The slot is finite here (no page scroll view), so the workspace
+            // takes all of it and its composer sits on the slot's bottom edge.
+            return Either::Left(
+                column()
+                    .flex(1, chat_app::<State, _, _>(rail(state), conversation(state)))
+                    .child(state.clock.pump(state.busy()))
+                    .cross_axis(CrossAxisAlignment::Stretch),
+            );
+        }
+
+        let page = column()
             .child(heading("Agents \u{b7} Chat"))
             .child(SizedBox(None, Some(8.0)))
             .child(caption(
@@ -415,7 +436,8 @@ impl Component for Chat {
                     .cross_axis(CrossAxisAlignment::Center),
             )
             .child(SizedBox(None, Some(8.0)))
-            .child(caption(moved))
+            .child(caption(moved));
+        Either::Right(page)
     }
 }
 

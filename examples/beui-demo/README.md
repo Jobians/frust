@@ -134,8 +134,10 @@ desktop window shows it too.
   with `.keyboard(true)`, so the top bar starts below the status bar or notch
   and the page ends above the home indicator, or above the soft keyboard
   while it is open. The page's scroll view then keeps a focused field's caret
-  in view, which is what keeps the Chat page's composer and the Content
-  page's text field above the keyboard.
+  in view, which is what keeps the Content page's text field above the
+  keyboard. The Chat page does not scroll as a page: it fills the slot
+  (`Page::fills_phone_slot`), so its composer, send button included, sits on
+  the slot's bottom edge and the transcript scrolls in the room above it.
 - **Density:** Android and iOS start under `Density::Touch`
   (`frust_beui::install_with_density`), every other target under
   `Density::Comfortable`. The Content page's density chips read the live
