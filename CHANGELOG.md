@@ -352,10 +352,12 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   to its inner box, and scrolls horizontally to keep the caret in view; the placeholder is clipped,
   not ellipsized.
 - The MCP server (`frust-mcp`) now also serves protocol 2026-07-28, which has no handshake or
-  session id. Clients on 2025-06-18 and 2025-11-25 keep their sessions unchanged, and the tool set is
-  unchanged. A request whose `Origin` header is not the server's own loopback origin is now refused
-  with 403; requests with no `Origin` (every non-browser client) are unaffected. An MCP client author
-  has nothing to change.
+  session id. Clients on any session version (2024-11-05 through 2025-11-25) keep their sessions
+  unchanged, and the tool set is unchanged. A request whose `Origin` header is not the server's own
+  loopback origin is now refused with 403. Clients that send no `Origin` header, which is every
+  non-browser client, have nothing to change; a browser-based client must be served from the server's
+  own loopback origin, and one on any other origin (another localhost port included, or
+  `Origin: null`) is now refused with 403.
 
 ### Fixed
 

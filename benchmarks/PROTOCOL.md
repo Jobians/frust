@@ -1073,7 +1073,7 @@ task — see §7's methodology-deviations note) reports, over the kept runs'
 ### 9.7 Fairness stance (declared convention)
 
 Frust column: **`frust-database`** — in-process `rusqlite`, **bundled
-SQLite 3.53.2** (version-pinned per this repo's Version-Pin Policy,
+SQLite 3.54.1** (version-pinned per this repo's Version-Pin Policy,
 `docs/DEVELOPMENT.md`). A **`turso`** column is added later, run through
 the identical d1/d2 scenarios, once that backend lands — same scenarios,
 same row shape, no separate protocol.
