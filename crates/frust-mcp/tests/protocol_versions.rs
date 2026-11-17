@@ -1,7 +1,7 @@
 //! Which MCP protocol versions the server speaks, and how it answers each.
 //!
-//! - The `initialize` handshake at 2025-06-18 and at 2025-11-25 opens a
-//!   stateful session and returns an `Mcp-Session-Id`.
+//! - The `initialize` handshake at 2024-11-05, 2025-03-26, 2025-06-18 and
+//!   2025-11-25 opens a stateful session and returns an `Mcp-Session-Id`.
 //! - A request naming a session the server never issued is answered 404.
 //! - A request with no session id that is not `initialize`, at a version that
 //!   has the handshake, is answered 400.
@@ -10,7 +10,9 @@
 //!   the same tools a session sees, `tools/call` runs, and the request leaves
 //!   no entry behind in the client registry.
 //! - Origin: none, this server's `127.0.0.1` origin and its `localhost` origin
-//!   are accepted; any other origin is refused with 403.
+//!   are accepted; any other origin (including `null`) is refused with 403,
+//!   on the stateful and the sessionless path alike.
+//! - A refused request (400, 403) leaves no entry in the client registry.
 //!
 //! Driven over raw `tokio` `TcpStream`s like the other transport tests (see
 //! `common/mcp.rs`). **No sleeps:** every wait is on an HTTP response or a
@@ -129,7 +131,21 @@ fn initialize_at(host: &str, version: &str, origin: Option<&str>) -> String {
 /// A 2026-07-28 request: no session id, the version in both the
 /// `MCP-Protocol-Version` header and `_meta`, plus the `Mcp-Method` (and,
 /// for a named method, `Mcp-Name`) headers that version requires.
-fn sessionless(host: &str, id: u64, method: &str, mut params: Value) -> String {
+fn sessionless(host: &str, id: u64, method: &str, params: Value) -> String {
+    sessionless_with_origin(host, id, method, params, None)
+}
+
+/// [`sessionless`] with an optional `Origin` header.
+fn sessionless_with_origin(
+    host: &str,
+    id: u64,
+    method: &str,
+    mut params: Value,
+    origin: Option<&str>,
+) -> String {
+    let origin = origin
+        .map(|origin| format!("Origin: {origin}\r\n"))
+        .unwrap_or_default();
     params["_meta"] = json!({
         "io.modelcontextprotocol/protocolVersion": SESSIONLESS_VERSION,
         "io.modelcontextprotocol/clientInfo": { "name": "frust-mcp-test", "version": "0.0.0" },
@@ -145,6 +161,7 @@ fn sessionless(host: &str, id: u64, method: &str, mut params: Value) -> String {
     format!(
         "POST /mcp HTTP/1.1\r\n\
          Host: {host}\r\n\
+         {origin}\
          Accept: application/json, text/event-stream\r\n\
          Content-Type: application/json\r\n\
          MCP-Protocol-Version: {SESSIONLESS_VERSION}\r\n\
@@ -195,6 +212,22 @@ fn tool_names(list: &Value) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+#[tokio::test]
+async fn initialize_at_2024_11_05_opens_a_session() {
+    let server = Server::start().await;
+    open_session_at(&server, "2024-11-05").await;
+    server.wait_for_count(1).await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn initialize_at_2025_03_26_opens_a_session() {
+    let server = Server::start().await;
+    open_session_at(&server, "2025-03-26").await;
+    server.wait_for_count(1).await;
+    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -250,6 +283,7 @@ async fn a_legacy_request_without_a_session_id_is_answered_400() {
         response.starts_with("HTTP/1.1 400"),
         "expected 400 for a session-less non-initialize request, got: {response}"
     );
+    server.wait_for_count(0).await;
     server.shutdown().await;
 }
 
@@ -346,7 +380,55 @@ async fn origin_is_checked_against_this_servers_loopback_origin() {
             response.starts_with("HTTP/1.1 403"),
             "Origin {origin} should be refused, got: {response}"
         );
+        server.wait_for_count(3).await;
     }
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn origin_null_on_initialize_is_refused() {
+    let server = Server::start().await;
+    let request = initialize_at(&server.host(), "2025-06-18", Some("null"));
+    let response = roundtrip(server.addr, &request, "\r\n\r\n").await;
+    assert!(
+        response.starts_with("HTTP/1.1 403"),
+        "Origin: null should be refused, got: {response}"
+    );
+    server.wait_for_count(0).await;
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_foreign_origin_on_a_sessionless_request_is_refused() {
+    let server = Server::start().await;
+    let call = json!({ "name": "ping", "arguments": {} });
+
+    let refused = sessionless_with_origin(
+        &server.host(),
+        30,
+        "tools/call",
+        call.clone(),
+        Some("http://evil.example"),
+    );
+    let response = roundtrip(server.addr, &refused, "\r\n\r\n").await;
+    assert!(
+        response.starts_with("HTTP/1.1 403"),
+        "a foreign Origin on a sessionless call should be refused, got: {response}"
+    );
+    server.wait_for_count(0).await;
+
+    let accepted = request_json(
+        server.addr,
+        &sessionless(&server.host(), 31, "tools/call", call),
+        31,
+    )
+    .await;
+    assert!(
+        accepted.get("error").is_none(),
+        "the same call without an Origin should succeed: {accepted}"
+    );
+    server.wait_for_count(0).await;
 
     server.shutdown().await;
 }
