@@ -351,6 +351,11 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 - A single-line `text_input` now always records a clip. It clips selection, text, placeholder and caret
   to its inner box, and scrolls horizontally to keep the caret in view; the placeholder is clipped,
   not ellipsized.
+- The MCP server (`frust-mcp`) now also serves protocol 2026-07-28, which has no handshake or
+  session id. Clients on 2025-06-18 and 2025-11-25 keep their sessions unchanged, and the tool set is
+  unchanged. A request whose `Origin` header is not the server's own loopback origin is now refused
+  with 403; requests with no `Origin` (every non-browser client) are unaffected. An MCP client author
+  has nothing to change.
 
 ### Fixed
 
@@ -403,6 +408,10 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   1.0.12: the three emSign roots, Buypass Class 2 and Class 3, and Certigna Root CA, plus DigiCert
   Trusted Root G4 and two QuoVadis G3 roots, which are no longer trusted for TLS. Images served from
   a site chained only to one of them stop loading in `frust-network-image`.
+- `frust-mcp` moves from rmcp 2.2.0 to 3.10.0, which drops the ignores for RUSTSEC-2026-0457 (OAuth
+  client SSRF) and RUSTSEC-2026-0462 (Streamable HTTP clients buffering unbounded response bodies).
+  Both advisories are in rmcp client code that frust never compiled: no `client`, `auth` or
+  client-transport feature is enabled. The 2.x line ended at 2.2.0 and gets no fixes.
 
 ## 0.6.6 — 2026-11-11
 
