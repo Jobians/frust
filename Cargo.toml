@@ -11,7 +11,7 @@ exclude = ["examples/huddle", "examples/shadertoy", "examples/web-spike", "examp
 [workspace.package]
 version = "0.6.6"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/frust-rs/frust"
 homepage = "https://frust.dev"
@@ -168,7 +168,7 @@ objc2-photos-ui = "0.3"
 arboard = { version = "=3.6.1", default-features = false }
 # Exact pin: pre-1.0 API churn; the tripwire is frust-database's cross-engine conformance suite.
 # `bundled` compiles SQLite from source, so no target needs a system libsqlite3.
-rusqlite = { version = "=0.40.1", default-features = false, features = [
+rusqlite = { version = "=0.43.0", default-features = false, features = [
     "bundled",
 ] }
 # Exact pin: a pre-1.0 rewrite whose API moves between minors (conformance suite, `--features engine-turso`).

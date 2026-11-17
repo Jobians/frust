@@ -27,7 +27,6 @@ ignore = [
   { id = "RUSTSEC-2026-0543", reason = "Unmaintained: chrono 0.4.45 (all versions affected). Pulled by rmcp 2.2.0 directly and through schemars 1.2.2, under frust-mcp, frust-dap, frust-tui and frust-cli. frust itself does not name chrono. Must move: rmcp (and its schemars) drops chrono or moves to a successor in a release that frust adopts." },
 
   # --- Vulnerabilities (patched release exists; the pinned line cannot take it here) ---
-  { id = "RUSTSEC-2026-0459", reason = "Vulnerability: libsqlite3-sys 0.38.2 bundles SQLite before 3.54.0 (uninitialised page-cache read via crafted -wal file, local, needs the victim to open the pair). Pulled by rusqlite 0.40.1 -> frust-database (plugins/database), bundled feature. Must move: rusqlite 0.41 (libsqlite3-sys 0.39.1 or later), a Version-Pin Policy change." },
   { id = "RUSTSEC-2026-0457", reason = "Vulnerability: rmcp 2.2.0 OAuth client SSRF filter checks host strings, not resolved addresses. Pulled by frust-mcp, frust-dap, frust-tui and frust-cli. Must move: rmcp 3.7.0 or later, a major-version move of the MCP surface." },
   { id = "RUSTSEC-2026-0462", reason = "Vulnerability: rmcp 2.2.0 Streamable HTTP clients buffer unbounded response bodies. Pulled by frust-mcp, frust-dap, frust-tui and frust-cli. Must move: rmcp 3.9.0 or later, a major-version move of the MCP surface (same move as RUSTSEC-2026-0457)." },
 ]
