@@ -13,10 +13,14 @@
 //! deliberately agree, because the mechanics are the framework's, not the
 //! catalog's:
 //!
-//! - **Pinned** (the initial state): every layout re-pins the offset onto the
-//!   end, so content growth is *pinned*, never chased — a message that arrives
-//!   while the reader is at the live edge is fully visible on the frame it
-//!   lands, with no catch-up scroll leaving it below the fold.
+//! - **Pinned** (the initial state): a layout that measures a different
+//!   content height or viewport re-pins the offset onto the end, so content
+//!   growth is *pinned*, never chased — a message that arrives while the
+//!   reader is at the live edge is fully visible on the frame it lands, with
+//!   no catch-up scroll leaving it below the fold. A layout that measures
+//!   nothing new, or one that runs under a live drag, leaves the offset
+//!   alone, so a host that rebuilds between input events does not undo a
+//!   slow scroll before it leaves the band.
 //! - **Unpinned**: a user scroll that leaves the offset more than
 //!   [`MESSAGE_SCROLLER_FOLLOW_THRESHOLD`] px from the end unpins, and from then
 //!   on growth *preserves the viewport* — the offset is untouched, so the
@@ -350,6 +354,9 @@ pub struct MessageScrollerWidget {
     offset: f64,
     viewport: Size,
     content_height: f64,
+    /// The content height and viewport the last layout measured: a pinned
+    /// surface is put back on the end only when one of them changed.
+    pinned_extent: Option<(f64, Size)>,
     /// The pin rule, and the observation fold feeding it.
     pin: MessageScrollerPin,
     fx: ScrollFx,
@@ -608,6 +615,7 @@ impl<State: 'static> View<State> for MessageScrollerView<State> {
             offset: 0.0,
             viewport: Size::ZERO,
             content_height: 0.0,
+            pinned_extent: None,
             pin: MessageScrollerPin::new(self.threshold),
             fx: ScrollFx::new(),
             down_active: false,
@@ -742,9 +750,19 @@ impl Widget for MessageScrollerWidget {
         self.viewport = Size::new(width, height);
 
         let max = self.max_offset();
+        // A layout that measured the same content in the same viewport is not
+        // growth, and a finger on the surface owns the offset: re-pinning on
+        // either would undo a slow scroll before it can leave the follow band.
+        let extent = (self.content_height, self.viewport);
+        let resized = self.pinned_extent != Some(extent);
+        self.pinned_extent = Some(extent);
         if self.pin.is_pinned() {
-            // Pinned: growth is *pinned*, never chased.
-            self.offset = max;
+            if resized && !self.dragging {
+                // Pinned: growth is *pinned*, never chased.
+                self.offset = max;
+            } else {
+                self.offset = self.offset.clamp(0.0, max);
+            }
             self.fx.observe(self.info());
         } else {
             self.offset = self.offset.clamp(0.0, max);
@@ -1611,6 +1629,88 @@ mod tests {
         );
         assert!(widget.offset() < start, "the content followed the finger");
         assert!(!widget.is_pinned());
+    }
+
+    /// A host that rebuilds between input events lays the surface out again
+    /// each time. Such a layout measures nothing new, so it leaves a pinned
+    /// offset where the reader put it: a slow drag and a run of small wheel
+    /// steps each add up and leave the follow band.
+    #[test]
+    fn a_relayout_between_small_scroll_steps_does_not_undo_them() {
+        let step = MESSAGE_SCROLLER_FOLLOW_THRESHOLD / 4.0;
+
+        let mut widget = laid_out(&view(30));
+        let mut state = Chat::default();
+        let end = widget.offset();
+        dispatch(
+            &mut widget,
+            &mut state,
+            &pointer(PointerPhase::Down, 40.0, 100.0),
+        );
+        let mut y = 100.0 + TOUCH_SLOP + 1.0;
+        dispatch(
+            &mut widget,
+            &mut state,
+            &pointer(PointerPhase::Move, 40.0, y),
+        );
+        for _ in 0..8 {
+            relayout(&mut widget);
+            y += step;
+            dispatch(
+                &mut widget,
+                &mut state,
+                &pointer(PointerPhase::Move, 40.0, y),
+            );
+        }
+        relayout(&mut widget);
+        assert!(
+            (end - widget.offset() - step * 8.0).abs() < 0.5,
+            "the drag added up: {} from {end}",
+            widget.offset()
+        );
+        assert!(!widget.is_pinned());
+
+        let mut widget = laid_out(&view(30));
+        for _ in 0..8 {
+            dispatch(&mut widget, &mut state, &wheel(-step));
+            relayout(&mut widget);
+        }
+        assert!(
+            (end - widget.offset() - step * 8.0).abs() < 0.5,
+            "the wheel steps added up: {} from {end}",
+            widget.offset()
+        );
+        assert!(!widget.is_pinned());
+    }
+
+    /// A finger on the surface owns the offset: a transcript that grows under
+    /// a drag still inside the follow band is not pulled back onto the end.
+    #[test]
+    fn growth_under_a_live_drag_does_not_take_the_offset_back() {
+        let thirty = view(30);
+        let mut widget = laid_out(&thirty);
+        let mut state = Chat::default();
+        dispatch(
+            &mut widget,
+            &mut state,
+            &pointer(PointerPhase::Down, 40.0, 100.0),
+        );
+        let y = 100.0 + TOUCH_SLOP + 1.0;
+        dispatch(
+            &mut widget,
+            &mut state,
+            &pointer(PointerPhase::Move, 40.0, y),
+        );
+        dispatch(
+            &mut widget,
+            &mut state,
+            &pointer(PointerPhase::Move, 40.0, y + 20.0),
+        );
+        assert!(widget.is_pinned(), "still inside the band");
+        let held = widget.offset();
+
+        rebuild(&mut widget, &thirty, &view(32));
+        assert_eq!(widget.offset(), held, "the drag kept its place");
     }
 
     /// The rows are clipped to the viewport — a transcript taller than its box
