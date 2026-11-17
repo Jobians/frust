@@ -137,11 +137,13 @@ pub fn shell(state: &mut AppState) -> impl View<AppState> + use<> {
     let compact = use_context::<WindowMetrics>().is_some_and(|m| nav::is_compact(m.size.width));
     let body = page_body(page, state);
     if compact {
-        let content = pattern_switcher::<AppState, FadeThrough, _>(
-            page as usize,
-            FadeThrough,
-            nav::phone_scroll_slot(body),
-        );
+        let slot = if page.fills_phone_slot() {
+            Either::Left(nav::phone_fill_slot(body))
+        } else {
+            Either::Right(nav::phone_scroll_slot(body))
+        };
+        let content =
+            pattern_switcher::<AppState, FadeThrough, _>(page as usize, FadeThrough, slot);
         let phone = nav::phone_shell(page, state.menu_open.get(), content);
         Either::Left(back_fallback(&state.menu_back, phone))
     } else {
@@ -188,6 +190,8 @@ mod shell_tests {
     use frust::authoring::{Rect, Role, Size, WindowEdgeInsets, WindowInsets};
     use frust::testing::{Tester, TesterOptions, find};
     use frust::{GetUntracked, View, push_back_press};
+    use frust_beui::agents::message_scroller::MessageScrollerWidget;
+    use frust_beui::agents::prompt_input::PROMPT_SEND_LABEL;
     use frust_beui::components::animated_sidebar::AnimatedSidebarWidget;
     use frust_beui::{BeuiMetrics, Density, theme_with_density};
 
@@ -366,12 +370,24 @@ mod shell_tests {
         assert!(menu.y0 >= 47.0 - EPSILON, "{menu:?}");
     }
 
-    /// Scroll the page slot toward the first text field, focus it, then raise
-    /// a `keyboard`-tall soft keyboard.
-    fn focus_then_raise_keyboard(page: Page, keyboard: f64) -> (Rect, Rect) {
-        let mut app = app(PHONE, WindowInsets::default(), page);
+    /// A `keyboard`-tall soft keyboard over the phone window.
+    fn keyboard_up(keyboard: f64) -> frust::WindowMetrics {
+        let bars = WindowEdgeInsets {
+            bottom: keyboard,
+            ..WindowEdgeInsets::default()
+        };
+        let insets = WindowInsets::new(WindowEdgeInsets::default(), bars);
+        frust::WindowMetrics::new(PHONE, 1.0, insets)
+    }
+
+    #[test]
+    fn a_focused_field_stays_above_the_keyboard() {
+        let _slot = slot();
+        let keyboard = 336.0;
+        let mut app = app(PHONE, WindowInsets::default(), Page::Content);
         run(&mut app, 30);
         let field = || find::role(Role::TextInput);
+        // Bring the field into the top half, where a tap can reach it.
         for _ in 0..40 {
             if app.bounds(&field()).y1 < PHONE.height / 2.0 {
                 break;
@@ -384,32 +400,65 @@ mod shell_tests {
         }
         app.tap(field());
         run(&mut app, 10);
-        let bars = WindowEdgeInsets {
-            bottom: keyboard,
-            ..WindowEdgeInsets::default()
-        };
-        let insets = WindowInsets::new(WindowEdgeInsets::default(), bars);
-        app.set_metrics(frust::WindowMetrics::new(PHONE, 1.0, insets));
+        app.set_metrics(keyboard_up(keyboard));
         run(&mut app, 60);
-        (app.bounds(&field()), page_viewport(&app))
+        let (field, viewport) = (app.bounds(&field()), page_viewport(&app));
+        assert!(
+            (viewport.y1 - (PHONE.height - keyboard)).abs() < EPSILON,
+            "{viewport:?}"
+        );
+        // The scroll view reveals the caret line with a 16 px margin, not
+        // the whole field, so a tall field's bottom edge may stay under.
+        let line = field.center().y;
+        assert!(
+            field.y0 >= viewport.y0 - EPSILON && line < viewport.y1,
+            "field {field:?} outside {viewport:?}"
+        );
     }
 
+    /// The Chat page fills the phone slot, so its composer is laid out from
+    /// the slot's bottom edge rather than revealed by a scroll: the field and
+    /// the send button both end above the keyboard, and the transcript keeps
+    /// the room above them.
     #[test]
-    fn a_focused_field_stays_above_the_keyboard() {
+    fn the_chat_composer_and_its_send_button_stay_above_the_keyboard() {
         let _slot = slot();
-        let keyboard = 336.0;
-        for page in [Page::Content, Page::AgentsChat] {
-            let (field, viewport) = focus_then_raise_keyboard(page, keyboard);
+        let mut app = app(PHONE, WindowInsets::default(), Page::AgentsChat);
+        run(&mut app, 30);
+        let field = || find::role(Role::TextInput);
+        let send = || find::label(Role::Button, PROMPT_SEND_LABEL);
+        let top_bar = app.bounds(&find::label(Role::Button, "Menu")).y1;
+
+        for keyboard in [0.0, 336.0] {
+            if keyboard > 0.0 {
+                app.tap(field());
+                run(&mut app, 10);
+                app.set_metrics(keyboard_up(keyboard));
+                run(&mut app, 60);
+            }
+            let edge = PHONE.height - keyboard;
+            let (field, send) = (app.bounds(&field()), app.bounds(&send()));
+            for (name, part) in [("field", field), ("send button", send)] {
+                assert!(
+                    part.y0 >= top_bar - EPSILON && part.y1 <= edge + EPSILON,
+                    "keyboard {keyboard}: the {name} {part:?} is outside {top_bar}..{edge}"
+                );
+            }
+            // Pinned to the slot's bottom edge, not merely somewhere above it.
             assert!(
-                (viewport.y1 - (PHONE.height - keyboard)).abs() < EPSILON,
-                "{page:?}: {viewport:?}"
+                edge - send.y1 < 48.0,
+                "keyboard {keyboard}: the send button {send:?} left the bottom edge {edge}"
             );
-            // The scroll view reveals the caret line with a 16 px margin, not
-            // the whole field, so a tall field's bottom edge may stay under.
-            let line = field.center().y;
+            let transcript = app
+                .find(&find::by_type::<MessageScrollerWidget>())
+                .first()
+                .expect("the transcript scrolls")
+                .bounds;
             assert!(
-                field.y0 >= viewport.y0 - EPSILON && line < viewport.y1,
-                "{page:?}: field {field:?} outside {viewport:?}"
+                transcript.y0 >= top_bar - EPSILON
+                    && transcript.y1 <= field.y0 + EPSILON
+                    && transcript.height() > 100.0,
+                "keyboard {keyboard}: transcript {transcript:?} above the field {field:?}"
             );
         }
     }
@@ -418,7 +467,7 @@ mod shell_tests {
     /// phone shell: fixed-width stages, rows that do not wrap and wide
     /// specimens. Recorded rather than fixed here; a page that stops
     /// overflowing leaves this list.
-    const WIDER_THAN_A_PHONE: [Page; 15] = [
+    const WIDER_THAN_A_PHONE: [Page; 14] = [
         Page::Home,
         Page::MotionText,
         Page::MotionButtons,
@@ -429,7 +478,6 @@ mod shell_tests {
         Page::MotionSurfaces,
         Page::MotionData,
         Page::MotionShader,
-        Page::AgentsChat,
         Page::BlocksCommand,
         Page::BlocksForms,
         Page::BlocksShowcase,

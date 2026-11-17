@@ -101,6 +101,14 @@ impl Page {
         Page::GpuEffects,
     ];
 
+    /// Whether the phone shell gives this page its whole slot instead of a
+    /// scroll view. The Chat page is one screen with its own transcript
+    /// scroller: filling the slot is what pins its composer to the slot's
+    /// bottom edge, which the shell's safe area holds above the soft keyboard.
+    pub fn fills_phone_slot(self) -> bool {
+        matches!(self, Page::AgentsChat)
+    }
+
     /// The section this page belongs to, or `None` for the four pages that
     /// stand outside every section.
     pub fn section(self) -> Option<&'static str> {
@@ -256,6 +264,13 @@ pub fn shell_inset(page: Page, open: bool, content: impl View<AppState>) -> impl
 /// The phone shell's page slot: [`scroll_slot`] with phone-width padding.
 pub fn phone_scroll_slot(content: impl View<AppState>) -> impl View<AppState> {
     scroll_view(Padding(EdgeInsets::all(PHONE_PAGE_PADDING), content))
+}
+
+/// The phone shell's slot for a page that [fills it](Page::fills_phone_slot):
+/// the same padding and no scroll view, so the page gets a finite height that
+/// ends where the safe area ends.
+pub fn phone_fill_slot(content: impl View<AppState>) -> impl View<AppState> {
+    Padding(EdgeInsets::all(PHONE_PAGE_PADDING), content)
 }
 
 /// The phone shell's top bar: the menu button, the page title and the theme
