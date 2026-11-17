@@ -594,11 +594,12 @@ jobs:
         run: scripts/ci/erasure-check.sh
 
   advisories:
-    # RustSec advisories for the root workspace's Cargo.lock, checked against
-    # deny.toml (advisories only: licences, bans and sources are not enforced).
-    # Runs on pull requests and on the weekly schedule. It covers the root
-    # workspace only: the standalone workspaces excluded in the root Cargo.toml
-    # have their own lockfiles. Deliberately outside `ci-ok`'s needs, like the
+    # RustSec advisories for every tracked Cargo.lock (the root workspace and
+    # each standalone workspace excluded in the root Cargo.toml), checked
+    # against the one root deny.toml (advisories only: licences, bans and
+    # sources are not enforced). Runs on pull requests and on the weekly
+    # schedule. scripts/ci/advisories.sh finds the lockfiles with git ls-files.
+    # Deliberately outside `ci-ok`'s needs, like the
     # advisory legs above: a new upstream advisory must not block an unrelated
     # merge. Each accepted advisory is recorded with its reason in deny.toml.
     if: github.event_name == 'pull_request' || github.event_name == 'schedule'
@@ -630,8 +631,8 @@ jobs:
           ver="$("$dir/bin/cargo-deny" --version | awk '{print $2}')"
           [ "$ver" = "0.20.2" ] || { echo "::error::cargo-deny is $ver, expected 0.20.2"; exit 1; }
           echo "$dir/bin" >> "$GITHUB_PATH"
-      - name: Check advisories
-        run: cargo deny check advisories
+      - name: Check advisories in every tracked lockfile
+        run: scripts/ci/advisories.sh
 
   ci-ok:
     # The one required status check (.github/rulesets/main.json).

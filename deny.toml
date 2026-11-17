@@ -3,10 +3,11 @@
 # is configured here: licences, bans and sources keep their cargo-deny defaults
 # and are not enforced by CI. Run from the repository root:
 #
-#   cargo deny check advisories
+#   scripts/ci/advisories.sh
 #
-# The standalone workspaces excluded in the root Cargo.toml have their own
-# lockfiles and are NOT covered by this file.
+# The CI advisories job applies this file to every tracked Cargo.lock, including
+# the standalone workspaces excluded in the root Cargo.toml, so an `ignore` entry
+# also covers the same advisory in a standalone workspace.
 #
 # Every `ignore` entry records its advisory kind, the frust crate that pulls the dependency in, and
 # what must move for the entry to be removed. The unmaintained entries have no upgrade. The entries
