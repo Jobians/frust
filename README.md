@@ -158,7 +158,7 @@ crate, or commit `Cargo.lock` and read the Breaking block before `cargo update`.
 
 ## Quickstart
 
-Prerequisites: Rust 1.88+ (edition 2024). See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for
+Prerequisites: Rust 1.89+ (edition 2024). See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) for
 platform toolchains (Android/iOS/Web) beyond the desktop preview.
 
 ```bash

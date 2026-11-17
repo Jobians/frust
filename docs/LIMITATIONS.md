@@ -939,7 +939,7 @@ nothing stops an app from reaching around `Database` with raw SQL that breaks it
 journal mode or applies encryption.
 
 **Why accepted**: this is the verified intersection of what both engines' SQLite builds
-(bundled `rusqlite` 3.53.2; turso self-reports `sqlite_version()` 3.50.4) actually
+(bundled `rusqlite` 3.54.1; turso self-reports `sqlite_version()` 3.50.4) actually
 support in common — not a narrower promise than necessary, but not a general SQLite-file
 compatibility guarantee either.
 
