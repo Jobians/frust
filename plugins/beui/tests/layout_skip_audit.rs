@@ -102,6 +102,14 @@ impl<S: 'static> Audit<S> {
             now: 0,
             offenders: Vec::new(),
         };
+        // Measure with the faces beUI ships, not the host's sans-serif: a fallback with a
+        // 1.0 em line height lets taller text fit inside a row's minimum height.
+        for bytes in frust_beui::font_data() {
+            audit
+                .text
+                .register_fonts(bytes.to_vec())
+                .expect("bundled faces register");
+        }
         audit.root.set_theme(Box::new(theme));
         audit
     }
