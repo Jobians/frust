@@ -719,7 +719,9 @@ mod tests {
         let add_key = call_it_key_of(&add);
         let mul_key = call_it_key_of(&mul);
         // Synthetic ranges: `add`'s key lies in image 0 (slide 0x100), `mul`'s in patch image 2.
-        let base = |key: u64| (key as usize - 0x10, key as usize + 0x10);
+        // One-address ranges: the two keys can sit a few bytes apart (8 on Linux
+        // with Rust 1.100), so a wider window around one would swallow the other.
+        let base = |key: u64| (key as usize, key as usize + 1);
         let (a_lo, a_hi) = base(add_key);
         let (m_lo, m_hi) = base(mul_key);
         crate::anchor::register_for_test(0, a_lo, a_hi, 0x100);
