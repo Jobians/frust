@@ -36,15 +36,17 @@ yourself (for example through `frust::set_app_theme`). `install()` and
   a clipping container needs `.floating(true)`, which paints the option panel
   in the root overlay layer. While a floated panel is open it shows no row
   hover highlight, masks the app's shortcuts and closes on Tab.
-- **Not yet device-tested.** No Android or iOS device run has yet checked the
-  touch density, the text scale or the gallery's phone shell.
+- **Device-tested once.** The gallery's phone shell, the touch density and
+  the text scale were walked on a Pixel 5 (Android 14) and an iPhone 13 mini
+  (iOS 27.2); the checks, the results and the date are in the gallery's
+  [README](https://github.com/frust-rs/frust/blob/main/examples/beui-demo/README.md)
+  under "Device gates".
 
 Limitations that matter on a phone, by their id in the repository's
 [docs/LIMITATIONS.md](https://github.com/frust-rs/frust/blob/main/docs/LIMITATIONS.md):
 
 - `beui-density-partial-coverage`: the parts outside the list above, the
-  button's state icon and `theme_toggle` keep comfortable sizes; no device
-  run yet.
+  button's state icon and `theme_toggle` keep comfortable sizes.
 - `beui-overlay-seam`: the default inline panel needs bounded constraints, so
   a select inside a modal needs `.floating(true)`.
 - `overlay-portal-v1-scope` (item 3): what a floated panel costs.
