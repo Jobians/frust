@@ -1,6 +1,6 @@
 # Continuous integration for pull requests and main.
 #
-# The toolchain is whatever rust-toolchain.toml pins (1.98.1 + rustfmt + clippy);
+# The toolchain is whatever rust-toolchain.toml pins (1.100.0 + rustfmt + clippy);
 # rustup installs it on first use. `ci-ok` is the single aggregate check that
 # .github/rulesets/main.json requires, so a job added here only gates merges once
 # it is listed in `ci-ok`'s `needs`. No secrets are used and nothing runs on

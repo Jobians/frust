@@ -170,6 +170,11 @@ impl FailureCell {
     pub(crate) fn record(&self, generation: u64, kind: u8) {
         debug_assert!((1..=3).contains(&kind), "failure kind {kind} out of range");
         let packed = (generation << Self::KIND_BITS) | u64::from(kind & 3);
+        // `try_update` is the new name of `fetch_update`, but it is not
+        // available at the workspace's minimum Rust version. Drop this allow
+        // (and rename the call) once the minimum passes the release that
+        // stabilised it.
+        #[allow(deprecated)]
         let _ = self
             .0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
