@@ -847,7 +847,13 @@ fn apply_contribution(
             comment,
         } => apply_maven_repository(project_root, url, groups, comment),
         Contribution::SwiftPackageRef { package_name, .. } => {
-            apply_swift_package_ref(project_root, package_name)
+            let pbxproj = apply_swift_package_ref(project_root, package_name)?;
+            if matches!(resolution.form, DepForm::Manifest { .. })
+                && apply_gitignore_ios_link(project_root, package_name)? == AddOutcome::Applied
+            {
+                return Ok(AddOutcome::Applied);
+            }
+            Ok(pbxproj)
         }
         Contribution::IosFramework { name } => apply_ios_framework(project_root, name),
         Contribution::IosEntitlement {
@@ -2221,6 +2227,63 @@ fn apply_swift_package_ref(
     }
 
     write_file(&path, PBXPROJ_REL, &out)?;
+    Ok(AddOutcome::Applied)
+}
+
+/// The app's root ignore file, where the machine-local `ios/<package>` link
+/// of a manifest-described plugin is listed.
+pub(super) const GITIGNORE_REL: &str = ".gitignore";
+
+/// Whether ignore-file text `src` already covers the `ios/<package_name>`
+/// link: a line equal to `/ios/<package_name>`, `ios/<package_name>`, either
+/// with a trailing slash, or `/ios/Frust*` for a package named `Frust...`.
+/// No general pattern matching.
+pub(super) fn gitignore_covers_ios_link(src: &str, package_name: &str) -> bool {
+    let exact = [
+        format!("/ios/{package_name}"),
+        format!("ios/{package_name}"),
+        format!("/ios/{package_name}/"),
+        format!("ios/{package_name}/"),
+    ];
+    src.lines().map(str::trim).any(|line| {
+        exact.iter().any(|e| e == line)
+            || (package_name.starts_with("Frust") && line == "/ios/Frust*")
+    })
+}
+
+/// Whether the app's root `.gitignore` exists and lacks an entry for the
+/// `ios/<package_name>` link. An app without the file is never pending: it
+/// may not be a git repository.
+pub(super) fn gitignore_ios_link_missing(
+    project_root: &Path,
+    package_name: &str,
+) -> Result<bool, PluginAddError> {
+    let path = project_root.join(GITIGNORE_REL);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let src = read_required(&path, GITIGNORE_REL)?;
+    Ok(!gitignore_covers_ios_link(&src, package_name))
+}
+
+/// Append `/ios/<package_name>` to the app's root `.gitignore` unless it
+/// already covers the link or the file does not exist. The existing bytes
+/// stay a prefix of the result; a missing final newline is supplied before
+/// the new line.
+fn apply_gitignore_ios_link(
+    project_root: &Path,
+    package_name: &str,
+) -> Result<AddOutcome, PluginAddError> {
+    if !gitignore_ios_link_missing(project_root, package_name)? {
+        return Ok(AddOutcome::AlreadyPresent);
+    }
+    let path = project_root.join(GITIGNORE_REL);
+    let mut out = read_required(&path, GITIGNORE_REL)?;
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("/ios/{package_name}\n"));
+    write_file(&path, GITIGNORE_REL, &out)?;
     Ok(AddOutcome::Applied)
 }
 

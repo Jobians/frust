@@ -8,6 +8,8 @@ android {
 
     defaultConfig {
         minSdk = 29
+        // Keep rules for the JNI-loaded host travel with this module.
+        consumerProguardFiles("consumer-rules.pro")
     }
 
     compileOptions {
