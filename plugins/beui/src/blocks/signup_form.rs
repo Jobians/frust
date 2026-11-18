@@ -1454,7 +1454,7 @@ impl SignupFormWidget {
             / STRENGTH_BARS as f64)
             .max(1.0);
         let hue = colors.strength_hue(self.strength);
-        for index in 0..STRENGTH_BARS {
+        for (index, bar) in self.bars.iter().enumerate().take(STRENGTH_BARS) {
             let x = at.x + index as f64 * (bar_width + STRENGTH_BAR_GAP);
             scene.fill_rounded_rect(
                 Point::new(x, at.y),
@@ -1463,7 +1463,7 @@ impl SignupFormWidget {
                 style::with_alpha(colors.muted, STRENGTH_TRACK_ALPHA),
             );
             // `scaleX` from the left origin, so a filling bar grows rightward.
-            let fill = self.bars[index].value().clamp(0.0, 1.0);
+            let fill = bar.value().clamp(0.0, 1.0);
             if fill > 0.0 {
                 scene.fill_rounded_rect(
                     Point::new(x, at.y),

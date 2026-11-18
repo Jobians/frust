@@ -727,8 +727,8 @@ impl<State: 'static> NavigatorWidget<State> {
     fn publish_reach(&mut self) {
         let own = self.reachable();
         let routed = self.input_routed_pages();
-        for index in 0..self.pages.len() {
-            self.pages[index].reach.set(own && routed.contains(&index));
+        for (index, page) in self.pages.iter().enumerate() {
+            page.reach.set(own && routed.contains(&index));
         }
     }
 

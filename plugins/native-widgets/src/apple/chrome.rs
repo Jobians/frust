@@ -360,6 +360,10 @@ const SETTLE_WINDOW: Duration = Duration::from_millis(250);
 /// a newer one's.
 fn record_failure(generation: u64, failure: Failure) {
     let packed = (generation << FAILURE_KIND_BITS) | failure as u64;
+    // `try_update` is the new name of `fetch_update`, but it is not available
+    // at the workspace's minimum Rust version. Drop this allow (and rename the
+    // call) once the minimum passes the release that stabilised it.
+    #[allow(deprecated)]
     let _ = FAILURE.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
         (held >> FAILURE_KIND_BITS <= generation).then_some(packed)
     });

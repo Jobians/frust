@@ -358,6 +358,8 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   non-browser client, have nothing to change; a browser-based client must be served from the server's
   own loopback origin, and one on any other origin (another localhost port included, or
   `Origin: null`) is now refused with 403.
+- The pinned toolchain (`rust-toolchain.toml`) is now Rust 1.100.0 (was 1.98.1); rustup installs it
+  on first use in a checkout. The minimum supported Rust version is not changed by this.
 
 ### Fixed
 

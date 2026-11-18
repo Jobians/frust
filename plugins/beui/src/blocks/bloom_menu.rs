@@ -897,8 +897,8 @@ impl BloomMenuWidget {
         // The cells' static hairlines, painted whole so the grid lines never
         // flicker as the items stagger in (upstream's own note).
         let count = self.cells.len();
-        for index in 0..count {
-            let rect = self.cells[index].rect;
+        for (index, cell) in self.cells.iter().enumerate() {
+            let rect = cell.rect;
             if index % BLOOM_COLUMNS != BLOOM_COLUMNS - 1 {
                 scene.fill_rect(
                     origin + Vec2::new(rect.x1 - style::BORDER_WIDTH, rect.y0),

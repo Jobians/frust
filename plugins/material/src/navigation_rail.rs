@@ -2341,8 +2341,7 @@ mod tests {
         );
 
         let inner = RAIL_COLLAPSED_WIDTH - HORIZONTAL_INSET * 2.0;
-        for index in 0..3 {
-            let pod = &w.items[index];
+        for pod in w.items.iter().take(3) {
             assert_eq!(pod.origin().x, HORIZONTAL_INSET);
             assert_eq!(pod.size(), Size::new(inner, RAIL_ITEM_COLLAPSED_HEIGHT));
         }

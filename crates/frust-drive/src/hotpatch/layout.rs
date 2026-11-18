@@ -1331,8 +1331,15 @@ pub(super) mod fixture {
         rlib_of(&lines).unwrap_or_else(|| panic!("no app rlib in cargo's output for {spec:?}"))
     }
 
-    /// The app's rlib in `deps/`, named with its metadata hash, so another
-    /// edit's build (which rewrites the unhashed copy) never replaces it.
+    /// The app's metadata-hash-named rlib, so another edit's build (which
+    /// rewrites the unhashed copy) never replaces it.
+    ///
+    /// Cargo reports the hashed `.rmeta` (and, on older layouts, the hashed
+    /// `.rlib`) in the `compiler-artifact` message; the rlib sits beside it.
+    /// Before Cargo 1.100 that directory was `deps/`; since then it is the
+    /// per-build directory `build/<package>/<hash>/out/`, which holds the
+    /// rlib but no `deps/` subdirectory. The sibling is tried first, then
+    /// `deps/` next to the reported file.
     fn rlib_of(lines: &[String]) -> Option<PathBuf> {
         lines.iter().find_map(|line| {
             let message: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -1346,13 +1353,11 @@ pub(super) mod fixture {
                 if !stem.contains('-') {
                     return None;
                 }
-                let deps = if file.parent()?.ends_with("deps") {
-                    file.parent()?.to_path_buf()
-                } else {
-                    file.parent()?.join("deps")
-                };
-                let rlib = deps.join(format!("{stem}.rlib"));
-                rlib.is_file().then_some(rlib)
+                let dir = file.parent()?;
+                let rlib = format!("{stem}.rlib");
+                [dir.join(&rlib), dir.join("deps").join(&rlib)]
+                    .into_iter()
+                    .find(|candidate| candidate.is_file())
             })
         })
     }
