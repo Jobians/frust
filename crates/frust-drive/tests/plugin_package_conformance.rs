@@ -446,19 +446,20 @@ mod plugin_package_location {
                 .base
                 .iter()
                 .find_map(|c| match c {
-                    Contribution::CargoDep { name } => Some(*name),
+                    Contribution::CargoDep { name } => Some(&**name),
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("`{}` adds no Cargo dependency", spec.id));
-            let crate_root = root.join("plugins").join(spec.crate_dir);
-            let contributions = spec
-                .base
-                .iter()
-                .chain(spec.optional_features.iter().flat_map(|f| f.contributions));
+            let crate_root = root.join("plugins").join(&*spec.crate_dir);
+            let contributions = spec.base.iter().chain(
+                spec.optional_features
+                    .iter()
+                    .flat_map(|f| f.contributions.iter()),
+            );
             for contribution in contributions {
                 let rel_path = match contribution {
                     Contribution::GradleModule { rel_path, .. }
-                    | Contribution::SwiftPackageRef { rel_path, .. } => *rel_path,
+                    | Contribution::SwiftPackageRef { rel_path, .. } => &**rel_path,
                     _ => continue,
                 };
                 let prefix = format!("plugins/{}/", spec.crate_dir);

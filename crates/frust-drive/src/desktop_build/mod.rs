@@ -278,7 +278,7 @@ pub enum BundleNote {
     /// An installed plugin's desktop contribution was merged into the
     /// assembled bundle (see the [`contributions`] module).
     PluginContribution {
-        plugin_id: &'static str,
+        plugin_id: String,
         /// [`crate::plugin::Contribution::describe`]'s label for the edit.
         description: String,
     },
@@ -286,7 +286,7 @@ pub enum BundleNote {
     /// already carries, so nothing was written — the existing (user-owned)
     /// value wins.
     PluginEntryPresent {
-        plugin_id: &'static str,
+        plugin_id: String,
         key: String,
         /// Which file already had the key, for the message.
         file: &'static str,
@@ -478,7 +478,7 @@ pub enum DesktopBuildError {
          runtime, so this refuses the build instead of skipping the contribution"
     )]
     ContributionUnappliable {
-        plugin_id: &'static str,
+        plugin_id: String,
         description: String,
         reason: String,
     },
@@ -689,6 +689,7 @@ mod tests {
     use crate::doctor::FakeEnv;
     use crate::plugin::Contribution;
     use crate::process::{FakeProcessRunner, Output};
+    use std::borrow::Cow;
     use std::fs;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1851,39 +1852,39 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Plugin desktop contributions, end to end through the whole pipeline.
-    // The rows are synthetic (`&'static` statics) because the real registry
+    // The rows are synthetic (copied from statics) because the real registry
     // declares no desktop contributions yet — see `build_with_contributions`.
     // -----------------------------------------------------------------------
 
     static PLIST_CAMERA: Contribution = Contribution::MacosPlistEntry {
-        key: "NSCameraUsageDescription",
-        value: "Scan a document & <sign> it",
-        comment: "Camera access",
+        key: Cow::Borrowed("NSCameraUsageDescription"),
+        value: Cow::Borrowed("Scan a document & <sign> it"),
+        comment: Cow::Borrowed("Camera access"),
     };
     static PLIST_MIC: Contribution = Contribution::MacosPlistEntry {
-        key: "NSMicrophoneUsageDescription",
-        value: "Record a voice note",
-        comment: "Microphone access",
+        key: Cow::Borrowed("NSMicrophoneUsageDescription"),
+        value: Cow::Borrowed("Record a voice note"),
+        comment: Cow::Borrowed("Microphone access"),
     };
     static ENTITLEMENT_CAMERA: Contribution = Contribution::MacosEntitlement {
-        key: "com.apple.security.device.camera",
-        comment: "Camera device access",
+        key: Cow::Borrowed("com.apple.security.device.camera"),
+        comment: Cow::Borrowed("Camera device access"),
     };
     static DESKTOP_MIME: Contribution = Contribution::LinuxDesktopEntry {
-        key: "MimeType",
-        value: "image/png;",
-        comment: "Handled file types",
+        key: Cow::Borrowed("MimeType"),
+        value: Cow::Borrowed("image/png;"),
+        comment: Cow::Borrowed("Handled file types"),
     };
     static DESKTOP_CATEGORIES: Contribution = Contribution::LinuxDesktopEntry {
-        key: "Categories",
-        value: "Graphics;",
-        comment: "Launcher categories",
+        key: Cow::Borrowed("Categories"),
+        value: Cow::Borrowed("Graphics;"),
+        comment: Cow::Borrowed("Launcher categories"),
     };
 
     fn row(contribution: &'static Contribution) -> DesktopContribution {
         DesktopContribution {
-            plugin_id: "camera",
-            contribution,
+            plugin_id: "camera".into(),
+            contribution: contribution.clone(),
         }
     }
 

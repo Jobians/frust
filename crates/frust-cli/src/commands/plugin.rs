@@ -1,8 +1,9 @@
 //! `frust plugin add`: applies a registry plugin to the project in the
 //! current directory, the shell route to the TUI's Add Plugin dialog.
 //!
-//! Delegates to [`frust_drive::plugin::add_plugin`], so it inherits that
-//! function's behaviour unchanged, including resolving packages with
+//! Delegates to [`frust_drive::plugin::add_plugin_from`] over the built-in
+//! [`PluginCatalog`] — what [`frust_drive::plugin::add_plugin`] does — so it
+//! inherits that function's behaviour unchanged, including resolving packages with
 //! `LockfilePolicy::AllowUpdate` (an existing `Cargo.lock` may gain the new
 //! dependency).
 
@@ -11,15 +12,17 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use frust_drive::plugin::{AddOutcome, AddReport, PluginAddError, add_plugin, known_plugins};
+use frust_drive::plugin::{AddOutcome, AddReport, PluginAddError, PluginCatalog, add_plugin_from};
 
 /// Adds plugin `id` with `features` to the project rooted at `project_root`
 /// (no walk-up), printing the report on stdout or the error on stderr.
 /// Returns the process exit code: 0 on success (including a no-op re-run),
 /// 1 on a [`PluginAddError`].
 pub fn add(project_root: &Path, id: &str, features: &[String]) -> Result<u8> {
+    let catalog = PluginCatalog::built_in();
     run_with(
-        add_plugin,
+        |root, id, features| add_plugin_from(root, &catalog, id, features),
+        &catalog,
         project_root,
         id,
         features,
@@ -29,9 +32,11 @@ pub fn add(project_root: &Path, id: &str, features: &[String]) -> Result<u8> {
 }
 
 /// The testable core of [`add`], with the apply function and output sinks
-/// injected.
+/// injected. `catalog` names the valid plugins and features an unknown id or
+/// feature is answered with.
 pub(crate) fn run_with(
     apply: impl FnOnce(&Path, &str, &[&str]) -> Result<AddReport, PluginAddError>,
+    catalog: &PluginCatalog,
     project_root: &Path,
     id: &str,
     features: &[String],
@@ -61,14 +66,13 @@ pub(crate) fn run_with(
             writeln!(err, "Error: {error}")?;
             match &error {
                 PluginAddError::UnknownPlugin(_) => {
-                    let ids: Vec<&str> = known_plugins().iter().map(|p| p.id).collect();
+                    let ids: Vec<&str> = catalog.specs().map(|p| &*p.id).collect();
                     writeln!(err, "Valid plugins: {}", ids.join(", "))?;
                 }
                 PluginAddError::UnknownFeature { plugin, .. } => {
-                    let valid: Vec<&str> = known_plugins()
-                        .iter()
-                        .find(|p| p.id == plugin)
-                        .map(|p| p.optional_features.iter().map(|f| f.id).collect())
+                    let valid: Vec<&str> = catalog
+                        .find(plugin)
+                        .map(|e| e.spec.optional_features.iter().map(|f| &*f.id).collect())
                         .unwrap_or_default();
                     if valid.is_empty() {
                         writeln!(err, "Plugin `{plugin}` has no optional features.")?;
@@ -112,6 +116,7 @@ mod tests {
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = run_with(
             |root, id, feats| add_plugin_with(&StubLocator::new(), root, id, feats),
+            &PluginCatalog::built_in(),
             dir,
             id,
             &features,
@@ -181,7 +186,7 @@ mod tests {
         let code = run_with(
             |_, _, _| {
                 Err(PluginAddError::PlatformFloorTooLow {
-                    plugin: "floor-plugin",
+                    plugin: "floor-plugin".into(),
                     platform: FloorPlatform::Ios,
                     required: "16.4".into(),
                     found: "15.0".into(),
@@ -190,6 +195,7 @@ mod tests {
                     hint: "Raise it in every build configuration, then re-run.",
                 })
             },
+            &PluginCatalog::built_in(),
             &dir,
             "floor-plugin",
             &[],

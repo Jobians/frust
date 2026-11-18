@@ -33,45 +33,55 @@
 //! see [`apply::desktop_contributions`], the detection API a bundle-assembly
 //! task consumes.
 //!
-//! v1 is a **static in-crate registry** ([`known_plugins`]): the
-//! `frust-plugin.toml` cargo-metadata discovery ARCHITECTURE.md sketches stays
-//! the deferred v2 path (needed only once plugins live outside this repo).
+//! Every plugin is looked up through a [`PluginCatalog`], which holds the
+//! static in-crate registry ([`PluginCatalog::built_in`], [`known_plugins`])
+//! and can carry plugins described at run time beside it, each entry tagged
+//! with its [`PluginOrigin`]. Discovering run-time plugins from a package's
+//! own manifest metadata is implemented in `plugin/manifest.rs`.
 //! Every mutation is format-preserving and never rewrites a file it can't
 //! parse; this module is **print-free** like every other drive core — the
 //! front-end (CLI/TUI) owns all output (see `docs/CODE_STANDARDS.md`).
 
 pub mod apply;
+pub mod catalog;
 pub mod registry;
 
-pub use apply::{DesktopContribution, add_plugin, add_plugin_with, desktop_contributions};
+pub use apply::{
+    DesktopContribution, add_plugin, add_plugin_from, add_plugin_from_with, add_plugin_with,
+    desktop_contributions, desktop_contributions_in,
+};
+pub use catalog::{CatalogEntry, DepSource, PluginCatalog, PluginOrigin};
 pub use registry::known_plugins;
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 
 /// One plugin's registry entry: its identity, the crate-directory segment its
 /// path dependency is derived from, and the contributions applying it makes.
 ///
-/// All fields are `&'static` so the whole registry is const data (the
-/// `default_validators()`/`default_discoverers()` Vec-factory convention).
-#[derive(Debug, Clone, Copy)]
+/// Every text and list field is a [`Cow`]: a registry entry borrows
+/// `'static` data, so the whole registry stays const data with no allocation
+/// (the `default_validators()`/`default_discoverers()` Vec-factory
+/// convention), while a spec described at run time owns its strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginSpec {
     /// Stable id a caller (CLI/TUI) selects by, e.g. `"secure-storage"`.
-    pub id: &'static str,
+    pub id: Cow<'static, str>,
     /// One-line human summary for a selection UI.
-    pub summary: &'static str,
+    pub summary: Cow<'static, str>,
     /// Path segment under `<frust repo>/plugins/` the crate lives in. In path
     /// mode the project's `frust = { path = ... }` dep is walked back to the
     /// repo root and down into this directory to write the plugin's own path
     /// dep; every [`Contribution::GradleModule`]/[`Contribution::SwiftPackageRef`]
     /// `rel_path` must sit under `plugins/<crate_dir>/`, since only the part
     /// below it is carried over to wherever cargo locates the package.
-    pub crate_dir: &'static str,
+    pub crate_dir: Cow<'static, str>,
     /// Contributions applied unconditionally when this plugin is added
     /// (always at least its own Cargo.toml dependency).
-    pub base: &'static [Contribution],
+    pub base: Cow<'static, [Contribution]>,
     /// Opt-in feature bundles a caller can request by id (e.g.
     /// secure-storage's `"biometric-gate"`), each adding further contributions.
-    pub optional_features: &'static [FeatureSpec],
+    pub optional_features: Cow<'static, [FeatureSpec]>,
     /// A sibling checkout this plugin needs present (facade-tier plugins whose
     /// own deps path into it), declared relative to the frust repo root —
     /// two levels above the facade package cargo locates for the project.
@@ -80,13 +90,13 @@ pub struct PluginSpec {
     /// `clean-signals-frust` needs none because `clean-signals` is a crates.io
     /// dependency (see `registry.rs`'s `CLEAN_SIGNALS_FRUST`) — but the
     /// mechanism stays in place for a future facade-tier plugin that does.
-    pub requires_sibling: Option<&'static str>,
+    pub requires_sibling: Option<Cow<'static, str>>,
     /// The lowest iOS version the plugin supports, e.g. `"16.4"` (dot-separated
     /// numbers). [`add_plugin`] refuses, before any write, an app whose lowest
     /// `IPHONEOS_DEPLOYMENT_TARGET` is below it
     /// ([`PluginAddError::PlatformFloorTooLow`]); the app's floor is checked,
     /// never raised. `None`: no requirement.
-    pub min_ios: Option<&'static str>,
+    pub min_ios: Option<Cow<'static, str>>,
     /// The lowest Android API level the plugin supports, checked against the
     /// app's `minSdkValue` like [`Self::min_ios`]. `None`: no requirement.
     pub min_android_sdk: Option<u32>,
@@ -97,11 +107,11 @@ impl PluginSpec {
     /// struct-updates from (`..PluginSpec::DEFAULT`), so a field added later
     /// defaults to "no requirement" without touching each entry.
     pub const DEFAULT: PluginSpec = PluginSpec {
-        id: "",
-        summary: "",
-        crate_dir: "",
-        base: &[],
-        optional_features: &[],
+        id: Cow::Borrowed(""),
+        summary: Cow::Borrowed(""),
+        crate_dir: Cow::Borrowed(""),
+        base: Cow::Borrowed(&[]),
+        optional_features: Cow::Borrowed(&[]),
         requires_sibling: None,
         min_ios: None,
         min_android_sdk: None,
@@ -114,7 +124,11 @@ impl PluginSpec {
     pub fn native_modules(&self) -> Vec<NativeModule> {
         self.base
             .iter()
-            .chain(self.optional_features.iter().flat_map(|f| f.contributions))
+            .chain(
+                self.optional_features
+                    .iter()
+                    .flat_map(|f| f.contributions.iter()),
+            )
             .filter_map(|contribution| apply::native_module(self, contribution)?.ok())
             .collect()
     }
@@ -123,43 +137,43 @@ impl PluginSpec {
 /// A plugin's Gradle library module or local Swift package, as the
 /// machine-local wiring knows it: which package ships it, where inside that
 /// package, and the name the generated host project refers to it by.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeModule {
     /// The cargo package shipping the module (the plugin's own crate).
-    pub package: &'static str,
+    pub package: Cow<'static, str>,
     /// The module's directory inside that package, e.g. `platform/android`.
-    pub dir_in_package: &'static str,
+    pub dir_in_package: Cow<'static, str>,
     /// What kind of module it is, with its host-project name.
     pub kind: NativeKind,
 }
 
 /// The two kinds of [`NativeModule`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeKind {
     /// A Gradle library module ([`Contribution::GradleModule`]), named by its
     /// Gradle path, e.g. `":frust-iap"`; its directory lives under
     /// [`crate::platform_wiring::plugin_module_key`] in
     /// `android/local.properties`.
-    GradleModule { gradle_name: &'static str },
+    GradleModule { gradle_name: Cow<'static, str> },
     /// A local Swift package ([`Contribution::SwiftPackageRef`]), named by its
     /// package/product name, e.g. `"FrustIap"`; referenced as
     /// `relativePath = "FrustIap"`, resolved through the
     /// [`crate::platform_wiring::swift_package_link`] symlink.
-    SwiftPackage { package_name: &'static str },
+    SwiftPackage { package_name: Cow<'static, str> },
 }
 
 /// An opt-in bundle of contributions under a [`PluginSpec`], selected by id.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureSpec {
     /// Feature id a caller passes in `add_plugin(.., features)`.
-    pub id: &'static str,
+    pub id: Cow<'static, str>,
     /// One-line human summary (a checkbox row lists exactly what it adds).
-    pub summary: &'static str,
+    pub summary: Cow<'static, str>,
     /// The extra contributions enabling this feature applies.
-    pub contributions: &'static [Contribution],
+    pub contributions: Cow<'static, [Contribution]>,
     /// The lowest iOS version this feature needs; when requested, it raises
     /// the add's requirement above its plugin's [`PluginSpec::min_ios`].
-    pub min_ios: Option<&'static str>,
+    pub min_ios: Option<Cow<'static, str>>,
     /// The lowest Android API level this feature needs, like [`Self::min_ios`].
     pub min_android_sdk: Option<u32>,
 }
@@ -168,9 +182,9 @@ impl FeatureSpec {
     /// Every field empty and every option `None` — the struct-update base of a
     /// registry feature (`..FeatureSpec::DEFAULT`), like [`PluginSpec::DEFAULT`].
     pub const DEFAULT: FeatureSpec = FeatureSpec {
-        id: "",
-        summary: "",
-        contributions: &[],
+        id: Cow::Borrowed(""),
+        summary: Cow::Borrowed(""),
+        contributions: Cow::Borrowed(&[]),
         min_ios: None,
         min_android_sdk: None,
     };
@@ -178,14 +192,14 @@ impl FeatureSpec {
 
 /// A single idempotent edit a plugin makes to a generated project. Each maps
 /// to one target file and one skip-if-present guard.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Contribution {
     /// A `[dependencies]` entry written in the form the project's own `frust`
     /// dependency takes: a path into the same checkout (path mode), or the
     /// same version requirement (registry mode — the plugin crates release in
     /// lockstep with the facade). `name` is the crate/dependency name, and
     /// the package the plugin's platform files are located in.
-    CargoDep { name: &'static str },
+    CargoDep { name: Cow<'static, str> },
     /// A `<uses-permission android:name="..."/>` line inserted into the app's
     /// own `AndroidManifest.xml` before `</manifest>`.
     ///
@@ -198,13 +212,13 @@ pub enum Contribution {
     /// the merger cannot supply. `haptics` uses it for `VIBRATE`, and the
     /// `permissions` plugin's features use it for the app-level policy case:
     /// each permission is declared only when the app opts in.
-    ManifestPermission { permission: &'static str },
+    ManifestPermission { permission: Cow<'static, str> },
     /// A `<key>/<string>` pair (with an explanatory XML comment) inserted into
     /// `Info.plist` before the root `</dict>`.
     PlistEntry {
-        key: &'static str,
-        value: &'static str,
-        comment: &'static str,
+        key: Cow<'static, str>,
+        value: Cow<'static, str>,
+        comment: Cow<'static, str>,
     },
     /// A `<key>` with an `<array>` of `<string>`s (with an explanatory XML
     /// comment) inserted into `Info.plist` before the root `</dict>`. An
@@ -212,9 +226,9 @@ pub enum Contribution {
     /// already present is left alone: the array is never merged into or
     /// reordered. Key, values and comment are escaped like [`Contribution::PlistEntry`]'s.
     PlistArrayEntry {
-        key: &'static str,
-        values: &'static [&'static str],
-        comment: &'static str,
+        key: Cow<'static, str>,
+        values: Cow<'static, [Cow<'static, str>]>,
+        comment: Cow<'static, str>,
     },
     /// A Gradle library module included into the generated project: appends
     /// the `include(...)` + `projectDir` (+ build-directory redirect) lines to
@@ -230,12 +244,12 @@ pub enum Contribution {
     /// [`AddOutcome::Applied`].
     GradleModule {
         /// The Gradle project path, e.g. `":frust-secure-storage"`.
-        gradle_name: &'static str,
+        gradle_name: Cow<'static, str>,
         /// The module directory, relative to the frust repo root, e.g.
         /// `"plugins/secure-storage/platform/android"`. Wired as the same
         /// subdirectory of the plugin's package wherever cargo locates it
         /// (`<package>/platform/android`).
-        rel_path: &'static str,
+        rel_path: Cow<'static, str>,
     },
     /// A plugin's local Swift package added to the generated app's
     /// `ios/Runner.xcodeproj/project.pbxproj` as a second package reference
@@ -258,14 +272,14 @@ pub enum Contribution {
         /// the `XCLocalSwiftPackageReference` comment and the
         /// `XCSwiftPackageProductDependency`'s `productName`, matching how the
         /// embedding's own wiring names `FrustEmbedding`.
-        package_name: &'static str,
+        package_name: Cow<'static, str>,
         /// The package directory, relative to the frust repo root, e.g.
         /// `"plugins/camera/platform/ios"` — resolved exactly like a
         /// [`Contribution::GradleModule`]'s `rel_path`. The reference itself
         /// is `relativePath = "<package_name>"`, which Xcode resolves against
         /// `<project>/ios/` — through the `ios/<package_name>` symlink
         /// [`add_plugin`] creates to the located directory.
-        rel_path: &'static str,
+        rel_path: Cow<'static, str>,
     },
     /// A system framework linked into the generated app's Runner target by
     /// name: `"-framework", <name>,` appended to every `OTHER_LDFLAGS` list
@@ -291,7 +305,7 @@ pub enum Contribution {
     IosFramework {
         /// The framework's name as `-framework` takes it, e.g.
         /// `"AuthenticationServices"` — no `.framework` suffix.
-        name: &'static str,
+        name: Cow<'static, str>,
     },
     /// An entitlement requested on the generated app's iOS Runner target:
     /// a `<key>` + value pair (with an explanatory XML comment) inserted into
@@ -317,12 +331,12 @@ pub enum Contribution {
     /// writes anything.
     IosEntitlement {
         /// The entitlement key, e.g. `"aps-environment"`.
-        key: &'static str,
+        key: Cow<'static, str>,
         /// The value written under the key.
         value: IosEntitlementValue,
         /// A short XML comment written above the key — it must not contain
         /// `--`, which XML comments forbid.
-        comment: &'static str,
+        comment: Cow<'static, str>,
     },
     /// A Maven repository, restricted to the groups a plugin's Gradle module
     /// needs, declared in `android/settings.gradle.kts`.
@@ -337,11 +351,11 @@ pub enum Contribution {
     /// is refused before `add_plugin` writes anything, with the line to add.
     MavenRepository {
         /// The repository URL; `http` or `https` only.
-        url: &'static str,
+        url: Cow<'static, str>,
         /// The Maven groups served from this repository; never empty.
-        groups: &'static [&'static str],
+        groups: Cow<'static, [Cow<'static, str>]>,
         /// A short comment written above the block.
-        comment: &'static str,
+        comment: Cow<'static, str>,
     },
     /// A macro invocation appended to the app crate's `src/lib.rs`.
     ///
@@ -366,13 +380,13 @@ pub enum Contribution {
         /// The invocation to append, e.g. `"frust_camera::ios_exports!();"`.
         /// Also the idempotence key — an exact substring match against the
         /// existing file means the edit is already present.
-        invocation: &'static str,
+        invocation: Cow<'static, str>,
         /// An optional `#[cfg(...)]` predicate written above the invocation,
         /// e.g. `"target_vendor = \"apple\""`. `None` emits it unguarded.
-        cfg: Option<&'static str>,
+        cfg: Option<Cow<'static, str>>,
         /// A short `//` comment written above, explaining why the app crate has
         /// to carry this.
-        comment: &'static str,
+        comment: Cow<'static, str>,
     },
     /// Enables a cargo feature on an already-contributed plugin dependency
     /// line in the app's `Cargo.toml`.
@@ -389,9 +403,9 @@ pub enum Contribution {
         /// The dependency name whose inline table gets a `features` entry —
         /// must match a `name` already contributed via
         /// [`Contribution::CargoDep`].
-        name: &'static str,
+        name: Cow<'static, str>,
         /// The cargo feature to enable, e.g. `"turso"`.
-        feature: &'static str,
+        feature: Cow<'static, str>,
     },
     /// Creates a file at `rel_path` (relative to the project root) with
     /// exact `contents`, if it doesn't already exist — parent directories
@@ -410,12 +424,12 @@ pub enum Contribution {
     ScaffoldFile {
         /// The path to create, relative to the project root, e.g.
         /// `"locales/en/main.ftl"`.
-        rel_path: &'static str,
+        rel_path: Cow<'static, str>,
         /// The exact contents written when the file is absent.
-        contents: &'static str,
+        contents: Cow<'static, str>,
         /// A short human-readable explanation for a selection/report UI —
         /// not written into the file itself.
-        comment: &'static str,
+        comment: Cow<'static, str>,
     },
     /// A `<key>/<string>` pair merged into the assembled macOS bundle's
     /// `Contents/Info.plist` at `frust build macos` time — **not** into the
@@ -435,9 +449,9 @@ pub enum Contribution {
     /// a manifest merger: remove the plugin dependency and the contribution
     /// simply stops being applied, with no file left carrying it.
     MacosPlistEntry {
-        key: &'static str,
-        value: &'static str,
-        comment: &'static str,
+        key: Cow<'static, str>,
+        value: Cow<'static, str>,
+        comment: Cow<'static, str>,
     },
     /// A boolean-true entitlement (`<key>k</key>` / `<true/>`) merged into
     /// the entitlements passed to `codesign` at `frust build macos` time.
@@ -448,8 +462,8 @@ pub enum Contribution {
     /// its doc comment): `macos/app.entitlements` is a user-owned,
     /// hand-editable project file, not an Add Plugin write target.
     MacosEntitlement {
-        key: &'static str,
-        comment: &'static str,
+        key: Cow<'static, str>,
+        comment: Cow<'static, str>,
     },
     /// A `[Desktop Entry]` `key=value` line merged into the assembled Linux
     /// bundle's `<identifier>.desktop` at `frust build linux` time, only
@@ -460,21 +474,21 @@ pub enum Contribution {
     /// `linux/app.desktop` is a user-owned, hand-editable project file a
     /// pre-Phase-B project may not even have at all.
     LinuxDesktopEntry {
-        key: &'static str,
-        value: &'static str,
-        comment: &'static str,
+        key: Cow<'static, str>,
+        value: Cow<'static, str>,
+        comment: Cow<'static, str>,
     },
 }
 
 /// The value of a [`Contribution::IosEntitlement`], as its plist element.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IosEntitlementValue {
     /// `<true/>` or `<false/>`.
     Bool(bool),
     /// One `<string>`, e.g. `aps-environment`'s `"development"`.
-    String(&'static str),
+    String(Cow<'static, str>),
     /// An `<array>` of `<string>`s, e.g. an app-group list.
-    StringArray(&'static [&'static str]),
+    StringArray(Cow<'static, [Cow<'static, str>]>),
 }
 
 impl Contribution {
@@ -608,7 +622,8 @@ impl AddReport {
 /// Handling — a library contract, `thiserror`-derived).
 #[derive(Debug, thiserror::Error)]
 pub enum PluginAddError {
-    /// No registry entry has this id (see [`known_plugins`]).
+    /// No catalog entry has this id (see [`known_plugins`] for the built-in
+    /// ones).
     #[error("unknown plugin `{0}` (see `known_plugins()`)")]
     UnknownPlugin(String),
     /// The plugin exists but has no such optional feature.
@@ -702,6 +717,11 @@ pub enum PluginAddError {
     /// than assuming that forever.
     #[error("scaffold file path `{0}` must be a relative path with no `..` component")]
     UnsafeScaffoldPath(String),
+    /// The catalog entry for this id did not come from the built-in registry
+    /// ([`PluginOrigin::Manifest`]), and this version applies only built-in
+    /// plugins. Raised before anything is written.
+    #[error("plugin `{0}` is described by a package manifest, which `add_plugin` cannot apply yet")]
+    UnsupportedOrigin(String),
     /// The app's platform floor is below what the plugin — or one of the
     /// requested features — needs ([`PluginSpec::min_ios`] /
     /// [`PluginSpec::min_android_sdk`]). Raised before anything is written;
@@ -710,9 +730,10 @@ pub enum PluginAddError {
         "plugin `{plugin}` needs {platform} {required} or later; {file} sets {key} = {found}. {hint}"
     )]
     PlatformFloorTooLow {
-        /// The plugin's registry id. The fixed texts are `&'static str`,
-        /// which keeps this variant within the error-size budget.
-        plugin: &'static str,
+        /// The plugin's id. A `Box<str>` (two words, not a `String`'s three)
+        /// and `&'static str` fixed texts keep this variant within the
+        /// error-size budget.
+        plugin: Box<str>,
         platform: FloorPlatform,
         /// The requirement, as the registry states it (`"16.4"`, `"31"`).
         required: String,
@@ -755,26 +776,26 @@ mod tests {
     fn desktop_lane_describe_strings_name_their_build_time() {
         assert_eq!(
             Contribution::MacosPlistEntry {
-                key: "NSSupportsSuddenTermination",
-                value: "NO",
-                comment: "test",
+                key: Cow::Borrowed("NSSupportsSuddenTermination"),
+                value: Cow::Borrowed("NO"),
+                comment: Cow::Borrowed("test"),
             }
             .describe(),
             "Info.plist key `NSSupportsSuddenTermination` (applied at `frust build macos`)"
         );
         assert_eq!(
             Contribution::MacosEntitlement {
-                key: "com.apple.security.network.client",
-                comment: "test",
+                key: Cow::Borrowed("com.apple.security.network.client"),
+                comment: Cow::Borrowed("test"),
             }
             .describe(),
             "entitlement `com.apple.security.network.client` (applied at `frust build macos`)"
         );
         assert_eq!(
             Contribution::LinuxDesktopEntry {
-                key: "Categories",
-                value: "Utility;",
-                comment: "test",
+                key: Cow::Borrowed("Categories"),
+                value: Cow::Borrowed("Utility;"),
+                comment: Cow::Borrowed("test"),
             }
             .describe(),
             "desktop entry `Categories` (applied at `frust build linux`)"
@@ -785,9 +806,9 @@ mod tests {
     fn ios_entitlement_describe_names_the_build_setting() {
         assert_eq!(
             Contribution::IosEntitlement {
-                key: "aps-environment",
-                value: IosEntitlementValue::String("development"),
-                comment: "test",
+                key: Cow::Borrowed("aps-environment"),
+                value: IosEntitlementValue::String(Cow::Borrowed("development")),
+                comment: Cow::Borrowed("test"),
             }
             .describe(),
             "iOS entitlement `aps-environment` (`CODE_SIGN_ENTITLEMENTS`)"
@@ -797,10 +818,11 @@ mod tests {
     #[test]
     fn no_registry_maven_repository_has_empty_groups() {
         for spec in crate::plugin::known_plugins() {
-            let all = spec
-                .base
-                .iter()
-                .chain(spec.optional_features.iter().flat_map(|f| f.contributions));
+            let all = spec.base.iter().chain(
+                spec.optional_features
+                    .iter()
+                    .flat_map(|f| f.contributions.iter()),
+            );
             for c in all {
                 if let Contribution::MavenRepository { url, groups, .. } = c {
                     assert!(
@@ -817,9 +839,9 @@ mod tests {
     fn maven_repository_describe_names_the_url() {
         assert_eq!(
             Contribution::MavenRepository {
-                url: "https://example.test/m",
-                groups: &["com.example"],
-                comment: "test",
+                url: Cow::Borrowed("https://example.test/m"),
+                groups: Cow::Borrowed(&[Cow::Borrowed("com.example")]),
+                comment: Cow::Borrowed("test"),
             }
             .describe(),
             "Gradle Maven repository `https://example.test/m`"

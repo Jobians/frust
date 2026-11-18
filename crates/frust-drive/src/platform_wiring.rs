@@ -40,7 +40,7 @@ use toml_edit::DocumentMut;
 use crate::android_build::local_properties::{self, Change, Missing};
 use crate::host_path;
 use crate::packages::{CargoLocator, PackageLocator, PackagesError};
-use crate::plugin::{NativeKind, NativeModule, apply::plugin_is_installed, known_plugins};
+use crate::plugin::{NativeKind, NativeModule, PluginCatalog, apply::plugin_is_installed};
 use crate::process::RealProcessRunner;
 
 /// The package shipping the Android embedding module.
@@ -95,7 +95,7 @@ pub enum SyncError {
         embedding_dir.display()
     )]
     EmbeddingMissing {
-        package: &'static str,
+        package: String,
         package_dir: PathBuf,
         embedding_dir: PathBuf,
     },
@@ -140,8 +140,8 @@ impl Wiring {
 /// One plugin native module's wiring in a [`Report`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleWiring {
-    /// The plugin's registry id (`"iap"`).
-    pub plugin_id: &'static str,
+    /// The plugin's id (`"iap"`).
+    pub plugin_id: String,
     /// The module wired.
     pub module: NativeModule,
     /// What happened to its key or link.
@@ -198,7 +198,7 @@ impl Report {
         lines.extend(android);
         lines.extend(describe("iOS embedding", IOS_EMBEDDING_LINK, &self.ios));
         for module in &self.plugins {
-            let (label, location) = match module.module.kind {
+            let (label, location) = match &module.module.kind {
                 NativeKind::GradleModule { gradle_name } => (
                     format!("Android module `{gradle_name}`"),
                     LOCAL_PROPERTIES.to_string(),
@@ -269,14 +269,26 @@ pub fn sync(project_dir: &Path) -> Result<Report, SyncError> {
     sync_with(&CargoLocator::new(&RealProcessRunner), project_dir)
 }
 
-/// [`sync`] through an injected locator.
+/// [`sync`] through an injected locator, for the built-in plugins.
+pub fn sync_with(locator: &dyn PackageLocator, project_dir: &Path) -> Result<Report, SyncError> {
+    sync_with_catalog(locator, project_dir, &PluginCatalog::built_in())
+}
+
+/// [`sync_with`] for the plugins of `catalog`: the modules of every installed
+/// plugin it holds are wired, in catalog order. Only built-in entries are
+/// wired; an entry described by a package manifest
+/// ([`crate::plugin::PluginOrigin::Manifest`]) wires nothing yet.
 ///
 /// Every package — the shell crate of each present platform and every
 /// installed plugin's package with a module for one — is located in one
 /// [`PackageLocator::locate_many`] call, and every native directory is
 /// verified before anything is written, so a failure leaves the project as
 /// it was.
-pub fn sync_with(locator: &dyn PackageLocator, project_dir: &Path) -> Result<Report, SyncError> {
+pub fn sync_with_catalog(
+    locator: &dyn PackageLocator,
+    project_dir: &Path,
+    catalog: &PluginCatalog,
+) -> Result<Report, SyncError> {
     let has_android = project_dir.join("android").is_dir();
     let has_ios = project_dir.join("ios").is_dir();
     let mut report = Report::skipped();
@@ -284,7 +296,7 @@ pub fn sync_with(locator: &dyn PackageLocator, project_dir: &Path) -> Result<Rep
         return Ok(report);
     }
 
-    let modules: Vec<(&'static str, NativeModule)> = installed_native_modules(project_dir)
+    let modules: Vec<(String, NativeModule)> = installed_native_modules(project_dir, catalog)
         .into_iter()
         .filter(|(_, module)| match module.kind {
             NativeKind::GradleModule { .. } => has_android,
@@ -292,7 +304,7 @@ pub fn sync_with(locator: &dyn PackageLocator, project_dir: &Path) -> Result<Rep
         })
         .collect();
 
-    let mut packages: Vec<&'static str> = Vec::new();
+    let mut packages: Vec<&str> = Vec::new();
     if has_android {
         packages.push(ANDROID_SHELL_PACKAGE);
     }
@@ -300,8 +312,8 @@ pub fn sync_with(locator: &dyn PackageLocator, project_dir: &Path) -> Result<Rep
         packages.push(IOS_SHELL_PACKAGE);
     }
     for (_, module) in &modules {
-        if !packages.contains(&module.package) {
-            packages.push(module.package);
+        if !packages.contains(&&*module.package) {
+            packages.push(&module.package);
         }
     }
     let package_dirs = locator.locate_many(project_dir, &packages)?;
@@ -334,9 +346,9 @@ pub fn sync_with(locator: &dyn PackageLocator, project_dir: &Path) -> Result<Rep
     let mut module_targets = Vec::with_capacity(modules.len());
     for (_, module) in &modules {
         module_targets.push(native_dir(
-            module.package,
-            package_dir(module.package),
-            module.dir_in_package,
+            &module.package,
+            package_dir(&module.package),
+            &module.dir_in_package,
         )?);
     }
 
@@ -345,7 +357,7 @@ pub fn sync_with(locator: &dyn PackageLocator, project_dir: &Path) -> Result<Rep
         let mut entries = vec![(EMBEDDING_DIR_KEY.to_string(), target.clone())];
         let mut slots = Vec::new();
         for (at, ((_, module), module_target)) in modules.iter().zip(&module_targets).enumerate() {
-            if let NativeKind::GradleModule { gradle_name } = module.kind {
+            if let NativeKind::GradleModule { gradle_name } = &module.kind {
                 entries.push((plugin_module_key(gradle_name), module_target.clone()));
                 slots.push(at);
             }
@@ -370,7 +382,7 @@ pub fn sync_with(locator: &dyn PackageLocator, project_dir: &Path) -> Result<Rep
     if let Some(target) = ios_target {
         report.ios = link_dir(&project_dir.join(IOS_EMBEDDING_LINK), &target)?;
         for (at, ((_, module), module_target)) in modules.iter().zip(&module_targets).enumerate() {
-            if let NativeKind::SwiftPackage { package_name } = module.kind {
+            if let NativeKind::SwiftPackage { package_name } = &module.kind {
                 let link = project_dir.join(swift_package_link(package_name));
                 module_wirings[at] = Some(link_dir(&link, module_target)?);
             }
@@ -389,28 +401,34 @@ pub fn sync_with(locator: &dyn PackageLocator, project_dir: &Path) -> Result<Rep
     Ok(report)
 }
 
-/// Every native module of every registry plugin `project_dir`'s `Cargo.toml`
+/// Every native module of every `catalog` plugin `project_dir`'s `Cargo.toml`
 /// depends on (a `[dependencies]` entry by name or `package = …`, either
 /// dependency form, never an `optional` one — cargo leaves a disabled
 /// optional dependency out of the resolve, so it could not be located),
 /// paired with its plugin's id. Base and optional-feature modules alike: an
 /// unused key or link is harmless, a missing one fails the build. An
 /// unreadable or unparseable manifest names no plugin — the locate that
-/// follows reports the manifest problem itself.
-fn installed_native_modules(project_dir: &Path) -> Vec<(&'static str, NativeModule)> {
+/// follows reports the manifest problem itself. Catalog order; a
+/// manifest-described entry contributes none yet (see [`sync_with_catalog`]).
+fn installed_native_modules(
+    project_dir: &Path,
+    catalog: &PluginCatalog,
+) -> Vec<(String, NativeModule)> {
     let Ok(text) = fs::read_to_string(project_dir.join("Cargo.toml")) else {
         return Vec::new();
     };
     let Ok(doc) = text.parse::<DocumentMut>() else {
         return Vec::new();
     };
-    known_plugins()
-        .into_iter()
+    catalog
+        .iter()
+        .filter(|entry| entry.is_built_in())
+        .map(|entry| &entry.spec)
         .filter(|spec| plugin_is_installed(spec, &doc))
         .flat_map(|spec| {
             spec.native_modules()
                 .into_iter()
-                .map(move |module| (spec.id, module))
+                .map(move |module| (spec.id.to_string(), module))
         })
         .collect()
 }
@@ -418,7 +436,7 @@ fn installed_native_modules(project_dir: &Path) -> Vec<(&'static str, NativeModu
 /// Whether `module`'s machine-local slot — its `local.properties` key or its
 /// `ios/` link — exists at all in `project_dir`, whatever it points at.
 pub(crate) fn module_slot_present(project_dir: &Path, module: &NativeModule) -> bool {
-    match module.kind {
+    match &module.kind {
         NativeKind::GradleModule { gradle_name } => local_properties::read_value(
             &project_dir.join(LOCAL_PROPERTIES),
             &plugin_module_key(gradle_name),
@@ -446,7 +464,7 @@ pub(crate) fn wire_modules(
     let mut entries = Vec::new();
     let mut slots = Vec::new();
     for (at, (module, dir)) in modules.iter().enumerate() {
-        match module.kind {
+        match &module.kind {
             NativeKind::GradleModule { gradle_name } => {
                 entries.push((plugin_module_key(gradle_name), dir.clone()));
                 slots.push(at);
@@ -476,11 +494,11 @@ pub(crate) fn wire_modules(
 /// `rel` under `package_dir`, verified to exist and made absolute and
 /// canonical, so the value written does not depend on the directory a build
 /// tool resolves it from.
-fn native_dir(package: &'static str, package_dir: &Path, rel: &str) -> Result<PathBuf, SyncError> {
+fn native_dir(package: &str, package_dir: &Path, rel: &str) -> Result<PathBuf, SyncError> {
     let dir = package_dir.join(rel);
     if !dir.is_dir() {
         return Err(SyncError::EmbeddingMissing {
-            package,
+            package: package.to_string(),
             package_dir: package_dir.to_path_buf(),
             embedding_dir: dir,
         });
@@ -623,6 +641,7 @@ fn is_unsupported(err: &io::Error) -> bool {
 mod tests {
     use super::*;
     use crate::packages::StubLocator;
+    use crate::plugin::known_plugins;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -764,7 +783,7 @@ mod tests {
             let wired: Vec<(&str, &Wiring)> = report
                 .plugins
                 .iter()
-                .map(|m| (m.plugin_id, &m.wiring))
+                .map(|m| (m.plugin_id.as_str(), &m.wiring))
                 .collect();
             assert_eq!(
                 wired,
@@ -1036,7 +1055,7 @@ mod tests {
             .with("frust-iap", &bare);
         let err = sync_with(&stub, &project).unwrap_err();
         assert!(
-            matches!(err, SyncError::EmbeddingMissing { package, .. } if package == "frust-iap"),
+            matches!(&err, SyncError::EmbeddingMissing { package, .. } if package == "frust-iap"),
             "{err:?}"
         );
         assert_eq!(
@@ -1100,7 +1119,10 @@ mod tests {
         let modules: Vec<(NativeModule, PathBuf)> = iap_spec
             .native_modules()
             .into_iter()
-            .map(|m| (m, iap.join(m.dir_in_package)))
+            .map(|m| {
+                let dir = iap.join(&*m.dir_in_package);
+                (m, dir)
+            })
             .collect();
         assert_eq!(modules.len(), 2);
         assert!(

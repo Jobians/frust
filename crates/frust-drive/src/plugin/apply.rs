@@ -2,13 +2,14 @@
 //! project. Every edit is idempotent and format-preserving; a file that fails
 //! to parse (or lacks its insertion anchor) is never rewritten.
 
+use std::borrow::Cow;
 use std::fs;
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Value};
 
-use super::registry::{find_plugin, known_plugins};
+use super::catalog::PluginCatalog;
 use super::{
     AddItem, AddOutcome, AddReport, Contribution, FloorPlatform, IosEntitlementValue, NativeKind,
     NativeModule, PluginAddError, PluginSpec,
@@ -80,9 +81,23 @@ pub fn add_plugin(
     id: &str,
     features: &[&str],
 ) -> Result<AddReport, PluginAddError> {
+    add_plugin_from(project_root, &PluginCatalog::built_in(), id, features)
+}
+
+/// [`add_plugin`] for plugin `id` of `catalog` rather than of the built-in
+/// registry alone: the same edits, the same idempotency, the same locator.
+/// An id `catalog` lacks is [`PluginAddError::UnknownPlugin`]; an entry that
+/// is not built in ([`super::PluginOrigin::Manifest`]) is
+/// [`PluginAddError::UnsupportedOrigin`], refused before anything is read.
+pub fn add_plugin_from(
+    project_root: &Path,
+    catalog: &PluginCatalog,
+    id: &str,
+    features: &[&str],
+) -> Result<AddReport, PluginAddError> {
     let locator =
         CargoLocator::new(&RealProcessRunner).with_lockfile_policy(LockfilePolicy::AllowUpdate);
-    add_plugin_with(&locator, project_root, id, features)
+    add_plugin_from_with(&locator, project_root, catalog, id, features)
 }
 
 /// [`add_plugin`] with the package locator injected — the seam a test stubs,
@@ -126,8 +141,31 @@ pub fn add_plugin_with(
     id: &str,
     features: &[&str],
 ) -> Result<AddReport, PluginAddError> {
-    let spec = find_plugin(id).ok_or_else(|| PluginAddError::UnknownPlugin(id.to_string()))?;
-    add_spec_with(locator, project_root, &spec, features)
+    add_plugin_from_with(
+        locator,
+        project_root,
+        &PluginCatalog::built_in(),
+        id,
+        features,
+    )
+}
+
+/// [`add_plugin_from`] with the package locator injected, as
+/// [`add_plugin_with`] is to [`add_plugin`].
+pub fn add_plugin_from_with(
+    locator: &dyn PackageLocator,
+    project_root: &Path,
+    catalog: &PluginCatalog,
+    id: &str,
+    features: &[&str],
+) -> Result<AddReport, PluginAddError> {
+    let entry = catalog
+        .find(id)
+        .ok_or_else(|| PluginAddError::UnknownPlugin(id.to_string()))?;
+    if !entry.is_built_in() {
+        return Err(PluginAddError::UnsupportedOrigin(id.to_string()));
+    }
+    add_spec_with(locator, project_root, &entry.spec, features)
 }
 
 /// [`add_plugin_with`] for an already-resolved registry entry — the seam a
@@ -139,7 +177,7 @@ fn add_spec_with(
     spec: &PluginSpec,
     features: &[&str],
 ) -> Result<AddReport, PluginAddError> {
-    let id = spec.id;
+    let id = &*spec.id;
 
     // Validate every requested feature up front, before mutating anything.
     for feat in features {
@@ -169,7 +207,7 @@ fn add_spec_with(
     let feature_contribs = spec
         .optional_features
         .iter()
-        .filter(|f| features.contains(&f.id))
+        .filter(|f| features.contains(&&*f.id))
         .flat_map(|f| f.contributions.iter());
     let contributions: Vec<&Contribution> = spec.base.iter().chain(feature_contribs).collect();
 
@@ -198,7 +236,7 @@ fn add_spec_with(
                 comment,
             } = contribution
             {
-                plan_ios_entitlement(project_root, key, *value, comment)?;
+                plan_ios_entitlement(project_root, key, value, comment)?;
             }
         }
     }
@@ -220,7 +258,7 @@ fn add_spec_with(
 
     // Facade plugins need a sibling checkout present; check before any edit
     // so a missing sibling leaves the tree untouched.
-    if let Some(sibling) = spec.requires_sibling {
+    if let Some(sibling) = spec.requires_sibling.as_deref() {
         let expected = resolution.sibling(sibling)?;
         if !expected.exists() {
             return Err(PluginAddError::SiblingCheckoutMissing {
@@ -263,7 +301,7 @@ fn add_spec_with(
         })
         .collect();
     let package_dir = match unwired.first() {
-        Some((_, module)) => Some(resolution.package_dir(module.package)?),
+        Some((_, module)) => Some(resolution.package_dir(&module.package)?),
         None => None,
     };
 
@@ -286,7 +324,7 @@ fn add_spec_with(
         let mut slots = Vec::new();
         let mut targets = Vec::new();
         for (at, module) in unwired {
-            let dir = package_dir.join(module.dir_in_package);
+            let dir = package_dir.join(&*module.dir_in_package);
             if dir.is_dir() {
                 let dir = host_path::canonicalize_simplified(&dir).unwrap_or(dir);
                 slots.push(at);
@@ -342,8 +380,8 @@ const ANDROID_DIR_REL: &str = "android";
 /// The highest floor over a plugin and its requested features: the iOS
 /// version as the registry writes it, and the Android API level.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct FloorRequirement {
-    ios: Option<&'static str>,
+struct FloorRequirement<'s> {
+    ios: Option<&'s str>,
     android_sdk: Option<u32>,
 }
 
@@ -351,19 +389,19 @@ struct FloorRequirement {
 /// over the spec's floors and those of every requested feature. A registry
 /// `min_ios` that is not a dot-separated version is
 /// [`PluginAddError::InvalidContribution`].
-fn floor_requirement(
-    spec: &PluginSpec,
+fn floor_requirement<'s>(
+    spec: &'s PluginSpec,
     features: &[&str],
-) -> Result<FloorRequirement, PluginAddError> {
+) -> Result<FloorRequirement<'s>, PluginAddError> {
     let requested = spec
         .optional_features
         .iter()
-        .filter(|f| features.contains(&f.id))
-        .map(|f| (f.min_ios, f.min_android_sdk));
+        .filter(|f| features.contains(&&*f.id))
+        .map(|f| (f.min_ios.as_deref(), f.min_android_sdk));
     let mut requirement = FloorRequirement::default();
     let mut highest_ios: Option<Vec<u32>> = None;
-    for (ios, android_sdk) in std::iter::once((spec.min_ios, spec.min_android_sdk)).chain(requested)
-    {
+    let own = (spec.min_ios.as_deref(), spec.min_android_sdk);
+    for (ios, android_sdk) in std::iter::once(own).chain(requested) {
         if let Some(ios) = ios {
             let version = parse_ios_version(ios).ok_or_else(|| {
                 PluginAddError::InvalidContribution(format!(
@@ -404,7 +442,7 @@ fn check_platform_floors(
         let required_version = parse_ios_version(required).unwrap_or_default();
         if compare_versions(&found_version, &required_version).is_lt() {
             return Err(PluginAddError::PlatformFloorTooLow {
-                plugin: spec.id,
+                plugin: spec.id.as_ref().into(),
                 platform: FloorPlatform::Ios,
                 required: required.to_string(),
                 found,
@@ -425,7 +463,7 @@ fn check_platform_floors(
         let (key, found) = android_min_sdk(&src)?;
         if found < required {
             return Err(PluginAddError::PlatformFloorTooLow {
-                plugin: spec.id,
+                plugin: spec.id.as_ref().into(),
                 platform: FloorPlatform::Android,
                 required: required.to_string(),
                 found: found.to_string(),
@@ -566,7 +604,7 @@ fn is_cargo_contribution(contribution: &Contribution) -> bool {
 
 /// The repo-root-relative platform path a Gradle module or Swift package
 /// contribution names, `None` for every other contribution.
-fn native_rel_path(contribution: &Contribution) -> Option<&'static str> {
+fn native_rel_path(contribution: &Contribution) -> Option<&str> {
     match contribution {
         Contribution::GradleModule { rel_path, .. }
         | Contribution::SwiftPackageRef { rel_path, .. } => Some(rel_path),
@@ -581,21 +619,37 @@ pub(crate) fn native_module(
     spec: &PluginSpec,
     contribution: &Contribution,
 ) -> Option<Result<NativeModule, PluginAddError>> {
-    let (rel_path, kind) = match *contribution {
+    let (rel_path, kind) = match contribution {
         Contribution::GradleModule {
             gradle_name,
             rel_path,
-        } => (rel_path, NativeKind::GradleModule { gradle_name }),
+        } => (
+            rel_path,
+            NativeKind::GradleModule {
+                gradle_name: gradle_name.clone(),
+            },
+        ),
         Contribution::SwiftPackageRef {
             package_name,
             rel_path,
-        } => (rel_path, NativeKind::SwiftPackage { package_name }),
+        } => (
+            rel_path,
+            NativeKind::SwiftPackage {
+                package_name: package_name.clone(),
+            },
+        ),
         _ => return None,
     };
     Some(
-        package_location(spec, rel_path).map(|(package, dir_in_package)| NativeModule {
-            package,
-            dir_in_package,
+        package_location(spec, rel_path).map(|(package, inside)| NativeModule {
+            package: package.clone(),
+            // `inside` is a suffix of `rel_path`: re-sliced from the
+            // `'static` original it stays borrowed, so a built-in module
+            // allocates nothing.
+            dir_in_package: match rel_path {
+                Cow::Borrowed(path) => Cow::Borrowed(&path[path.len() - inside.len()..]),
+                Cow::Owned(_) => Cow::Owned(inside.to_owned()),
+            },
             kind,
         }),
     )
@@ -613,7 +667,7 @@ fn apply_contribution(
             doc,
             cargo_changed,
             name,
-            resolution.spec.crate_dir,
+            &resolution.spec.crate_dir,
             resolution.frust,
         ),
         Contribution::ManifestPermission { permission } => {
@@ -645,12 +699,12 @@ fn apply_contribution(
             key,
             value,
             comment,
-        } => apply_ios_entitlement(project_root, key, *value, comment),
+        } => apply_ios_entitlement(project_root, key, value, comment),
         Contribution::AppCrateMacro {
             invocation,
             cfg,
             comment,
-        } => apply_app_crate_macro(project_root, invocation, *cfg, comment),
+        } => apply_app_crate_macro(project_root, invocation, cfg.as_deref(), comment),
         Contribution::CargoFeature { name, feature } => {
             apply_cargo_feature(doc, cargo_changed, name, feature)
         }
@@ -680,13 +734,14 @@ fn apply_contribution(
 /// A desktop-lane contribution ([`Contribution::MacosPlistEntry`] /
 /// [`Contribution::MacosEntitlement`] / [`Contribution::LinuxDesktopEntry`])
 /// owed by a plugin the project depends on — one [`desktop_contributions`]
-/// result row.
-#[derive(Debug, Clone, Copy)]
+/// result row. Both fields are copies of the catalog's data; for a built-in
+/// plugin they borrow the static registry and allocate nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopContribution {
     /// The owning plugin's [`PluginSpec::id`].
-    pub plugin_id: &'static str,
+    pub plugin_id: Cow<'static, str>,
     /// The contribution itself — always one of the three desktop variants.
-    pub contribution: &'static Contribution,
+    pub contribution: Contribution,
 }
 
 /// Desktop-lane contributions owed by every plugin the project at
@@ -715,10 +770,20 @@ pub struct DesktopContribution {
 /// target-scoped table (`[target.'cfg(...)'.dependencies]`) is invisible to
 /// this function, matching the same base-only conservatism.
 ///
-/// Order is deterministic: registry order ([`known_plugins`]), then each
-/// plugin's own declaration order within `base`.
+/// Order is deterministic: registry order ([`super::known_plugins`]), then
+/// each plugin's own declaration order within `base`.
 pub fn desktop_contributions(
     project_root: &Path,
+) -> Result<Vec<DesktopContribution>, PluginAddError> {
+    desktop_contributions_in(project_root, &PluginCatalog::built_in())
+}
+
+/// [`desktop_contributions`] over the plugins of `catalog`, in catalog order.
+/// Only built-in entries are scanned: an entry described by a package
+/// manifest ([`super::PluginOrigin::Manifest`]) contributes no row yet.
+pub fn desktop_contributions_in(
+    project_root: &Path,
+    catalog: &PluginCatalog,
 ) -> Result<Vec<DesktopContribution>, PluginAddError> {
     let cargo_path = project_root.join(CARGO_TOML_REL);
     let cargo_src = fs::read_to_string(&cargo_path)
@@ -726,7 +791,11 @@ pub fn desktop_contributions(
     let doc = cargo_src
         .parse::<DocumentMut>()
         .map_err(|e| PluginAddError::UnparseableCargoToml(e.to_string()))?;
-    Ok(desktop_contributions_for(&known_plugins(), &doc))
+    let specs = catalog
+        .iter()
+        .filter(|entry| entry.is_built_in())
+        .map(|entry| &entry.spec);
+    Ok(desktop_contributions_for(specs, &doc))
 }
 
 /// [`desktop_contributions`]'s pure inner logic, parameterized over the
@@ -734,17 +803,21 @@ pub fn desktop_contributions(
 /// synthetic [`PluginSpec`]s, so the detection logic is testable independently
 /// of which desktop-lane rows (`MacosPlistEntry`, `MacosEntitlement`) the
 /// real registry carries at any given time.
-fn desktop_contributions_for(specs: &[PluginSpec], doc: &DocumentMut) -> Vec<DesktopContribution> {
+fn desktop_contributions_for<'s>(
+    specs: impl IntoIterator<Item = &'s PluginSpec>,
+    doc: &DocumentMut,
+) -> Vec<DesktopContribution> {
     specs
-        .iter()
+        .into_iter()
         .filter(|spec| plugin_is_installed(spec, doc))
         .flat_map(|spec| {
-            spec.base.iter().filter_map(move |contribution| {
-                is_desktop_contribution(contribution).then_some(DesktopContribution {
-                    plugin_id: spec.id,
-                    contribution,
+            spec.base
+                .iter()
+                .filter(|contribution| is_desktop_contribution(contribution))
+                .map(move |contribution| DesktopContribution {
+                    plugin_id: spec.id.clone(),
+                    contribution: contribution.clone(),
                 })
-            })
         })
         .collect()
 }
@@ -770,7 +843,7 @@ fn is_desktop_contribution(contribution: &Contribution) -> bool {
 /// wires by.
 pub(crate) fn plugin_is_installed(spec: &PluginSpec, doc: &DocumentMut) -> bool {
     let Some(name) = spec.base.iter().find_map(|c| match c {
-        Contribution::CargoDep { name } => Some(*name),
+        Contribution::CargoDep { name } => Some(&**name),
         _ => None,
     }) else {
         return false;
@@ -924,11 +997,11 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 
 /// The package a plugin's platform files ship in: the crate its base
 /// [`Contribution::CargoDep`] adds.
-fn plugin_package(spec: &PluginSpec) -> Option<&'static str> {
+fn plugin_package(spec: &PluginSpec) -> Option<&Cow<'static, str>> {
     spec.base
         .iter()
         .find_map(|contribution| match contribution {
-            Contribution::CargoDep { name } => Some(*name),
+            Contribution::CargoDep { name } => Some(name),
             _ => None,
         })
 }
@@ -938,10 +1011,10 @@ fn plugin_package(spec: &PluginSpec) -> Option<&'static str> {
 /// package ([`plugin_package`]) and the path inside it, e.g.
 /// `platform/android` — the part that stays the same wherever cargo finds
 /// the package.
-fn package_location<'r>(
-    spec: &PluginSpec,
+fn package_location<'s, 'r>(
+    spec: &'s PluginSpec,
     rel_path: &'r str,
-) -> Result<(&'static str, &'r str), PluginAddError> {
+) -> Result<(&'s Cow<'static, str>, &'r str), PluginAddError> {
     let outside = || PluginAddError::NativePathOutsidePackage {
         plugin: spec.id.to_string(),
         rel_path: rel_path.to_string(),
@@ -950,7 +1023,7 @@ fn package_location<'r>(
     let package = plugin_package(spec).ok_or_else(outside)?;
     let inside = rel_path
         .strip_prefix("plugins/")
-        .and_then(|rest| rest.strip_prefix(spec.crate_dir))
+        .and_then(|rest| rest.strip_prefix(&*spec.crate_dir))
         .and_then(|rest| rest.strip_prefix('/'))
         .filter(|rest| !rest.is_empty())
         .ok_or_else(outside)?;
@@ -993,7 +1066,7 @@ impl<'a> Resolution<'a> {
             Ok(dir) => Ok(dir),
             Err(source) => match self.frust {
                 FrustDep::Path { path, .. } => {
-                    let dep = plugin_dep_path(path, self.spec.crate_dir);
+                    let dep = plugin_dep_path(path, &self.spec.crate_dir);
                     let dep = host_path::simplify(Path::new(&dep));
                     Ok(normalize_lexically(&self.project_root.join(dep)))
                 }
@@ -1150,7 +1223,7 @@ fn apply_plist_entry(
 fn apply_plist_array_entry(
     project_root: &Path,
     key: &str,
-    values: &[&str],
+    values: &[impl AsRef<str>],
     comment: &str,
 ) -> Result<AddOutcome, PluginAddError> {
     apply_plist_block(project_root, key, |key| {
@@ -1190,13 +1263,16 @@ fn plist_entry_block(escaped_key: &str, value: &str, comment: &str) -> String {
 /// The tab-indented comment / key / `<array>` lines of one
 /// [`Contribution::PlistArrayEntry`]; no values gives `<array>` and
 /// `</array>` on adjacent lines.
-fn plist_array_entry_block(escaped_key: &str, values: &[&str], comment: &str) -> String {
+fn plist_array_entry_block(escaped_key: &str, values: &[impl AsRef<str>], comment: &str) -> String {
     let mut out = format!(
         "\t<!-- {} -->\n\t<key>{escaped_key}</key>\n\t<array>\n",
         xml_comment_safe(comment)
     );
     for value in values {
-        out.push_str(&format!("\t\t<string>{}</string>\n", xml_escape(value)));
+        out.push_str(&format!(
+            "\t\t<string>{}</string>\n",
+            xml_escape(value.as_ref())
+        ));
     }
     out.push_str("\t</array>\n");
     out
@@ -1353,7 +1429,7 @@ fn apply_gradle_module(
 /// Refuse a [`Contribution::MavenRepository`] that can never be applied: no
 /// groups (a repository is never added unfiltered) or a url that is not
 /// `http(s)`.
-fn validate_maven_repository(url: &str, groups: &[&str]) -> Result<(), PluginAddError> {
+fn validate_maven_repository(url: &str, groups: &[impl AsRef<str>]) -> Result<(), PluginAddError> {
     if groups.is_empty() {
         return Err(PluginAddError::InvalidContribution(format!(
             "Maven repository `{url}` names no groups; a repository is never added unfiltered"
@@ -1390,7 +1466,7 @@ fn kotlin_string_escape(text: &str) -> String {
 }
 
 /// The `exclusiveContent` block one [`Contribution::MavenRepository`] adds.
-fn maven_repository_block(url: &str, groups: &[&str], comment: &str) -> String {
+fn maven_repository_block(url: &str, groups: &[impl AsRef<str>], comment: &str) -> String {
     let comment = comment.replace(['\r', '\n'], " ");
     let mut block = format!(
         "        // {comment}\n\
@@ -1402,7 +1478,7 @@ fn maven_repository_block(url: &str, groups: &[&str], comment: &str) -> String {
     for group in groups {
         block.push_str(&format!(
             "                includeGroup(\"{}\")\n",
-            kotlin_string_escape(group)
+            kotlin_string_escape(group.as_ref())
         ));
     }
     block.push_str("            }\n        }\n");
@@ -1414,7 +1490,7 @@ fn maven_repository_block(url: &str, groups: &[&str], comment: &str) -> String {
 fn apply_maven_repository(
     project_root: &Path,
     url: &str,
-    groups: &[&str],
+    groups: &[impl AsRef<str>],
     comment: &str,
 ) -> Result<AddOutcome, PluginAddError> {
     validate_maven_repository(url, groups)?;
@@ -1789,7 +1865,7 @@ struct EntitlementPlan {
 fn apply_ios_entitlement(
     project_root: &Path,
     key: &str,
-    value: IosEntitlementValue,
+    value: &IosEntitlementValue,
     comment: &str,
 ) -> Result<AddOutcome, PluginAddError> {
     let plan = plan_ios_entitlement(project_root, key, value, comment)?;
@@ -1822,7 +1898,7 @@ fn apply_ios_entitlement(
 fn plan_ios_entitlement(
     project_root: &Path,
     key: &str,
-    value: IosEntitlementValue,
+    value: &IosEntitlementValue,
     comment: &str,
 ) -> Result<EntitlementPlan, PluginAddError> {
     let src = read_required(&project_root.join(PBXPROJ_REL), PBXPROJ_REL)?;
@@ -1914,15 +1990,15 @@ fn plan_ios_entitlement(
 
 /// The tab-indented `<!-- comment -->` / `<key>` / value lines one
 /// entitlement adds to the root `<dict>`, key and string values XML-escaped.
-fn entitlement_block(key: &str, value: IosEntitlementValue, comment: &str) -> String {
+fn entitlement_block(key: &str, value: &IosEntitlementValue, comment: &str) -> String {
     let value = match value {
         IosEntitlementValue::Bool(true) => "\t<true/>\n".to_string(),
         IosEntitlementValue::Bool(false) => "\t<false/>\n".to_string(),
         IosEntitlementValue::String(text) => format!("\t<string>{}</string>\n", xml_escape(text)),
-        IosEntitlementValue::StringArray([]) => "\t<array/>\n".to_string(),
+        IosEntitlementValue::StringArray(items) if items.is_empty() => "\t<array/>\n".to_string(),
         IosEntitlementValue::StringArray(items) => {
             let mut out = "\t<array>\n".to_string();
-            for item in items {
+            for item in items.iter() {
                 out.push_str(&format!("\t\t<string>{}</string>\n", xml_escape(item)));
             }
             out.push_str("\t</array>\n");
@@ -2673,6 +2749,7 @@ mod tests {
     use super::*;
     use crate::android_build::local_properties;
     use crate::packages::{PackagesError, StubLocator};
+    use crate::plugin::registry::{find_plugin, known_plugins};
     use crate::scaffold::{self, TemplateContext};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2732,7 +2809,9 @@ mod tests {
             .fold(
                 StubLocator::new().with(package, facade),
                 |stub, spec| match plugin_package(spec) {
-                    Some(name) => stub.with(name, checkout.join("plugins").join(spec.crate_dir)),
+                    Some(name) => {
+                        stub.with(&**name, checkout.join("plugins").join(&*spec.crate_dir))
+                    }
                     None => stub,
                 },
             )
@@ -3488,10 +3567,11 @@ mod tests {
     #[test]
     fn every_registry_platform_path_is_inside_its_plugin_package() {
         for spec in known_plugins() {
-            let contributions = spec
-                .base
-                .iter()
-                .chain(spec.optional_features.iter().flat_map(|f| f.contributions));
+            let contributions = spec.base.iter().chain(
+                spec.optional_features
+                    .iter()
+                    .flat_map(|f| f.contributions.iter()),
+            );
             for contribution in contributions {
                 if let Some(rel_path) = native_rel_path(contribution) {
                     let (package, inside) = package_location(&spec, rel_path)
@@ -3508,19 +3588,19 @@ mod tests {
     #[test]
     fn a_platform_path_outside_the_plugin_package_is_refused_untouched() {
         const STRAY: PluginSpec = PluginSpec {
-            id: "stray",
-            summary: "synthetic, test-only",
-            crate_dir: "stray",
-            base: &[
+            id: Cow::Borrowed("stray"),
+            summary: Cow::Borrowed("synthetic, test-only"),
+            crate_dir: Cow::Borrowed("stray"),
+            base: Cow::Borrowed(&[
                 Contribution::CargoDep {
-                    name: "frust-stray",
+                    name: Cow::Borrowed("frust-stray"),
                 },
                 Contribution::GradleModule {
-                    gradle_name: ":frust-stray",
-                    rel_path: "plugins/other/platform/android",
+                    gradle_name: Cow::Borrowed(":frust-stray"),
+                    rel_path: Cow::Borrowed("plugins/other/platform/android"),
                 },
-            ],
-            optional_features: &[],
+            ]),
+            optional_features: Cow::Borrowed(&[]),
             requires_sibling: None,
             ..PluginSpec::DEFAULT
         };
@@ -3898,7 +3978,7 @@ mod tests {
 
         apply_contribution(
             &Contribution::CargoDep {
-                name: "frust-secure-storage",
+                name: Cow::Borrowed("frust-secure-storage"),
             },
             &resolution,
             &mut doc,
@@ -3908,8 +3988,8 @@ mod tests {
 
         let outcome = apply_contribution(
             &Contribution::CargoFeature {
-                name: "frust-secure-storage",
-                feature: "biometric",
+                name: Cow::Borrowed("frust-secure-storage"),
+                feature: Cow::Borrowed("biometric"),
             },
             &resolution,
             &mut doc,
@@ -4063,9 +4143,9 @@ mod tests {
         let locator = StubLocator::new();
         let resolution = Resolution::new(&locator, &root, &spec, &frust);
         let contribution = Contribution::ScaffoldFile {
-            rel_path: SCAFFOLD_REL,
-            contents: SCAFFOLD_CONTENTS,
-            comment: "test-only scaffold file",
+            rel_path: SCAFFOLD_REL.into(),
+            contents: SCAFFOLD_CONTENTS.into(),
+            comment: Cow::Borrowed("test-only scaffold file"),
         };
 
         let first = apply_contribution(&contribution, &resolution, &mut doc, &mut changed).unwrap();
@@ -4122,18 +4202,18 @@ mod tests {
 
         for contribution in [
             Contribution::MacosPlistEntry {
-                key: "NSSupportsSuddenTermination",
-                value: "NO",
-                comment: "test",
+                key: Cow::Borrowed("NSSupportsSuddenTermination"),
+                value: Cow::Borrowed("NO"),
+                comment: Cow::Borrowed("test"),
             },
             Contribution::MacosEntitlement {
-                key: "com.apple.security.network.client",
-                comment: "test",
+                key: Cow::Borrowed("com.apple.security.network.client"),
+                comment: Cow::Borrowed("test"),
             },
             Contribution::LinuxDesktopEntry {
-                key: "Categories",
-                value: "Utility;",
-                comment: "test",
+                key: Cow::Borrowed("Categories"),
+                value: Cow::Borrowed("Utility;"),
+                comment: Cow::Borrowed("test"),
             },
         ] {
             let outcome =
@@ -4162,87 +4242,87 @@ mod tests {
     // -----------------------------------------------------------------------
 
     const DESKTOP_PLUGIN: PluginSpec = PluginSpec {
-        id: "desktop-test-plugin",
-        summary: "synthetic, test-only",
-        crate_dir: "desktop-test-plugin",
-        base: &[
+        id: Cow::Borrowed("desktop-test-plugin"),
+        summary: Cow::Borrowed("synthetic, test-only"),
+        crate_dir: Cow::Borrowed("desktop-test-plugin"),
+        base: Cow::Borrowed(&[
             Contribution::CargoDep {
-                name: "frust-desktop-test-plugin",
+                name: Cow::Borrowed("frust-desktop-test-plugin"),
             },
             Contribution::MacosPlistEntry {
-                key: "NSSupportsSuddenTermination",
-                value: "NO",
-                comment: "test",
+                key: Cow::Borrowed("NSSupportsSuddenTermination"),
+                value: Cow::Borrowed("NO"),
+                comment: Cow::Borrowed("test"),
             },
             Contribution::MacosEntitlement {
-                key: "com.apple.security.network.client",
-                comment: "test",
+                key: Cow::Borrowed("com.apple.security.network.client"),
+                comment: Cow::Borrowed("test"),
             },
             Contribution::LinuxDesktopEntry {
-                key: "Categories",
-                value: "Utility;",
-                comment: "test",
+                key: Cow::Borrowed("Categories"),
+                value: Cow::Borrowed("Utility;"),
+                comment: Cow::Borrowed("test"),
             },
-        ],
-        optional_features: &[],
+        ]),
+        optional_features: Cow::Borrowed(&[]),
         requires_sibling: None,
         ..PluginSpec::DEFAULT
     };
 
     const MOBILE_ONLY_PLUGIN: PluginSpec = PluginSpec {
-        id: "mobile-only-test-plugin",
-        summary: "synthetic, test-only",
-        crate_dir: "mobile-only-test-plugin",
-        base: &[
+        id: Cow::Borrowed("mobile-only-test-plugin"),
+        summary: Cow::Borrowed("synthetic, test-only"),
+        crate_dir: Cow::Borrowed("mobile-only-test-plugin"),
+        base: Cow::Borrowed(&[
             Contribution::CargoDep {
-                name: "frust-mobile-only-test-plugin",
+                name: Cow::Borrowed("frust-mobile-only-test-plugin"),
             },
             Contribution::PlistEntry {
-                key: "NSCameraUsageDescription",
-                value: "test",
-                comment: "test",
+                key: Cow::Borrowed("NSCameraUsageDescription"),
+                value: Cow::Borrowed("test"),
+                comment: Cow::Borrowed("test"),
             },
             Contribution::ManifestPermission {
-                permission: "android.permission.CAMERA",
+                permission: Cow::Borrowed("android.permission.CAMERA"),
             },
-        ],
-        optional_features: &[],
+        ]),
+        optional_features: Cow::Borrowed(&[]),
         requires_sibling: None,
         ..PluginSpec::DEFAULT
     };
 
     const MIXED_PLUGIN: PluginSpec = PluginSpec {
-        id: "mixed-test-plugin",
-        summary: "synthetic, test-only",
-        crate_dir: "mixed-test-plugin",
-        base: &[
+        id: Cow::Borrowed("mixed-test-plugin"),
+        summary: Cow::Borrowed("synthetic, test-only"),
+        crate_dir: Cow::Borrowed("mixed-test-plugin"),
+        base: Cow::Borrowed(&[
             Contribution::CargoDep {
-                name: "frust-mixed-test-plugin",
+                name: Cow::Borrowed("frust-mixed-test-plugin"),
             },
             Contribution::PlistEntry {
-                key: "NSCameraUsageDescription",
-                value: "test",
-                comment: "test",
+                key: Cow::Borrowed("NSCameraUsageDescription"),
+                value: Cow::Borrowed("test"),
+                comment: Cow::Borrowed("test"),
             },
             Contribution::ManifestPermission {
-                permission: "android.permission.CAMERA",
+                permission: Cow::Borrowed("android.permission.CAMERA"),
             },
             Contribution::MacosPlistEntry {
-                key: "NSSupportsSuddenTermination",
-                value: "NO",
-                comment: "test",
+                key: Cow::Borrowed("NSSupportsSuddenTermination"),
+                value: Cow::Borrowed("NO"),
+                comment: Cow::Borrowed("test"),
             },
             Contribution::MacosEntitlement {
-                key: "com.apple.security.network.client",
-                comment: "test",
+                key: Cow::Borrowed("com.apple.security.network.client"),
+                comment: Cow::Borrowed("test"),
             },
             Contribution::LinuxDesktopEntry {
-                key: "Categories",
-                value: "Utility;",
-                comment: "test",
+                key: Cow::Borrowed("Categories"),
+                value: Cow::Borrowed("Utility;"),
+                comment: Cow::Borrowed("test"),
             },
-        ],
-        optional_features: &[],
+        ]),
+        optional_features: Cow::Borrowed(&[]),
         requires_sibling: None,
         ..PluginSpec::DEFAULT
     };
@@ -4280,27 +4360,24 @@ mod tests {
         let result = desktop_contributions_for(&[DESKTOP_PLUGIN], &doc);
         assert_eq!(result.len(), 3, "{result:?}");
         assert!(result.iter().all(|c| c.plugin_id == "desktop-test-plugin"));
-        assert!(matches!(
-            result[0].contribution,
-            Contribution::MacosPlistEntry {
-                key: "NSSupportsSuddenTermination",
+        assert!(
+            matches!(&result[0].contribution, Contribution::MacosPlistEntry {
+                key,
                 ..
-            }
-        ));
-        assert!(matches!(
-            result[1].contribution,
-            Contribution::MacosEntitlement {
-                key: "com.apple.security.network.client",
+            } if key == "NSSupportsSuddenTermination")
+        );
+        assert!(
+            matches!(&result[1].contribution, Contribution::MacosEntitlement {
+                key,
                 ..
-            }
-        ));
-        assert!(matches!(
-            result[2].contribution,
-            Contribution::LinuxDesktopEntry {
-                key: "Categories",
+            } if key == "com.apple.security.network.client")
+        );
+        assert!(
+            matches!(&result[2].contribution, Contribution::LinuxDesktopEntry {
+                key,
                 ..
-            }
-        ));
+            } if key == "Categories")
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -4905,25 +4982,25 @@ mod tests {
     const TEST_ENTITLEMENT: &str = "com.apple.developer.test";
 
     const ENTITLEMENT_PLUGIN: PluginSpec = PluginSpec {
-        id: "entitlement-test-plugin",
-        summary: "synthetic, test-only",
-        crate_dir: "entitlement-test-plugin",
-        base: &[
+        id: Cow::Borrowed("entitlement-test-plugin"),
+        summary: Cow::Borrowed("synthetic, test-only"),
+        crate_dir: Cow::Borrowed("entitlement-test-plugin"),
+        base: Cow::Borrowed(&[
             Contribution::CargoDep {
-                name: "frust-entitlement-test-plugin",
+                name: Cow::Borrowed("frust-entitlement-test-plugin"),
             },
             Contribution::PlistEntry {
-                key: "NSUserTrackingUsageDescription",
-                value: "test",
-                comment: "test",
+                key: Cow::Borrowed("NSUserTrackingUsageDescription"),
+                value: Cow::Borrowed("test"),
+                comment: Cow::Borrowed("test"),
             },
             Contribution::IosEntitlement {
-                key: TEST_ENTITLEMENT,
+                key: Cow::Borrowed(TEST_ENTITLEMENT),
                 value: IosEntitlementValue::Bool(true),
-                comment: "Test entitlement",
+                comment: Cow::Borrowed("Test entitlement"),
             },
-        ],
-        optional_features: &[],
+        ]),
+        optional_features: Cow::Borrowed(&[]),
         requires_sibling: None,
         ..PluginSpec::DEFAULT
     };
@@ -4936,7 +5013,7 @@ mod tests {
         apply_ios_entitlement(
             root,
             TEST_ENTITLEMENT,
-            IosEntitlementValue::Bool(true),
+            &IosEntitlementValue::Bool(true),
             "Test entitlement",
         )
     }
@@ -5060,19 +5137,22 @@ mod tests {
         let applied = [
             (
                 "aps-environment",
-                IosEntitlementValue::String("dev&<x>"),
+                IosEntitlementValue::String(Cow::Borrowed("dev&<x>")),
                 "Push",
             ),
             (
                 "com.apple.security.application-groups",
-                IosEntitlementValue::StringArray(&["group.a&b", "group.<c>"]),
+                IosEntitlementValue::StringArray(Cow::Borrowed(&[
+                    Cow::Borrowed("group.a&b"),
+                    Cow::Borrowed("group.<c>"),
+                ])),
                 "Groups",
             ),
             ("odd&<key>", IosEntitlementValue::Bool(false), "Odd key"),
         ];
         for (key, value, comment) in applied {
             assert_eq!(
-                apply_ios_entitlement(&root, key, value, comment).unwrap(),
+                apply_ios_entitlement(&root, key, &value, comment).unwrap(),
                 AddOutcome::Applied,
                 "{key}"
             );
@@ -5105,7 +5185,7 @@ mod tests {
             apply_ios_entitlement(
                 &root,
                 "odd&<key>",
-                IosEntitlementValue::Bool(false),
+                &IosEntitlementValue::Bool(false),
                 "Odd key"
             )
             .unwrap(),
@@ -5120,7 +5200,11 @@ mod tests {
     #[test]
     fn an_empty_string_array_entitlement_is_an_empty_array() {
         assert_eq!(
-            entitlement_block("k", IosEntitlementValue::StringArray(&[]), "c"),
+            entitlement_block(
+                "k",
+                &IosEntitlementValue::StringArray(Cow::Borrowed(&[])),
+                "c"
+            ),
             "\t<!-- c -->\n\t<key>k</key>\n\t<array/>\n"
         );
     }
@@ -5147,7 +5231,7 @@ mod tests {
 
         let block = entitlement_block(
             TEST_ENTITLEMENT,
-            IosEntitlementValue::Bool(true),
+            &IosEntitlementValue::Bool(true),
             "Test entitlement",
         );
         let entitlements = read_entitlements(&root, ENTITLEMENTS_REL);
@@ -5471,25 +5555,28 @@ mod tests {
 
     fn maven_spec(contribs: &'static [Contribution]) -> PluginSpec {
         PluginSpec {
-            id: "maven-test-plugin",
-            summary: "synthetic, test-only",
-            crate_dir: "maven-test-plugin",
-            base: contribs,
-            optional_features: &[],
+            id: Cow::Borrowed("maven-test-plugin"),
+            summary: Cow::Borrowed("synthetic, test-only"),
+            crate_dir: Cow::Borrowed("maven-test-plugin"),
+            base: Cow::Borrowed(contribs),
+            optional_features: Cow::Borrowed(&[]),
             requires_sibling: None,
             ..PluginSpec::DEFAULT
         }
     }
 
     const REPO_A: Contribution = Contribution::MavenRepository {
-        url: "https://repo.example.test/a",
-        groups: &["com.example.a", "com.example.b"],
-        comment: "Repo A",
+        url: Cow::Borrowed("https://repo.example.test/a"),
+        groups: Cow::Borrowed(&[
+            Cow::Borrowed("com.example.a"),
+            Cow::Borrowed("com.example.b"),
+        ]),
+        comment: Cow::Borrowed("Repo A"),
     };
     const REPO_B: Contribution = Contribution::MavenRepository {
-        url: "https://repo.example.test/b",
-        groups: &["org.example"],
-        comment: "Repo B",
+        url: Cow::Borrowed("https://repo.example.test/b"),
+        groups: Cow::Borrowed(&[Cow::Borrowed("org.example")]),
+        comment: Cow::Borrowed("Repo B"),
     };
 
     #[test]
@@ -5534,7 +5621,7 @@ mod tests {
     fn two_maven_repositories_make_two_blocks() {
         static SPEC_BASE: [Contribution; 3] = [
             Contribution::CargoDep {
-                name: "frust-maven-test-plugin",
+                name: Cow::Borrowed("frust-maven-test-plugin"),
             },
             REPO_A,
             REPO_B,
@@ -5563,7 +5650,7 @@ mod tests {
     fn maven_repository_without_the_marker_fails_before_any_write() {
         static SPEC_BASE: [Contribution; 2] = [
             Contribution::CargoDep {
-                name: "frust-maven-test-plugin",
+                name: Cow::Borrowed("frust-maven-test-plugin"),
             },
             REPO_A,
         ];
@@ -5592,7 +5679,7 @@ mod tests {
         let root = scaffold_project("maven-repo-invalid");
         let before = fs::read(root.join(SETTINGS_GRADLE_REL)).unwrap();
         assert!(matches!(
-            apply_maven_repository(&root, "https://x.test/m", &[], "c"),
+            apply_maven_repository(&root, "https://x.test/m", &[] as &[&str], "c"),
             Err(PluginAddError::InvalidContribution(_))
         ));
         assert!(matches!(
@@ -5653,7 +5740,7 @@ mod tests {
     fn plist_array_entry_with_no_values_is_an_empty_array() {
         let root = scaffold_project("plist-array-empty");
         assert_eq!(
-            apply_plist_array_entry(&root, "TestIds", &[], "Ids").unwrap(),
+            apply_plist_array_entry(&root, "TestIds", &[] as &[&str], "Ids").unwrap(),
             AddOutcome::Applied
         );
         assert!(read_plist(&root).contains("\t<key>TestIds</key>\n\t<array>\n\t</array>\n</dict>"));
@@ -5712,10 +5799,11 @@ mod tests {
     fn every_registry_plist_entry_is_written_byte_identically_to_the_old_format() {
         let mut checked = 0;
         for spec in crate::plugin::known_plugins() {
-            let all = spec
-                .base
-                .iter()
-                .chain(spec.optional_features.iter().flat_map(|f| f.contributions));
+            let all = spec.base.iter().chain(
+                spec.optional_features
+                    .iter()
+                    .flat_map(|f| f.contributions.iter()),
+            );
             for c in all {
                 if let Contribution::PlistEntry {
                     key,
@@ -5763,28 +5851,28 @@ mod tests {
     /// Gradle files, so a refused add can be shown to have touched none.
     const FLOOR_BASE: &[Contribution] = &[
         Contribution::CargoDep {
-            name: "frust-floor-test-plugin",
+            name: Cow::Borrowed("frust-floor-test-plugin"),
         },
         Contribution::PlistEntry {
-            key: "NSFloorTestUsageDescription",
-            value: "test",
-            comment: "test",
+            key: Cow::Borrowed("NSFloorTestUsageDescription"),
+            value: Cow::Borrowed("test"),
+            comment: Cow::Borrowed("test"),
         },
         Contribution::IosFramework {
-            name: "FloorTestKit",
+            name: Cow::Borrowed("FloorTestKit"),
         },
         Contribution::GradleModule {
-            gradle_name: ":frust-floor-test-plugin",
-            rel_path: "plugins/floor-test-plugin/platform/android",
+            gradle_name: Cow::Borrowed(":frust-floor-test-plugin"),
+            rel_path: Cow::Borrowed("plugins/floor-test-plugin/platform/android"),
         },
     ];
 
     /// A feature needing iOS 17 / API 33, above any floor its spec states.
     const FLOOR_FEATURES: &[FeatureSpec] = &[FeatureSpec {
-        id: "needs-17",
-        summary: "synthetic, test-only",
-        contributions: &[],
-        min_ios: Some("17.0"),
+        id: Cow::Borrowed("needs-17"),
+        summary: Cow::Borrowed("synthetic, test-only"),
+        contributions: Cow::Borrowed(&[]),
+        min_ios: Some(Cow::Borrowed("17.0")),
         min_android_sdk: Some(33),
     }];
 
@@ -5798,12 +5886,12 @@ mod tests {
         min_android_sdk: Option<u32>,
     ) -> PluginSpec {
         PluginSpec {
-            id: "floor-test-plugin",
-            summary: "synthetic, test-only",
-            crate_dir: "floor-test-plugin",
-            base,
-            optional_features: FLOOR_FEATURES,
-            min_ios,
+            id: Cow::Borrowed("floor-test-plugin"),
+            summary: Cow::Borrowed("synthetic, test-only"),
+            crate_dir: Cow::Borrowed("floor-test-plugin"),
+            base: Cow::Borrowed(base),
+            optional_features: Cow::Borrowed(FLOOR_FEATURES),
+            min_ios: min_ios.map(Cow::Borrowed),
             min_android_sdk,
             ..PluginSpec::DEFAULT
         }
@@ -5871,7 +5959,7 @@ mod tests {
                 file,
                 ..
             } => {
-                assert_eq!(*plugin, "floor-test-plugin");
+                assert_eq!(&**plugin, "floor-test-plugin");
                 assert_eq!(*platform, FloorPlatform::Ios);
                 assert_eq!(required, "16.4");
                 assert_eq!(found, "15.0");
@@ -6117,7 +6205,7 @@ mod tests {
     #[test]
     fn a_missing_platform_directory_skips_its_check() {
         const CARGO_ONLY: &[Contribution] = &[Contribution::CargoDep {
-            name: "frust-floor-test-plugin",
+            name: Cow::Borrowed("frust-floor-test-plugin"),
         }];
         let root = scaffold_project("floor-no-platforms");
         fs::remove_dir_all(root.join(IOS_DIR_REL)).unwrap();
