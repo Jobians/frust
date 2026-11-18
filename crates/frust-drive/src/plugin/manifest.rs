@@ -71,11 +71,15 @@ pub struct Discovery {
 
 /// Every package in the resolved dependency graph of the app at `project_dir`
 /// that describes itself as a plugin, from one `cargo metadata` run through
-/// `locator`. The app's own root package is never a plugin. Of two packages
-/// declaring the same id the first by package name is kept and the other is
-/// reported in [`Discovery::problems`]. In a discovered spec, `crate_dir` is
-/// the package name and a native module's `rel_path` is relative to the
-/// package directory.
+/// `locator`. The app's own root package is never a plugin, and when cargo
+/// resolved the graph only a package the root reaches is one. Where two
+/// versions of one package, or two packages declaring one id, both qualify,
+/// the one the root depends on directly as a normal dependency is kept; with
+/// no single direct candidate none is kept and the conflict goes to
+/// [`Discovery::problems`] — versions are never ranked. Without a resolve
+/// graph, of two packages declaring one id the first by package name is kept.
+/// In a discovered spec, `crate_dir` is the package name and a native
+/// module's `rel_path` is relative to the package directory.
 pub fn discover(
     project_dir: &Path,
     locator: &CargoLocator<'_>,
@@ -85,47 +89,149 @@ pub fn discover(
 
 /// [`discover`] over an already-read package graph.
 pub(crate) fn discover_in(graph: &PackageGraph) -> Discovery {
-    let mut candidates: Vec<(&GraphPackage, &Value)> = graph
-        .packages
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| Some(*index) != graph.root)
-        .filter_map(|(_, package)| {
-            let table = package.metadata.get("frust")?.get("plugin")?;
-            Some((package, table))
-        })
-        .collect();
-    candidates.sort_by(|(a, _), (b, _)| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
+    let resolved = graph.closure.is_some();
+    // Every qualifying plugin package, grouped by package name: the root is
+    // never one, nor is a package the root does not reach.
+    let mut versions: BTreeMap<&str, Vec<(usize, &Value)>> = BTreeMap::new();
+    for (index, package) in graph.packages.iter().enumerate() {
+        if Some(index) == graph.root || !graph.in_closure(index) {
+            continue;
+        }
+        if let Some(table) = package.metadata.get("frust").and_then(|f| f.get("plugin")) {
+            versions
+                .entry(&package.name)
+                .or_default()
+                .push((index, table));
+        }
+    }
 
     let mut discovery = Discovery::default();
-    for (package, table) in candidates {
-        match plugin_entry(package, table) {
-            Ok(entry) => {
-                let earlier = discovery
-                    .plugins
-                    .iter()
-                    .find(|e| e.spec.id == entry.spec.id);
-                if let Some(earlier) = earlier {
-                    let earlier = match &earlier.origin {
-                        PluginOrigin::Manifest { package, .. } => package.as_str(),
-                        PluginOrigin::BuiltIn => "a built-in plugin",
-                    };
-                    discovery.problems.push(ManifestError {
-                        package: package.name.clone(),
-                        key: format!("{ROOT_KEY}.id"),
-                        reason: format!(
-                            "is `{}`, which package `{earlier}` already declares",
-                            entry.spec.id
-                        ),
-                    });
-                } else {
-                    discovery.plugins.push(entry);
-                }
+    // At most one version per package name, in package-name order.
+    let mut parsed: Vec<(usize, CatalogEntry)> = Vec::new();
+    for (name, candidates) in versions {
+        let direct: Vec<(usize, &Value)> = candidates
+            .iter()
+            .copied()
+            .filter(|(index, _)| graph.is_direct(*index))
+            .collect();
+        let chosen = match (candidates.as_slice(), direct.as_slice()) {
+            ([only], _) | (_, [only]) => *only,
+            _ => {
+                discovery.problems.push(version_conflict(
+                    graph,
+                    name,
+                    &candidates,
+                    resolved,
+                    direct.len(),
+                ));
+                continue;
             }
+        };
+        match plugin_entry(&graph.packages[chosen.0], chosen.1) {
+            Ok(entry) => parsed.push((chosen.0, entry)),
             Err(err) => discovery.problems.push(err),
         }
     }
+
+    // Of the packages declaring one id: the single direct one with a resolve
+    // graph, the first by package name without one; otherwise none.
+    let mut by_id: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (position, (_, entry)) in parsed.iter().enumerate() {
+        by_id.entry(&entry.spec.id).or_default().push(position);
+    }
+    let mut keep = vec![false; parsed.len()];
+    for (id, rivals) in by_id {
+        let direct: Vec<usize> = rivals
+            .iter()
+            .copied()
+            .filter(|position| graph.is_direct(parsed[*position].0))
+            .collect();
+        let winner = match (rivals.as_slice(), direct.as_slice()) {
+            ([only], _) => Some(*only),
+            ([first, ..], _) if !resolved => Some(*first),
+            (_, [only]) => Some(*only),
+            _ => None,
+        };
+        for &position in &rivals {
+            if Some(position) == winner {
+                keep[position] = true;
+                continue;
+            }
+            let package = &graph.packages[parsed[position].0].name;
+            let reason = match winner {
+                Some(winner) => format!(
+                    "is `{id}`, which package `{}` already declares",
+                    graph.packages[parsed[winner].0].name
+                ),
+                None => {
+                    let others: Vec<String> = rivals
+                        .iter()
+                        .filter(|other| **other != position)
+                        .map(|other| format!("`{}`", graph.packages[parsed[*other].0].name))
+                        .collect();
+                    let (noun, verb) = match others.len() {
+                        1 => ("package", "declares"),
+                        _ => ("packages", "declare"),
+                    };
+                    let how_many = if direct.is_empty() {
+                        "none"
+                    } else {
+                        "more than one"
+                    };
+                    format!(
+                        "is `{id}`, which {noun} {} also {verb}, and the app depends directly \
+                         on {how_many} of them; none is used",
+                        others.join(", ")
+                    )
+                }
+            };
+            discovery.problems.push(ManifestError {
+                package: package.clone(),
+                key: format!("{ROOT_KEY}.id"),
+                reason,
+            });
+        }
+    }
+    discovery.plugins = parsed
+        .into_iter()
+        .zip(keep)
+        .filter_map(|((_, entry), keep)| keep.then_some(entry))
+        .collect();
+    discovery.problems.sort_by(|a, b| a.package.cmp(&b.package));
     discovery
+}
+
+/// The problem for package `name` when more than one of its versions
+/// qualifies and not exactly one of them (`direct` counts those that are) is
+/// a direct dependency of the root. The versions are named in the order
+/// cargo listed them; none is preferred.
+fn version_conflict(
+    graph: &PackageGraph,
+    name: &str,
+    candidates: &[(usize, &Value)],
+    resolved: bool,
+    direct: usize,
+) -> ManifestError {
+    let listed: Vec<String> = candidates
+        .iter()
+        .map(|(index, _)| format!("`{name}@{}`", graph.packages[*index].version))
+        .collect();
+    let why = match (resolved, direct) {
+        (false, _) => "the dependency graph has no resolve information to tell which one the app \
+                       builds against"
+            .to_string(),
+        (true, 0) => "the app depends directly on none of them".to_string(),
+        (true, _) => "the app depends directly on more than one of them".to_string(),
+    };
+    ManifestError {
+        package: name.to_string(),
+        key: ROOT_KEY.to_string(),
+        reason: format!(
+            "is declared by {} versions of the package ({}) and {why}; none is used",
+            listed.len(),
+            listed.join(", ")
+        ),
+    }
 }
 
 /// One package's catalog entry, from its `package.metadata.frust.plugin`
@@ -1245,6 +1351,386 @@ mod tests {
             found.problems[1].reason.contains("frust-acme-ble"),
             "{}",
             found.problems[1]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The root package of [`discover_resolved`]'s app.
+    const APP_ID: &str = "acme-app@0.1.0";
+
+    /// Discovery over canned `cargo metadata` for an app `acme-app` whose
+    /// graph holds `packages` (`(name, version, metadata)`, each in
+    /// `<root>/<name>-<version>`), through the fake runner. With `resolve`
+    /// the document carries a resolve graph whose edges are `edges`:
+    /// `(from, to, kind)` with ids `name@version`, `kind` one of `normal`,
+    /// `dev`, `build`. Returns the discovery and the root directory.
+    fn discover_resolved(
+        tag: &str,
+        packages: &[(&str, &str, Value)],
+        resolve: bool,
+        edges: &[(&str, &str, &str)],
+    ) -> (Discovery, PathBuf) {
+        let root = temp_dir(tag);
+        let app = root.join("app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("Cargo.toml"), "[package]\nname = \"acme-app\"\n").unwrap();
+        let mut listed = vec![serde_json::json!({
+            "name": "acme-app", "version": "0.1.0", "id": APP_ID, "source": null,
+            "manifest_path": app.join("Cargo.toml"), "metadata": null, "dependencies": [],
+        })];
+        let mut ids = vec![APP_ID.to_string()];
+        for (name, version, metadata) in packages {
+            let dir = root.join(format!("{name}-{version}"));
+            fs::create_dir_all(&dir).unwrap();
+            let id = format!("{name}@{version}");
+            listed.push(serde_json::json!({
+                "name": name, "version": version, "id": id, "source": null,
+                "manifest_path": dir.join("Cargo.toml"), "features": {},
+                "metadata": metadata, "dependencies": [],
+            }));
+            ids.push(id);
+        }
+        let nodes: Vec<Value> = ids
+            .iter()
+            .map(|id| {
+                let out: Vec<&(&str, &str, &str)> =
+                    edges.iter().filter(|(from, ..)| from == id).collect();
+                let kind = |kind: &str| match kind {
+                    "normal" => Value::Null,
+                    other => Value::String(other.to_string()),
+                };
+                serde_json::json!({
+                    "id": id,
+                    "dependencies": out.iter().map(|(_, to, _)| *to).collect::<Vec<_>>(),
+                    "deps": out.iter().map(|(_, to, k)| serde_json::json!({
+                        "name": to.split('@').next().unwrap().replace('-', "_"),
+                        "pkg": to,
+                        "dep_kinds": [{ "kind": kind(k), "target": null }],
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let resolve = if resolve {
+            serde_json::json!({ "root": APP_ID, "nodes": nodes })
+        } else {
+            Value::Null
+        };
+        let metadata = serde_json::json!({
+            "packages": listed,
+            "workspace_members": [APP_ID],
+            "resolve": resolve,
+            "version": 1,
+        })
+        .to_string();
+        let runner = FakeProcessRunner::new().with(
+            format!(
+                "cargo metadata --format-version 1 --manifest-path {}",
+                app.join("Cargo.toml").display()
+            ),
+            Output {
+                success: true,
+                stdout: metadata,
+                stderr: String::new(),
+            },
+        );
+        (discover(&app, &CargoLocator::new(&runner)).unwrap(), root)
+    }
+
+    /// `(package, version)` of every discovered plugin.
+    fn kept(found: &Discovery) -> Vec<(String, String)> {
+        found
+            .plugins
+            .iter()
+            .map(|entry| match &entry.origin {
+                PluginOrigin::Manifest {
+                    package, version, ..
+                } => (package.clone(), version.clone()),
+                PluginOrigin::BuiltIn => panic!("discovery found a built-in plugin"),
+            })
+            .collect()
+    }
+
+    fn kept_one(package: &str, version: &str) -> Vec<(String, String)> {
+        vec![(package.to_string(), version.to_string())]
+    }
+
+    #[test]
+    fn of_two_versions_the_roots_direct_dependency_is_kept() {
+        let (found, root) = discover_resolved(
+            "direct-version",
+            &[
+                ("frust-acme-ble", "0.2.0", plugin_metadata("acme-ble", "")),
+                ("frust-acme-ble", "0.3.0", plugin_metadata("acme-ble", "")),
+                ("acme-radio", "1.0.0", Value::Null),
+            ],
+            true,
+            &[
+                (APP_ID, "frust-acme-ble@0.3.0", "normal"),
+                (APP_ID, "acme-radio@1.0.0", "normal"),
+                ("acme-radio@1.0.0", "frust-acme-ble@0.2.0", "normal"),
+            ],
+        );
+        assert_eq!(kept(&found), kept_one("frust-acme-ble", "0.3.0"));
+        assert!(matches!(
+            &found.plugins[0].origin,
+            PluginOrigin::Manifest { package_dir, .. }
+                if *package_dir == root.join("frust-acme-ble-0.3.0")
+        ));
+        assert!(found.problems.is_empty(), "{:?}", found.problems);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `0.9.0` sorts after `0.10.0` as a string and before it as a version:
+    /// whichever is direct wins either way, so neither order is consulted.
+    #[test]
+    fn versions_are_never_ranked() {
+        for (direct, transitive) in [("0.9.0", "0.10.0"), ("0.10.0", "0.9.0")] {
+            let (found, root) = discover_resolved(
+                "no-ranking",
+                &[
+                    ("frust-acme-ble", "0.9.0", plugin_metadata("acme-ble", "")),
+                    ("frust-acme-ble", "0.10.0", plugin_metadata("acme-ble", "")),
+                    ("acme-radio", "1.0.0", Value::Null),
+                ],
+                true,
+                &[
+                    (APP_ID, &format!("frust-acme-ble@{direct}"), "normal"),
+                    (APP_ID, "acme-radio@1.0.0", "normal"),
+                    (
+                        "acme-radio@1.0.0",
+                        &format!("frust-acme-ble@{transitive}"),
+                        "normal",
+                    ),
+                ],
+            );
+            assert_eq!(kept(&found), kept_one("frust-acme-ble", direct), "{direct}");
+            assert!(found.problems.is_empty(), "{:?}", found.problems);
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Two renamed dependency lines on two versions: neither is the app's
+    /// one plugin, so one problem names both and neither is kept. Two
+    /// versions both reached only transitively are refused the same way.
+    #[test]
+    fn two_qualifying_versions_without_one_direct_are_ambiguous() {
+        for (tag, edges, why) in [
+            (
+                "both-direct",
+                vec![
+                    (APP_ID, "frust-acme-ble@0.2.0", "normal"),
+                    (APP_ID, "frust-acme-ble@0.3.0", "normal"),
+                ],
+                "more than one",
+            ),
+            (
+                "none-direct",
+                vec![
+                    (APP_ID, "acme-radio@1.0.0", "normal"),
+                    ("acme-radio@1.0.0", "frust-acme-ble@0.2.0", "normal"),
+                    ("acme-radio@1.0.0", "frust-acme-ble@0.3.0", "normal"),
+                ],
+                "none of them",
+            ),
+        ] {
+            let (found, root) = discover_resolved(
+                tag,
+                &[
+                    ("frust-acme-ble", "0.2.0", plugin_metadata("acme-ble", "")),
+                    ("frust-acme-ble", "0.3.0", plugin_metadata("acme-ble", "")),
+                    ("acme-radio", "1.0.0", Value::Null),
+                ],
+                true,
+                &edges,
+            );
+            assert!(found.plugins.is_empty(), "{tag}: {:?}", kept(&found));
+            assert_eq!(found.problems.len(), 1, "{tag}: {:?}", found.problems);
+            let problem = &found.problems[0];
+            assert_eq!(
+                (problem.package.as_str(), problem.key.as_str()),
+                ("frust-acme-ble", ROOT_KEY)
+            );
+            for named in ["`frust-acme-ble@0.2.0`", "`frust-acme-ble@0.3.0`", why] {
+                assert!(problem.reason.contains(named), "{tag}: {problem}");
+            }
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// `aaa-ble` sorts first by name, but the app's own plugin is the direct
+    /// dependency `frust-acme-ble`.
+    #[test]
+    fn of_two_packages_declaring_one_id_the_direct_one_is_kept() {
+        let (found, root) = discover_resolved(
+            "direct-id",
+            &[
+                ("aaa-ble", "0.1.0", plugin_metadata("acme-ble", "")),
+                ("frust-acme-ble", "0.3.0", plugin_metadata("acme-ble", "")),
+                ("acme-radio", "1.0.0", Value::Null),
+            ],
+            true,
+            &[
+                (APP_ID, "frust-acme-ble@0.3.0", "normal"),
+                (APP_ID, "acme-radio@1.0.0", "normal"),
+                ("acme-radio@1.0.0", "aaa-ble@0.1.0", "normal"),
+            ],
+        );
+        assert_eq!(kept(&found), kept_one("frust-acme-ble", "0.3.0"));
+        assert_eq!(found.problems.len(), 1, "{:?}", found.problems);
+        let problem = &found.problems[0];
+        assert_eq!(
+            (problem.package.as_str(), problem.key.clone()),
+            ("aaa-ble", format!("{ROOT_KEY}.id"))
+        );
+        assert!(
+            problem
+                .reason
+                .contains("package `frust-acme-ble` already declares"),
+            "{problem}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A package cargo listed but the root never reaches is not part of the
+    /// app: not a plugin, and no collision either.
+    #[test]
+    fn a_package_outside_the_roots_closure_is_not_a_plugin() {
+        let (found, root) = discover_resolved(
+            "unreached",
+            &[
+                ("aaa-ble", "0.1.0", plugin_metadata("acme-ble", "")),
+                ("aaa-scan", "0.1.0", plugin_metadata("aaa-scan", "")),
+                ("frust-acme-ble", "0.3.0", plugin_metadata("acme-ble", "")),
+            ],
+            true,
+            &[(APP_ID, "frust-acme-ble@0.3.0", "normal")],
+        );
+        assert_eq!(kept(&found), kept_one("frust-acme-ble", "0.3.0"));
+        assert!(found.problems.is_empty(), "{:?}", found.problems);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two direct packages declaring one id, or two transitive ones: no
+    /// single candidate is the app's, so each is refused naming the other.
+    #[test]
+    fn two_packages_declaring_one_id_without_one_direct_are_ambiguous() {
+        for (tag, edges, why) in [
+            (
+                "both-direct-id",
+                vec![
+                    (APP_ID, "aaa-ble@0.1.0", "normal"),
+                    (APP_ID, "frust-acme-ble@0.3.0", "normal"),
+                ],
+                "more than one of them",
+            ),
+            (
+                "none-direct-id",
+                vec![
+                    (APP_ID, "acme-radio@1.0.0", "normal"),
+                    ("acme-radio@1.0.0", "aaa-ble@0.1.0", "normal"),
+                    ("acme-radio@1.0.0", "frust-acme-ble@0.3.0", "normal"),
+                ],
+                "none of them",
+            ),
+        ] {
+            let (found, root) = discover_resolved(
+                tag,
+                &[
+                    ("aaa-ble", "0.1.0", plugin_metadata("acme-ble", "")),
+                    ("frust-acme-ble", "0.3.0", plugin_metadata("acme-ble", "")),
+                    ("acme-radio", "1.0.0", Value::Null),
+                ],
+                true,
+                &edges,
+            );
+            assert!(found.plugins.is_empty(), "{tag}: {:?}", kept(&found));
+            let refused: Vec<(&str, &str)> = found
+                .problems
+                .iter()
+                .map(|p| (p.package.as_str(), p.reason.as_str()))
+                .collect();
+            assert_eq!(refused.len(), 2, "{tag}: {refused:?}");
+            for ((package, reason), other) in refused.iter().zip(["frust-acme-ble", "aaa-ble"]) {
+                assert!(
+                    reason.contains(&format!("package `{other}` also declares"))
+                        && reason.contains(why),
+                    "{tag}: {package}: {reason}"
+                );
+            }
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A dev-dependency edge puts a package in the closure but does not make
+    /// it direct: alone it is the app's plugin, against a direct rival it
+    /// loses even though it sorts first.
+    #[test]
+    fn a_dev_only_plugin_qualifies_but_loses_to_a_direct_one() {
+        let (found, root) = discover_resolved(
+            "dev-alone",
+            &[("aaa-ble", "0.1.0", plugin_metadata("acme-ble", ""))],
+            true,
+            &[(APP_ID, "aaa-ble@0.1.0", "dev")],
+        );
+        assert_eq!(kept(&found), kept_one("aaa-ble", "0.1.0"));
+        assert!(found.problems.is_empty(), "{:?}", found.problems);
+        let _ = fs::remove_dir_all(&root);
+
+        let (found, root) = discover_resolved(
+            "dev-rival",
+            &[
+                ("aaa-ble", "0.1.0", plugin_metadata("acme-ble", "")),
+                ("frust-acme-ble", "0.3.0", plugin_metadata("acme-ble", "")),
+            ],
+            true,
+            &[
+                (APP_ID, "aaa-ble@0.1.0", "dev"),
+                (APP_ID, "frust-acme-ble@0.3.0", "normal"),
+            ],
+        );
+        assert_eq!(kept(&found), kept_one("frust-acme-ble", "0.3.0"));
+        let refused: Vec<&str> = found.problems.iter().map(|p| p.package.as_str()).collect();
+        assert_eq!(refused, ["aaa-ble"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// With no resolve graph nothing is filtered: a lone plugin package is
+    /// discovered, with or without a root package. Two versions of one
+    /// package cannot be told apart, so neither is kept — never ranked.
+    #[test]
+    fn without_a_resolve_graph_nothing_is_filtered_and_versions_stay_unranked() {
+        let (found, root) = discover_resolved(
+            "no-resolve",
+            &[("frust-acme-ble", "0.3.0", plugin_metadata("acme-ble", ""))],
+            false,
+            &[],
+        );
+        assert_eq!(kept(&found), kept_one("frust-acme-ble", "0.3.0"));
+        assert!(found.problems.is_empty(), "{:?}", found.problems);
+        let _ = fs::remove_dir_all(&root);
+
+        let dir = temp_dir("no-root");
+        let mut lone = package("frust-acme-ble", &dir, "");
+        lone.metadata = plugin_metadata("acme-ble", "");
+        let found = discover_in(&PackageGraph::new(vec![lone], None));
+        assert_eq!(kept(&found), kept_one("frust-acme-ble", "0.3.1"));
+        let _ = fs::remove_dir_all(&dir);
+
+        let (found, root) = discover_resolved(
+            "no-resolve-versions",
+            &[
+                ("frust-acme-ble", "0.2.0", plugin_metadata("acme-ble", "")),
+                ("frust-acme-ble", "0.3.0", plugin_metadata("acme-ble", "")),
+            ],
+            false,
+            &[],
+        );
+        assert!(found.plugins.is_empty(), "{:?}", kept(&found));
+        assert_eq!(found.problems.len(), 1, "{:?}", found.problems);
+        assert!(
+            found.problems[0].reason.contains("no resolve information"),
+            "{}",
+            found.problems[0]
         );
         let _ = fs::remove_dir_all(&root);
     }

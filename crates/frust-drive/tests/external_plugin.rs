@@ -100,7 +100,26 @@ fn metadata_runner(app: &Path) -> FakeProcessRunner {
             },
         ],
         "workspace_members": ["my_app@0.1.0"],
-        "resolve": { "root": "my_app@0.1.0", "nodes": [] },
+        // The app depends on the fixture directly, as its manifest says.
+        "resolve": {
+            "root": "my_app@0.1.0",
+            "nodes": [
+                {
+                    "id": "my_app@0.1.0",
+                    "dependencies": ["frust-ext-plugin-fixture@0.1.0"],
+                    "deps": [{
+                        "name": "frust_ext_plugin_fixture",
+                        "pkg": "frust-ext-plugin-fixture@0.1.0",
+                        "dep_kinds": [{ "kind": null, "target": null }],
+                    }],
+                },
+                {
+                    "id": "frust-ext-plugin-fixture@0.1.0",
+                    "dependencies": [],
+                    "deps": [],
+                },
+            ],
+        },
         "version": 1,
     })
     .to_string();

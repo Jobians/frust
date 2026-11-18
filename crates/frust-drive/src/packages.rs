@@ -465,7 +465,7 @@ impl GraphPackage {
 }
 
 /// Every package of a resolved dependency graph, with the project's own root
-/// package marked.
+/// package marked and, when cargo resolved the graph, what the root reaches.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PackageGraph {
     /// The packages, in the order cargo listed them.
@@ -474,6 +474,41 @@ pub(crate) struct PackageGraph {
     /// manifest sits in the project directory, else `resolve.root`. `None`
     /// for a virtual workspace.
     pub(crate) root: Option<usize>,
+    /// The indices in `packages` reachable from the root package through
+    /// `resolve.nodes` (every dependency kind), the root included. `None`
+    /// when the document carries no resolve graph or the project has no root
+    /// package: nothing can then be told unreachable.
+    pub(crate) closure: Option<BTreeSet<usize>>,
+    /// The indices in `packages` the root package depends on directly as a
+    /// normal dependency (any target); an edge that is dev-only or build-only
+    /// does not count. Empty whenever `closure` is `None`.
+    pub(crate) direct: BTreeSet<usize>,
+}
+
+impl PackageGraph {
+    /// A graph with no resolve information: no closure, no direct set.
+    pub(crate) fn new(packages: Vec<GraphPackage>, root: Option<usize>) -> Self {
+        Self {
+            packages,
+            root,
+            closure: None,
+            direct: BTreeSet::new(),
+        }
+    }
+
+    /// Whether the package at `index` is reachable from the root package;
+    /// always `true` when the graph carries no closure.
+    pub(crate) fn in_closure(&self, index: usize) -> bool {
+        self.closure
+            .as_ref()
+            .is_none_or(|closure| closure.contains(&index))
+    }
+
+    /// Whether the package at `index` is a direct normal dependency of the
+    /// root package.
+    pub(crate) fn is_direct(&self, index: usize) -> bool {
+        self.direct.contains(&index)
+    }
 }
 
 /// Reads every package out of a `cargo metadata --format-version 1`
@@ -539,17 +574,91 @@ pub(crate) fn package_graph_from_metadata(
             let root = resolve_root?;
             ids.iter().position(|id| id.as_deref() == Some(root))
         });
-    Ok(PackageGraph { packages, root })
+    let root_id = root.and_then(|index| ids[index].as_deref());
+    let mut graph = PackageGraph::new(packages, root);
+    if let (Some(resolve), Some(root_id)) = (resolve_of(&doc), root_id) {
+        let indices_of = |wanted: &HashSet<String>| -> BTreeSet<usize> {
+            ids.iter()
+                .enumerate()
+                .filter(|(_, id)| id.as_ref().is_some_and(|id| wanted.contains(id)))
+                .map(|(index, _)| index)
+                .collect()
+        };
+        graph.closure = Some(indices_of(&closure_from(resolve, vec![root_id])));
+        graph.direct = indices_of(&direct_dependencies(resolve, root_id));
+    }
+    Ok(graph)
+}
+
+/// The document's `resolve` object; `None` when it is absent or `null`.
+fn resolve_of(doc: &serde_json::Value) -> Option<&serde_json::Value> {
+    doc.get("resolve").filter(|resolve| !resolve.is_null())
+}
+
+/// The package ids the node `root_id` of `resolve` depends on as a normal
+/// dependency for any target. Read from the node's `deps` entries, whose
+/// `dep_kinds` say which kinds an edge carries; an edge whose kinds are all
+/// `dev` or `build` is not direct. An entry without `dep_kinds`, and a node
+/// without `deps` (whose plain `dependencies` list is then used), cannot be
+/// told apart by kind and counts as direct.
+fn direct_dependencies(resolve: &serde_json::Value, root_id: &str) -> HashSet<String> {
+    let Some(node) = resolve
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|node| node.get("id").and_then(serde_json::Value::as_str) == Some(root_id))
+    else {
+        return HashSet::new();
+    };
+    let Some(deps) = node.get("deps").and_then(serde_json::Value::as_array) else {
+        return node
+            .get("dependencies")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect();
+    };
+    deps.iter()
+        .filter(
+            |dep| match dep.get("dep_kinds").and_then(serde_json::Value::as_array) {
+                Some(kinds) => kinds
+                    .iter()
+                    .any(|kind| kind.get("kind").is_none_or(serde_json::Value::is_null)),
+                None => true,
+            },
+        )
+        .filter_map(|dep| dep.get("pkg").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
 }
 
 /// The package ids reachable from the root package (every workspace member
 /// for a virtual workspace, which has no root) through `resolve.nodes`.
 /// Empty when the document carries no resolve graph.
 fn root_closure(doc: &serde_json::Value) -> HashSet<String> {
-    let mut seen = HashSet::new();
-    let Some(resolve) = doc.get("resolve").filter(|resolve| !resolve.is_null()) else {
-        return seen;
+    let Some(resolve) = resolve_of(doc) else {
+        return HashSet::new();
     };
+    let starts = match resolve.get("root").and_then(serde_json::Value::as_str) {
+        Some(root) => vec![root],
+        None => doc
+            .get("workspace_members")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect(),
+    };
+    closure_from(resolve, starts)
+}
+
+/// The package ids reachable from `starts` (included) through the
+/// `dependencies` edges of `resolve.nodes` — every dependency kind.
+fn closure_from<'a>(resolve: &'a serde_json::Value, starts: Vec<&'a str>) -> HashSet<String> {
+    let mut seen = HashSet::new();
     let mut deps_of: HashMap<&str, Vec<&str>> = HashMap::new();
     for node in resolve
         .get("nodes")
@@ -569,16 +678,7 @@ fn root_closure(doc: &serde_json::Value) -> HashSet<String> {
             .collect();
         deps_of.insert(id, deps);
     }
-    let mut stack: Vec<&str> = match resolve.get("root").and_then(serde_json::Value::as_str) {
-        Some(root) => vec![root],
-        None => doc
-            .get("workspace_members")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str)
-            .collect(),
-    };
+    let mut stack = starts;
     while let Some(id) = stack.pop() {
         if seen.insert(id.to_string()) {
             stack.extend(deps_of.get(id).into_iter().flatten().copied());
@@ -1025,6 +1125,83 @@ mod tests {
             package_graph_from_metadata(Path::new("/p"), r#"{"packages":[{"name":"x"}]}"#),
             Err(PackagesError::MetadataUnreadable { .. })
         ));
+    }
+
+    /// The closure follows every edge from the root; the direct set keeps
+    /// only the root's normal edges, whatever their target, and drops
+    /// dev-only and build-only ones. A package nothing reaches is in neither.
+    #[test]
+    fn the_package_graph_carries_the_roots_closure_and_direct_dependencies() {
+        let package = |name: &str| {
+            format!(
+                r#"{{"name":"{name}","version":"1.0.0","id":"{name} 1.0.0",
+                    "manifest_path":"/reg/{name}/Cargo.toml"}}"#
+            )
+        };
+        let names = [
+            "app", "normal", "unix", "dev", "build", "both", "nested", "stray",
+        ];
+        let packages: Vec<String> = names.iter().map(|name| package(name)).collect();
+        let edge = |name: &str, kinds: &str| {
+            format!(r#"{{"name":"{name}","pkg":"{name} 1.0.0","dep_kinds":[{kinds}]}}"#)
+        };
+        let deps = [
+            edge("normal", r#"{"kind":null,"target":null}"#),
+            edge("unix", r#"{"kind":null,"target":"cfg(unix)"}"#),
+            edge("dev", r#"{"kind":"dev","target":null}"#),
+            edge("build", r#"{"kind":"build","target":null}"#),
+            edge(
+                "both",
+                r#"{"kind":"dev","target":null},{"kind":null,"target":"cfg(windows)"}"#,
+            ),
+        ];
+        let metadata = format!(
+            r#"{{"packages":[{}],"resolve":{{"root":"app 1.0.0","nodes":[
+                {{"id":"app 1.0.0","dependencies":["normal 1.0.0","unix 1.0.0","dev 1.0.0",
+                  "build 1.0.0","both 1.0.0"],"deps":[{}]}},
+                {{"id":"dev 1.0.0","dependencies":["nested 1.0.0"],"deps":[]}},
+                {{"id":"stray 1.0.0","dependencies":[],"deps":[]}}
+            ]}},"version":1}}"#,
+            packages.join(","),
+            deps.join(",")
+        );
+        let graph = package_graph_from_metadata(Path::new("/work/app"), &metadata).unwrap();
+        let index = |name: &str| names.iter().position(|n| *n == name).unwrap();
+        let set = |members: &[&str]| members.iter().map(|name| index(name)).collect();
+        assert_eq!(graph.root, Some(index("app")));
+        assert_eq!(
+            graph.closure,
+            Some(set(&[
+                "app", "normal", "unix", "dev", "build", "both", "nested"
+            ]))
+        );
+        assert_eq!(graph.direct, set(&["normal", "unix", "both"]));
+        assert!(graph.in_closure(index("nested")) && !graph.in_closure(index("stray")));
+        assert!(graph.is_direct(index("unix")) && !graph.is_direct(index("dev")));
+
+        // Without `deps`, the node's plain `dependencies` are the direct set.
+        let plain = format!(
+            r#"{{"packages":[{},{}],"resolve":{{"root":"app 1.0.0","nodes":[
+                {{"id":"app 1.0.0","dependencies":["normal 1.0.0"]}}]}}}}"#,
+            package("app"),
+            package("normal")
+        );
+        let graph = package_graph_from_metadata(Path::new("/work/app"), &plain).unwrap();
+        assert_eq!(graph.direct, set(&["normal"]));
+
+        // No resolve graph, or no root: no closure and nothing direct, so
+        // every package counts as reachable.
+        for document in [
+            format!(r#"{{"packages":[{}],"resolve":null}}"#, package("normal")),
+            format!(
+                r#"{{"packages":[{}],"resolve":{{"root":null,"nodes":[]}}}}"#,
+                package("normal")
+            ),
+        ] {
+            let graph = package_graph_from_metadata(Path::new("/work/ws"), &document).unwrap();
+            assert_eq!((graph.closure.clone(), graph.direct.len()), (None, 0));
+            assert!(graph.in_closure(0) && !graph.is_direct(0));
+        }
     }
 
     #[test]
