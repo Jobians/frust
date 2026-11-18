@@ -95,10 +95,19 @@ is additional or different for a plugin.
   one also adds the app's usage string, so an app never links or declares a capability it does not use
   (Apple's static analysis of the binary is reported to flag unexplained privacy-API references, ITMS-90683:
   <https://developer.apple.com/forums/thread/744965>, a forum report, not Apple documentation).
-- **Play-policy-sensitive permissions are app-side `ManifestPermission` contributions inside a
-  `FeatureSpec`, never declared in a plugin's module manifest** (`frust-permissions`' module manifest
-  declares no `uses-permission`). `background-task` is the explicit exception: `FOREGROUND_SERVICE` is the plugin's core
-  function and merges only into apps that opt in, and apps can remove it with `tools:node="remove"`. A plugin host launches Activity Result contracts through the resumed
+- **A module manifest declares only the permissions that are the plugin's core function; a permission an
+  app opts into, or that Play policy restricts, is an app-side `ManifestPermission` inside a
+  `FeatureSpec`.** The module manifests of `camera`, `connectivity`, `secure-storage`, `video-player` and
+  `background-task` declare theirs (merged only into apps that add the plugin; an app can drop one with
+  `tools:node="remove"`); `frust-permissions`' declares none, and neither do `auth-session` or `iap`.
+- **An optional hardware feature is declared in the plugin's own module manifest as
+  `<uses-feature ... android:required="false"/>` and checked at runtime, never `required="true"`**: manifest
+  merging ORs the attribute, so one plugin would hide the app from devices without the hardware.
+- **A `MavenRepository` contribution names its groups** (an empty list is refused: a repository is never added
+  unfiltered), so it serves only the artifacts its plugin needs.
+- **An `IosEntitlement` is written to every Runner target configuration, so a capability-backed entitlement
+  must be enabled for each bundle identifier a flavor signs with.**
+- **A plugin host launches Activity Result contracts** through the resumed
   `ComponentActivity`'s `activityResultRegistry`, under a plugin-prefixed key.
 - **Content a plugin picks or shares is staged in a plugin-named cache subdirectory** (`frust-photo-library` picks, `frust-share/<uuid>/`
   copies), never linked to the original. A plugin's `FileProvider` is a subclass with its own authority that exposes only that

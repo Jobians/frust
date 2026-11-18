@@ -87,7 +87,7 @@ pub(crate) fn run_with(
 mod tests {
     use super::*;
     use frust_drive::packages::StubLocator;
-    use frust_drive::plugin::add_plugin_with;
+    use frust_drive::plugin::{FloorPlatform, add_plugin_with};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn project(tag: &str) -> std::path::PathBuf {
@@ -168,6 +168,44 @@ mod tests {
         let (code, _, err) = run(&dir, "device-info", &["nope"]);
         assert_eq!(code, 1);
         assert!(err.contains("no optional features"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A platform floor the app is below is printed as it reads and fails the
+    /// command, with nothing written (the refusal happens before any edit).
+    #[test]
+    fn a_platform_floor_refusal_is_printed_and_exits_non_zero() {
+        let dir = project("floor");
+        let before = std::fs::read(dir.join("Cargo.toml")).unwrap();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_with(
+            |_, _, _| {
+                Err(PluginAddError::PlatformFloorTooLow {
+                    plugin: "floor-plugin",
+                    platform: FloorPlatform::Ios,
+                    required: "16.4".into(),
+                    found: "15.0".into(),
+                    key: "IPHONEOS_DEPLOYMENT_TARGET",
+                    file: "ios/Runner.xcodeproj/project.pbxproj",
+                    hint: "Raise it in every build configuration, then re-run.",
+                })
+            },
+            &dir,
+            "floor-plugin",
+            &[],
+            &mut out,
+            &mut err,
+        )
+        .unwrap();
+        assert_eq!(code, 1);
+        assert!(out.is_empty());
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "Error: plugin `floor-plugin` needs iOS 16.4 or later; \
+             ios/Runner.xcodeproj/project.pbxproj sets IPHONEOS_DEPLOYMENT_TARGET = 15.0. \
+             Raise it in every build configuration, then re-run.\n"
+        );
+        assert_eq!(std::fs::read(dir.join("Cargo.toml")).unwrap(), before);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

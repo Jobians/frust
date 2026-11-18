@@ -10,8 +10,8 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Value};
 
 use super::registry::{find_plugin, known_plugins};
 use super::{
-    AddItem, AddOutcome, AddReport, Contribution, NativeKind, NativeModule, PluginAddError,
-    PluginSpec,
+    AddItem, AddOutcome, AddReport, Contribution, FloorPlatform, IosEntitlementValue, NativeKind,
+    NativeModule, PluginAddError, PluginSpec,
 };
 use crate::build_dirs::BuildLayout;
 use crate::facade_key;
@@ -38,6 +38,7 @@ const LIB_RS_REL: &str = "src/lib.rs";
 /// unpinned convention.
 const SETTINGS_ANCHOR: &str = "// frust:plugin-includes";
 const APP_DEPS_ANCHOR: &str = "// frust:plugin-dependencies";
+const REPOSITORIES_ANCHOR: &str = "// frust:plugin-repositories";
 
 /// The `settings.gradle.kts` helper every machine-local module directory is
 /// resolved through: it loads the gitignored `local.properties` beside the
@@ -114,6 +115,11 @@ pub fn add_plugin(
 /// whose key or link was just written reports [`AddOutcome::Applied`]. A run
 /// that finds every edit, key and link already in place never asks the
 /// locator.
+///
+/// A plugin or requested feature stating a platform floor
+/// ([`PluginSpec::min_ios`] / [`PluginSpec::min_android_sdk`]) is checked
+/// against the app's before anything is written, and refused with
+/// [`PluginAddError::PlatformFloorTooLow`] when the app is below it.
 pub fn add_plugin_with(
     locator: &dyn PackageLocator,
     project_root: &Path,
@@ -121,6 +127,19 @@ pub fn add_plugin_with(
     features: &[&str],
 ) -> Result<AddReport, PluginAddError> {
     let spec = find_plugin(id).ok_or_else(|| PluginAddError::UnknownPlugin(id.to_string()))?;
+    add_spec_with(locator, project_root, &spec, features)
+}
+
+/// [`add_plugin_with`] for an already-resolved registry entry — the seam a
+/// test drives with a synthetic [`PluginSpec`] the static registry does not
+/// carry.
+fn add_spec_with(
+    locator: &dyn PackageLocator,
+    project_root: &Path,
+    spec: &PluginSpec,
+    features: &[&str],
+) -> Result<AddReport, PluginAddError> {
+    let id = spec.id;
 
     // Validate every requested feature up front, before mutating anything.
     for feat in features {
@@ -143,7 +162,7 @@ pub fn add_plugin_with(
         .map_err(|e| PluginAddError::UnparseableCargoToml(e.to_string()))?;
 
     let frust = FrustDep::read(&doc).ok_or(PluginAddError::NoFrustDependency)?;
-    let resolution = Resolution::new(locator, project_root, &spec, &frust);
+    let resolution = Resolution::new(locator, project_root, spec, &frust);
 
     // Base contributions, then the selected features' (in registry order for
     // a stable report regardless of the caller's feature ordering).
@@ -154,11 +173,48 @@ pub fn add_plugin_with(
         .flat_map(|f| f.contributions.iter());
     let contributions: Vec<&Contribution> = spec.base.iter().chain(feature_contribs).collect();
 
+    // The app's iOS / Android floors must meet the plugin's (and every
+    // requested feature's); they are checked here and never raised.
+    check_platform_floors(project_root, spec, features)?;
+
     // A registry entry naming a platform path outside its own package cannot
     // be located; refuse it before anything is written.
     for contribution in &contributions {
         if let Some(rel_path) = native_rel_path(contribution) {
-            package_location(&spec, rel_path)?;
+            package_location(spec, rel_path)?;
+        }
+    }
+
+    // An iOS entitlement edits two files whose shape is only known once the
+    // pbxproj's Runner target is resolved; plan it in memory (and discard the
+    // plan) so a project it cannot be applied to is refused before the first
+    // write. A project without `ios/` is left to the applier itself, which
+    // answers it exactly as every other iOS contribution does.
+    if project_root.join(IOS_DIR_REL).is_dir() {
+        for contribution in &contributions {
+            if let Contribution::IosEntitlement {
+                key,
+                value,
+                comment,
+            } = contribution
+            {
+                plan_ios_entitlement(project_root, key, *value, comment)?;
+            }
+        }
+    }
+
+    // A Maven repository needs its marker in settings.gradle.kts and a
+    // well-formed url/group set; check both before the first write. A project
+    // without `android/settings.gradle.kts` is left to the applier, which
+    // answers it as every other Gradle contribution does.
+    for contribution in &contributions {
+        if let Contribution::MavenRepository { url, groups, .. } = contribution {
+            validate_maven_repository(url, groups)?;
+            if let Ok(settings) = fs::read_to_string(project_root.join(SETTINGS_GRADLE_REL))
+                && !settings.contains(REPOSITORIES_ANCHOR)
+            {
+                return Err(missing_repositories_marker());
+            }
         }
     }
 
@@ -200,7 +256,7 @@ pub fn add_plugin_with(
     let unwired: Vec<(usize, NativeModule)> = contributions
         .iter()
         .enumerate()
-        .filter_map(|(at, contribution)| Some((at, native_module(&spec, contribution)?.ok()?)))
+        .filter_map(|(at, contribution)| Some((at, native_module(spec, contribution)?.ok()?)))
         .filter(|(_, module)| {
             platform_present(project_root, module)
                 && !platform_wiring::module_slot_present(project_root, module)
@@ -275,6 +331,230 @@ fn wiring_error(err: SyncError) -> PluginAddError {
     }
 }
 
+/// The build setting an iOS floor is read from.
+const IOS_DEPLOYMENT_TARGET: &str = "IPHONEOS_DEPLOYMENT_TARGET";
+/// The Android app template's single floor variable, and the `defaultConfig`
+/// property read when a project has no such variable.
+const MIN_SDK_VALUE: &str = "minSdkValue";
+const MIN_SDK: &str = "minSdk";
+const ANDROID_DIR_REL: &str = "android";
+
+/// The highest floor over a plugin and its requested features: the iOS
+/// version as the registry writes it, and the Android API level.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FloorRequirement {
+    ios: Option<&'static str>,
+    android_sdk: Option<u32>,
+}
+
+/// The [`FloorRequirement`] of adding `spec` with `features`: the maximum
+/// over the spec's floors and those of every requested feature. A registry
+/// `min_ios` that is not a dot-separated version is
+/// [`PluginAddError::InvalidContribution`].
+fn floor_requirement(
+    spec: &PluginSpec,
+    features: &[&str],
+) -> Result<FloorRequirement, PluginAddError> {
+    let requested = spec
+        .optional_features
+        .iter()
+        .filter(|f| features.contains(&f.id))
+        .map(|f| (f.min_ios, f.min_android_sdk));
+    let mut requirement = FloorRequirement::default();
+    let mut highest_ios: Option<Vec<u32>> = None;
+    for (ios, android_sdk) in std::iter::once((spec.min_ios, spec.min_android_sdk)).chain(requested)
+    {
+        if let Some(ios) = ios {
+            let version = parse_ios_version(ios).ok_or_else(|| {
+                PluginAddError::InvalidContribution(format!(
+                    "plugin `{}` declares minimum iOS version `{ios}`, which is not a \
+                     dot-separated version",
+                    spec.id
+                ))
+            })?;
+            if highest_ios
+                .as_ref()
+                .is_none_or(|highest| compare_versions(&version, highest).is_gt())
+            {
+                highest_ios = Some(version);
+                requirement.ios = Some(ios);
+            }
+        }
+        requirement.android_sdk = requirement.android_sdk.max(android_sdk);
+    }
+    Ok(requirement)
+}
+
+/// Refuse, before any write, an app whose iOS deployment target or Android
+/// `minSdk` is below what adding `spec` with `features` needs. A platform the
+/// app has no directory for is skipped; a floor that cannot be read is
+/// [`PluginAddError::MalformedProjectFile`] naming the key looked for, never a
+/// guess. Nothing is read when the add states no floor.
+fn check_platform_floors(
+    project_root: &Path,
+    spec: &PluginSpec,
+    features: &[&str],
+) -> Result<(), PluginAddError> {
+    let requirement = floor_requirement(spec, features)?;
+    if let Some(required) = requirement.ios
+        && project_root.join(IOS_DIR_REL).is_dir()
+    {
+        let src = read_required(&project_root.join(PBXPROJ_REL), PBXPROJ_REL)?;
+        let (found, found_version) = lowest_ios_deployment_target(&src)?;
+        let required_version = parse_ios_version(required).unwrap_or_default();
+        if compare_versions(&found_version, &required_version).is_lt() {
+            return Err(PluginAddError::PlatformFloorTooLow {
+                plugin: spec.id,
+                platform: FloorPlatform::Ios,
+                required: required.to_string(),
+                found,
+                key: IOS_DEPLOYMENT_TARGET,
+                file: PBXPROJ_REL,
+                hint: "Raise it in every build configuration (and keep it at or above every \
+                       Swift package's minimum), then re-run.",
+            });
+        }
+    }
+    if let Some(required) = requirement.android_sdk
+        && project_root.join(ANDROID_DIR_REL).is_dir()
+    {
+        let src = read_required(
+            &project_root.join(APP_BUILD_GRADLE_REL),
+            APP_BUILD_GRADLE_REL,
+        )?;
+        let (key, found) = android_min_sdk(&src)?;
+        if found < required {
+            return Err(PluginAddError::PlatformFloorTooLow {
+                plugin: spec.id,
+                platform: FloorPlatform::Android,
+                required: required.to_string(),
+                found: found.to_string(),
+                key,
+                file: APP_BUILD_GRADLE_REL,
+                hint: "Raise it (and any product flavor's own `minSdk` below it), then re-run.",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A dot-separated version (`"16"`, `"16.4"`, `"17.0.1"`) as its numeric
+/// components; `None` for anything else.
+fn parse_ios_version(text: &str) -> Option<Vec<u32>> {
+    text.trim()
+        .split('.')
+        .map(|part| {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            part.parse().ok()
+        })
+        .collect()
+}
+
+/// Compare two versions component by component, a missing component counting
+/// as `0` (so `16` equals `16.0`).
+fn compare_versions(a: &[u32], b: &[u32]) -> std::cmp::Ordering {
+    (0..a.len().max(b.len()))
+        .map(|at| {
+            let left = a.get(at).copied().unwrap_or(0);
+            let right = b.get(at).copied().unwrap_or(0);
+            left.cmp(&right)
+        })
+        .find(|order| order.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// The lowest `IPHONEOS_DEPLOYMENT_TARGET` over every build configuration of
+/// the project, project-level and target-level alike (so a flavored project's
+/// extra configurations count too): its value as written, and that value
+/// parsed. No setting at all, or one that is not a version, is
+/// [`PluginAddError::MalformedProjectFile`].
+fn lowest_ios_deployment_target(src: &str) -> Result<(String, Vec<u32>), PluginAddError> {
+    let mut lowest: Option<(String, Vec<u32>)> = None;
+    let objects = pbx_objects(src, pbx_section_range(src, "XCBuildConfiguration")?)?;
+    for object in &objects {
+        let statements = pbx_statements(src, object.body.clone())?;
+        let Some(settings) = statements.iter().find(|s| s.key == "buildSettings") else {
+            continue;
+        };
+        let body = pbx_dict_body(src, settings.value.clone())?;
+        for setting in pbx_statements(src, body)? {
+            if setting.key != IOS_DEPLOYMENT_TARGET {
+                continue;
+            }
+            let raw = pbx_unquote(pbx_strip_comments(&src[setting.value.clone()]).trim());
+            let version = parse_ios_version(&raw).ok_or_else(|| {
+                PluginAddError::MalformedProjectFile(format!(
+                    "{PBXPROJ_REL}: `{IOS_DEPLOYMENT_TARGET} = {raw}` is not a version the \
+                     plugin's minimum iOS version can be compared with"
+                ))
+            })?;
+            if lowest
+                .as_ref()
+                .is_none_or(|(_, low)| compare_versions(&version, low).is_lt())
+            {
+                lowest = Some((raw, version));
+            }
+        }
+    }
+    lowest.ok_or_else(|| {
+        PluginAddError::MalformedProjectFile(format!(
+            "{PBXPROJ_REL}: no build configuration sets `{IOS_DEPLOYMENT_TARGET}`, so the \
+             plugin's minimum iOS version cannot be checked"
+        ))
+    })
+}
+
+/// The app's Android floor from `app/build.gradle.kts`: the integer assigned
+/// to `minSdkValue`, else a literal `minSdk = <n>` (the first one, which is
+/// `defaultConfig`'s in a generated project; per-flavor overrides are not
+/// read). Returns the key read and its value; a floor that is absent or not
+/// an integer literal is [`PluginAddError::MalformedProjectFile`].
+fn android_min_sdk(src: &str) -> Result<(&'static str, u32), PluginAddError> {
+    for key in [MIN_SDK_VALUE, MIN_SDK] {
+        if let Some(value) = gradle_assignment(src, key) {
+            return value.parse::<u32>().map(|level| (key, level)).map_err(|_| {
+                PluginAddError::MalformedProjectFile(format!(
+                    "{APP_BUILD_GRADLE_REL}: `{key} = {value}` is not an integer API level the \
+                     plugin's minimum Android SDK can be compared with"
+                ))
+            });
+        }
+    }
+    Err(PluginAddError::MalformedProjectFile(format!(
+        "{APP_BUILD_GRADLE_REL}: found neither `val {MIN_SDK_VALUE} = <n>` nor \
+         `{MIN_SDK} = <n>`, so the plugin's minimum Android SDK cannot be checked"
+    )))
+}
+
+/// The right-hand side of the first `key = …` assignment in a Kotlin build
+/// script (optionally `val`/`var`-declared, optionally typed), comments
+/// skipped; `None` when no line assigns `key`.
+fn gradle_assignment<'s>(src: &'s str, key: &str) -> Option<&'s str> {
+    src.lines().find_map(|line| {
+        let code = line.split("//").next().unwrap_or_default().trim();
+        if code.starts_with("/*") || code.starts_with('*') {
+            return None;
+        }
+        let declared = code
+            .strip_prefix("val ")
+            .or_else(|| code.strip_prefix("var "))
+            .unwrap_or(code)
+            .trim_start();
+        let rest = declared.strip_prefix(key)?.trim_start();
+        let rest = match rest.strip_prefix(':') {
+            Some(typed) => &typed[typed.find('=')?..],
+            None => rest,
+        };
+        let value = rest.strip_prefix('=')?;
+        if value.starts_with('=') {
+            return None;
+        }
+        Some(value.trim().trim_end_matches(';').trim_end())
+    })
+}
+
 /// Whether `contribution` edits `Cargo.toml` (applied before every other
 /// contribution — see [`add_plugin_with`]).
 fn is_cargo_contribution(contribution: &Contribution) -> bool {
@@ -344,13 +624,28 @@ fn apply_contribution(
             value,
             comment,
         } => apply_plist_entry(project_root, key, value, comment),
+        Contribution::PlistArrayEntry {
+            key,
+            values,
+            comment,
+        } => apply_plist_array_entry(project_root, key, values, comment),
         Contribution::GradleModule { gradle_name, .. } => {
             apply_gradle_module(project_root, gradle_name)
         }
+        Contribution::MavenRepository {
+            url,
+            groups,
+            comment,
+        } => apply_maven_repository(project_root, url, groups, comment),
         Contribution::SwiftPackageRef { package_name, .. } => {
             apply_swift_package_ref(project_root, package_name)
         }
         Contribution::IosFramework { name } => apply_ios_framework(project_root, name),
+        Contribution::IosEntitlement {
+            key,
+            value,
+            comment,
+        } => apply_ios_entitlement(project_root, key, *value, comment),
         Contribution::AppCrateMacro {
             invocation,
             cfg,
@@ -844,17 +1139,82 @@ fn apply_plist_entry(
     value: &str,
     comment: &str,
 ) -> Result<AddOutcome, PluginAddError> {
+    apply_plist_block(project_root, key, |key| {
+        plist_entry_block(key, value, comment)
+    })
+}
+
+/// [`Contribution::PlistArrayEntry`]: like [`apply_plist_entry`], with an
+/// `<array>` of `<string>`s as the value. An existing key is never merged
+/// into or reordered.
+fn apply_plist_array_entry(
+    project_root: &Path,
+    key: &str,
+    values: &[&str],
+    comment: &str,
+) -> Result<AddOutcome, PluginAddError> {
+    apply_plist_block(project_root, key, |key| {
+        plist_array_entry_block(key, values, comment)
+    })
+}
+
+/// Shared body of the two Info.plist appliers: skip when the (escaped) key
+/// is present, else insert the block before the root dict's close (the last
+/// `</dict>`, immediately preceding `</plist>`).
+fn apply_plist_block(
+    project_root: &Path,
+    key: &str,
+    block: impl FnOnce(&str) -> String,
+) -> Result<AddOutcome, PluginAddError> {
     let path = project_root.join(PLIST_REL);
     let src = read_required(&path, PLIST_REL)?;
+    let key = xml_escape(key);
     if src.contains(&format!("<key>{key}</key>")) {
         return Ok(AddOutcome::AlreadyPresent);
     }
-    // Insert before the root dict's close (the last `</dict>`, immediately
-    // preceding `</plist>`), tab-indented like the surrounding entries.
-    let block = format!("\t<!-- {comment} -->\n\t<key>{key}</key>\n\t<string>{value}</string>\n");
-    let out = insert_before_anchor(&src, "</dict>", &block, PLIST_REL)?;
+    let out = insert_before_anchor(&src, "</dict>", &block(&key), PLIST_REL)?;
     write_file(&path, PLIST_REL, &out)?;
     Ok(AddOutcome::Applied)
+}
+
+/// The tab-indented comment / key / `<string>` lines of one
+/// [`Contribution::PlistEntry`]. `escaped_key` is already XML-escaped.
+fn plist_entry_block(escaped_key: &str, value: &str, comment: &str) -> String {
+    format!(
+        "\t<!-- {} -->\n\t<key>{escaped_key}</key>\n\t<string>{}</string>\n",
+        xml_comment_safe(comment),
+        xml_escape(value)
+    )
+}
+
+/// The tab-indented comment / key / `<array>` lines of one
+/// [`Contribution::PlistArrayEntry`]; no values gives `<array>` and
+/// `</array>` on adjacent lines.
+fn plist_array_entry_block(escaped_key: &str, values: &[&str], comment: &str) -> String {
+    let mut out = format!(
+        "\t<!-- {} -->\n\t<key>{escaped_key}</key>\n\t<array>\n",
+        xml_comment_safe(comment)
+    );
+    for value in values {
+        out.push_str(&format!("\t\t<string>{}</string>\n", xml_escape(value)));
+    }
+    out.push_str("\t</array>\n");
+    out
+}
+
+/// `comment` with every `--` run collapsed to one `-`, so it cannot end or
+/// malform the XML comment around it.
+fn xml_comment_safe(comment: &str) -> String {
+    let mut out = String::with_capacity(comment.len());
+    let mut prev_dash = false;
+    for ch in comment.chars() {
+        if ch == '-' && prev_dash {
+            continue;
+        }
+        prev_dash = ch == '-';
+        out.push(ch);
+    }
+    out
 }
 
 /// Create a file at `rel_path` (relative to the project root) with exact
@@ -987,6 +1347,92 @@ fn apply_gradle_module(
     if let Some(out) = build_out {
         write_file(&build_path, APP_BUILD_GRADLE_REL, &out)?;
     }
+    Ok(AddOutcome::Applied)
+}
+
+/// Refuse a [`Contribution::MavenRepository`] that can never be applied: no
+/// groups (a repository is never added unfiltered) or a url that is not
+/// `http(s)`.
+fn validate_maven_repository(url: &str, groups: &[&str]) -> Result<(), PluginAddError> {
+    if groups.is_empty() {
+        return Err(PluginAddError::InvalidContribution(format!(
+            "Maven repository `{url}` names no groups; a repository is never added unfiltered"
+        )));
+    }
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(PluginAddError::InvalidContribution(format!(
+            "Maven repository url `{url}` is not an http(s) url"
+        )));
+    }
+    Ok(())
+}
+
+/// The error for a settings file that predates the repositories marker,
+/// quoting the exact line to add and where.
+fn missing_repositories_marker() -> PluginAddError {
+    PluginAddError::MalformedProjectFile(format!(
+        "{SETTINGS_GRADLE_REL}: add the line `{REPOSITORIES_ANCHOR}` inside \
+         `dependencyResolutionManagement {{ repositories {{ ... }} }}`, after `mavenCentral()`"
+    ))
+}
+
+/// Escape `"` and `\` for a Kotlin string literal (`$` too, which would
+/// start a template).
+fn kotlin_string_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '"' | '\\' | '$') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// The `exclusiveContent` block one [`Contribution::MavenRepository`] adds.
+fn maven_repository_block(url: &str, groups: &[&str], comment: &str) -> String {
+    let comment = comment.replace(['\r', '\n'], " ");
+    let mut block = format!(
+        "        // {comment}\n\
+         \x20       exclusiveContent {{\n\
+         \x20           forRepository {{ maven {{ url = uri(\"{}\") }} }}\n\
+         \x20           filter {{\n",
+        kotlin_string_escape(url)
+    );
+    for group in groups {
+        block.push_str(&format!(
+            "                includeGroup(\"{}\")\n",
+            kotlin_string_escape(group)
+        ));
+    }
+    block.push_str("            }\n        }\n");
+    block
+}
+
+/// [`Contribution::MavenRepository`]: an `exclusiveContent` block at the
+/// `// frust:plugin-repositories` marker, idempotent by url.
+fn apply_maven_repository(
+    project_root: &Path,
+    url: &str,
+    groups: &[&str],
+    comment: &str,
+) -> Result<AddOutcome, PluginAddError> {
+    validate_maven_repository(url, groups)?;
+    let settings_path = project_root.join(SETTINGS_GRADLE_REL);
+    let src = read_required(&settings_path, SETTINGS_GRADLE_REL)?;
+    if src.contains(&format!("uri(\"{}\")", kotlin_string_escape(url))) {
+        return Ok(AddOutcome::AlreadyPresent);
+    }
+    if !src.contains(REPOSITORIES_ANCHOR) {
+        return Err(missing_repositories_marker());
+    }
+    let out = insert_after_anchor_line(
+        &src,
+        REPOSITORIES_ANCHOR,
+        &maven_repository_block(url, groups, comment),
+        SETTINGS_GRADLE_REL,
+    )?;
+    write_file(&settings_path, SETTINGS_GRADLE_REL, &out)?;
     Ok(AddOutcome::Applied)
 }
 
@@ -1295,6 +1741,619 @@ fn ldflags_link_framework(body: &str, name: &str) -> bool {
     entries
         .windows(2)
         .any(|pair| pair[0] == "\"-framework\"," && (pair[1] == bare || pair[1] == quoted))
+}
+
+// ---------------------------------------------------------------------------
+// `Contribution::IosEntitlement` — the entitlements file plus the Runner
+// target's `CODE_SIGN_ENTITLEMENTS` build setting.
+// ---------------------------------------------------------------------------
+
+/// The build setting naming the file a target is signed with.
+const CODE_SIGN_ENTITLEMENTS: &str = "CODE_SIGN_ENTITLEMENTS";
+
+/// The entitlements file a generated app's Runner target signs with, as
+/// `CODE_SIGN_ENTITLEMENTS` names it: relative to `ios/`, Xcode's `SRCROOT`.
+const ENTITLEMENTS_SETTING: &str = "Runner/Runner.entitlements";
+
+/// The directory every `SRCROOT`-relative setting resolves under.
+const IOS_DIR_REL: &str = "ios";
+
+/// The Runner target, by the `name` its `PBXNativeTarget` carries.
+const RUNNER_TARGET: &str = "Runner";
+
+/// The text of a newly created entitlements file, before its first key.
+const EMPTY_ENTITLEMENTS: &str = "\
+<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+</dict>
+</plist>
+";
+
+/// The writes one [`Contribution::IosEntitlement`] needs, computed entirely in
+/// memory so [`add_spec_with`] can check it before anything is written.
+#[derive(Debug)]
+struct EntitlementPlan {
+    /// Entitlements files to write, as `(project-relative path, contents)`.
+    files: Vec<(String, String)>,
+    /// The edited `project.pbxproj`, when a configuration lacked the setting.
+    pbxproj: Option<String>,
+}
+
+/// Request entitlement `key` on the Runner target: the key in the
+/// entitlements file every Runner configuration signs with, and
+/// `CODE_SIGN_ENTITLEMENTS` in every configuration lacking it (see
+/// [`Contribution::IosEntitlement`]). The entitlements files are written
+/// before the pbxproj, so the project never names a file not yet on disk.
+fn apply_ios_entitlement(
+    project_root: &Path,
+    key: &str,
+    value: IosEntitlementValue,
+    comment: &str,
+) -> Result<AddOutcome, PluginAddError> {
+    let plan = plan_ios_entitlement(project_root, key, value, comment)?;
+    if plan.files.is_empty() && plan.pbxproj.is_none() {
+        return Ok(AddOutcome::AlreadyPresent);
+    }
+    for (rel, contents) in &plan.files {
+        let path = project_root.join(rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| PluginAddError::Io {
+                path: rel.clone(),
+                message: e.to_string(),
+            })?;
+        }
+        write_file(&path, rel, contents)?;
+    }
+    if let Some(pbxproj) = &plan.pbxproj {
+        write_file(&project_root.join(PBXPROJ_REL), PBXPROJ_REL, pbxproj)?;
+    }
+    Ok(AddOutcome::Applied)
+}
+
+/// [`apply_ios_entitlement`]'s edits, without writing them.
+///
+/// Each Runner configuration signs with the file its own
+/// `CODE_SIGN_ENTITLEMENTS` names; a configuration without one is given the
+/// file the others already agree on, or [`ENTITLEMENTS_SETTING`] when none
+/// (or more than one) is named. The key then goes into every file in that
+/// set that lacks it.
+fn plan_ios_entitlement(
+    project_root: &Path,
+    key: &str,
+    value: IosEntitlementValue,
+    comment: &str,
+) -> Result<EntitlementPlan, PluginAddError> {
+    let src = read_required(&project_root.join(PBXPROJ_REL), PBXPROJ_REL)?;
+    let configs = runner_target_configurations(&src)?;
+
+    let mut named: Vec<&PbxSetting> = Vec::new();
+    for setting in configs.iter().filter_map(|c| c.entitlements.as_ref()) {
+        if !named.iter().any(|n| n.value == setting.value) {
+            named.push(setting);
+        }
+    }
+    let (default_raw, default_value) = match named.as_slice() {
+        [only] => (only.raw.clone(), only.value.clone()),
+        _ => (
+            ENTITLEMENTS_SETTING.to_string(),
+            ENTITLEMENTS_SETTING.to_string(),
+        ),
+    };
+
+    // Configurations are edited back to front in *file* order (the list's
+    // order need not match it) so every offset scanned from the original
+    // stays valid.
+    let mut missing: Vec<&PbxInsertion> = configs
+        .iter()
+        .filter(|c| c.entitlements.is_none())
+        .map(|c| &c.insert)
+        .collect();
+    missing.sort_by_key(|insert| std::cmp::Reverse(insert.at));
+    let pbx_changed = !missing.is_empty();
+    let mut out = src.clone();
+    for insert in missing {
+        out.insert_str(
+            insert.at,
+            &insert.text(CODE_SIGN_ENTITLEMENTS, &default_raw),
+        );
+    }
+    if pbx_changed {
+        // All-or-nothing: every Runner configuration must carry the setting
+        // before a byte is written.
+        let verified = runner_target_configurations(&out)?;
+        if verified.len() != configs.len() || verified.iter().any(|c| c.entitlements.is_none()) {
+            return Err(PluginAddError::PbxWiringNotVerified {
+                file: PBXPROJ_REL.to_string(),
+                package: key.to_string(),
+                site: CODE_SIGN_ENTITLEMENTS.to_string(),
+            });
+        }
+    }
+
+    let mut targets: Vec<String> = Vec::new();
+    for config in &configs {
+        let value = config
+            .entitlements
+            .as_ref()
+            .map_or(default_value.as_str(), |s| s.value.as_str());
+        if !targets.iter().any(|t| t == value) {
+            targets.push(value.to_string());
+        }
+    }
+
+    let presence = format!("<key>{}</key>", xml_escape(key));
+    let block = entitlement_block(key, value, comment);
+    let mut files = Vec::new();
+    for setting in targets {
+        let rel = entitlements_rel_path(&setting)?;
+        let path = project_root.join(&rel);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => EMPTY_ENTITLEMENTS.to_string(),
+            Err(e) => {
+                return Err(PluginAddError::Io {
+                    path: rel,
+                    message: e.to_string(),
+                });
+            }
+        };
+        if text.contains(&presence) {
+            continue;
+        }
+        let edited = insert_before_anchor(&text, "</dict>", &block, &rel)?;
+        files.push((rel, edited));
+    }
+
+    Ok(EntitlementPlan {
+        files,
+        pbxproj: pbx_changed.then_some(out),
+    })
+}
+
+/// The tab-indented `<!-- comment -->` / `<key>` / value lines one
+/// entitlement adds to the root `<dict>`, key and string values XML-escaped.
+fn entitlement_block(key: &str, value: IosEntitlementValue, comment: &str) -> String {
+    let value = match value {
+        IosEntitlementValue::Bool(true) => "\t<true/>\n".to_string(),
+        IosEntitlementValue::Bool(false) => "\t<false/>\n".to_string(),
+        IosEntitlementValue::String(text) => format!("\t<string>{}</string>\n", xml_escape(text)),
+        IosEntitlementValue::StringArray([]) => "\t<array/>\n".to_string(),
+        IosEntitlementValue::StringArray(items) => {
+            let mut out = "\t<array>\n".to_string();
+            for item in items {
+                out.push_str(&format!("\t\t<string>{}</string>\n", xml_escape(item)));
+            }
+            out.push_str("\t</array>\n");
+            out
+        }
+    };
+    format!(
+        "\t<!-- {comment} -->\n\t<key>{}</key>\n{value}",
+        xml_escape(key)
+    )
+}
+
+/// `text` with the three characters XML character data cannot carry
+/// literally (`&`, `<`, `>`) replaced by their entities.
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// The project-relative path of the entitlements file a
+/// `CODE_SIGN_ENTITLEMENTS` value names: relative to `ios/`, optionally
+/// spelled through `$(SRCROOT)`/`$(PROJECT_DIR)`. A value naming another
+/// build variable, an absolute path, or a `..` climb cannot be located
+/// inside the project, so it is [`PluginAddError::MalformedProjectFile`]
+/// rather than a guess.
+fn entitlements_rel_path(setting: &str) -> Result<String, PluginAddError> {
+    let malformed = || PluginAddError::MalformedProjectFile(PBXPROJ_REL.to_string());
+    let rel = [
+        "$(SRCROOT)/",
+        "${SRCROOT}/",
+        "$(PROJECT_DIR)/",
+        "${PROJECT_DIR}/",
+    ]
+    .iter()
+    .find_map(|prefix| setting.strip_prefix(prefix))
+    .unwrap_or(setting);
+    let unsafe_path = rel.is_empty()
+        || rel.contains('$')
+        || rel.contains('\\')
+        || rel.starts_with('/')
+        || rel.contains(':')
+        || rel.split('/').any(|part| part == "..");
+    if unsafe_path {
+        return Err(malformed());
+    }
+    Ok(format!("{IOS_DIR_REL}/{rel}"))
+}
+
+/// One build configuration of the Runner target.
+#[derive(Debug)]
+struct RunnerConfiguration {
+    /// Its `CODE_SIGN_ENTITLEMENTS` setting, when it has one.
+    entitlements: Option<PbxSetting>,
+    /// Where a missing setting is inserted.
+    insert: PbxInsertion,
+}
+
+/// A build-setting value: as written in the file, and unquoted.
+#[derive(Debug)]
+struct PbxSetting {
+    raw: String,
+    value: String,
+}
+
+/// Where a new `KEY = value;` statement goes inside a `buildSettings`
+/// dictionary — sorted among its siblings, as Xcode writes them.
+#[derive(Debug)]
+struct PbxInsertion {
+    /// Byte offset the statement is inserted at.
+    at: usize,
+    /// The indentation of its own line; `None` when the dictionary is written
+    /// on one line, so the statement is inserted inline instead.
+    indent: Option<String>,
+}
+
+impl PbxInsertion {
+    fn text(&self, key: &str, raw_value: &str) -> String {
+        match &self.indent {
+            Some(indent) => format!("{indent}{key} = {raw_value};\n"),
+            None => format!("{key} = {raw_value}; "),
+        }
+    }
+}
+
+/// Every build configuration of the Runner target, in configuration-list
+/// order: the `PBXNativeTarget` named `Runner`, its `buildConfigurationList`,
+/// that list's `buildConfigurations`, and each one's `buildSettings`. A
+/// flavored project's extra `<Mode>-<Flavor>` configurations are found the
+/// same way; the project-level list is never consulted. Any link missing is
+/// [`PluginAddError::MalformedProjectFile`].
+fn runner_target_configurations(src: &str) -> Result<Vec<RunnerConfiguration>, PluginAddError> {
+    let malformed = || PluginAddError::MalformedProjectFile(PBXPROJ_REL.to_string());
+
+    let targets = pbx_objects(src, pbx_section_range(src, "PBXNativeTarget")?)?;
+    let mut list_id = None;
+    for target in &targets {
+        let statements = pbx_statements(src, target.body.clone())?;
+        if pbx_lookup(src, &statements, "name").as_deref() == Some(RUNNER_TARGET) {
+            list_id = pbx_lookup(src, &statements, "buildConfigurationList");
+            break;
+        }
+    }
+    let list_id = list_id.ok_or_else(malformed)?;
+
+    let lists = pbx_objects(src, pbx_section_range(src, "XCConfigurationList")?)?;
+    let list = lists
+        .iter()
+        .find(|object| object.id == list_id)
+        .ok_or_else(malformed)?;
+    let statements = pbx_statements(src, list.body.clone())?;
+    let entries = statements
+        .iter()
+        .find(|s| s.key == "buildConfigurations")
+        .ok_or_else(malformed)?;
+    let mut config_ids: Vec<String> = Vec::new();
+    for id in pbx_strip_comments(&src[entries.value.clone()])
+        .trim()
+        .strip_prefix('(')
+        .and_then(|rest| rest.strip_suffix(')'))
+        .ok_or_else(malformed)?
+        .split(',')
+        .map(|id| pbx_unquote(id.trim()))
+    {
+        // A configuration listed twice is still edited once.
+        if !id.is_empty() && !config_ids.contains(&id) {
+            config_ids.push(id);
+        }
+    }
+    if config_ids.is_empty() {
+        return Err(malformed());
+    }
+
+    let objects = pbx_objects(src, pbx_section_range(src, "XCBuildConfiguration")?)?;
+    config_ids
+        .iter()
+        .map(|id| {
+            let object = objects
+                .iter()
+                .find(|object| object.id == *id)
+                .ok_or_else(malformed)?;
+            let statements = pbx_statements(src, object.body.clone())?;
+            let settings = statements
+                .iter()
+                .find(|s| s.key == "buildSettings")
+                .ok_or_else(malformed)?;
+            build_settings_configuration(src, settings.value.clone())
+        })
+        .collect()
+}
+
+/// One configuration's `buildSettings = { … }` value (`value` is the text
+/// between its `=` and `;`), read for its `CODE_SIGN_ENTITLEMENTS` and the
+/// sorted insertion point a missing one takes.
+fn build_settings_configuration(
+    src: &str,
+    value: Range<usize>,
+) -> Result<RunnerConfiguration, PluginAddError> {
+    let body = pbx_dict_body(src, value)?;
+    let (open, close) = (body.start - 1, body.end);
+    let statements = pbx_statements(src, body)?;
+
+    let entitlements = statements
+        .iter()
+        .find(|s| s.key == CODE_SIGN_ENTITLEMENTS)
+        .map(|s| {
+            let raw = pbx_strip_comments(&src[s.value.clone()]).trim().to_string();
+            PbxSetting {
+                value: pbx_unquote(&raw),
+                raw,
+            }
+        });
+
+    let insert = match statements
+        .iter()
+        .find(|s| s.key.as_str() > CODE_SIGN_ENTITLEMENTS)
+    {
+        Some(next) => before_statement(src, next.start),
+        None => {
+            let line_start = line_start_of(src, close);
+            let closing_indent = &src[line_start..close];
+            if line_start > open && closing_indent.trim().is_empty() {
+                let indent = statements
+                    .last()
+                    .map(|s| &src[line_start_of(src, s.start)..s.start])
+                    .filter(|indent| indent.trim().is_empty())
+                    .map_or_else(|| format!("{closing_indent}\t"), str::to_string);
+                PbxInsertion {
+                    at: line_start,
+                    indent: Some(indent),
+                }
+            } else {
+                PbxInsertion {
+                    at: close,
+                    indent: None,
+                }
+            }
+        }
+    };
+    Ok(RunnerConfiguration {
+        entitlements,
+        insert,
+    })
+}
+
+/// The bytes between the braces of a statement value written `{ … }` (`value`
+/// is the text between its `=` and `;`); any other shape is
+/// [`PluginAddError::MalformedProjectFile`].
+fn pbx_dict_body(src: &str, value: Range<usize>) -> Result<Range<usize>, PluginAddError> {
+    let malformed = || PluginAddError::MalformedProjectFile(PBXPROJ_REL.to_string());
+    let code = pbx_code_bytes(src, value);
+    let open = code
+        .iter()
+        .find(|(_, byte)| !byte.is_ascii_whitespace())
+        .filter(|(_, byte)| *byte == b'{')
+        .map(|(at, _)| *at)
+        .ok_or_else(malformed)?;
+    let close = code
+        .iter()
+        .rev()
+        .find(|(_, byte)| !byte.is_ascii_whitespace())
+        .filter(|(_, byte)| *byte == b'}')
+        .map(|(at, _)| *at)
+        .ok_or_else(malformed)?;
+    Ok(open + 1..close)
+}
+
+/// The insertion point ahead of the statement starting at `start`: its own
+/// line when it begins one, else inline right before it.
+fn before_statement(src: &str, start: usize) -> PbxInsertion {
+    let line_start = line_start_of(src, start);
+    let indent = &src[line_start..start];
+    if indent.trim().is_empty() {
+        PbxInsertion {
+            at: line_start,
+            indent: Some(indent.to_string()),
+        }
+    } else {
+        PbxInsertion {
+            at: start,
+            indent: None,
+        }
+    }
+}
+
+/// The byte offset of the start of the line holding `at`.
+fn line_start_of(src: &str, at: usize) -> usize {
+    src[..at].rfind('\n').map_or(0, |nl| nl + 1)
+}
+
+/// One top-level object of a pbxproj section: its id and the bytes between
+/// its braces.
+#[derive(Debug)]
+struct PbxObject {
+    id: String,
+    body: Range<usize>,
+}
+
+/// One `key = value;` statement of a pbxproj dictionary.
+#[derive(Debug)]
+struct PbxStatement {
+    /// The key, unquoted (`"KEY[sdk=…]"` keeps its condition).
+    key: String,
+    /// The bytes between its `=` and `;`.
+    value: Range<usize>,
+    /// Where the statement's first byte is.
+    start: usize,
+}
+
+/// The `(offset, byte)` pairs of `range` that are pbxproj syntax — outside
+/// every quoted string and `/* … */` comment, so a brace, `=` or `;` inside
+/// a shell script or an object's comment is never taken for structure.
+fn pbx_code_bytes(src: &str, range: Range<usize>) -> Vec<(usize, u8)> {
+    let bytes = src.as_bytes();
+    let end = range.end;
+    let mut out = Vec::new();
+    let mut i = range.start;
+    while i < end {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < end && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'/' if i + 1 < end && bytes[i + 1] == b'*' => {
+                i = src[i + 2..end]
+                    .find("*/")
+                    .map_or(end, |found| i + 2 + found + 2);
+            }
+            byte => {
+                out.push((i, byte));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Every top-level `<id> … = { … };` object in `section`, in file order. An
+/// unbalanced brace is [`PluginAddError::MalformedProjectFile`].
+fn pbx_objects(src: &str, section: Range<usize>) -> Result<Vec<PbxObject>, PluginAddError> {
+    let malformed = || PluginAddError::MalformedProjectFile(PBXPROJ_REL.to_string());
+    let mut objects = Vec::new();
+    let mut depth = 0usize;
+    let mut open: Option<(String, usize)> = None;
+    for (at, byte) in pbx_code_bytes(src, section.clone()) {
+        match byte {
+            b'{' => {
+                if depth == 0 {
+                    let line_start = line_start_of(src, at).max(section.start);
+                    let id = src[line_start..at]
+                        .split_whitespace()
+                        .next()
+                        .map(pbx_unquote)
+                        .unwrap_or_default();
+                    open = Some((id, at + 1));
+                }
+                depth += 1;
+            }
+            b'}' => {
+                depth = depth.checked_sub(1).ok_or_else(malformed)?;
+                if depth == 0 {
+                    let (id, start) = open.take().ok_or_else(malformed)?;
+                    objects.push(PbxObject {
+                        id,
+                        body: start..at,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return Err(malformed());
+    }
+    Ok(objects)
+}
+
+/// The `key = value;` statements directly inside the dictionary body `body`
+/// (nested dictionaries and lists stay inside their statement's value). A
+/// statement without `=` or `;`, or an unbalanced bracket, is
+/// [`PluginAddError::MalformedProjectFile`].
+fn pbx_statements(src: &str, body: Range<usize>) -> Result<Vec<PbxStatement>, PluginAddError> {
+    let malformed = || PluginAddError::MalformedProjectFile(PBXPROJ_REL.to_string());
+    let mut statements = Vec::new();
+    let mut depth = 0usize;
+    let mut start: Option<usize> = None;
+    let mut equals: Option<usize> = None;
+    for (at, byte) in pbx_code_bytes(src, body) {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        let first = *start.get_or_insert(at);
+        match byte {
+            b'{' | b'(' => depth += 1,
+            b'}' | b')' => depth = depth.checked_sub(1).ok_or_else(malformed)?,
+            b'=' if depth == 0 && equals.is_none() => equals = Some(at),
+            b';' if depth == 0 => {
+                let eq = equals.take().ok_or_else(malformed)?;
+                statements.push(PbxStatement {
+                    key: pbx_unquote(pbx_strip_comments(&src[first..eq]).trim()),
+                    value: eq + 1..at,
+                    start: first,
+                });
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if start.is_some() || depth != 0 {
+        return Err(malformed());
+    }
+    Ok(statements)
+}
+
+/// The unquoted, comment-free value of the statement keyed `key`.
+fn pbx_lookup(src: &str, statements: &[PbxStatement], key: &str) -> Option<String> {
+    statements
+        .iter()
+        .find(|s| s.key == key)
+        .map(|s| pbx_unquote(pbx_strip_comments(&src[s.value.clone()]).trim()))
+}
+
+/// `text` without its `/* … */` comments (a comment-like run inside a quoted
+/// string is kept).
+fn pbx_strip_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut kept_from = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                out.push_str(&text[kept_from..i]);
+                i = text[i + 2..]
+                    .find("*/")
+                    .map_or(bytes.len(), |found| i + 2 + found + 2);
+                kept_from = i;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push_str(&text[kept_from.min(text.len())..]);
+    out
+}
+
+/// A pbxproj token without its surrounding quotes and `\"`/`\\` escapes; a
+/// bare token is returned as is.
+fn pbx_unquote(token: &str) -> String {
+    match token
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    {
+        Some(inner) => inner.replace("\\\"", "\"").replace("\\\\", "\\"),
+        None => token.to_string(),
+    }
 }
 
 /// Splice one site into `src`, returning the whole edited file. A list entry
@@ -2463,6 +3522,7 @@ mod tests {
             ],
             optional_features: &[],
             requires_sibling: None,
+            ..PluginSpec::DEFAULT
         };
         assert!(matches!(
             package_location(&STRAY, "plugins/other/platform/android"),
@@ -3126,6 +4186,7 @@ mod tests {
         ],
         optional_features: &[],
         requires_sibling: None,
+        ..PluginSpec::DEFAULT
     };
 
     const MOBILE_ONLY_PLUGIN: PluginSpec = PluginSpec {
@@ -3147,6 +4208,7 @@ mod tests {
         ],
         optional_features: &[],
         requires_sibling: None,
+        ..PluginSpec::DEFAULT
     };
 
     const MIXED_PLUGIN: PluginSpec = PluginSpec {
@@ -3182,6 +4244,7 @@ mod tests {
         ],
         optional_features: &[],
         requires_sibling: None,
+        ..PluginSpec::DEFAULT
     };
 
     /// Parse a freshly scaffolded project's `Cargo.toml` and insert a bare
@@ -3812,6 +4875,529 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    // -----------------------------------------------------------------------
+    // `Contribution::IosEntitlement`
+    //
+    // The whole-add tests drive `add_spec_with` with a synthetic spec — no
+    // registry entry uses the variant — and the per-file ones call
+    // `apply_ios_entitlement` directly.
+    // -----------------------------------------------------------------------
+
+    /// The entitlements file a fresh scaffold's Runner target is pointed at.
+    const ENTITLEMENTS_REL: &str = "ios/Runner/Runner.entitlements";
+
+    /// The build-setting line the applier adds.
+    const ENTITLEMENTS_LINE: &str = "CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;";
+
+    /// The template's Runner target configurations (Debug, Release, Profile)
+    /// and its project-level ones, which must never be touched.
+    const RUNNER_CONFIG_IDS: [&str; 3] = [
+        "ABCDABCDABCDABCDABCD000E",
+        "ABCDABCDABCDABCDABCD000F",
+        "ABCDABCDABCDABCDABCD0026",
+    ];
+    const PROJECT_CONFIG_IDS: [&str; 3] = [
+        "ABCDABCDABCDABCDABCD000C",
+        "ABCDABCDABCDABCDABCD000D",
+        "ABCDABCDABCDABCDABCD0025",
+    ];
+
+    const TEST_ENTITLEMENT: &str = "com.apple.developer.test";
+
+    const ENTITLEMENT_PLUGIN: PluginSpec = PluginSpec {
+        id: "entitlement-test-plugin",
+        summary: "synthetic, test-only",
+        crate_dir: "entitlement-test-plugin",
+        base: &[
+            Contribution::CargoDep {
+                name: "frust-entitlement-test-plugin",
+            },
+            Contribution::PlistEntry {
+                key: "NSUserTrackingUsageDescription",
+                value: "test",
+                comment: "test",
+            },
+            Contribution::IosEntitlement {
+                key: TEST_ENTITLEMENT,
+                value: IosEntitlementValue::Bool(true),
+                comment: "Test entitlement",
+            },
+        ],
+        optional_features: &[],
+        requires_sibling: None,
+        ..PluginSpec::DEFAULT
+    };
+
+    fn add_test_spec(root: &Path, spec: &PluginSpec) -> Result<AddReport, PluginAddError> {
+        add_spec_with(&checkout_locator(root), root, spec, &[])
+    }
+
+    fn apply_test_entitlement(root: &Path) -> Result<AddOutcome, PluginAddError> {
+        apply_ios_entitlement(
+            root,
+            TEST_ENTITLEMENT,
+            IosEntitlementValue::Bool(true),
+            "Test entitlement",
+        )
+    }
+
+    fn read_entitlements(root: &Path, rel: &str) -> String {
+        fs::read_to_string(root.join(rel)).unwrap()
+    }
+
+    /// The body of the `XCBuildConfiguration` object `id`.
+    fn build_configuration_body(pbxproj: &str, id: &str) -> String {
+        let section = pbx_section_range(pbxproj, "XCBuildConfiguration").unwrap();
+        let object = pbx_objects(pbxproj, section)
+            .unwrap()
+            .into_iter()
+            .find(|object| object.id == id)
+            .unwrap_or_else(|| panic!("no build configuration `{id}`:\n{pbxproj}"));
+        pbxproj[object.body].to_string()
+    }
+
+    /// `pbxproj` with a copy of the Runner target's Release configuration
+    /// added as `name`, listed in the Runner target's configuration list —
+    /// what a natively declared flavor's `<Mode>-<Flavor>` configuration
+    /// looks like.
+    fn with_runner_configuration(pbxproj: &str, id: &str, name: &str) -> String {
+        let marker = "\t\tABCDABCDABCDABCDABCD000F /* Release */ = {\n";
+        let close = "\n\t\t};\n";
+        let start = pbxproj.find(marker).unwrap();
+        let end = start + pbxproj[start..].find(close).unwrap() + close.len();
+        let copy = pbxproj[start..end]
+            .replace(
+                "ABCDABCDABCDABCDABCD000F /* Release */",
+                &format!("{id} /* {name} */"),
+            )
+            .replace("name = Release;", &format!("name = \"{name}\";"));
+        let mut out = pbxproj.to_string();
+        out.insert_str(end, &copy);
+        let entry = "\t\t\t\tABCDABCDABCDABCDABCD0026 /* Profile */,\n";
+        let at = out.find(entry).unwrap() + entry.len();
+        out.insert_str(at, &format!("\t\t\t\t{id} /* {name} */,\n"));
+        out
+    }
+
+    #[test]
+    fn ios_entitlement_creates_the_file_and_sets_every_runner_configuration() {
+        let root = scaffold_project("ios-entitlement-fresh");
+        assert!(!root.join(ENTITLEMENTS_REL).exists());
+
+        let report = add_test_spec(&root, &ENTITLEMENT_PLUGIN).unwrap();
+        assert_eq!(report.plugin_id, "entitlement-test-plugin");
+        assert_eq!(report.items.len(), 3, "{report:?}");
+        assert!(
+            report
+                .items
+                .iter()
+                .all(|i| i.outcome == AddOutcome::Applied),
+            "{report:?}"
+        );
+        assert_eq!(
+            report.items[2].description,
+            format!("iOS entitlement `{TEST_ENTITLEMENT}` (`CODE_SIGN_ENTITLEMENTS`)")
+        );
+
+        // The file: a plist holding the key, created from nothing.
+        let entitlements = read_entitlements(&root, ENTITLEMENTS_REL);
+        assert!(entitlements.starts_with("<?xml"), "{entitlements}");
+        assert!(
+            entitlements.contains(&format!(
+                "\t<!-- Test entitlement -->\n\t<key>{TEST_ENTITLEMENT}</key>\n\t<true/>\n</dict>\n</plist>\n"
+            )),
+            "{entitlements}"
+        );
+
+        // The setting: once in each Runner target configuration, sorted
+        // where Xcode puts it, and in no project-level configuration.
+        let pbxproj = read_pbxproj(&root);
+        for id in RUNNER_CONFIG_IDS {
+            let body = build_configuration_body(&pbxproj, id);
+            assert_eq!(body.matches(ENTITLEMENTS_LINE).count(), 1, "{id}:\n{body}");
+        }
+        for id in PROJECT_CONFIG_IDS {
+            let body = build_configuration_body(&pbxproj, id);
+            assert!(!body.contains(CODE_SIGN_ENTITLEMENTS), "{id}:\n{body}");
+        }
+        assert_eq!(pbxproj.matches(CODE_SIGN_ENTITLEMENTS).count(), 3);
+        assert_eq!(
+            pbxproj
+                .matches(
+                    "\t\t\t\tCODE_SIGNING_REQUIRED = NO;\n\
+                     \t\t\t\tCODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;\n\
+                     \t\t\t\tCODE_SIGN_STYLE = Automatic;\n"
+                )
+                .count(),
+            3,
+            "{pbxproj}"
+        );
+        assert_pbxproj_well_formed(&pbxproj);
+
+        // A second add changes no byte.
+        let after_first = snapshot_tree(&root);
+        let again = add_test_spec(&root, &ENTITLEMENT_PLUGIN).unwrap();
+        assert!(
+            again
+                .items
+                .iter()
+                .all(|i| i.outcome == AddOutcome::AlreadyPresent),
+            "{again:?}"
+        );
+        assert_eq!(
+            after_first,
+            snapshot_tree(&root),
+            "a second add must leave a byte-identical tree"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ios_entitlement_values_are_plist_elements_with_escaped_text() {
+        let root = scaffold_project("ios-entitlement-values");
+
+        let applied = [
+            (
+                "aps-environment",
+                IosEntitlementValue::String("dev&<x>"),
+                "Push",
+            ),
+            (
+                "com.apple.security.application-groups",
+                IosEntitlementValue::StringArray(&["group.a&b", "group.<c>"]),
+                "Groups",
+            ),
+            ("odd&<key>", IosEntitlementValue::Bool(false), "Odd key"),
+        ];
+        for (key, value, comment) in applied {
+            assert_eq!(
+                apply_ios_entitlement(&root, key, value, comment).unwrap(),
+                AddOutcome::Applied,
+                "{key}"
+            );
+        }
+
+        let entitlements = read_entitlements(&root, ENTITLEMENTS_REL);
+        assert!(
+            entitlements
+                .contains("\t<key>aps-environment</key>\n\t<string>dev&amp;&lt;x&gt;</string>\n"),
+            "{entitlements}"
+        );
+        assert!(
+            entitlements.contains(
+                "\t<key>com.apple.security.application-groups</key>\n\
+                 \t<array>\n\
+                 \t\t<string>group.a&amp;b</string>\n\
+                 \t\t<string>group.&lt;c&gt;</string>\n\
+                 \t</array>\n"
+            ),
+            "{entitlements}"
+        );
+        assert!(
+            entitlements.contains("\t<key>odd&amp;&lt;key&gt;</key>\n\t<false/>\n"),
+            "{entitlements}"
+        );
+        assert!(!entitlements.contains("&<"), "{entitlements}");
+
+        // The escaped key is what the presence check looks for, too.
+        assert_eq!(
+            apply_ios_entitlement(
+                &root,
+                "odd&<key>",
+                IosEntitlementValue::Bool(false),
+                "Odd key"
+            )
+            .unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        // The setting was added once, by the first entitlement.
+        assert_eq!(read_pbxproj(&root).matches(ENTITLEMENTS_LINE).count(), 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_empty_string_array_entitlement_is_an_empty_array() {
+        assert_eq!(
+            entitlement_block("k", IosEntitlementValue::StringArray(&[]), "c"),
+            "\t<!-- c -->\n\t<key>k</key>\n\t<array/>\n"
+        );
+    }
+
+    #[test]
+    fn ios_entitlement_keeps_an_existing_files_other_keys_byte_for_byte() {
+        let root = scaffold_project("ios-entitlement-existing-keys");
+        let existing = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+            \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+            <plist version=\"1.0\">\n\
+            <dict>\n\
+            \x20   <key>keychain-access-groups</key>\n\
+            \x20   <array>\n\
+            \x20       <string>$(AppIdentifierPrefix)dev.f0x.myApp</string>\n\
+            \x20   </array>\n\
+            \x20   <key>com.apple.developer.associated-domains</key>\n\
+            \x20   <array/>\n\
+            </dict>\n\
+            </plist>\n";
+        fs::write(root.join(ENTITLEMENTS_REL), existing).unwrap();
+
+        assert_eq!(apply_test_entitlement(&root).unwrap(), AddOutcome::Applied);
+
+        let block = entitlement_block(
+            TEST_ENTITLEMENT,
+            IosEntitlementValue::Bool(true),
+            "Test entitlement",
+        );
+        let entitlements = read_entitlements(&root, ENTITLEMENTS_REL);
+        assert_eq!(entitlements.matches(&block).count(), 1, "{entitlements}");
+        assert_eq!(entitlements.replacen(&block, "", 1), existing);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ios_entitlement_reaches_a_flavored_fourth_runner_configuration() {
+        const PAID: &str = "ABCDABCDABCDABCDABCD00F0";
+        let root = scaffold_project("ios-entitlement-flavored");
+        let flavored = with_runner_configuration(&read_pbxproj(&root), PAID, "Release-Paid");
+        assert_pbxproj_well_formed(&flavored);
+        fs::write(root.join(PBXPROJ_REL), &flavored).unwrap();
+
+        assert_eq!(apply_test_entitlement(&root).unwrap(), AddOutcome::Applied);
+
+        let pbxproj = read_pbxproj(&root);
+        assert_eq!(pbxproj.matches(ENTITLEMENTS_LINE).count(), 4, "{pbxproj}");
+        for id in RUNNER_CONFIG_IDS.into_iter().chain([PAID]) {
+            let body = build_configuration_body(&pbxproj, id);
+            assert_eq!(body.matches(ENTITLEMENTS_LINE).count(), 1, "{id}:\n{body}");
+        }
+        assert!(
+            build_configuration_body(&pbxproj, PAID).contains("name = \"Release-Paid\";"),
+            "{pbxproj}"
+        );
+        assert_pbxproj_well_formed(&pbxproj);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A pbxproj whose Runner configurations cannot be resolved refuses the
+    /// whole add before its first write: not the entitlements file, nor the
+    /// pbxproj, nor the `Cargo.toml` dependency and `Info.plist` key that
+    /// would otherwise have landed first.
+    #[test]
+    fn an_unresolvable_runner_target_refuses_the_add_before_any_write() {
+        let manglings: [(&str, &str); 2] = [
+            (
+                "\t\t\tbuildConfigurationList = ABCDABCDABCDABCDABCD000B \
+                 /* Build configuration list for PBXNativeTarget \"Runner\" */;\n",
+                "",
+            ),
+            (
+                "\t\t\t\tABCDABCDABCDABCDABCD000E /* Debug */,\n\
+                 \t\t\t\tABCDABCDABCDABCDABCD000F /* Release */,\n\
+                 \t\t\t\tABCDABCDABCDABCDABCD0026 /* Profile */,\n",
+                "",
+            ),
+        ];
+        for (i, (from, to)) in manglings.into_iter().enumerate() {
+            let root = scaffold_project(&format!("ios-entitlement-unresolvable-{i}"));
+            let pbxproj = read_pbxproj(&root);
+            let mangled = pbxproj.replace(from, to);
+            assert_ne!(mangled, pbxproj, "mangling {i} must change the pbxproj");
+            fs::write(root.join(PBXPROJ_REL), &mangled).unwrap();
+            let cargo_before = fs::read(root.join(CARGO_TOML_REL)).unwrap();
+            let plist_before = fs::read(root.join(PLIST_REL)).unwrap();
+            let before = snapshot_tree(&root);
+
+            let err = add_test_spec(&root, &ENTITLEMENT_PLUGIN).unwrap_err();
+            assert!(
+                matches!(&err, PluginAddError::MalformedProjectFile(f) if f == PBXPROJ_REL),
+                "mangling {i}: {err}"
+            );
+            assert_eq!(fs::read(root.join(CARGO_TOML_REL)).unwrap(), cargo_before);
+            assert_eq!(fs::read(root.join(PLIST_REL)).unwrap(), plist_before);
+            assert_eq!(read_pbxproj(&root), mangled);
+            assert!(!root.join(ENTITLEMENTS_REL).exists());
+            assert_eq!(before, snapshot_tree(&root), "mangling {i}");
+
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// An existing entitlements file the key cannot be inserted into is
+    /// refused up front as well.
+    #[test]
+    fn an_entitlements_file_without_its_dict_refuses_the_add_before_any_write() {
+        let root = scaffold_project("ios-entitlement-no-dict");
+        fs::write(
+            root.join(ENTITLEMENTS_REL),
+            "<plist version=\"1.0\">\n</plist>\n",
+        )
+        .unwrap();
+        let before = snapshot_tree(&root);
+
+        let err = add_test_spec(&root, &ENTITLEMENT_PLUGIN).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::MalformedProjectFile(f) if f == ENTITLEMENTS_REL),
+            "{err}"
+        );
+        assert_eq!(before, snapshot_tree(&root));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A configuration already naming another entitlements file keeps its
+    /// setting; the key goes into that file instead.
+    #[test]
+    fn ios_entitlement_writes_into_the_file_an_existing_setting_names() {
+        let root = scaffold_project("ios-entitlement-other-file");
+        let custom_line = "CODE_SIGN_ENTITLEMENTS = Runner/App.entitlements;";
+        let style = "\t\t\t\tCODE_SIGN_STYLE = Automatic;\n";
+        let pbxproj =
+            read_pbxproj(&root).replace(style, &format!("\t\t\t\t{custom_line}\n{style}"));
+        assert_eq!(pbxproj.matches(custom_line).count(), 3);
+        fs::write(root.join(PBXPROJ_REL), &pbxproj).unwrap();
+        fs::write(root.join("ios/Runner/App.entitlements"), EMPTY_ENTITLEMENTS).unwrap();
+
+        assert_eq!(apply_test_entitlement(&root).unwrap(), AddOutcome::Applied);
+
+        assert_eq!(read_pbxproj(&root), pbxproj, "the setting is left alone");
+        assert!(!root.join(ENTITLEMENTS_REL).exists());
+        let entitlements = read_entitlements(&root, "ios/Runner/App.entitlements");
+        assert!(
+            entitlements.contains(&format!("<key>{TEST_ENTITLEMENT}</key>")),
+            "{entitlements}"
+        );
+        assert_eq!(
+            apply_test_entitlement(&root).unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// When only some configurations name a file, the rest are pointed at
+    /// that same file, so every configuration signs with the entitlement.
+    #[test]
+    fn configurations_without_a_setting_join_the_file_the_others_name() {
+        let root = scaffold_project("ios-entitlement-partial-setting");
+        let custom_line = "CODE_SIGN_ENTITLEMENTS = Runner/App.entitlements;";
+        let style = "\t\t\t\tCODE_SIGN_STYLE = Automatic;\n";
+        let pbxproj =
+            read_pbxproj(&root).replacen(style, &format!("\t\t\t\t{custom_line}\n{style}"), 1);
+        fs::write(root.join(PBXPROJ_REL), &pbxproj).unwrap();
+
+        assert_eq!(apply_test_entitlement(&root).unwrap(), AddOutcome::Applied);
+
+        let edited = read_pbxproj(&root);
+        assert_eq!(edited.matches(custom_line).count(), 3, "{edited}");
+        assert!(!edited.contains(ENTITLEMENTS_LINE), "{edited}");
+        assert!(!root.join(ENTITLEMENTS_REL).exists());
+        assert!(
+            read_entitlements(&root, "ios/Runner/App.entitlements")
+                .contains(&format!("<key>{TEST_ENTITLEMENT}</key>"))
+        );
+        assert_pbxproj_well_formed(&edited);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The setting in place but the file gone: the file is recreated and the
+    /// pbxproj left as it is.
+    #[test]
+    fn a_half_applied_ios_entitlement_completes_the_missing_file() {
+        let root = scaffold_project("ios-entitlement-half");
+        assert_eq!(apply_test_entitlement(&root).unwrap(), AddOutcome::Applied);
+        let pbxproj = read_pbxproj(&root);
+        let entitlements = read_entitlements(&root, ENTITLEMENTS_REL);
+        fs::remove_file(root.join(ENTITLEMENTS_REL)).unwrap();
+
+        assert_eq!(apply_test_entitlement(&root).unwrap(), AddOutcome::Applied);
+        assert_eq!(read_pbxproj(&root), pbxproj);
+        assert_eq!(read_entitlements(&root, ENTITLEMENTS_REL), entitlements);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A project without `ios/` answers an entitlement exactly as it answers
+    /// every other iOS contribution today.
+    #[test]
+    fn a_project_without_ios_answers_like_every_other_ios_contribution() {
+        let root = scaffold_project("ios-entitlement-no-ios");
+        fs::remove_dir_all(root.join("ios")).unwrap();
+
+        let entitlement = apply_test_entitlement(&root).unwrap_err();
+        let framework = apply_ios_framework(&root, "UserNotifications").unwrap_err();
+        assert!(
+            matches!(&entitlement, PluginAddError::MissingProjectFile(f) if f == PBXPROJ_REL),
+            "{entitlement}"
+        );
+        assert_eq!(entitlement.to_string(), framework.to_string());
+        assert!(!root.join("ios").exists(), "nothing is created under ios/");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn entitlements_setting_paths_resolve_inside_ios_only() {
+        for (setting, rel) in [
+            (
+                "Runner/Runner.entitlements",
+                "ios/Runner/Runner.entitlements",
+            ),
+            (
+                "$(SRCROOT)/Runner/App.entitlements",
+                "ios/Runner/App.entitlements",
+            ),
+            ("${PROJECT_DIR}/App.entitlements", "ios/App.entitlements"),
+        ] {
+            assert_eq!(entitlements_rel_path(setting).unwrap(), rel, "{setting}");
+        }
+        for setting in [
+            "",
+            "/etc/App.entitlements",
+            "../App.entitlements",
+            "Runner/../../App.entitlements",
+            "$(TARGET_NAME)/App.entitlements",
+            "C:/App.entitlements",
+        ] {
+            assert!(
+                matches!(
+                    entitlements_rel_path(setting),
+                    Err(PluginAddError::MalformedProjectFile(_))
+                ),
+                "{setting}"
+            );
+        }
+    }
+
+    /// Braces, `=` and `;` inside a quoted string or a comment are not
+    /// structure: the shell-script phase and the object comments of a real
+    /// scaffold must not confuse the object scan.
+    #[test]
+    fn the_pbx_scanner_skips_strings_and_comments() {
+        let src = "/* Begin X section */\n\
+                   \t\tAAAA /* a { comment ; */ = {\n\
+                   \t\t\tisa = X;\n\
+                   \t\t\tshellScript = \"echo \\\"${HOME}\\\"; }\";\n\
+                   \t\t\tname = \"Two Words\";\n\
+                   \t\t};\n\
+                   /* End X section */\n";
+        let section = pbx_section_range(src, "X").unwrap();
+        let objects = pbx_objects(src, section).unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].id, "AAAA");
+        let statements = pbx_statements(src, objects[0].body.clone()).unwrap();
+        let keys: Vec<&str> = statements.iter().map(|s| s.key.as_str()).collect();
+        assert_eq!(keys, ["isa", "shellScript", "name"]);
+        assert_eq!(
+            pbx_lookup(src, &statements, "name").as_deref(),
+            Some("Two Words")
+        );
+    }
+
     /// The regression guard for anchor drift in already-checked-in
     /// consumers: `add_plugin`'s tests above only ever exercise a **freshly
     /// scaffolded** project, which by construction always carries the
@@ -3877,5 +5463,747 @@ mod tests {
 
             let _ = fs::remove_dir_all(&dest);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // `Contribution::MavenRepository`
+    // -----------------------------------------------------------------------
+
+    fn maven_spec(contribs: &'static [Contribution]) -> PluginSpec {
+        PluginSpec {
+            id: "maven-test-plugin",
+            summary: "synthetic, test-only",
+            crate_dir: "maven-test-plugin",
+            base: contribs,
+            optional_features: &[],
+            requires_sibling: None,
+            ..PluginSpec::DEFAULT
+        }
+    }
+
+    const REPO_A: Contribution = Contribution::MavenRepository {
+        url: "https://repo.example.test/a",
+        groups: &["com.example.a", "com.example.b"],
+        comment: "Repo A",
+    };
+    const REPO_B: Contribution = Contribution::MavenRepository {
+        url: "https://repo.example.test/b",
+        groups: &["org.example"],
+        comment: "Repo B",
+    };
+
+    #[test]
+    fn maven_repository_lands_in_dependency_resolution_after_maven_central() {
+        let root = scaffold_project("maven-repo-lands");
+        let path = root.join(SETTINGS_GRADLE_REL);
+        assert_eq!(
+            apply_maven_repository(
+                &root,
+                "https://repo.example.test/a",
+                &["g.one", "g.two"],
+                "Repo A"
+            )
+            .unwrap(),
+            AddOutcome::Applied
+        );
+        let after = fs::read_to_string(&path).unwrap();
+        let drm = after.find("dependencyResolutionManagement").unwrap();
+        let central = drm + after[drm..].find("mavenCentral()").unwrap();
+        let marker = after.find(REPOSITORIES_ANCHOR).unwrap();
+        let block = after.find("exclusiveContent {").unwrap();
+        assert!(
+            drm < central && central < marker && marker < block,
+            "{after}"
+        );
+        assert!(after.contains("uri(\"https://repo.example.test/a\")"));
+        assert!(after.contains("includeGroup(\"g.one\")"));
+        assert!(after.contains("includeGroup(\"g.two\")"));
+        assert!(after.contains("// Repo A\n"));
+        // pluginManagement is untouched.
+        assert_eq!(after.matches("exclusiveContent").count(), 1);
+        assert_eq!(
+            apply_maven_repository(&root, "https://repo.example.test/a", &["g.one"], "Repo A")
+                .unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), after);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_maven_repositories_make_two_blocks() {
+        static SPEC_BASE: [Contribution; 3] = [
+            Contribution::CargoDep {
+                name: "frust-maven-test-plugin",
+            },
+            REPO_A,
+            REPO_B,
+        ];
+        let root = scaffold_project("maven-repo-two");
+        let spec = maven_spec(&SPEC_BASE);
+        let report = add_test_spec(&root, &spec).unwrap();
+        assert_eq!(report.items.len(), 3);
+        let after = fs::read_to_string(root.join(SETTINGS_GRADLE_REL)).unwrap();
+        assert_eq!(after.matches("exclusiveContent {").count(), 2, "{after}");
+        let again = add_test_spec(&root, &spec).unwrap();
+        assert!(
+            again
+                .items
+                .iter()
+                .all(|i| i.outcome == AddOutcome::AlreadyPresent)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(SETTINGS_GRADLE_REL)).unwrap(),
+            after
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maven_repository_without_the_marker_fails_before_any_write() {
+        static SPEC_BASE: [Contribution; 2] = [
+            Contribution::CargoDep {
+                name: "frust-maven-test-plugin",
+            },
+            REPO_A,
+        ];
+        let root = scaffold_project("maven-repo-no-marker");
+        let path = root.join(SETTINGS_GRADLE_REL);
+        let mangled = fs::read_to_string(&path)
+            .unwrap()
+            .replace(REPOSITORIES_ANCHOR, "// (marker removed)");
+        fs::write(&path, &mangled).unwrap();
+        let cargo_before = fs::read(root.join(CARGO_TOML_REL)).unwrap();
+        let err = add_test_spec(&root, &maven_spec(&SPEC_BASE)).unwrap_err();
+        match &err {
+            PluginAddError::MalformedProjectFile(msg) => {
+                assert!(msg.contains(REPOSITORIES_ANCHOR), "{msg}");
+                assert!(msg.contains("mavenCentral()"), "{msg}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), mangled);
+        assert_eq!(fs::read(root.join(CARGO_TOML_REL)).unwrap(), cargo_before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maven_repository_rejects_empty_groups_and_non_http_urls() {
+        let root = scaffold_project("maven-repo-invalid");
+        let before = fs::read(root.join(SETTINGS_GRADLE_REL)).unwrap();
+        assert!(matches!(
+            apply_maven_repository(&root, "https://x.test/m", &[], "c"),
+            Err(PluginAddError::InvalidContribution(_))
+        ));
+        assert!(matches!(
+            apply_maven_repository(&root, "file:///tmp/m", &["g"], "c"),
+            Err(PluginAddError::InvalidContribution(_))
+        ));
+        assert_eq!(fs::read(root.join(SETTINGS_GRADLE_REL)).unwrap(), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maven_repository_escapes_quotes_and_backslashes() {
+        let root = scaffold_project("maven-repo-escape");
+        apply_maven_repository(&root, "https://x.test/a\"b\\c", &["g\"h"], "c").unwrap();
+        let after = fs::read_to_string(root.join(SETTINGS_GRADLE_REL)).unwrap();
+        assert!(
+            after.contains("uri(\"https://x.test/a\\\"b\\\\c\")"),
+            "{after}"
+        );
+        assert!(after.contains("includeGroup(\"g\\\"h\")"), "{after}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // `Contribution::PlistArrayEntry` and Info.plist escaping
+    // -----------------------------------------------------------------------
+
+    fn read_plist(root: &Path) -> String {
+        fs::read_to_string(root.join(PLIST_REL)).unwrap()
+    }
+
+    #[test]
+    fn plist_array_entry_writes_a_well_formed_array_and_reapply_is_a_no_op() {
+        let root = scaffold_project("plist-array-two");
+        let before = read_plist(&root);
+        assert_eq!(
+            apply_plist_array_entry(&root, "TestIds", &["a.one", "a.two"], "Ids").unwrap(),
+            AddOutcome::Applied
+        );
+        let after = read_plist(&root);
+        assert!(
+            after.contains(
+                "\t<!-- Ids -->\n\t<key>TestIds</key>\n\t<array>\n\
+                 \t\t<string>a.one</string>\n\t\t<string>a.two</string>\n\t</array>\n</dict>"
+            ),
+            "{after}"
+        );
+        assert!(after.len() > before.len());
+        assert_eq!(
+            apply_plist_array_entry(&root, "TestIds", &["other"], "Ids").unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        assert_eq!(read_plist(&root), after);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plist_array_entry_with_no_values_is_an_empty_array() {
+        let root = scaffold_project("plist-array-empty");
+        assert_eq!(
+            apply_plist_array_entry(&root, "TestIds", &[], "Ids").unwrap(),
+            AddOutcome::Applied
+        );
+        assert!(read_plist(&root).contains("\t<key>TestIds</key>\n\t<array>\n\t</array>\n</dict>"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plist_values_and_keys_are_xml_escaped_for_both_kinds() {
+        let root = scaffold_project("plist-escape");
+        apply_plist_entry(&root, "k&<s>", "a&b<c", "x -- y --- z").unwrap();
+        apply_plist_array_entry(&root, "k&<a>", &["a&b<c", "d>e"], "arr").unwrap();
+        let plist = read_plist(&root);
+        assert!(
+            plist.contains("<key>k&amp;&lt;s&gt;</key>\n\t<string>a&amp;b&lt;c</string>"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains(
+                "<key>k&amp;&lt;a&gt;</key>\n\t<array>\n\t\t<string>a&amp;b&lt;c</string>\n\t\t<string>d&gt;e</string>"
+            ),
+            "{plist}"
+        );
+        let comment_line = plist.lines().find(|l| l.contains("x - y")).unwrap();
+        assert!(
+            !comment_line
+                .replace("<!--", "")
+                .replace("-->", "")
+                .contains("--")
+        );
+        // Escaped key is what the presence check looks for.
+        assert_eq!(
+            apply_plist_entry(&root, "k&<s>", "v", "c").unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plist_entries_without_a_dict_anchor_are_malformed_and_write_nothing() {
+        let root = scaffold_project("plist-no-anchor");
+        let broken = "<plist version=\"1.0\"></plist>\n";
+        fs::write(root.join(PLIST_REL), broken).unwrap();
+        assert!(matches!(
+            apply_plist_array_entry(&root, "K", &["v"], "c"),
+            Err(PluginAddError::MalformedProjectFile(_))
+        ));
+        assert!(matches!(
+            apply_plist_entry(&root, "K", "v", "c"),
+            Err(PluginAddError::MalformedProjectFile(_))
+        ));
+        assert_eq!(read_plist(&root), broken);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_registry_plist_entry_is_written_byte_identically_to_the_old_format() {
+        let mut checked = 0;
+        for spec in crate::plugin::known_plugins() {
+            let all = spec
+                .base
+                .iter()
+                .chain(spec.optional_features.iter().flat_map(|f| f.contributions));
+            for c in all {
+                if let Contribution::PlistEntry {
+                    key,
+                    value,
+                    comment,
+                } = c
+                {
+                    let golden = format!(
+                        "\t<!-- {comment} -->\n\t<key>{key}</key>\n\t<string>{value}</string>\n"
+                    );
+                    assert_eq!(
+                        plist_entry_block(&xml_escape(key), value, comment),
+                        golden,
+                        "{}: {key}",
+                        spec.id
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn plist_writes_leave_existing_build_setting_references_unchanged() {
+        let root = scaffold_project("plist-build-setting");
+        let before = read_plist(&root);
+        assert!(before.contains("$(FRUST_DISPLAY_NAME)"), "{before}");
+        apply_plist_entry(&root, "K", "v", "c").unwrap();
+        apply_plist_array_entry(&root, "A", &["v"], "c").unwrap();
+        let after = read_plist(&root);
+        assert!(after.contains("$(FRUST_DISPLAY_NAME)"));
+        let tail = before.rfind("</dict>").unwrap();
+        assert_eq!(&after[..tail], &before[..tail]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // Platform floors (`PluginSpec::min_ios` / `min_android_sdk`)
+    // -----------------------------------------------------------------------
+
+    use crate::plugin::FeatureSpec;
+
+    /// A synthetic plugin editing Cargo.toml, Info.plist, the pbxproj and both
+    /// Gradle files, so a refused add can be shown to have touched none.
+    const FLOOR_BASE: &[Contribution] = &[
+        Contribution::CargoDep {
+            name: "frust-floor-test-plugin",
+        },
+        Contribution::PlistEntry {
+            key: "NSFloorTestUsageDescription",
+            value: "test",
+            comment: "test",
+        },
+        Contribution::IosFramework {
+            name: "FloorTestKit",
+        },
+        Contribution::GradleModule {
+            gradle_name: ":frust-floor-test-plugin",
+            rel_path: "plugins/floor-test-plugin/platform/android",
+        },
+    ];
+
+    /// A feature needing iOS 17 / API 33, above any floor its spec states.
+    const FLOOR_FEATURES: &[FeatureSpec] = &[FeatureSpec {
+        id: "needs-17",
+        summary: "synthetic, test-only",
+        contributions: &[],
+        min_ios: Some("17.0"),
+        min_android_sdk: Some(33),
+    }];
+
+    /// The generated app's deployment-target line, in each of the three
+    /// build configurations.
+    const TARGET_15: &str = "IPHONEOS_DEPLOYMENT_TARGET = 15.0;";
+
+    fn floor_spec(
+        base: &'static [Contribution],
+        min_ios: Option<&'static str>,
+        min_android_sdk: Option<u32>,
+    ) -> PluginSpec {
+        PluginSpec {
+            id: "floor-test-plugin",
+            summary: "synthetic, test-only",
+            crate_dir: "floor-test-plugin",
+            base,
+            optional_features: FLOOR_FEATURES,
+            min_ios,
+            min_android_sdk,
+            ..PluginSpec::DEFAULT
+        }
+    }
+
+    fn add_floor_spec(
+        root: &Path,
+        spec: &PluginSpec,
+        features: &[&str],
+    ) -> Result<AddReport, PluginAddError> {
+        add_spec_with(&checkout_locator(root), root, spec, features)
+    }
+
+    /// Rewrite `rel` in place, asserting `from` was there to replace.
+    fn rewrite(root: &Path, rel: &str, from: &str, to: &str) {
+        let path = root.join(rel);
+        let src = fs::read_to_string(&path).unwrap();
+        assert!(src.contains(from), "`{from}` not in {rel}");
+        fs::write(&path, src.replace(from, to)).unwrap();
+    }
+
+    #[test]
+    fn ios_versions_compare_numerically_per_component() {
+        let ordered = ["15.0", "15.1", "16", "16.4", "17.0"];
+        for pair in ordered.windows(2) {
+            let (low, high) = (
+                parse_ios_version(pair[0]).unwrap(),
+                parse_ios_version(pair[1]).unwrap(),
+            );
+            assert!(compare_versions(&low, &high).is_lt(), "{pair:?}");
+            assert!(compare_versions(&high, &low).is_gt(), "{pair:?}");
+        }
+        assert!(
+            compare_versions(
+                &parse_ios_version("16").unwrap(),
+                &parse_ios_version("16.0").unwrap()
+            )
+            .is_eq()
+        );
+        assert!(
+            compare_versions(
+                &parse_ios_version("16.10").unwrap(),
+                &parse_ios_version("16.9").unwrap()
+            )
+            .is_gt()
+        );
+        for bad in ["", "16.", ".4", "a", "16.x", "16 .4", "-1"] {
+            assert_eq!(parse_ios_version(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_min_ios_above_the_generated_app_is_refused_and_writes_nothing() {
+        let root = scaffold_project("floor-ios-refused");
+        let before = snapshot_tree(&root);
+        let err =
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[]).unwrap_err();
+        match &err {
+            PluginAddError::PlatformFloorTooLow {
+                plugin,
+                platform,
+                required,
+                found,
+                key,
+                file,
+                ..
+            } => {
+                assert_eq!(*plugin, "floor-test-plugin");
+                assert_eq!(*platform, FloorPlatform::Ios);
+                assert_eq!(required, "16.4");
+                assert_eq!(found, "15.0");
+                assert_eq!(*key, IOS_DEPLOYMENT_TARGET);
+                assert_eq!(*file, PBXPROJ_REL);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "plugin `floor-test-plugin` needs iOS 16.4 or later; \
+             ios/Runner.xcodeproj/project.pbxproj sets IPHONEOS_DEPLOYMENT_TARGET = 15.0. \
+             Raise it in every build configuration (and keep it at or above every Swift \
+             package's minimum), then re-run."
+        );
+        // Cargo.toml, Info.plist, the pbxproj and both Gradle files — the whole
+        // tree — are byte-identical.
+        assert_eq!(snapshot_tree(&root), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn raising_every_configuration_to_the_floor_lets_the_add_proceed() {
+        for raised in ["16.4", "17.0", "16.4.1"] {
+            let root = scaffold_project("floor-ios-raised");
+            rewrite(
+                &root,
+                PBXPROJ_REL,
+                TARGET_15,
+                &format!("IPHONEOS_DEPLOYMENT_TARGET = {raised};"),
+            );
+            let report = add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[])
+                .unwrap_or_else(|e| panic!("{raised}: {e}"));
+            assert!(
+                report
+                    .items
+                    .iter()
+                    .all(|item| item.outcome == AddOutcome::Applied),
+                "{raised}: {report:?}"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn one_configuration_left_below_the_floor_still_refuses() {
+        let root = scaffold_project("floor-ios-partial");
+        let path = root.join(PBXPROJ_REL);
+        let src = fs::read_to_string(&path).unwrap();
+        assert_eq!(src.matches(TARGET_15).count(), 3);
+        // Raise the first two configurations only.
+        let raised = src
+            .replacen(TARGET_15, "IPHONEOS_DEPLOYMENT_TARGET = 17.0;", 2)
+            .replacen(TARGET_15, "IPHONEOS_DEPLOYMENT_TARGET = 16.0;", 1);
+        fs::write(&path, &raised).unwrap();
+        let err =
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::PlatformFloorTooLow { found, .. } if found == "16.0"),
+            "{err}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), raised);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A project carrying a flavor natively has a fourth build configuration;
+    /// its deployment target counts like the other three.
+    #[test]
+    fn a_fourth_flavor_configuration_below_the_floor_refuses() {
+        let root = scaffold_project("floor-ios-flavor");
+        rewrite(
+            &root,
+            PBXPROJ_REL,
+            TARGET_15,
+            "IPHONEOS_DEPLOYMENT_TARGET = 17.0;",
+        );
+        rewrite(
+            &root,
+            PBXPROJ_REL,
+            "/* End XCBuildConfiguration section */",
+            "\t\tABCDABCDABCDABCDABCD00F0 /* Debug-dev */ = {\n\
+             \t\t\tisa = XCBuildConfiguration;\n\
+             \t\t\tbuildSettings = {\n\
+             \t\t\t\tIPHONEOS_DEPLOYMENT_TARGET = 15.1;\n\
+             \t\t\t};\n\
+             \t\t\tname = \"Debug-dev\";\n\
+             \t\t};\n\
+             /* End XCBuildConfiguration section */",
+        );
+        let pbxproj = fs::read_to_string(root.join(PBXPROJ_REL)).unwrap();
+        assert_eq!(pbxproj.matches("isa = XCBuildConfiguration;").count(), 7);
+        let err =
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::PlatformFloorTooLow { found, .. } if found == "15.1"),
+            "{err}"
+        );
+        // At 15.0 the flavor configuration meets the floor too.
+        add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("15.0"), None), &[]).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_min_android_sdk_above_min_sdk_value_is_refused_and_writes_nothing() {
+        let root = scaffold_project("floor-android-refused");
+        let before = snapshot_tree(&root);
+        let err = add_floor_spec(&root, &floor_spec(FLOOR_BASE, None, Some(31)), &[]).unwrap_err();
+        match &err {
+            PluginAddError::PlatformFloorTooLow {
+                platform,
+                required,
+                found,
+                key,
+                file,
+                ..
+            } => {
+                assert_eq!(*platform, FloorPlatform::Android);
+                assert_eq!(required, "31");
+                assert_eq!(found, "29");
+                assert_eq!(*key, MIN_SDK_VALUE);
+                assert_eq!(*file, APP_BUILD_GRADLE_REL);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "plugin `floor-test-plugin` needs Android minSdk 31 or later; \
+             android/app/build.gradle.kts sets minSdkValue = 29. Raise it (and any product \
+             flavor's own `minSdk` below it), then re-run."
+        );
+        assert_eq!(snapshot_tree(&root), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn min_sdk_value_at_or_above_the_floor_lets_the_add_proceed() {
+        for raised in [31, 34] {
+            let root = scaffold_project("floor-android-raised");
+            rewrite(
+                &root,
+                APP_BUILD_GRADLE_REL,
+                "val minSdkValue = 29",
+                &format!("val minSdkValue = {raised}"),
+            );
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, None, Some(31)), &[])
+                .unwrap_or_else(|e| panic!("{raised}: {e}"));
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Without `minSdkValue`, a literal `defaultConfig` `minSdk` is read, and
+    /// the message names that key.
+    #[test]
+    fn a_literal_min_sdk_is_read_when_min_sdk_value_is_absent() {
+        let root = scaffold_project("floor-android-literal");
+        rewrite(
+            &root,
+            APP_BUILD_GRADLE_REL,
+            "val minSdkValue = 29",
+            "// floor below",
+        );
+        rewrite(
+            &root,
+            APP_BUILD_GRADLE_REL,
+            "minSdk = minSdkValue",
+            "minSdk = 30",
+        );
+        let err = add_floor_spec(&root, &floor_spec(FLOOR_BASE, None, Some(31)), &[]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::PlatformFloorTooLow { key, found, .. }
+                if *key == MIN_SDK && found == "30"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("sets minSdk = 30."), "{err}");
+        add_floor_spec(&root, &floor_spec(FLOOR_BASE, None, Some(30)), &[]).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_floor_that_cannot_be_read_is_malformed_naming_the_key() {
+        let root = scaffold_project("floor-unreadable");
+        rewrite(
+            &root,
+            APP_BUILD_GRADLE_REL,
+            "val minSdkValue = 29",
+            "val minSdkValue = libs.versions.minSdk.get().toInt()",
+        );
+        let cargo_before = fs::read(root.join(CARGO_TOML_REL)).unwrap();
+        let err = add_floor_spec(&root, &floor_spec(FLOOR_BASE, None, Some(31)), &[]).unwrap_err();
+        match &err {
+            PluginAddError::MalformedProjectFile(msg) => {
+                assert!(msg.starts_with(APP_BUILD_GRADLE_REL), "{msg}");
+                assert!(msg.contains("`minSdkValue = libs."), "{msg}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        rewrite(
+            &root,
+            PBXPROJ_REL,
+            TARGET_15,
+            "IPHONEOS_DEPLOYMENT_TARGET = \"$(BASE)\";",
+        );
+        let err =
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[]).unwrap_err();
+        match &err {
+            PluginAddError::MalformedProjectFile(msg) => {
+                assert!(msg.starts_with(PBXPROJ_REL), "{msg}");
+                assert!(
+                    msg.contains("`IPHONEOS_DEPLOYMENT_TARGET = $(BASE)`"),
+                    "{msg}"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(fs::read(root.join(CARGO_TOML_REL)).unwrap(), cargo_before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_floor_key_missing_entirely_is_malformed_naming_the_key() {
+        let root = scaffold_project("floor-missing-key");
+        rewrite(&root, PBXPROJ_REL, TARGET_15, "SDKROOT = iphoneos;");
+        let err =
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::MalformedProjectFile(msg)
+                if msg.contains(IOS_DEPLOYMENT_TARGET)),
+            "{err}"
+        );
+        rewrite(&root, APP_BUILD_GRADLE_REL, "val minSdkValue = 29", "");
+        rewrite(&root, APP_BUILD_GRADLE_REL, "minSdk = minSdkValue", "");
+        let err = add_floor_spec(&root, &floor_spec(FLOOR_BASE, None, Some(31)), &[]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::MalformedProjectFile(msg)
+                if msg.contains(MIN_SDK_VALUE) && msg.contains("`minSdk = <n>`")),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A platform the app has no directory for has no floor to check.
+    #[test]
+    fn a_missing_platform_directory_skips_its_check() {
+        const CARGO_ONLY: &[Contribution] = &[Contribution::CargoDep {
+            name: "frust-floor-test-plugin",
+        }];
+        let root = scaffold_project("floor-no-platforms");
+        fs::remove_dir_all(root.join(IOS_DIR_REL)).unwrap();
+        fs::remove_dir_all(root.join(ANDROID_DIR_REL)).unwrap();
+        let report =
+            add_floor_spec(&root, &floor_spec(CARGO_ONLY, Some("99.0"), Some(99)), &[]).unwrap();
+        assert_eq!(report.items.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A feature's floor counts only when that feature is requested, and only
+    /// raises the requirement.
+    #[test]
+    fn a_feature_floor_raises_the_requirement_only_when_requested() {
+        let root = scaffold_project("floor-feature");
+        rewrite(
+            &root,
+            PBXPROJ_REL,
+            TARGET_15,
+            "IPHONEOS_DEPLOYMENT_TARGET = 16.4;",
+        );
+        rewrite(
+            &root,
+            APP_BUILD_GRADLE_REL,
+            "val minSdkValue = 29",
+            "val minSdkValue = 31",
+        );
+        let spec = floor_spec(FLOOR_BASE, Some("16.4"), Some(31));
+        let before = snapshot_tree(&root);
+        let err = add_floor_spec(&root, &spec, &["needs-17"]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::PlatformFloorTooLow { platform: FloorPlatform::Ios,
+                required, .. } if required == "17.0"),
+            "{err}"
+        );
+        assert_eq!(snapshot_tree(&root), before);
+        add_floor_spec(&root, &spec, &[]).unwrap();
+
+        assert_eq!(
+            floor_requirement(&spec, &["needs-17"]).unwrap(),
+            FloorRequirement {
+                ios: Some("17.0"),
+                android_sdk: Some(33),
+            }
+        );
+        assert_eq!(
+            floor_requirement(&spec, &[]).unwrap(),
+            FloorRequirement {
+                ios: Some("16.4"),
+                android_sdk: Some(31),
+            }
+        );
+        // A feature below its spec never lowers the requirement.
+        let high = floor_spec(FLOOR_BASE, Some("18.0"), Some(35));
+        assert_eq!(
+            floor_requirement(&high, &["needs-17"]).unwrap(),
+            FloorRequirement {
+                ios: Some("18.0"),
+                android_sdk: Some(35),
+            }
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_registry_min_ios_that_is_not_a_version_is_refused_before_any_write() {
+        let root = scaffold_project("floor-invalid");
+        let before = snapshot_tree(&root);
+        assert!(matches!(
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("sixteen"), None), &[]),
+            Err(PluginAddError::InvalidContribution(msg)) if msg.contains("`sixteen`")
+        ));
+        assert_eq!(snapshot_tree(&root), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gradle_assignment_reads_declarations_and_skips_comments() {
+        let src = "// val minSdkValue = 99\n\
+                   /* minSdk = 98 */\n\
+                   val minSdkValue: Int = 30 // the floor\n\
+                   minSdkVersion = 12\n\
+                   minSdk == 5\n\
+                   minSdk = 24;\n";
+        assert_eq!(gradle_assignment(src, MIN_SDK_VALUE), Some("30"));
+        assert_eq!(gradle_assignment(src, MIN_SDK), Some("24"));
+        assert_eq!(gradle_assignment(src, "targetSdk"), None);
     }
 }

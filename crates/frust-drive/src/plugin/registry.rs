@@ -110,6 +110,7 @@ const SECURE_STORAGE_FEATURES: &[FeatureSpec] = &[FeatureSpec {
               the FrustBiometric helper, the USE_BIOMETRIC permission, and \
               the R8 keep rule).",
     contributions: SECURE_STORAGE_BIOMETRIC,
+    ..FeatureSpec::DEFAULT
 }];
 
 const SHARED_PREFERENCES: PluginSpec = PluginSpec {
@@ -121,6 +122,7 @@ const SHARED_PREFERENCES: PluginSpec = PluginSpec {
     }],
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 const SECURE_STORAGE: PluginSpec = PluginSpec {
@@ -133,6 +135,7 @@ const SECURE_STORAGE: PluginSpec = PluginSpec {
     }],
     optional_features: SECURE_STORAGE_FEATURES,
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 const CLEAN_SIGNALS_FRUST: PluginSpec = PluginSpec {
@@ -144,6 +147,7 @@ const CLEAN_SIGNALS_FRUST: PluginSpec = PluginSpec {
     }],
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `camera`'s base contributions, unwidened since first landing. No optional
@@ -210,6 +214,7 @@ const CAMERA: PluginSpec = PluginSpec {
     base: CAMERA_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `native-widgets`' base contributions — deliberately just **two**, and the
@@ -251,6 +256,7 @@ const NATIVE_WIDGETS: PluginSpec = PluginSpec {
     base: NATIVE_WIDGETS_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `clipboard`'s base contribution — a single Cargo dependency, and nothing
@@ -269,6 +275,7 @@ const CLIPBOARD: PluginSpec = PluginSpec {
     }],
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `haptics`' base contributions — a Cargo dependency plus one
@@ -305,6 +312,7 @@ const HAPTICS: PluginSpec = PluginSpec {
     base: HAPTICS_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `url-launcher`'s single base contribution — a Cargo dependency and
@@ -341,6 +349,7 @@ const URL_LAUNCHER: PluginSpec = PluginSpec {
     base: URL_LAUNCHER_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `auth-session`'s base contributions — a Cargo dependency, the plugin's own
@@ -390,6 +399,7 @@ const AUTH_SESSION: PluginSpec = PluginSpec {
     base: AUTH_SESSION_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 const OAUTH_NATIVE: PluginSpec = PluginSpec {
@@ -402,6 +412,7 @@ const OAUTH_NATIVE: PluginSpec = PluginSpec {
     }],
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `iap`'s base contributions — a Cargo dependency plus its own Android
@@ -439,6 +450,7 @@ const IAP: PluginSpec = PluginSpec {
     base: IAP_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `video-player`'s base contributions — the exact two-contribution shape
@@ -479,6 +491,7 @@ const VIDEO_PLAYER: PluginSpec = PluginSpec {
     base: VIDEO_PLAYER_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `database`'s single optional feature — enables the Turso engine (a pure-Rust
@@ -502,6 +515,7 @@ const DATABASE_FEATURES: &[FeatureSpec] = &[FeatureSpec {
               Significant binary-size cost (see plugin README); enables future \
               vector-search/cloud-sync capabilities. Engine chosen at open time.",
     contributions: DATABASE_TURSO,
+    ..FeatureSpec::DEFAULT
 }];
 
 const DATABASE: PluginSpec = PluginSpec {
@@ -513,6 +527,7 @@ const DATABASE: PluginSpec = PluginSpec {
     }],
     optional_features: DATABASE_FEATURES,
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `i18n`'s base contributions — a Cargo dependency, a starter locale file,
@@ -554,6 +569,7 @@ const I18N: PluginSpec = PluginSpec {
     base: I18N_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `glyph`'s single base contribution — a Cargo dependency and nothing else.
@@ -574,6 +590,7 @@ const GLYPH: PluginSpec = PluginSpec {
     }],
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `material`'s single base contribution — see [`GLYPH`]'s doc comment for
@@ -588,6 +605,7 @@ const MATERIAL: PluginSpec = PluginSpec {
     }],
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `cupertino`'s single base contribution — see [`GLYPH`]'s doc comment for
@@ -602,6 +620,7 @@ const CUPERTINO: PluginSpec = PluginSpec {
     }],
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `shadcn`'s single base contribution — see [`GLYPH`]'s doc comment for the
@@ -623,6 +642,7 @@ const SHADCN: PluginSpec = PluginSpec {
     }],
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `beui`'s single base contribution — see [`GLYPH`]'s doc comment for the
@@ -636,6 +656,7 @@ const BEUI: PluginSpec = PluginSpec {
     base: &[Contribution::CargoDep { name: "frust-beui" }],
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `network-image`'s single optional feature: pure-Rust WebP decoding in the
@@ -666,8 +687,10 @@ const NETWORK_IMAGE: PluginSpec = PluginSpec {
         id: "webp",
         summary: "WebP decoding (pure-Rust image-webp).",
         contributions: NETWORK_IMAGE_WEBP,
+        ..FeatureSpec::DEFAULT
     }],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `share`'s base contributions: a Cargo dependency and the plugin's own
@@ -693,6 +716,7 @@ const SHARE: PluginSpec = PluginSpec {
     base: SHARE_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `connectivity`'s base contributions: a Cargo dependency, the plugin's own
@@ -718,6 +742,7 @@ const CONNECTIVITY: PluginSpec = PluginSpec {
     base: CONNECTIVITY_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `qr`'s single base contribution: a Cargo dependency only (platform-free
@@ -731,6 +756,7 @@ const QR: PluginSpec = PluginSpec {
     base: QR_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `file-dialogs`' base contributions: the Cargo dependency, the plugin's own
@@ -763,6 +789,7 @@ const FILE_DIALOGS: PluginSpec = PluginSpec {
     base: FILE_DIALOGS_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `material-i18n`'s single base contribution: the bridge is a plain
@@ -778,6 +805,7 @@ const MATERIAL_I18N: PluginSpec = PluginSpec {
     }],
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `device-info`'s single base contribution: a Cargo dependency only (a plain-JNI and
@@ -792,6 +820,7 @@ const DEVICE_INFO: PluginSpec = PluginSpec {
     }],
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `permissions`' feature contributions. Every feature turns on the matching
@@ -993,6 +1022,7 @@ const PERMISSIONS_FEATURES: &[FeatureSpec] = &[
         summary: "Photo library read access (Android media permissions, \
                   NSPhotoLibraryUsageDescription, Photos framework).",
         contributions: PERMISSIONS_PHOTOS,
+        ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
         id: "photos-images",
@@ -1001,6 +1031,7 @@ const PERMISSIONS_FEATURES: &[FeatureSpec] = &[
                   NSPhotoLibraryUsageDescription, Photos framework). No video \
                   permission; use `photos` for both.",
         contributions: PERMISSIONS_PHOTOS_IMAGES,
+        ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
         id: "photos-videos",
@@ -1009,29 +1040,34 @@ const PERMISSIONS_FEATURES: &[FeatureSpec] = &[
                   NSPhotoLibraryUsageDescription, Photos framework). No image \
                   permission; use `photos` for both.",
         contributions: PERMISSIONS_PHOTOS_VIDEOS,
+        ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
         id: "photos-add",
         summary: "Photo library add-only access (NSPhotoLibraryAddUsageDescription, \
                   Photos framework).",
         contributions: PERMISSIONS_PHOTOS_ADD,
+        ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
         id: "camera",
         summary: "Camera permission (CAMERA, NSCameraUsageDescription, macOS \
                   camera entitlement).",
         contributions: PERMISSIONS_CAMERA,
+        ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
         id: "microphone",
         summary: "Microphone permission (RECORD_AUDIO, NSMicrophoneUsageDescription, \
                   macOS audio-input entitlement).",
         contributions: PERMISSIONS_MICROPHONE,
+        ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
         id: "media-location",
         summary: "Photo location metadata (ACCESS_MEDIA_LOCATION on Android).",
         contributions: PERMISSIONS_MEDIA_LOCATION,
+        ..FeatureSpec::DEFAULT
     },
 ];
 
@@ -1055,6 +1091,7 @@ const PERMISSIONS: PluginSpec = PluginSpec {
     ],
     optional_features: PERMISSIONS_FEATURES,
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `photo-library`'s `library` feature contributions: the browsing half
@@ -1210,6 +1247,7 @@ const PHOTO_LIBRARY_FEATURES: &[FeatureSpec] = &[
                   and the Photos and ImageIO frameworks. Add `permissions` with \
                   its `photos` feature to request access.",
         contributions: PHOTO_LIBRARY_LIBRARY,
+        ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
         id: "library-images",
@@ -1219,6 +1257,7 @@ const PHOTO_LIBRARY_FEATURES: &[FeatureSpec] = &[
                   Photos and ImageIO frameworks. Add `permissions` with its \
                   `photos-images` feature to request access.",
         contributions: PHOTO_LIBRARY_LIBRARY_IMAGES,
+        ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
         id: "library-videos",
@@ -1228,6 +1267,7 @@ const PHOTO_LIBRARY_FEATURES: &[FeatureSpec] = &[
                   Photos and ImageIO frameworks. Add `permissions` with its \
                   `photos-videos` feature to request access.",
         contributions: PHOTO_LIBRARY_LIBRARY_VIDEOS,
+        ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
         id: "save",
@@ -1238,6 +1278,7 @@ const PHOTO_LIBRARY_FEATURES: &[FeatureSpec] = &[
                   needs read-write access and the `library` feature's usage \
                   string; add-only access returns PermissionDenied.",
         contributions: PHOTO_LIBRARY_SAVE,
+        ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
         id: "decode",
@@ -1246,6 +1287,7 @@ const PHOTO_LIBRARY_FEATURES: &[FeatureSpec] = &[
                   permission or usage string; reading an asset from the library \
                   still needs the `library` feature and `permissions` `photos`.",
         contributions: PHOTO_LIBRARY_DECODE,
+        ..FeatureSpec::DEFAULT
     },
 ];
 
@@ -1273,6 +1315,7 @@ const PHOTO_LIBRARY: PluginSpec = PluginSpec {
     ],
     optional_features: PHOTO_LIBRARY_FEATURES,
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// `background-task`'s base contributions: a Cargo dependency and the
@@ -1298,6 +1341,7 @@ const BACKGROUND_TASK: PluginSpec = PluginSpec {
     base: BACKGROUND_TASK_BASE,
     optional_features: &[],
     requires_sibling: None,
+    ..PluginSpec::DEFAULT
 };
 
 /// The v1 static plugin registry (Vec-factory convention). A caller (the CLI
@@ -1389,6 +1433,20 @@ mod tests {
                 "background-task",
             ]
         );
+    }
+
+    /// No registry entry or feature states a platform floor, so adding any of
+    /// them reads no project floor and refuses nothing it did not before.
+    #[test]
+    fn no_registry_entry_or_feature_states_a_platform_floor() {
+        for spec in known_plugins() {
+            assert_eq!(spec.min_ios, None, "{}", spec.id);
+            assert_eq!(spec.min_android_sdk, None, "{}", spec.id);
+            for feature in spec.optional_features {
+                assert_eq!(feature.min_ios, None, "{}/{}", spec.id, feature.id);
+                assert_eq!(feature.min_android_sdk, None, "{}/{}", spec.id, feature.id);
+            }
+        }
     }
 
     /// `network-image` is a facade-tier entry: one `CargoDep` on its own

@@ -113,9 +113,12 @@ fn applies_to(contribution: &Contribution, target: DesktopBundleTarget) -> bool 
         Contribution::CargoDep { .. }
         | Contribution::ManifestPermission { .. }
         | Contribution::PlistEntry { .. }
+        | Contribution::PlistArrayEntry { .. }
         | Contribution::GradleModule { .. }
+        | Contribution::MavenRepository { .. }
         | Contribution::SwiftPackageRef { .. }
         | Contribution::IosFramework { .. }
+        | Contribution::IosEntitlement { .. }
         | Contribution::AppCrateMacro { .. }
         | Contribution::CargoFeature { .. }
         | Contribution::ScaffoldFile { .. } => false,
@@ -631,6 +634,11 @@ mod tests {
     static CARGO_DEP: Contribution = Contribution::CargoDep {
         name: "frust-camera",
     };
+    static IOS_ENTITLEMENT: Contribution = Contribution::IosEntitlement {
+        key: "aps-environment",
+        value: crate::plugin::IosEntitlementValue::String("development"),
+        comment: "Push",
+    };
     static COMMENT_WITH_DASHES: Contribution = Contribution::MacosPlistEntry {
         key: "NSFooUsageDescription",
         value: "ok",
@@ -705,6 +713,19 @@ mod tests {
                 applies_to(&CARGO_DEP, target),
             ];
             assert_eq!(actual, expected, "{target}");
+        }
+    }
+
+    /// An iOS entitlement is a mobile-lane edit `add_plugin` writes into the
+    /// project itself, so no desktop bundle assembly ever applies it.
+    #[test]
+    fn an_ios_entitlement_applies_to_no_desktop_target() {
+        for target in [
+            DesktopBundleTarget::Macos,
+            DesktopBundleTarget::Linux,
+            DesktopBundleTarget::Windows,
+        ] {
+            assert!(!applies_to(&IOS_ENTITLEMENT, target), "{target}");
         }
     }
 

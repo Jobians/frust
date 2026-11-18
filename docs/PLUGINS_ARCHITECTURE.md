@@ -497,6 +497,14 @@ host ignores the back press.
   (Gradle module, Swift package, Info.plist key, manifest permission, Cargo dependency) onto a
   scaffolded app, driven by the `frust` TUI's Add Plugin dialog or manually per plugin README (see
   [CLI_ARCHITECTURE.md](CLI_ARCHITECTURE.md) and [TUI_ARCHITECTURE.md](TUI_ARCHITECTURE.md)).
+  Three further kinds, each idempotent: `PlistArrayEntry` inserts a key with an `<array>` of strings into
+  `Info.plist` (a present key is never merged into); `IosEntitlement` (`Bool`/`String`/`StringArray`) writes a
+  key into `ios/Runner/Runner.entitlements`, created when absent, and sets `CODE_SIGN_ENTITLEMENTS` in every
+  build configuration of the Runner target (one that already names another file keeps it and the key goes
+  there); `MavenRepository` writes a group-filtered `exclusiveContent` block at the
+  `// frust:plugin-repositories` marker of `android/settings.gradle.kts`, idempotent by url. A
+  `PluginSpec`/`FeatureSpec` may state `min_ios`/`min_android_sdk`; the add checks the app's lowest
+  `IPHONEOS_DEPLOYMENT_TARGET` and its `minSdk` against them and refuses rather than raising either.
   `haptics` is the registry's first entry to add a manifest permission
   (`android.permission.VIBRATE`) directly rather than folding it inside a plugin's own Gradle
   module, since its Android backend is plain JNI with no Kotlin helper class to carry it.
