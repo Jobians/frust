@@ -67,11 +67,13 @@ pub fn dispatch(command: Command, cli: &Cli) -> Result<u8> {
             let cwd = std::env::current_dir().context("reading current directory")?;
             clean::run_in(&*runner, &cwd)
         }
-        Command::Plugin {
-            command: PluginCommand::Add { id, features },
-        } => {
+        Command::Plugin { command } => {
             let cwd = std::env::current_dir().context("reading current directory")?;
-            plugin::add(&cwd, &id, &features)
+            match command {
+                PluginCommand::Add { id, features } => plugin::add(&*runner, &cwd, &id, &features),
+                PluginCommand::List => plugin::list(&*runner, &cwd),
+                PluginCommand::Sync => plugin::sync(&*runner, &cwd),
+            }
         }
         Command::Tui => tui::run(),
         Command::Run {

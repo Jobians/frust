@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- A hardware requirement a module declares for itself, not an app permission: optional, so
+         devices without NFC can still install. -->
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
+
+</manifest>

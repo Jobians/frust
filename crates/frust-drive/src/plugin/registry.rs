@@ -73,6 +73,8 @@
 //! features: `library` for album and asset browsing, and `save` for writing
 //! originals into the library), is described at `PHOTO_LIBRARY`.
 
+use std::borrow::Cow;
+
 use super::{Contribution, FeatureSpec, PluginSpec};
 
 /// The `biometric-gate` feature's two contributions — the exact Android/iOS
@@ -89,63 +91,69 @@ use super::{Contribution, FeatureSpec, PluginSpec};
 /// `Info.plist`.
 const SECURE_STORAGE_BIOMETRIC: &[Contribution] = &[
     Contribution::PlistEntry {
-        key: "NSFaceIDUsageDescription",
-        value: "Unlock your stored credentials.",
+        key: Cow::Borrowed("NSFaceIDUsageDescription"),
+        value: Cow::Borrowed("Unlock your stored credentials."),
         // No `--` here: an XML comment may not contain a double hyphen.
-        comment: "Face ID / Touch ID usage description, added only when the \
+        comment: Cow::Borrowed(
+            "Face ID / Touch ID usage description, added only when the \
                   frust-secure-storage biometric gate is used.",
+        ),
     },
     Contribution::GradleModule {
-        gradle_name: ":frust-secure-storage",
-        rel_path: "plugins/secure-storage/platform/android",
+        gradle_name: Cow::Borrowed(":frust-secure-storage"),
+        rel_path: Cow::Borrowed("plugins/secure-storage/platform/android"),
     },
 ];
 
 /// secure-storage's single optional feature.
 const SECURE_STORAGE_FEATURES: &[FeatureSpec] = &[FeatureSpec {
-    id: "biometric-gate",
-    summary: "Per-store Face ID / Touch ID / BiometricPrompt gate: adds the \
+    id: Cow::Borrowed("biometric-gate"),
+    summary: Cow::Borrowed(
+        "Per-store Face ID / Touch ID / BiometricPrompt gate: adds the \
               NSFaceIDUsageDescription plist key and includes the plugin's \
               `:frust-secure-storage` Android library module (which carries \
               the FrustBiometric helper, the USE_BIOMETRIC permission, and \
               the R8 keep rule).",
-    contributions: SECURE_STORAGE_BIOMETRIC,
+    ),
+    contributions: Cow::Borrowed(SECURE_STORAGE_BIOMETRIC),
     ..FeatureSpec::DEFAULT
 }];
 
 const SHARED_PREFERENCES: PluginSpec = PluginSpec {
-    id: "shared-preferences",
-    summary: "Synchronous, thread-safe key-value store (plaintext).",
-    crate_dir: "shared-preferences",
-    base: &[Contribution::CargoDep {
-        name: "frust-shared-preferences",
-    }],
-    optional_features: &[],
+    id: Cow::Borrowed("shared-preferences"),
+    summary: Cow::Borrowed("Synchronous, thread-safe key-value store (plaintext)."),
+    crate_dir: Cow::Borrowed("shared-preferences"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-shared-preferences"),
+    }]),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
 
 const SECURE_STORAGE: PluginSpec = PluginSpec {
-    id: "secure-storage",
-    summary: "Encrypted key-value store (Keychain / Keystore / keyring) with an \
+    id: Cow::Borrowed("secure-storage"),
+    summary: Cow::Borrowed(
+        "Encrypted key-value store (Keychain / Keystore / keyring) with an \
               optional per-store biometric gate.",
-    crate_dir: "secure-storage",
-    base: &[Contribution::CargoDep {
-        name: "frust-secure-storage",
-    }],
-    optional_features: SECURE_STORAGE_FEATURES,
+    ),
+    crate_dir: Cow::Borrowed("secure-storage"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-secure-storage"),
+    }]),
+    optional_features: Cow::Borrowed(SECURE_STORAGE_FEATURES),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
 
 const CLEAN_SIGNALS_FRUST: PluginSpec = PluginSpec {
-    id: "clean-signals-frust",
-    summary: "Clean-architecture facade binding the clean-signals core to frust.",
-    crate_dir: "clean-signals-frust",
-    base: &[Contribution::CargoDep {
-        name: "clean-signals-frust",
-    }],
-    optional_features: &[],
+    id: Cow::Borrowed("clean-signals-frust"),
+    summary: Cow::Borrowed("Clean-architecture facade binding the clean-signals core to frust."),
+    crate_dir: Cow::Borrowed("clean-signals-frust"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("clean-signals-frust"),
+    }]),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -158,19 +166,21 @@ const CLEAN_SIGNALS_FRUST: PluginSpec = PluginSpec {
 /// requires the usage string in the app's own `Info.plist`.
 const CAMERA_BASE: &[Contribution] = &[
     Contribution::CargoDep {
-        name: "frust-camera",
+        name: Cow::Borrowed("frust-camera"),
     },
     Contribution::PlistEntry {
-        key: "NSCameraUsageDescription",
-        value: "Take photos and record video.",
+        key: Cow::Borrowed("NSCameraUsageDescription"),
+        value: Cow::Borrowed("Take photos and record video."),
         // No `--` here: an XML comment may not contain a double hyphen.
-        comment: "Camera usage description, required by Apple in the app's \
+        comment: Cow::Borrowed(
+            "Camera usage description, required by Apple in the app's \
                   own Info.plist — no plugin module can supply it, unlike \
                   the GradleModule/SwiftPackageRef contributions below.",
+        ),
     },
     Contribution::GradleModule {
-        gradle_name: ":frust-camera",
-        rel_path: "plugins/camera/platform/android",
+        gradle_name: Cow::Borrowed(":frust-camera"),
+        rel_path: Cow::Borrowed("plugins/camera/platform/android"),
     },
     // The first registry use of this variant (the embedding work defined the
     // multi-package shape without building it — see
@@ -183,8 +193,8 @@ const CAMERA_BASE: &[Contribution] = &[
     // `swift_package_refs_have_unique_spm_identities`; later plugin packages
     // therefore nest in a directory named for their product (iap's `FrustIap/`).
     Contribution::SwiftPackageRef {
-        package_name: "FrustCamera",
-        rel_path: "plugins/camera/platform/ios",
+        package_name: Cow::Borrowed("FrustCamera"),
+        rel_path: Cow::Borrowed("plugins/camera/platform/ios"),
     },
     // Added after a device gate measured the failure this prevents: without
     // it a freshly scaffolded app that added the camera
@@ -199,20 +209,24 @@ const CAMERA_BASE: &[Contribution] = &[
     // `apple.rs`'s `ios_exports!` doc says to invoke it "only if the device
     // gate shows the direct export missing". The gate showed exactly that.
     Contribution::AppCrateMacro {
-        invocation: "frust_camera::ios_exports!();",
-        cfg: Some("target_vendor = \"apple\""),
-        comment: "Keeps frust-camera's Swift-called C export alive through \
+        invocation: Cow::Borrowed("frust_camera::ios_exports!();"),
+        cfg: Some(Cow::Borrowed("target_vendor = \"apple\"")),
+        comment: Cow::Borrowed(
+            "Keeps frust-camera's Swift-called C export alive through \
                   release LTO (see frust_camera::ios_exports).",
+        ),
     },
 ];
 
 const CAMERA: PluginSpec = PluginSpec {
-    id: "camera",
-    summary: "Camera preview (a platform view), still capture, and a YUV/BGRA \
+    id: Cow::Borrowed("camera"),
+    summary: Cow::Borrowed(
+        "Camera preview (a platform view), still capture, and a YUV/BGRA \
               image stream (CameraX / AVFoundation).",
-    crate_dir: "camera",
-    base: CAMERA_BASE,
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("camera"),
+    base: Cow::Borrowed(CAMERA_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -239,22 +253,24 @@ const CAMERA: PluginSpec = PluginSpec {
 /// privacy-gated API. So an iOS app needs exactly the Cargo dependency.
 const NATIVE_WIDGETS_BASE: &[Contribution] = &[
     Contribution::CargoDep {
-        name: "frust-native-widgets",
+        name: Cow::Borrowed("frust-native-widgets"),
     },
     Contribution::GradleModule {
-        gradle_name: ":frust-native-widgets",
-        rel_path: "plugins/native-widgets/platform/android",
+        gradle_name: Cow::Borrowed(":frust-native-widgets"),
+        rel_path: Cow::Borrowed("plugins/native-widgets/platform/android"),
     },
 ];
 
 const NATIVE_WIDGETS: PluginSpec = PluginSpec {
-    id: "native-widgets",
-    summary: "Real OS controls (button, label, switch, slider, progress, \
+    id: Cow::Borrowed("native-widgets"),
+    summary: Cow::Borrowed(
+        "Real OS controls (button, label, switch, slider, progress, \
               image) hosted as platform views and driven from Rust \
               (android.widget / UIKit).",
-    crate_dir: "native-widgets",
-    base: NATIVE_WIDGETS_BASE,
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("native-widgets"),
+    base: Cow::Borrowed(NATIVE_WIDGETS_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -266,14 +282,16 @@ const NATIVE_WIDGETS: PluginSpec = PluginSpec {
 /// Swift package (the iOS backend is plain `objc2-ui-kit` against
 /// `UIPasteboard`) — see `plugins/clipboard/README.md`.
 const CLIPBOARD: PluginSpec = PluginSpec {
-    id: "clipboard",
-    summary: "Synchronous plain-text clipboard access (ClipboardManager / \
+    id: Cow::Borrowed("clipboard"),
+    summary: Cow::Borrowed(
+        "Synchronous plain-text clipboard access (ClipboardManager / \
               UIPasteboard / arboard).",
-    crate_dir: "clipboard",
-    base: &[Contribution::CargoDep {
-        name: "frust-clipboard",
-    }],
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("clipboard"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-clipboard"),
+    }]),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -297,20 +315,22 @@ const CLIPBOARD: PluginSpec = PluginSpec {
 /// complexity a dangerous permission would.
 const HAPTICS_BASE: &[Contribution] = &[
     Contribution::CargoDep {
-        name: "frust-haptics",
+        name: Cow::Borrowed("frust-haptics"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.VIBRATE",
+        permission: Cow::Borrowed("android.permission.VIBRATE"),
     },
 ];
 
 const HAPTICS: PluginSpec = PluginSpec {
-    id: "haptics",
-    summary: "Minimal haptic feedback (selection tick, impact, success/warning/error) \
+    id: Cow::Borrowed("haptics"),
+    summary: Cow::Borrowed(
+        "Minimal haptic feedback (selection tick, impact, success/warning/error) \
               over Vibrator/VibrationEffect and UIKit's feedback generators.",
-    crate_dir: "haptics",
-    base: HAPTICS_BASE,
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("haptics"),
+    base: Cow::Borrowed(HAPTICS_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -336,18 +356,20 @@ const HAPTICS: PluginSpec = PluginSpec {
 /// `haptics`, there is no Kotlin helper class or Swift package: both mobile
 /// backends are plain JNI/objc2 against framework APIs.
 const URL_LAUNCHER_BASE: &[Contribution] = &[Contribution::CargoDep {
-    name: "frust-url-launcher",
+    name: Cow::Borrowed("frust-url-launcher"),
 }];
 
 const URL_LAUNCHER: PluginSpec = PluginSpec {
-    id: "url-launcher",
-    summary: "Open an absolute http/https URL in the platform's default external browser \
+    id: Cow::Borrowed("url-launcher"),
+    summary: Cow::Borrowed(
+        "Open an absolute http/https URL in the platform's default external browser \
               (Android ACTION_VIEW, iOS openURL:, desktop xdg-open/open/ShellExecuteW) — \
               the launch half of an RFC 8252 OAuth round trip; completion returns through \
               deep links.",
-    crate_dir: "url-launcher",
-    base: URL_LAUNCHER_BASE,
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("url-launcher"),
+    base: Cow::Borrowed(URL_LAUNCHER_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -377,40 +399,44 @@ const URL_LAUNCHER: PluginSpec = PluginSpec {
 /// it with ASWebAuthenticationSession).
 const AUTH_SESSION_BASE: &[Contribution] = &[
     Contribution::CargoDep {
-        name: "frust-auth-session",
+        name: Cow::Borrowed("frust-auth-session"),
     },
     Contribution::GradleModule {
-        gradle_name: ":frust-auth-session",
-        rel_path: "plugins/auth-session/platform/android",
+        gradle_name: Cow::Borrowed(":frust-auth-session"),
+        rel_path: Cow::Borrowed("plugins/auth-session/platform/android"),
     },
     Contribution::IosFramework {
-        name: "AuthenticationServices",
+        name: Cow::Borrowed("AuthenticationServices"),
     },
 ];
 
 const AUTH_SESSION: PluginSpec = PluginSpec {
-    id: "auth-session",
-    summary: "OAuth round trip in the platform auth user agent — ASWebAuthenticationSession \
+    id: Cow::Borrowed("auth-session"),
+    summary: Cow::Borrowed(
+        "OAuth round trip in the platform auth user agent — ASWebAuthenticationSession \
               (iOS/macOS, in-process callback) or Chrome Custom Tabs (Android, Gradle module) — \
               resolving Callback(url)/Cancelled with an ephemeral mode; desktop (Linux/Windows/macOS) \
               uses the RFC 8252 loopback backend (`LoopbackSession`); on Linux/Windows a \
               custom-scheme start still reports NoHandler.",
-    crate_dir: "auth-session",
-    base: AUTH_SESSION_BASE,
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("auth-session"),
+    base: Cow::Borrowed(AUTH_SESSION_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
 
 const OAUTH_NATIVE: PluginSpec = PluginSpec {
-    id: "oauth-native",
-    summary: "OAuth 2.0 native-app helper: PKCE (S256), state, authorization URL, callback + \
+    id: Cow::Borrowed("oauth-native"),
+    summary: Cow::Borrowed(
+        "OAuth 2.0 native-app helper: PKCE (S256), state, authorization URL, callback + \
               token-response parsing (pure Rust, no HTTP).",
-    crate_dir: "oauth-native",
-    base: &[Contribution::CargoDep {
-        name: "frust-oauth-native",
-    }],
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("oauth-native"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-oauth-native"),
+    }]),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -429,26 +455,30 @@ const OAUTH_NATIVE: PluginSpec = PluginSpec {
 /// hazard for release LTO to strip (camera's export shim exists only because
 /// nothing in Rust calls the symbol it protects).
 const IAP_BASE: &[Contribution] = &[
-    Contribution::CargoDep { name: "frust-iap" },
+    Contribution::CargoDep {
+        name: Cow::Borrowed("frust-iap"),
+    },
     Contribution::GradleModule {
-        gradle_name: ":frust-iap",
-        rel_path: "plugins/iap/platform/android",
+        gradle_name: Cow::Borrowed(":frust-iap"),
+        rel_path: Cow::Borrowed("plugins/iap/platform/android"),
     },
     // Nested in `FrustIap/`: at `plugins/iap/platform/ios` its SwiftPM identity
     // would be `ios`, camera's, and Xcode silently drops one of the two.
     Contribution::SwiftPackageRef {
-        package_name: "FrustIap",
-        rel_path: "plugins/iap/platform/ios/FrustIap",
+        package_name: Cow::Borrowed("FrustIap"),
+        rel_path: Cow::Borrowed("plugins/iap/platform/ios/FrustIap"),
     },
 ];
 
 const IAP: PluginSpec = PluginSpec {
-    id: "iap",
-    summary: "In-app purchases and subscriptions over Play Billing / StoreKit 2, \
+    id: Cow::Borrowed("iap"),
+    summary: Cow::Borrowed(
+        "In-app purchases and subscriptions over Play Billing / StoreKit 2, \
               speaking the OpenIAP wire protocol.",
-    crate_dir: "iap",
-    base: IAP_BASE,
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("iap"),
+    base: Cow::Borrowed(IAP_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -474,22 +504,24 @@ const IAP: PluginSpec = PluginSpec {
 /// factory uses.
 const VIDEO_PLAYER_BASE: &[Contribution] = &[
     Contribution::CargoDep {
-        name: "frust-video-player",
+        name: Cow::Borrowed("frust-video-player"),
     },
     Contribution::GradleModule {
-        gradle_name: ":frust-video-player",
-        rel_path: "plugins/video-player/platform/android",
+        gradle_name: Cow::Borrowed(":frust-video-player"),
+        rel_path: Cow::Borrowed("plugins/video-player/platform/android"),
     },
 ];
 
 const VIDEO_PLAYER: PluginSpec = PluginSpec {
-    id: "video-player",
-    summary: "Video playback (Media3 ExoPlayer / AVPlayer) with the video \
+    id: Cow::Borrowed("video-player"),
+    summary: Cow::Borrowed(
+        "Video playback (Media3 ExoPlayer / AVPlayer) with the video \
               surface as a platform view; local, asset, http(s) and HLS \
               sources; Android, iOS, macOS.",
-    crate_dir: "video-player",
-    base: VIDEO_PLAYER_BASE,
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("video-player"),
+    base: Cow::Borrowed(VIDEO_PLAYER_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -504,28 +536,30 @@ const VIDEO_PLAYER: PluginSpec = PluginSpec {
 /// engine-agnostic), so adding this feature does not lock an app to a single
 /// choice.
 const DATABASE_TURSO: &[Contribution] = &[Contribution::CargoFeature {
-    name: "frust-database",
-    feature: "engine-turso",
+    name: Cow::Borrowed("frust-database"),
+    feature: Cow::Borrowed("engine-turso"),
 }];
 
 /// database's single optional feature.
 const DATABASE_FEATURES: &[FeatureSpec] = &[FeatureSpec {
-    id: "engine-turso",
-    summary: "Adds the Turso (Rust SQLite rewrite) engine alongside SQLite. \
+    id: Cow::Borrowed("engine-turso"),
+    summary: Cow::Borrowed(
+        "Adds the Turso (Rust SQLite rewrite) engine alongside SQLite. \
               Significant binary-size cost (see plugin README); enables future \
               vector-search/cloud-sync capabilities. Engine chosen at open time.",
-    contributions: DATABASE_TURSO,
+    ),
+    contributions: Cow::Borrowed(DATABASE_TURSO),
     ..FeatureSpec::DEFAULT
 }];
 
 const DATABASE: PluginSpec = PluginSpec {
-    id: "database",
-    summary: "Embedded SQL database (SQLite via rusqlite; engine-agnostic API).",
-    crate_dir: "database",
-    base: &[Contribution::CargoDep {
-        name: "frust-database",
-    }],
-    optional_features: DATABASE_FEATURES,
+    id: Cow::Borrowed("database"),
+    summary: Cow::Borrowed("Embedded SQL database (SQLite via rusqlite; engine-agnostic API)."),
+    crate_dir: Cow::Borrowed("database"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-database"),
+    }]),
+    optional_features: Cow::Borrowed(DATABASE_FEATURES),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -547,27 +581,35 @@ const DATABASE: PluginSpec = PluginSpec {
 /// `plugins/i18n/README.md`).
 const I18N_BASE: &[Contribution] = &[
     Contribution::ScaffoldFile {
-        rel_path: "locales/en/main.ftl",
-        contents: "# English locale — add sibling directories (de/, fr/, ...) with the same file names.\n\
+        rel_path: Cow::Borrowed("locales/en/main.ftl"),
+        contents: Cow::Borrowed(
+            "# English locale — add sibling directories (de/, fr/, ...) with the same file names.\n\
                    # Syntax: https://projectfluent.org/fluent/guide/\n\
                    hello = Hello, { $name }!\n",
-        comment: "Starter English Fluent locale file",
+        ),
+        comment: Cow::Borrowed("Starter English Fluent locale file"),
     },
-    Contribution::CargoDep { name: "frust-i18n" },
+    Contribution::CargoDep {
+        name: Cow::Borrowed("frust-i18n"),
+    },
     Contribution::AppCrateMacro {
-        invocation: "frust_i18n::locales!(\"locales\");",
+        invocation: Cow::Borrowed("frust_i18n::locales!(\"locales\");"),
         cfg: None,
-        comment: "Load and compile Fluent locale bundles (see plugins/i18n/README.md).",
+        comment: Cow::Borrowed(
+            "Load and compile Fluent locale bundles (see plugins/i18n/README.md).",
+        ),
     },
 ];
 
 const I18N: PluginSpec = PluginSpec {
-    id: "i18n",
-    summary: "Fluent Project-based internationalization/localization: locale-aware message \
+    id: Cow::Borrowed("i18n"),
+    summary: Cow::Borrowed(
+        "Fluent Project-based internationalization/localization: locale-aware message \
               resolution and system-locale detection.",
-    crate_dir: "i18n",
-    base: I18N_BASE,
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("i18n"),
+    base: Cow::Borrowed(I18N_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -581,14 +623,16 @@ const I18N: PluginSpec = PluginSpec {
 /// for the caller, since it doesn't know which design system (if any) the
 /// app already has installed there.
 const GLYPH: PluginSpec = PluginSpec {
-    id: "glyph",
-    summary: "Glyph catalog; needs frust_glyph::install() in app! setup \
+    id: Cow::Borrowed("glyph"),
+    summary: Cow::Borrowed(
+        "Glyph catalog; needs frust_glyph::install() in app! setup \
               (widgets + tokens + bundled fonts).",
-    crate_dir: "glyph",
-    base: &[Contribution::CargoDep {
-        name: "frust-glyph",
-    }],
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("glyph"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-glyph"),
+    }]),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -596,14 +640,16 @@ const GLYPH: PluginSpec = PluginSpec {
 /// `material`'s single base contribution — see [`GLYPH`]'s doc comment for
 /// the shape and the same install-call caveat.
 const MATERIAL: PluginSpec = PluginSpec {
-    id: "material",
-    summary: "Material 3 catalog; needs frust_material::install() in app! \
+    id: Cow::Borrowed("material"),
+    summary: Cow::Borrowed(
+        "Material 3 catalog; needs frust_material::install() in app! \
               setup (widgets + tokens).",
-    crate_dir: "material",
-    base: &[Contribution::CargoDep {
-        name: "frust-material",
-    }],
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("material"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-material"),
+    }]),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -611,14 +657,16 @@ const MATERIAL: PluginSpec = PluginSpec {
 /// `cupertino`'s single base contribution — see [`GLYPH`]'s doc comment for
 /// the shape and the same install-call caveat.
 const CUPERTINO: PluginSpec = PluginSpec {
-    id: "cupertino",
-    summary: "Cupertino catalog; needs frust_cupertino::install() in app! \
+    id: Cow::Borrowed("cupertino"),
+    summary: Cow::Borrowed(
+        "Cupertino catalog; needs frust_cupertino::install() in app! \
               setup (widgets + tokens).",
-    crate_dir: "cupertino",
-    base: &[Contribution::CargoDep {
-        name: "frust-cupertino",
-    }],
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("cupertino"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-cupertino"),
+    }]),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -633,14 +681,16 @@ const CUPERTINO: PluginSpec = PluginSpec {
 /// has no way to know where that block should go, or whether one is already
 /// installing another design system there).
 const SHADCN: PluginSpec = PluginSpec {
-    id: "shadcn",
-    summary: "shadcn/ui catalog; needs frust_shadcn::install() in app! setup \
+    id: Cow::Borrowed("shadcn"),
+    summary: Cow::Borrowed(
+        "shadcn/ui catalog; needs frust_shadcn::install() in app! setup \
               (48 components + tokens + bundled Inter/JetBrains Mono fonts).",
-    crate_dir: "shadcn",
-    base: &[Contribution::CargoDep {
-        name: "frust-shadcn",
-    }],
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("shadcn"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-shadcn"),
+    }]),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -649,12 +699,16 @@ const SHADCN: PluginSpec = PluginSpec {
 /// shape and the same install-call caveat: a pure Cargo dependency, with
 /// `frust_beui::install()` left to the app's own `app!(setup = {..})` block.
 const BEUI: PluginSpec = PluginSpec {
-    id: "beui",
-    summary: "beUI catalog; needs frust_beui::install() in app! setup \
+    id: Cow::Borrowed("beui"),
+    summary: Cow::Borrowed(
+        "beUI catalog; needs frust_beui::install() in app! setup \
               (widgets + tokens, density-aware metrics).",
-    crate_dir: "beui",
-    base: &[Contribution::CargoDep { name: "frust-beui" }],
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("beui"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-beui"),
+    }]),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -663,8 +717,8 @@ const BEUI: PluginSpec = PluginSpec {
 /// plugin's own `image` dependency. Without it a WebP body is rejected as
 /// `UnsupportedFormat`.
 const NETWORK_IMAGE_WEBP: &[Contribution] = &[Contribution::CargoFeature {
-    name: "frust-network-image",
-    feature: "webp",
+    name: Cow::Borrowed("frust-network-image"),
+    feature: Cow::Borrowed("webp"),
 }];
 
 /// `network-image`'s single base contribution — a Cargo dependency and
@@ -674,21 +728,23 @@ const NETWORK_IMAGE_WEBP: &[Contribution] = &[Contribution::CargoFeature {
 /// comes in through the plugin's own default feature, not through a registry
 /// contribution.
 const NETWORK_IMAGE_BASE: &[Contribution] = &[Contribution::CargoDep {
-    name: "frust-network-image",
+    name: Cow::Borrowed("frust-network-image"),
 }];
 
 const NETWORK_IMAGE: PluginSpec = PluginSpec {
-    id: "network-image",
-    summary: "Network image view: URL images with an in-memory + disk cache \
+    id: Cow::Borrowed("network-image"),
+    summary: Cow::Borrowed(
+        "Network image view: URL images with an in-memory + disk cache \
               (reqwest default fetcher).",
-    crate_dir: "network-image",
-    base: NETWORK_IMAGE_BASE,
-    optional_features: &[FeatureSpec {
-        id: "webp",
-        summary: "WebP decoding (pure-Rust image-webp).",
-        contributions: NETWORK_IMAGE_WEBP,
+    ),
+    crate_dir: Cow::Borrowed("network-image"),
+    base: Cow::Borrowed(NETWORK_IMAGE_BASE),
+    optional_features: Cow::Borrowed(&[FeatureSpec {
+        id: Cow::Borrowed("webp"),
+        summary: Cow::Borrowed("WebP decoding (pure-Rust image-webp)."),
+        contributions: Cow::Borrowed(NETWORK_IMAGE_WEBP),
         ..FeatureSpec::DEFAULT
-    }],
+    }]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -700,21 +756,23 @@ const NETWORK_IMAGE: PluginSpec = PluginSpec {
 /// activity sheet needs no plist key.
 const SHARE_BASE: &[Contribution] = &[
     Contribution::CargoDep {
-        name: "frust-share",
+        name: Cow::Borrowed("frust-share"),
     },
     Contribution::GradleModule {
-        gradle_name: ":frust-share",
-        rel_path: "plugins/share/platform/android",
+        gradle_name: Cow::Borrowed(":frust-share"),
+        rel_path: Cow::Borrowed("plugins/share/platform/android"),
     },
 ];
 
 const SHARE: PluginSpec = PluginSpec {
-    id: "share",
-    summary: "Share text, a URL or files through the platform share sheet (Android chooser, \
+    id: Cow::Borrowed("share"),
+    summary: Cow::Borrowed(
+        "Share text, a URL or files through the platform share sheet (Android chooser, \
               iOS activity sheet, desktop clipboard fallback)",
-    crate_dir: "share",
-    base: SHARE_BASE,
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("share"),
+    base: Cow::Borrowed(SHARE_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -726,35 +784,39 @@ const SHARE: PluginSpec = PluginSpec {
 /// same rule camera's `CAMERA` follows). No `PlistEntry`: no usage string.
 const CONNECTIVITY_BASE: &[Contribution] = &[
     Contribution::CargoDep {
-        name: "frust-connectivity",
+        name: Cow::Borrowed("frust-connectivity"),
     },
     Contribution::GradleModule {
-        gradle_name: ":frust-connectivity",
-        rel_path: "plugins/connectivity/platform/android",
+        gradle_name: Cow::Borrowed(":frust-connectivity"),
+        rel_path: Cow::Borrowed("plugins/connectivity/platform/android"),
     },
-    Contribution::IosFramework { name: "Network" },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("Network"),
+    },
 ];
 
 const CONNECTIVITY: PluginSpec = PluginSpec {
-    id: "connectivity",
-    summary: "Default-network availability and change events (Android, iOS, macOS)",
-    crate_dir: "connectivity",
-    base: CONNECTIVITY_BASE,
-    optional_features: &[],
+    id: Cow::Borrowed("connectivity"),
+    summary: Cow::Borrowed("Default-network availability and change events (Android, iOS, macOS)"),
+    crate_dir: Cow::Borrowed("connectivity"),
+    base: Cow::Borrowed(CONNECTIVITY_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
 
 /// `qr`'s single base contribution: a Cargo dependency only (platform-free
 /// canvas widget; no permission, plist key or setup call).
-const QR_BASE: &[Contribution] = &[Contribution::CargoDep { name: "frust-qr" }];
+const QR_BASE: &[Contribution] = &[Contribution::CargoDep {
+    name: Cow::Borrowed("frust-qr"),
+}];
 
 const QR: PluginSpec = PluginSpec {
-    id: "qr",
-    summary: "QR code view (qrcode encoder, canvas-painted)",
-    crate_dir: "qr",
-    base: QR_BASE,
-    optional_features: &[],
+    id: Cow::Borrowed("qr"),
+    summary: Cow::Borrowed("QR code view (qrcode encoder, canvas-painted)"),
+    crate_dir: Cow::Borrowed("qr"),
+    base: Cow::Borrowed(QR_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -768,26 +830,28 @@ const QR: PluginSpec = PluginSpec {
 /// The web target reports `Unsupported`.
 const FILE_DIALOGS_BASE: &[Contribution] = &[
     Contribution::CargoDep {
-        name: "frust-file-dialogs",
+        name: Cow::Borrowed("frust-file-dialogs"),
     },
     Contribution::GradleModule {
-        gradle_name: ":frust-file-dialogs",
-        rel_path: "plugins/file-dialogs/platform/android",
+        gradle_name: Cow::Borrowed(":frust-file-dialogs"),
+        rel_path: Cow::Borrowed("plugins/file-dialogs/platform/android"),
     },
     Contribution::IosFramework {
-        name: "UniformTypeIdentifiers",
+        name: Cow::Borrowed("UniformTypeIdentifiers"),
     },
 ];
 
 const FILE_DIALOGS: PluginSpec = PluginSpec {
-    id: "file-dialogs",
-    summary: "Native file open/save dialogs on Linux, macOS and Windows via rfd; \
+    id: Cow::Borrowed("file-dialogs"),
+    summary: Cow::Borrowed(
+        "Native file open/save dialogs on Linux, macOS and Windows via rfd; \
               Android (Storage Access Framework) and iOS (document picker) \
               pickers; web reports Unsupported (blocking calls: run them in \
               spawn_blocking).",
-    crate_dir: "file-dialogs",
-    base: FILE_DIALOGS_BASE,
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("file-dialogs"),
+    base: Cow::Borrowed(FILE_DIALOGS_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -796,14 +860,16 @@ const FILE_DIALOGS: PluginSpec = PluginSpec {
 /// dependency (no file, no install call). It needs `material` and `i18n`
 /// wired in the app as well; see `plugins/material-i18n/README.md`.
 const MATERIAL_I18N: PluginSpec = PluginSpec {
-    id: "material-i18n",
-    summary: "Localized Material widget strings that follow the active \
+    id: Cow::Borrowed("material-i18n"),
+    summary: Cow::Borrowed(
+        "Localized Material widget strings that follow the active \
               frust-i18n locale; use with material and i18n.",
-    crate_dir: "material-i18n",
-    base: &[Contribution::CargoDep {
-        name: "frust-material-i18n",
-    }],
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("material-i18n"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-material-i18n"),
+    }]),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -811,14 +877,16 @@ const MATERIAL_I18N: PluginSpec = PluginSpec {
 /// `device-info`'s single base contribution: a Cargo dependency only (a plain-JNI and
 /// plain-C memory query; no permission, Gradle module or plist key).
 const DEVICE_INFO: PluginSpec = PluginSpec {
-    id: "device-info",
-    summary: "Device memory query (total RAM, low-RAM flag, available memory, iOS headroom); \
+    id: Cow::Borrowed("device-info"),
+    summary: Cow::Borrowed(
+        "Device memory query (total RAM, low-RAM flag, available memory, iOS headroom); \
               no permission, Gradle module or plist key.",
-    crate_dir: "device-info",
-    base: &[Contribution::CargoDep {
-        name: "frust-device-info",
-    }],
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("device-info"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-device-info"),
+    }]),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -847,29 +915,33 @@ const DEVICE_INFO: PluginSpec = PluginSpec {
 /// name; it is harmless on newer Android versions.
 const PERMISSIONS_PHOTOS: &[Contribution] = &[
     Contribution::CargoFeature {
-        name: "frust-permissions",
-        feature: "photos",
+        name: Cow::Borrowed("frust-permissions"),
+        feature: Cow::Borrowed("photos"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_IMAGES",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_IMAGES"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_VIDEO",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_VIDEO"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_VISUAL_USER_SELECTED"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_EXTERNAL_STORAGE",
+        permission: Cow::Borrowed("android.permission.READ_EXTERNAL_STORAGE"),
     },
     Contribution::PlistEntry {
-        key: "NSPhotoLibraryUsageDescription",
-        value: "Choose photos from your library.",
+        key: Cow::Borrowed("NSPhotoLibraryUsageDescription"),
+        value: Cow::Borrowed("Choose photos from your library."),
         // No `--` here: an XML comment may not contain a double hyphen.
-        comment: "Photo library usage description, required by Apple in the \
+        comment: Cow::Borrowed(
+            "Photo library usage description, required by Apple in the \
                   app's own Info.plist. Edit the text to match your app.",
+        ),
     },
-    Contribution::IosFramework { name: "Photos" },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("Photos"),
+    },
 ];
 
 /// `permissions`' `photos-images` feature: `photos` without the video media
@@ -879,26 +951,30 @@ const PERMISSIONS_PHOTOS: &[Contribution] = &[
 /// `photos` writes. An app that only reads images declares no video access.
 const PERMISSIONS_PHOTOS_IMAGES: &[Contribution] = &[
     Contribution::CargoFeature {
-        name: "frust-permissions",
-        feature: "photos",
+        name: Cow::Borrowed("frust-permissions"),
+        feature: Cow::Borrowed("photos"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_IMAGES",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_IMAGES"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_VISUAL_USER_SELECTED"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_EXTERNAL_STORAGE",
+        permission: Cow::Borrowed("android.permission.READ_EXTERNAL_STORAGE"),
     },
     Contribution::PlistEntry {
-        key: "NSPhotoLibraryUsageDescription",
-        value: "Choose photos from your library.",
+        key: Cow::Borrowed("NSPhotoLibraryUsageDescription"),
+        value: Cow::Borrowed("Choose photos from your library."),
         // No `--` here: an XML comment may not contain a double hyphen.
-        comment: "Photo library usage description, required by Apple in the \
+        comment: Cow::Borrowed(
+            "Photo library usage description, required by Apple in the \
                   app's own Info.plist. Edit the text to match your app.",
+        ),
     },
-    Contribution::IosFramework { name: "Photos" },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("Photos"),
+    },
 ];
 
 /// `permissions`' `photos-videos` feature: `photos` without the image media
@@ -908,165 +984,191 @@ const PERMISSIONS_PHOTOS_IMAGES: &[Contribution] = &[
 /// applying both features writes each once.
 const PERMISSIONS_PHOTOS_VIDEOS: &[Contribution] = &[
     Contribution::CargoFeature {
-        name: "frust-permissions",
-        feature: "photos",
+        name: Cow::Borrowed("frust-permissions"),
+        feature: Cow::Borrowed("photos"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_VIDEO",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_VIDEO"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_VISUAL_USER_SELECTED"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_EXTERNAL_STORAGE",
+        permission: Cow::Borrowed("android.permission.READ_EXTERNAL_STORAGE"),
     },
     Contribution::PlistEntry {
-        key: "NSPhotoLibraryUsageDescription",
-        value: "Choose photos from your library.",
+        key: Cow::Borrowed("NSPhotoLibraryUsageDescription"),
+        value: Cow::Borrowed("Choose photos from your library."),
         // No `--` here: an XML comment may not contain a double hyphen.
-        comment: "Photo library usage description, required by Apple in the \
+        comment: Cow::Borrowed(
+            "Photo library usage description, required by Apple in the \
                   app's own Info.plist. Edit the text to match your app.",
+        ),
     },
-    Contribution::IosFramework { name: "Photos" },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("Photos"),
+    },
 ];
 
 const PERMISSIONS_PHOTOS_ADD: &[Contribution] = &[
     Contribution::CargoFeature {
-        name: "frust-permissions",
-        feature: "photos",
+        name: Cow::Borrowed("frust-permissions"),
+        feature: Cow::Borrowed("photos"),
     },
     Contribution::PlistEntry {
-        key: "NSPhotoLibraryAddUsageDescription",
-        value: "Save photos to your library.",
+        key: Cow::Borrowed("NSPhotoLibraryAddUsageDescription"),
+        value: Cow::Borrowed("Save photos to your library."),
         // No `--` here: an XML comment may not contain a double hyphen.
-        comment: "Photo library add-only usage description, required by \
+        comment: Cow::Borrowed(
+            "Photo library add-only usage description, required by \
                   Apple in the app's own Info.plist. Edit the text to match \
                   your app.",
+        ),
     },
-    Contribution::IosFramework { name: "Photos" },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("Photos"),
+    },
 ];
 
 const PERMISSIONS_CAMERA: &[Contribution] = &[
     Contribution::CargoFeature {
-        name: "frust-permissions",
-        feature: "camera",
+        name: Cow::Borrowed("frust-permissions"),
+        feature: Cow::Borrowed("camera"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.CAMERA",
+        permission: Cow::Borrowed("android.permission.CAMERA"),
     },
     Contribution::PlistEntry {
-        key: "NSCameraUsageDescription",
-        value: "Take photos and record video.",
+        key: Cow::Borrowed("NSCameraUsageDescription"),
+        value: Cow::Borrowed("Take photos and record video."),
         // No `--` here: an XML comment may not contain a double hyphen.
-        comment: "Camera usage description, required by Apple in the app's \
+        comment: Cow::Borrowed(
+            "Camera usage description, required by Apple in the app's \
                   own Info.plist. Edit the text to match your app.",
+        ),
     },
     Contribution::MacosPlistEntry {
-        key: "NSCameraUsageDescription",
-        value: "Take photos and record video.",
-        comment: "Camera usage description for the macOS bundle.",
+        key: Cow::Borrowed("NSCameraUsageDescription"),
+        value: Cow::Borrowed("Take photos and record video."),
+        comment: Cow::Borrowed("Camera usage description for the macOS bundle."),
     },
     Contribution::MacosEntitlement {
-        key: "com.apple.security.device.camera",
-        comment: "Hardened-runtime camera access.",
+        key: Cow::Borrowed("com.apple.security.device.camera"),
+        comment: Cow::Borrowed("Hardened-runtime camera access."),
     },
     Contribution::IosFramework {
-        name: "AVFoundation",
+        name: Cow::Borrowed("AVFoundation"),
     },
 ];
 
 const PERMISSIONS_MICROPHONE: &[Contribution] = &[
     Contribution::CargoFeature {
-        name: "frust-permissions",
-        feature: "microphone",
+        name: Cow::Borrowed("frust-permissions"),
+        feature: Cow::Borrowed("microphone"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.RECORD_AUDIO",
+        permission: Cow::Borrowed("android.permission.RECORD_AUDIO"),
     },
     Contribution::PlistEntry {
-        key: "NSMicrophoneUsageDescription",
-        value: "Record audio.",
+        key: Cow::Borrowed("NSMicrophoneUsageDescription"),
+        value: Cow::Borrowed("Record audio."),
         // No `--` here: an XML comment may not contain a double hyphen.
-        comment: "Microphone usage description, required by Apple in the \
+        comment: Cow::Borrowed(
+            "Microphone usage description, required by Apple in the \
                   app's own Info.plist. Edit the text to match your app.",
+        ),
     },
     Contribution::MacosPlistEntry {
-        key: "NSMicrophoneUsageDescription",
-        value: "Record audio.",
-        comment: "Microphone usage description for the macOS bundle.",
+        key: Cow::Borrowed("NSMicrophoneUsageDescription"),
+        value: Cow::Borrowed("Record audio."),
+        comment: Cow::Borrowed("Microphone usage description for the macOS bundle."),
     },
     Contribution::MacosEntitlement {
-        key: "com.apple.security.device.audio-input",
-        comment: "Hardened-runtime microphone access.",
+        key: Cow::Borrowed("com.apple.security.device.audio-input"),
+        comment: Cow::Borrowed("Hardened-runtime microphone access."),
     },
     Contribution::IosFramework {
-        name: "AVFoundation",
+        name: Cow::Borrowed("AVFoundation"),
     },
 ];
 
 const PERMISSIONS_MEDIA_LOCATION: &[Contribution] = &[
     Contribution::CargoFeature {
-        name: "frust-permissions",
-        feature: "media-location",
+        name: Cow::Borrowed("frust-permissions"),
+        feature: Cow::Borrowed("media-location"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.ACCESS_MEDIA_LOCATION",
+        permission: Cow::Borrowed("android.permission.ACCESS_MEDIA_LOCATION"),
     },
     // iOS reads media location from the Photos authorization status.
-    Contribution::IosFramework { name: "Photos" },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("Photos"),
+    },
 ];
 
 const PERMISSIONS_FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
-        id: "photos",
-        summary: "Photo library read access (Android media permissions, \
+        id: Cow::Borrowed("photos"),
+        summary: Cow::Borrowed(
+            "Photo library read access (Android media permissions, \
                   NSPhotoLibraryUsageDescription, Photos framework).",
-        contributions: PERMISSIONS_PHOTOS,
+        ),
+        contributions: Cow::Borrowed(PERMISSIONS_PHOTOS),
         ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
-        id: "photos-images",
-        summary: "Photo image read access only (READ_MEDIA_IMAGES, \
+        id: Cow::Borrowed("photos-images"),
+        summary: Cow::Borrowed(
+            "Photo image read access only (READ_MEDIA_IMAGES, \
                   READ_MEDIA_VISUAL_USER_SELECTED, READ_EXTERNAL_STORAGE, \
                   NSPhotoLibraryUsageDescription, Photos framework). No video \
                   permission; use `photos` for both.",
-        contributions: PERMISSIONS_PHOTOS_IMAGES,
+        ),
+        contributions: Cow::Borrowed(PERMISSIONS_PHOTOS_IMAGES),
         ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
-        id: "photos-videos",
-        summary: "Photo video read access only (READ_MEDIA_VIDEO, \
+        id: Cow::Borrowed("photos-videos"),
+        summary: Cow::Borrowed(
+            "Photo video read access only (READ_MEDIA_VIDEO, \
                   READ_MEDIA_VISUAL_USER_SELECTED, READ_EXTERNAL_STORAGE, \
                   NSPhotoLibraryUsageDescription, Photos framework). No image \
                   permission; use `photos` for both.",
-        contributions: PERMISSIONS_PHOTOS_VIDEOS,
+        ),
+        contributions: Cow::Borrowed(PERMISSIONS_PHOTOS_VIDEOS),
         ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
-        id: "photos-add",
-        summary: "Photo library add-only access (NSPhotoLibraryAddUsageDescription, \
+        id: Cow::Borrowed("photos-add"),
+        summary: Cow::Borrowed(
+            "Photo library add-only access (NSPhotoLibraryAddUsageDescription, \
                   Photos framework).",
-        contributions: PERMISSIONS_PHOTOS_ADD,
+        ),
+        contributions: Cow::Borrowed(PERMISSIONS_PHOTOS_ADD),
         ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
-        id: "camera",
-        summary: "Camera permission (CAMERA, NSCameraUsageDescription, macOS \
+        id: Cow::Borrowed("camera"),
+        summary: Cow::Borrowed(
+            "Camera permission (CAMERA, NSCameraUsageDescription, macOS \
                   camera entitlement).",
-        contributions: PERMISSIONS_CAMERA,
+        ),
+        contributions: Cow::Borrowed(PERMISSIONS_CAMERA),
         ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
-        id: "microphone",
-        summary: "Microphone permission (RECORD_AUDIO, NSMicrophoneUsageDescription, \
+        id: Cow::Borrowed("microphone"),
+        summary: Cow::Borrowed(
+            "Microphone permission (RECORD_AUDIO, NSMicrophoneUsageDescription, \
                   macOS audio-input entitlement).",
-        contributions: PERMISSIONS_MICROPHONE,
+        ),
+        contributions: Cow::Borrowed(PERMISSIONS_MICROPHONE),
         ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
-        id: "media-location",
-        summary: "Photo location metadata (ACCESS_MEDIA_LOCATION on Android).",
-        contributions: PERMISSIONS_MEDIA_LOCATION,
+        id: Cow::Borrowed("media-location"),
+        summary: Cow::Borrowed("Photo location metadata (ACCESS_MEDIA_LOCATION on Android)."),
+        contributions: Cow::Borrowed(PERMISSIONS_MEDIA_LOCATION),
         ..FeatureSpec::DEFAULT
     },
 ];
@@ -1075,21 +1177,23 @@ const PERMISSIONS_FEATURES: &[FeatureSpec] = &[
 /// library module (the Kotlin host and init provider). Each permission the
 /// app uses is an opt-in feature, since the declarations are app policy.
 const PERMISSIONS: PluginSpec = PluginSpec {
-    id: "permissions",
-    summary: "Permission status, request and open_settings; features: photos, \
+    id: Cow::Borrowed("permissions"),
+    summary: Cow::Borrowed(
+        "Permission status, request and open_settings; features: photos, \
               photos-images, photos-videos, photos-add, camera, microphone, \
               media-location.",
-    crate_dir: "permissions",
-    base: &[
+    ),
+    crate_dir: Cow::Borrowed("permissions"),
+    base: Cow::Borrowed(&[
         Contribution::CargoDep {
-            name: "frust-permissions",
+            name: Cow::Borrowed("frust-permissions"),
         },
         Contribution::GradleModule {
-            gradle_name: ":frust-permissions",
-            rel_path: "plugins/permissions/platform/android",
+            gradle_name: Cow::Borrowed(":frust-permissions"),
+            rel_path: Cow::Borrowed("plugins/permissions/platform/android"),
         },
-    ],
-    optional_features: PERMISSIONS_FEATURES,
+    ]),
+    optional_features: Cow::Borrowed(PERMISSIONS_FEATURES),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -1110,30 +1214,36 @@ const PERMISSIONS: PluginSpec = PluginSpec {
 /// features links ImageIO once.
 const PHOTO_LIBRARY_LIBRARY: &[Contribution] = &[
     Contribution::CargoFeature {
-        name: "frust-photo-library",
-        feature: "library",
+        name: Cow::Borrowed("frust-photo-library"),
+        feature: Cow::Borrowed("library"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_IMAGES",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_IMAGES"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_VIDEO",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_VIDEO"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_VISUAL_USER_SELECTED"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_EXTERNAL_STORAGE",
+        permission: Cow::Borrowed("android.permission.READ_EXTERNAL_STORAGE"),
     },
     Contribution::PlistEntry {
-        key: "NSPhotoLibraryUsageDescription",
-        value: "Choose photos from your library.",
+        key: Cow::Borrowed("NSPhotoLibraryUsageDescription"),
+        value: Cow::Borrowed("Choose photos from your library."),
         // No `--` here: an XML comment may not contain a double hyphen.
-        comment: "Photo library usage description, required by Apple in the \
+        comment: Cow::Borrowed(
+            "Photo library usage description, required by Apple in the \
                   app's own Info.plist. Edit the text to match your app.",
+        ),
     },
-    Contribution::IosFramework { name: "Photos" },
-    Contribution::IosFramework { name: "ImageIO" },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("Photos"),
+    },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("ImageIO"),
+    },
 ];
 
 /// `photo-library`'s `library-images` feature contributions: `library` for an
@@ -1143,27 +1253,33 @@ const PHOTO_LIBRARY_LIBRARY: &[Contribution] = &[
 /// the usage string and the Photos and ImageIO frameworks.
 const PHOTO_LIBRARY_LIBRARY_IMAGES: &[Contribution] = &[
     Contribution::CargoFeature {
-        name: "frust-photo-library",
-        feature: "library",
+        name: Cow::Borrowed("frust-photo-library"),
+        feature: Cow::Borrowed("library"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_IMAGES",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_IMAGES"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_VISUAL_USER_SELECTED"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_EXTERNAL_STORAGE",
+        permission: Cow::Borrowed("android.permission.READ_EXTERNAL_STORAGE"),
     },
     Contribution::PlistEntry {
-        key: "NSPhotoLibraryUsageDescription",
-        value: "Choose photos from your library.",
+        key: Cow::Borrowed("NSPhotoLibraryUsageDescription"),
+        value: Cow::Borrowed("Choose photos from your library."),
         // No `--` here: an XML comment may not contain a double hyphen.
-        comment: "Photo library usage description, required by Apple in the \
+        comment: Cow::Borrowed(
+            "Photo library usage description, required by Apple in the \
                   app's own Info.plist. Edit the text to match your app.",
+        ),
     },
-    Contribution::IosFramework { name: "Photos" },
-    Contribution::IosFramework { name: "ImageIO" },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("Photos"),
+    },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("ImageIO"),
+    },
 ];
 
 /// `photo-library`'s `library-videos` feature contributions: `library` for an
@@ -1172,27 +1288,33 @@ const PHOTO_LIBRARY_LIBRARY_IMAGES: &[Contribution] = &[
 /// [`PHOTO_LIBRARY_LIBRARY_IMAGES`], so applying both writes each once.
 const PHOTO_LIBRARY_LIBRARY_VIDEOS: &[Contribution] = &[
     Contribution::CargoFeature {
-        name: "frust-photo-library",
-        feature: "library",
+        name: Cow::Borrowed("frust-photo-library"),
+        feature: Cow::Borrowed("library"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_VIDEO",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_VIDEO"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        permission: Cow::Borrowed("android.permission.READ_MEDIA_VISUAL_USER_SELECTED"),
     },
     Contribution::ManifestPermission {
-        permission: "android.permission.READ_EXTERNAL_STORAGE",
+        permission: Cow::Borrowed("android.permission.READ_EXTERNAL_STORAGE"),
     },
     Contribution::PlistEntry {
-        key: "NSPhotoLibraryUsageDescription",
-        value: "Choose photos from your library.",
+        key: Cow::Borrowed("NSPhotoLibraryUsageDescription"),
+        value: Cow::Borrowed("Choose photos from your library."),
         // No `--` here: an XML comment may not contain a double hyphen.
-        comment: "Photo library usage description, required by Apple in the \
+        comment: Cow::Borrowed(
+            "Photo library usage description, required by Apple in the \
                   app's own Info.plist. Edit the text to match your app.",
+        ),
     },
-    Contribution::IosFramework { name: "Photos" },
-    Contribution::IosFramework { name: "ImageIO" },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("Photos"),
+    },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("ImageIO"),
+    },
 ];
 
 /// `photo-library`'s `save` feature contributions: the saving half (writing
@@ -1206,18 +1328,22 @@ const PHOTO_LIBRARY_LIBRARY_VIDEOS: &[Contribution] = &[
 /// `photos-add` feature to request add-only access at run time.
 const PHOTO_LIBRARY_SAVE: &[Contribution] = &[
     Contribution::CargoFeature {
-        name: "frust-photo-library",
-        feature: "save",
+        name: Cow::Borrowed("frust-photo-library"),
+        feature: Cow::Borrowed("save"),
     },
     Contribution::PlistEntry {
-        key: "NSPhotoLibraryAddUsageDescription",
-        value: "Save photos to your library.",
+        key: Cow::Borrowed("NSPhotoLibraryAddUsageDescription"),
+        value: Cow::Borrowed("Save photos to your library."),
         // No `--` here: an XML comment may not contain a double hyphen.
-        comment: "Photo library add-only usage description, required by \
+        comment: Cow::Borrowed(
+            "Photo library add-only usage description, required by \
                   Apple in the app's own Info.plist. Edit the text to match \
                   your app.",
+        ),
     },
-    Contribution::IosFramework { name: "Photos" },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("Photos"),
+    },
 ];
 
 /// `photo-library`'s `decode` feature contributions: the full-resolution
@@ -1228,10 +1354,12 @@ const PHOTO_LIBRARY_SAVE: &[Contribution] = &[
 /// `frust_drive` applier writes into `OTHER_LDFLAGS`.
 const PHOTO_LIBRARY_DECODE: &[Contribution] = &[
     Contribution::CargoFeature {
-        name: "frust-photo-library",
-        feature: "decode",
+        name: Cow::Borrowed("frust-photo-library"),
+        feature: Cow::Borrowed("decode"),
     },
-    Contribution::IosFramework { name: "ImageIO" },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("ImageIO"),
+    },
 ];
 
 /// `photo-library`'s optional features: `library` (browsing), `save`
@@ -1240,53 +1368,63 @@ const PHOTO_LIBRARY_DECODE: &[Contribution] = &[
 /// [`PHOTO_LIBRARY_SAVE`] and [`PHOTO_LIBRARY_DECODE`].
 const PHOTO_LIBRARY_FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
-        id: "library",
-        summary: "Album and asset browsing with byte-budgeted thumbnails, and \
+        id: Cow::Borrowed("library"),
+        summary: Cow::Borrowed(
+            "Album and asset browsing with byte-budgeted thumbnails, and \
                   one asset's EXIF: enables the Cargo feature and adds the \
                   Android media read permissions, NSPhotoLibraryUsageDescription \
                   and the Photos and ImageIO frameworks. Add `permissions` with \
                   its `photos` feature to request access.",
-        contributions: PHOTO_LIBRARY_LIBRARY,
+        ),
+        contributions: Cow::Borrowed(PHOTO_LIBRARY_LIBRARY),
         ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
-        id: "library-images",
-        summary: "Album and asset browsing of images only: enables the Cargo \
+        id: Cow::Borrowed("library-images"),
+        summary: Cow::Borrowed(
+            "Album and asset browsing of images only: enables the Cargo \
                   feature and adds READ_MEDIA_IMAGES, READ_MEDIA_VISUAL_USER_SELECTED, \
                   READ_EXTERNAL_STORAGE, NSPhotoLibraryUsageDescription and the \
                   Photos and ImageIO frameworks. Add `permissions` with its \
                   `photos-images` feature to request access.",
-        contributions: PHOTO_LIBRARY_LIBRARY_IMAGES,
+        ),
+        contributions: Cow::Borrowed(PHOTO_LIBRARY_LIBRARY_IMAGES),
         ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
-        id: "library-videos",
-        summary: "Album and asset browsing of videos only: enables the Cargo \
+        id: Cow::Borrowed("library-videos"),
+        summary: Cow::Borrowed(
+            "Album and asset browsing of videos only: enables the Cargo \
                   feature and adds READ_MEDIA_VIDEO, READ_MEDIA_VISUAL_USER_SELECTED, \
                   READ_EXTERNAL_STORAGE, NSPhotoLibraryUsageDescription and the \
                   Photos and ImageIO frameworks. Add `permissions` with its \
                   `photos-videos` feature to request access.",
-        contributions: PHOTO_LIBRARY_LIBRARY_VIDEOS,
+        ),
+        contributions: Cow::Borrowed(PHOTO_LIBRARY_LIBRARY_VIDEOS),
         ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
-        id: "save",
-        summary: "Saving originals into the library: enables the Cargo feature \
+        id: Cow::Borrowed("save"),
+        summary: Cow::Borrowed(
+            "Saving originals into the library: enables the Cargo feature \
                   and adds NSPhotoLibraryAddUsageDescription and the Photos \
                   framework. Add `permissions` with its `photos-add` feature \
                   to request add-only access. Saving into an album on iOS \
                   needs read-write access and the `library` feature's usage \
                   string; add-only access returns PermissionDenied.",
-        contributions: PHOTO_LIBRARY_SAVE,
+        ),
+        contributions: Cow::Borrowed(PHOTO_LIBRARY_SAVE),
         ..FeatureSpec::DEFAULT
     },
     FeatureSpec {
-        id: "decode",
-        summary: "Full-resolution native decode of a photo file or library asset: \
+        id: Cow::Borrowed("decode"),
+        summary: Cow::Borrowed(
+            "Full-resolution native decode of a photo file or library asset: \
                   enables the Cargo feature and links the ImageIO framework. No \
                   permission or usage string; reading an asset from the library \
                   still needs the `library` feature and `permissions` `photos`.",
-        contributions: PHOTO_LIBRARY_DECODE,
+        ),
+        contributions: Cow::Borrowed(PHOTO_LIBRARY_DECODE),
         ..FeatureSpec::DEFAULT
     },
 ];
@@ -1298,22 +1436,26 @@ const PHOTO_LIBRARY_FEATURES: &[FeatureSpec] = &[
 /// string. Its two optional features, `library` and `save`, are described at
 /// [`PHOTO_LIBRARY_FEATURES`].
 const PHOTO_LIBRARY: PluginSpec = PluginSpec {
-    id: "photo-library",
-    summary: "Pick photos and videos with the system picker (Android, iOS; \
+    id: Cow::Borrowed("photo-library"),
+    summary: Cow::Borrowed(
+        "Pick photos and videos with the system picker (Android, iOS; \
               file dialog on desktop); features: library, library-images, \
               library-videos, save, decode.",
-    crate_dir: "photo-library",
-    base: &[
+    ),
+    crate_dir: Cow::Borrowed("photo-library"),
+    base: Cow::Borrowed(&[
         Contribution::CargoDep {
-            name: "frust-photo-library",
+            name: Cow::Borrowed("frust-photo-library"),
         },
         Contribution::GradleModule {
-            gradle_name: ":frust-photo-library",
-            rel_path: "plugins/photo-library/platform/android",
+            gradle_name: Cow::Borrowed(":frust-photo-library"),
+            rel_path: Cow::Borrowed("plugins/photo-library/platform/android"),
         },
-        Contribution::IosFramework { name: "PhotosUI" },
-    ],
-    optional_features: PHOTO_LIBRARY_FEATURES,
+        Contribution::IosFramework {
+            name: Cow::Borrowed("PhotosUI"),
+        },
+    ]),
+    optional_features: Cow::Borrowed(PHOTO_LIBRARY_FEATURES),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -1324,22 +1466,24 @@ const PHOTO_LIBRARY: PluginSpec = PluginSpec {
 /// iOS background-task assertion needs only UIKit, which is already linked.
 const BACKGROUND_TASK_BASE: &[Contribution] = &[
     Contribution::CargoDep {
-        name: "frust-background-task",
+        name: Cow::Borrowed("frust-background-task"),
     },
     Contribution::GradleModule {
-        gradle_name: ":frust-background-task",
-        rel_path: "plugins/background-task/platform/android",
+        gradle_name: Cow::Borrowed(":frust-background-task"),
+        rel_path: Cow::Borrowed("plugins/background-task/platform/android"),
     },
 ];
 
 const BACKGROUND_TASK: PluginSpec = PluginSpec {
-    id: "background-task",
-    summary: "Keeps a short write alive after the app leaves the foreground: iOS \
+    id: Cow::Borrowed("background-task"),
+    summary: Cow::Borrowed(
+        "Keeps a short write alive after the app leaves the foreground: iOS \
               background-task assertion, Android short foreground service; call \
               frust_background_task::install() in setup",
-    crate_dir: "background-task",
-    base: BACKGROUND_TASK_BASE,
-    optional_features: &[],
+    ),
+    crate_dir: Cow::Borrowed("background-task"),
+    base: Cow::Borrowed(BACKGROUND_TASK_BASE),
+    optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
 };
@@ -1382,6 +1526,7 @@ pub fn known_plugins() -> Vec<PluginSpec> {
 }
 
 /// Look up a registry entry by id.
+#[cfg(test)]
 pub(crate) fn find_plugin(id: &str) -> Option<PluginSpec> {
     known_plugins().into_iter().find(|p| p.id == id)
 }
@@ -1398,7 +1543,8 @@ mod tests {
 
     #[test]
     fn registry_lists_the_twenty_nine_v1_plugins() {
-        let ids: Vec<&str> = known_plugins().iter().map(|p| p.id).collect();
+        let plugins = known_plugins();
+        let ids: Vec<&str> = plugins.iter().map(|p| &*p.id).collect();
         assert_eq!(
             ids,
             vec![
@@ -1442,7 +1588,7 @@ mod tests {
         for spec in known_plugins() {
             assert_eq!(spec.min_ios, None, "{}", spec.id);
             assert_eq!(spec.min_android_sdk, None, "{}", spec.id);
-            for feature in spec.optional_features {
+            for feature in spec.optional_features.iter() {
                 assert_eq!(feature.min_ios, None, "{}/{}", spec.id, feature.id);
                 assert_eq!(feature.min_android_sdk, None, "{}/{}", spec.id, feature.id);
             }
@@ -1458,14 +1604,14 @@ mod tests {
         assert_eq!(spec.crate_dir, "network-image");
         assert_eq!(spec.requires_sibling, None);
         assert!(matches!(
-            spec.base,
+            &*spec.base,
             [Contribution::CargoDep { name }] if *name == "frust-network-image"
         ));
         assert_eq!(spec.optional_features.len(), 1);
         let webp = &spec.optional_features[0];
         assert_eq!(webp.id, "webp");
         assert!(matches!(
-            webp.contributions,
+            &*webp.contributions,
             [Contribution::CargoFeature { name, feature }]
                 if *name == "frust-network-image" && *feature == "webp"
         ));
@@ -1502,7 +1648,7 @@ mod tests {
             assert_eq!(spec.base.len(), 1, "{:?}", spec.base);
             assert!(
                 matches!(
-                    spec.base[0],
+                    &spec.base[0],
                     Contribution::CargoDep { name } if name == crate_name
                 ),
                 "{:?}",
@@ -1524,18 +1670,12 @@ mod tests {
         assert_eq!(spec.requires_sibling, None);
 
         assert_eq!(spec.base.len(), 2, "{:?}", spec.base);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::CargoDep {
-                name: "frust-haptics"
-            }
-        ));
-        assert!(matches!(
-            spec.base[1],
-            Contribution::ManifestPermission {
-                permission: "android.permission.VIBRATE"
-            }
-        ));
+        assert!(matches!(&spec.base[0], Contribution::CargoDep {
+                name
+            } if name == "frust-haptics"));
+        assert!(matches!(&spec.base[1], Contribution::ManifestPermission {
+                permission
+            } if permission == "android.permission.VIBRATE"));
     }
 
     /// The `clipboard` entry is exactly one `CargoDep` — no manifest
@@ -1549,12 +1689,9 @@ mod tests {
         assert_eq!(spec.requires_sibling, None);
 
         assert_eq!(spec.base.len(), 1, "{:?}", spec.base);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::CargoDep {
-                name: "frust-clipboard"
-            }
-        ));
+        assert!(matches!(&spec.base[0], Contribution::CargoDep {
+                name
+            } if name == "frust-clipboard"));
     }
 
     /// The `database` entry is exactly one `CargoDep` — no manifest
@@ -1570,12 +1707,9 @@ mod tests {
         assert_eq!(spec.requires_sibling, None);
 
         assert_eq!(spec.base.len(), 1, "{:?}", spec.base);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::CargoDep {
-                name: "frust-database"
-            }
-        ));
+        assert!(matches!(&spec.base[0], Contribution::CargoDep {
+                name
+            } if name == "frust-database"));
     }
 
     /// The `database` entry's `engine-turso` feature is exactly one
@@ -1598,13 +1732,12 @@ mod tests {
             "{:?}",
             feature.contributions
         );
-        assert!(matches!(
-            feature.contributions[0],
-            Contribution::CargoFeature {
-                name: "frust-database",
-                feature: "engine-turso"
-            }
-        ));
+        assert!(
+            matches!(&feature.contributions[0], Contribution::CargoFeature {
+                name,
+                feature
+            } if name == "frust-database" && feature == "engine-turso")
+        );
     }
 
     /// The `native-widgets` entry is exactly a Cargo dependency plus the
@@ -1621,19 +1754,13 @@ mod tests {
         assert_eq!(spec.requires_sibling, None);
 
         assert_eq!(spec.base.len(), 2, "{:?}", spec.base);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::CargoDep {
-                name: "frust-native-widgets"
-            }
-        ));
-        assert!(matches!(
-            spec.base[1],
-            Contribution::GradleModule {
-                gradle_name: ":frust-native-widgets",
-                rel_path: "plugins/native-widgets/platform/android",
-            }
-        ));
+        assert!(matches!(&spec.base[0], Contribution::CargoDep {
+                name
+            } if name == "frust-native-widgets"));
+        assert!(matches!(&spec.base[1], Contribution::GradleModule {
+                gradle_name,
+                rel_path,
+            } if gradle_name == ":frust-native-widgets" && rel_path == "plugins/native-widgets/platform/android"));
         assert!(
             !spec
                 .base
@@ -1660,19 +1787,13 @@ mod tests {
         assert_eq!(spec.requires_sibling, None);
 
         assert_eq!(spec.base.len(), 2, "{:?}", spec.base);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::CargoDep {
-                name: "frust-video-player"
-            }
-        ));
-        assert!(matches!(
-            spec.base[1],
-            Contribution::GradleModule {
-                gradle_name: ":frust-video-player",
-                rel_path: "plugins/video-player/platform/android",
-            }
-        ));
+        assert!(matches!(&spec.base[0], Contribution::CargoDep {
+                name
+            } if name == "frust-video-player"));
+        assert!(matches!(&spec.base[1], Contribution::GradleModule {
+                gradle_name,
+                rel_path,
+            } if gradle_name == ":frust-video-player" && rel_path == "plugins/video-player/platform/android"));
         assert!(
             !spec
                 .base
@@ -1694,45 +1815,30 @@ mod tests {
         assert_eq!(spec.requires_sibling, None);
 
         assert_eq!(spec.base.len(), 5);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::CargoDep {
-                name: "frust-camera"
-            }
-        ));
-        assert!(matches!(
-            spec.base[1],
-            Contribution::PlistEntry {
-                key: "NSCameraUsageDescription",
+        assert!(matches!(&spec.base[0], Contribution::CargoDep {
+                name
+            } if name == "frust-camera"));
+        assert!(matches!(&spec.base[1], Contribution::PlistEntry {
+                key,
                 ..
-            }
-        ));
-        assert!(matches!(
-            spec.base[2],
-            Contribution::GradleModule {
-                gradle_name: ":frust-camera",
-                rel_path: "plugins/camera/platform/android",
-            }
-        ));
-        assert!(matches!(
-            spec.base[3],
-            Contribution::SwiftPackageRef {
-                package_name: "FrustCamera",
-                rel_path: "plugins/camera/platform/ios",
-            }
-        ));
+            } if key == "NSCameraUsageDescription"));
+        assert!(matches!(&spec.base[2], Contribution::GradleModule {
+                gradle_name,
+                rel_path,
+            } if gradle_name == ":frust-camera" && rel_path == "plugins/camera/platform/android"));
+        assert!(matches!(&spec.base[3], Contribution::SwiftPackageRef {
+                package_name,
+                rel_path,
+            } if package_name == "FrustCamera" && rel_path == "plugins/camera/platform/ios"));
         // The device-gate addition (see `CAMERA_BASE`'s doc comment). Pinned
         // by exact invocation because this string IS the idempotence key,
         // and because it is what keeps a fresh
         // scaffold's iOS link from failing on `_frust_camera_session_handle`.
-        assert!(matches!(
-            spec.base[4],
-            Contribution::AppCrateMacro {
-                invocation: "frust_camera::ios_exports!();",
-                cfg: Some("target_vendor = \"apple\""),
+        assert!(matches!(&spec.base[4], Contribution::AppCrateMacro {
+                invocation,
+                cfg,
                 ..
-            }
-        ));
+            } if invocation == "frust_camera::ios_exports!();" && cfg.as_deref() == Some("target_vendor = \"apple\"")));
     }
 
     /// The `iap` entry's base contributions, exactly [`IAP_BASE`]'s own list
@@ -1747,24 +1853,15 @@ mod tests {
         assert_eq!(spec.requires_sibling, None);
 
         assert_eq!(spec.base.len(), 3);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::CargoDep { name: "frust-iap" }
-        ));
-        assert!(matches!(
-            spec.base[1],
-            Contribution::GradleModule {
-                gradle_name: ":frust-iap",
-                rel_path: "plugins/iap/platform/android",
-            }
-        ));
-        assert!(matches!(
-            spec.base[2],
-            Contribution::SwiftPackageRef {
-                package_name: "FrustIap",
-                rel_path: "plugins/iap/platform/ios/FrustIap",
-            }
-        ));
+        assert!(matches!(&spec.base[0], Contribution::CargoDep { name } if name == "frust-iap"));
+        assert!(matches!(&spec.base[1], Contribution::GradleModule {
+                gradle_name,
+                rel_path,
+            } if gradle_name == ":frust-iap" && rel_path == "plugins/iap/platform/android"));
+        assert!(matches!(&spec.base[2], Contribution::SwiftPackageRef {
+                package_name,
+                rel_path,
+            } if package_name == "FrustIap" && rel_path == "plugins/iap/platform/ios/FrustIap"));
         assert!(
             !spec
                 .base
@@ -1785,23 +1882,14 @@ mod tests {
         assert_eq!(spec.requires_sibling, None);
 
         assert_eq!(spec.base.len(), 3);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::CargoDep {
-                name: "frust-connectivity"
-            }
-        ));
-        assert!(matches!(
-            spec.base[1],
-            Contribution::GradleModule {
-                gradle_name: ":frust-connectivity",
-                rel_path: "plugins/connectivity/platform/android",
-            }
-        ));
-        assert!(matches!(
-            spec.base[2],
-            Contribution::IosFramework { name: "Network" }
-        ));
+        assert!(matches!(&spec.base[0], Contribution::CargoDep {
+                name
+            } if name == "frust-connectivity"));
+        assert!(matches!(&spec.base[1], Contribution::GradleModule {
+                gradle_name,
+                rel_path,
+            } if gradle_name == ":frust-connectivity" && rel_path == "plugins/connectivity/platform/android"));
+        assert!(matches!(&spec.base[2], Contribution::IosFramework { name } if name == "Network"));
         assert!(
             !spec.base.iter().any(|c| matches!(
                 c,
@@ -1820,19 +1908,13 @@ mod tests {
         assert!(spec.optional_features.is_empty());
         assert_eq!(spec.requires_sibling, None);
         assert_eq!(spec.base.len(), 2);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::CargoDep {
-                name: "frust-share"
-            }
-        ));
-        assert!(matches!(
-            spec.base[1],
-            Contribution::GradleModule {
-                gradle_name: ":frust-share",
-                rel_path: "plugins/share/platform/android",
-            }
-        ));
+        assert!(matches!(&spec.base[0], Contribution::CargoDep {
+                name
+            } if name == "frust-share"));
+        assert!(matches!(&spec.base[1], Contribution::GradleModule {
+                gradle_name,
+                rel_path,
+            } if gradle_name == ":frust-share" && rel_path == "plugins/share/platform/android"));
     }
 
     /// The `share` and `photo-library` module paths must exist in this checkout.
@@ -1842,11 +1924,14 @@ mod tests {
         for id in ["share", "photo-library"] {
             let spec = find_plugin(id).unwrap();
             let mut seen = 0;
-            for c in spec.base {
+            for c in spec.base.iter() {
                 if let Contribution::GradleModule { rel_path, .. } = c {
                     seen += 1;
                     assert!(
-                        repo_root.join(rel_path).join("build.gradle.kts").is_file(),
+                        repo_root
+                            .join(&**rel_path)
+                            .join("build.gradle.kts")
+                            .is_file(),
                         "`{rel_path}` must be a Gradle module directory in this checkout"
                     );
                 }
@@ -1863,7 +1948,7 @@ mod tests {
     fn photo_library_base_contributions_match_the_final_accounting() {
         let spec = find_plugin("photo-library").unwrap();
         assert_eq!(spec.crate_dir, "photo-library");
-        let ids: Vec<&str> = spec.optional_features.iter().map(|f| f.id).collect();
+        let ids: Vec<&str> = spec.optional_features.iter().map(|f| &*f.id).collect();
         assert_eq!(
             ids,
             vec![
@@ -1876,23 +1961,14 @@ mod tests {
         );
         assert_eq!(spec.requires_sibling, None);
         assert_eq!(spec.base.len(), 3);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::CargoDep {
-                name: "frust-photo-library"
-            }
-        ));
-        assert!(matches!(
-            spec.base[1],
-            Contribution::GradleModule {
-                gradle_name: ":frust-photo-library",
-                rel_path: "plugins/photo-library/platform/android",
-            }
-        ));
-        assert!(matches!(
-            spec.base[2],
-            Contribution::IosFramework { name: "PhotosUI" }
-        ));
+        assert!(matches!(&spec.base[0], Contribution::CargoDep {
+                name
+            } if name == "frust-photo-library"));
+        assert!(matches!(&spec.base[1], Contribution::GradleModule {
+                gradle_name,
+                rel_path,
+            } if gradle_name == ":frust-photo-library" && rel_path == "plugins/photo-library/platform/android"));
+        assert!(matches!(&spec.base[2], Contribution::IosFramework { name } if name == "PhotosUI"));
         assert!(
             !spec.base.iter().any(|c| matches!(
                 c,
@@ -1974,25 +2050,16 @@ mod tests {
         assert!(spec.optional_features.is_empty());
         assert_eq!(spec.requires_sibling, None);
         assert_eq!(spec.base.len(), 3, "{:?}", spec.base);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::CargoDep {
-                name: "frust-file-dialogs"
-            }
-        ));
-        assert!(matches!(
-            spec.base[1],
-            Contribution::GradleModule {
-                gradle_name: ":frust-file-dialogs",
-                rel_path: "plugins/file-dialogs/platform/android",
-            }
-        ));
-        assert!(matches!(
-            spec.base[2],
-            Contribution::IosFramework {
-                name: "UniformTypeIdentifiers"
-            }
-        ));
+        assert!(matches!(&spec.base[0], Contribution::CargoDep {
+                name
+            } if name == "frust-file-dialogs"));
+        assert!(matches!(&spec.base[1], Contribution::GradleModule {
+                gradle_name,
+                rel_path,
+            } if gradle_name == ":frust-file-dialogs" && rel_path == "plugins/file-dialogs/platform/android"));
+        assert!(matches!(&spec.base[2], Contribution::IosFramework {
+                name
+            } if name == "UniformTypeIdentifiers"));
         assert!(
             !spec.base.iter().any(|c| matches!(
                 c,
@@ -2013,7 +2080,7 @@ mod tests {
             .base
             .iter()
             .filter_map(|c| match c {
-                Contribution::GradleModule { rel_path, .. } => Some(*rel_path),
+                Contribution::GradleModule { rel_path, .. } => Some(&**rel_path),
                 _ => None,
             })
             .collect();
@@ -2103,54 +2170,30 @@ mod tests {
             .iter()
             .find(|f| f.id == "library")
             .unwrap();
-        let c = feature.contributions;
+        let c = &feature.contributions;
         assert_eq!(c.len(), 8, "{c:?}");
-        assert!(matches!(
-            c[0],
-            Contribution::CargoFeature {
-                name: "frust-photo-library",
-                feature: "library",
-            }
-        ));
-        assert!(matches!(
-            c[1],
-            Contribution::ManifestPermission {
-                permission: "android.permission.READ_MEDIA_IMAGES",
-            }
-        ));
-        assert!(matches!(
-            c[2],
-            Contribution::ManifestPermission {
-                permission: "android.permission.READ_MEDIA_VIDEO",
-            }
-        ));
-        assert!(matches!(
-            c[3],
-            Contribution::ManifestPermission {
-                permission: "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
-            }
-        ));
-        assert!(matches!(
-            c[4],
-            Contribution::ManifestPermission {
-                permission: "android.permission.READ_EXTERNAL_STORAGE",
-            }
-        ));
-        assert!(matches!(
-            c[5],
-            Contribution::PlistEntry {
-                key: "NSPhotoLibraryUsageDescription",
+        assert!(matches!(&c[0], Contribution::CargoFeature {
+                name,
+                feature,
+            } if name == "frust-photo-library" && feature == "library"));
+        assert!(matches!(&c[1], Contribution::ManifestPermission {
+                permission,
+            } if permission == "android.permission.READ_MEDIA_IMAGES"));
+        assert!(matches!(&c[2], Contribution::ManifestPermission {
+                permission,
+            } if permission == "android.permission.READ_MEDIA_VIDEO"));
+        assert!(matches!(&c[3], Contribution::ManifestPermission {
+                permission,
+            } if permission == "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"));
+        assert!(matches!(&c[4], Contribution::ManifestPermission {
+                permission,
+            } if permission == "android.permission.READ_EXTERNAL_STORAGE"));
+        assert!(matches!(&c[5], Contribution::PlistEntry {
+                key,
                 ..
-            }
-        ));
-        assert!(matches!(
-            c[6],
-            Contribution::IosFramework { name: "Photos" }
-        ));
-        assert!(matches!(
-            c[7],
-            Contribution::IosFramework { name: "ImageIO" }
-        ));
+            } if key == "NSPhotoLibraryUsageDescription"));
+        assert!(matches!(&c[6], Contribution::IosFramework { name } if name == "Photos"));
+        assert!(matches!(&c[7], Contribution::IosFramework { name } if name == "ImageIO"));
     }
 
     /// Every `library` contribution except its Cargo feature and its ImageIO
@@ -2166,25 +2209,30 @@ mod tests {
             .iter()
             .find(|f| f.id == "library")
             .unwrap()
-            .contributions;
+            .contributions
+            .clone();
         let photos = find_plugin("permissions")
             .unwrap()
             .optional_features
             .iter()
             .find(|f| f.id == "photos")
             .unwrap()
-            .contributions;
+            .contributions
+            .clone();
         let decode = find_plugin("photo-library")
             .unwrap()
             .optional_features
             .iter()
             .find(|f| f.id == "decode")
             .unwrap()
-            .contributions;
-        let image_io = Contribution::IosFramework { name: "ImageIO" };
+            .contributions
+            .clone();
+        let image_io = Contribution::IosFramework {
+            name: "ImageIO".into(),
+        };
         let image_io = format!("{image_io:?}");
         let mut repeats = 0;
-        for c in library {
+        for c in library.iter() {
             if matches!(c, Contribution::CargoFeature { .. }) {
                 continue;
             }
@@ -2302,26 +2350,17 @@ mod tests {
             .iter()
             .find(|f| f.id == "save")
             .unwrap();
-        let c = feature.contributions;
+        let c = &feature.contributions;
         assert_eq!(c.len(), 3, "{c:?}");
-        assert!(matches!(
-            c[0],
-            Contribution::CargoFeature {
-                name: "frust-photo-library",
-                feature: "save",
-            }
-        ));
-        assert!(matches!(
-            c[1],
-            Contribution::PlistEntry {
-                key: "NSPhotoLibraryAddUsageDescription",
+        assert!(matches!(&c[0], Contribution::CargoFeature {
+                name,
+                feature,
+            } if name == "frust-photo-library" && feature == "save"));
+        assert!(matches!(&c[1], Contribution::PlistEntry {
+                key,
                 ..
-            }
-        ));
-        assert!(matches!(
-            c[2],
-            Contribution::IosFramework { name: "Photos" }
-        ));
+            } if key == "NSPhotoLibraryAddUsageDescription"));
+        assert!(matches!(&c[2], Contribution::IosFramework { name } if name == "Photos"));
     }
 
     /// Every `save` contribution except its Cargo feature is one that
@@ -2335,16 +2374,18 @@ mod tests {
             .iter()
             .find(|f| f.id == "save")
             .unwrap()
-            .contributions;
+            .contributions
+            .clone();
         let photos_add = find_plugin("permissions")
             .unwrap()
             .optional_features
             .iter()
             .find(|f| f.id == "photos-add")
             .unwrap()
-            .contributions;
+            .contributions
+            .clone();
         let mut repeats = 0;
-        for c in save {
+        for c in save.iter() {
             if matches!(c, Contribution::CargoFeature { .. }) {
                 continue;
             }
@@ -2370,19 +2411,13 @@ mod tests {
             .iter()
             .find(|f| f.id == "decode")
             .unwrap();
-        let c = feature.contributions;
+        let c = &feature.contributions;
         assert_eq!(c.len(), 2, "{c:?}");
-        assert!(matches!(
-            c[0],
-            Contribution::CargoFeature {
-                name: "frust-photo-library",
-                feature: "decode",
-            }
-        ));
-        assert!(matches!(
-            c[1],
-            Contribution::IosFramework { name: "ImageIO" }
-        ));
+        assert!(matches!(&c[0], Contribution::CargoFeature {
+                name,
+                feature,
+            } if name == "frust-photo-library" && feature == "decode"));
+        assert!(matches!(&c[1], Contribution::IosFramework { name } if name == "ImageIO"));
     }
 
     /// `photo-library` with `decode` applied twice: the Cargo feature and the
@@ -2563,7 +2598,7 @@ mod tests {
             ) {
                 if let Contribution::SwiftPackageRef { rel_path, .. } = contribution {
                     found = true;
-                    let dir = repo_root.join(rel_path);
+                    let dir = repo_root.join(&**rel_path);
                     assert!(
                         dir.join("Package.swift").is_file(),
                         "`{rel_path}` must be a Swift package directory (a \
@@ -2597,7 +2632,7 @@ mod tests {
                     .flat_map(|f| f.contributions.iter()),
             ) {
                 if let Contribution::SwiftPackageRef { rel_path, .. } = contribution {
-                    let identity = Path::new(rel_path)
+                    let identity = Path::new(&**rel_path)
                         .file_name()
                         .and_then(|n| n.to_str())
                         .expect("rel_path ends in a directory name")
@@ -2658,7 +2693,7 @@ mod tests {
                     .flat_map(|f| f.contributions.iter()),
             ) {
                 if let Contribution::GradleModule { rel_path, .. } = contribution {
-                    let dir = repo_root.join(rel_path);
+                    let dir = repo_root.join(&**rel_path);
                     assert!(
                         dir.join("build.gradle.kts").is_file(),
                         "`{rel_path}` must be a Gradle module directory in this checkout"
@@ -3194,21 +3229,15 @@ mod tests {
         assert_eq!(spec.requires_sibling, None);
 
         assert_eq!(spec.base.len(), 2);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::CargoDep {
-                name: "frust-permissions"
-            }
-        ));
-        assert!(matches!(
-            spec.base[1],
-            Contribution::GradleModule {
-                gradle_name: ":frust-permissions",
-                rel_path: "plugins/permissions/platform/android",
-            }
-        ));
+        assert!(matches!(&spec.base[0], Contribution::CargoDep {
+                name
+            } if name == "frust-permissions"));
+        assert!(matches!(&spec.base[1], Contribution::GradleModule {
+                gradle_name,
+                rel_path,
+            } if gradle_name == ":frust-permissions" && rel_path == "plugins/permissions/platform/android"));
 
-        let ids: Vec<&str> = spec.optional_features.iter().map(|f| f.id).collect();
+        let ids: Vec<&str> = spec.optional_features.iter().map(|f| &*f.id).collect();
         assert_eq!(
             ids,
             vec![
@@ -3227,12 +3256,13 @@ mod tests {
                 .find(|f| f.id == id)
                 .unwrap()
                 .contributions
+                .clone()
         };
-        let perms = |id: &str| -> Vec<&'static str> {
+        let perms = |id: &str| -> Vec<String> {
             feature(id)
                 .iter()
                 .filter_map(|c| match c {
-                    Contribution::ManifestPermission { permission } => Some(*permission),
+                    Contribution::ManifestPermission { permission } => Some(permission.to_string()),
                     _ => None,
                 })
                 .collect()
@@ -3262,34 +3292,31 @@ mod tests {
 
         // Every feature starts with the cargo feature of the same name
         // (photos-add, photos-images and photos-videos share `photos`).
-        for f in spec.optional_features {
-            let want = match f.id {
+        for f in spec.optional_features.iter() {
+            let want = match &*f.id {
                 "photos-add" | "photos-images" | "photos-videos" => "photos",
                 id => id,
             };
             assert!(
-                matches!(
-                    f.contributions[0],
-                    Contribution::CargoFeature { name: "frust-permissions", feature } if feature == want
-                ),
+                matches!(&f.contributions[0], Contribution::CargoFeature { name, feature } if feature == want && name == "frust-permissions"),
                 "{}",
                 f.id
             );
         }
-        assert!(feature("camera").iter().any(|c| matches!(
-            c,
-            Contribution::MacosEntitlement {
-                key: "com.apple.security.device.camera",
+        assert!(
+            feature("camera")
+                .iter()
+                .any(|c| matches!(&c, Contribution::MacosEntitlement {
+                key,
                 ..
-            }
-        )));
-        assert!(feature("microphone").iter().any(|c| matches!(
-            c,
-            Contribution::MacosEntitlement {
-                key: "com.apple.security.device.audio-input",
+            } if key == "com.apple.security.device.camera"))
+        );
+        assert!(feature("microphone").iter().any(
+            |c| matches!(&c, Contribution::MacosEntitlement {
+                key,
                 ..
-            }
-        )));
+            } if key == "com.apple.security.device.audio-input")
+        ));
     }
 
     /// How many times each Android media permission line appears in the
@@ -3458,11 +3485,14 @@ mod tests {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let spec = find_plugin("permissions").unwrap();
         let mut seen = 0;
-        for c in spec.base {
+        for c in spec.base.iter() {
             if let Contribution::GradleModule { rel_path, .. } = c {
                 seen += 1;
                 assert!(
-                    repo_root.join(rel_path).join("build.gradle.kts").is_file(),
+                    repo_root
+                        .join(&**rel_path)
+                        .join("build.gradle.kts")
+                        .is_file(),
                     "`{rel_path}` must be a Gradle module directory in this checkout"
                 );
             }
@@ -3582,25 +3612,16 @@ mod tests {
         assert_eq!(spec.requires_sibling, None);
 
         assert_eq!(spec.base.len(), 3);
-        assert!(matches!(
-            spec.base[0],
-            Contribution::ScaffoldFile {
-                rel_path: "locales/en/main.ftl",
+        assert!(matches!(&spec.base[0], Contribution::ScaffoldFile {
+                rel_path,
                 ..
-            }
-        ));
-        assert!(matches!(
-            spec.base[1],
-            Contribution::CargoDep { name: "frust-i18n" }
-        ));
-        assert!(matches!(
-            spec.base[2],
-            Contribution::AppCrateMacro {
-                invocation: "frust_i18n::locales!(\"locales\");",
+            } if rel_path == "locales/en/main.ftl"));
+        assert!(matches!(&spec.base[1], Contribution::CargoDep { name } if name == "frust-i18n"));
+        assert!(matches!(&spec.base[2], Contribution::AppCrateMacro {
+                invocation,
                 cfg: None,
                 ..
-            }
-        ));
+            } if invocation == "frust_i18n::locales!(\"locales\");"));
     }
 
     /// The `i18n` plugin end to end: a fresh scaffold, `add_plugin(..,

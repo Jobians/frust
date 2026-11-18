@@ -92,7 +92,7 @@ pub(super) fn collect(
     };
     Ok(rows
         .into_iter()
-        .filter(|row| applies_to(row.contribution, target))
+        .filter(|row| applies_to(&row.contribution, target))
         .collect())
 }
 
@@ -150,7 +150,7 @@ pub(super) fn apply(
     // particular, which has no desktop variant of its own in v1.
     let applicable = rows
         .iter()
-        .filter(|row| applies_to(row.contribution, report.target))
+        .filter(|row| applies_to(&row.contribution, report.target))
         .count();
     if applicable > 0 {
         on_line(&format!(
@@ -195,7 +195,7 @@ fn merge_info_plist(
             key,
             value,
             comment,
-        } = row.contribution
+        } = &row.contribution
         else {
             continue;
         };
@@ -205,7 +205,7 @@ fn merge_info_plist(
         }
         let block = format!(
             "{}\t<key>{}</key>\n\t<string>{}</string>\n",
-            comment_line(comment, row.plugin_id),
+            comment_line(comment, &row.plugin_id),
             xml_escape(key),
             xml_escape(value)
         );
@@ -269,7 +269,7 @@ fn resolve_entitlements(
         None => ENTITLEMENTS_SKELETON.to_string(),
     };
     for row in entitlements {
-        let Contribution::MacosEntitlement { key, comment } = row.contribution else {
+        let Contribution::MacosEntitlement { key, comment } = &row.contribution else {
             continue;
         };
         if has_root_key(&text, &xml_escape(key)) {
@@ -278,7 +278,7 @@ fn resolve_entitlements(
         }
         let block = format!(
             "{}\t<key>{}</key>\n\t<true/>\n",
-            comment_line(comment, row.plugin_id),
+            comment_line(comment, &row.plugin_id),
             xml_escape(key)
         );
         let anchor_missing = || {
@@ -320,7 +320,7 @@ fn merge_desktop_entry(
             key,
             value,
             comment,
-        } = row.contribution
+        } = &row.contribution
         else {
             continue;
         };
@@ -440,14 +440,14 @@ fn xml_comment_text(raw: &str) -> String {
 
 fn applied_note(row: &DesktopContribution) -> BundleNote {
     BundleNote::PluginContribution {
-        plugin_id: row.plugin_id,
+        plugin_id: row.plugin_id.to_string(),
         description: row.contribution.describe(),
     }
 }
 
 fn present_note(row: &DesktopContribution, key: &str, file: &'static str) -> BundleNote {
     BundleNote::PluginEntryPresent {
-        plugin_id: row.plugin_id,
+        plugin_id: row.plugin_id.to_string(),
         key: key.to_string(),
         file,
     }
@@ -455,7 +455,7 @@ fn present_note(row: &DesktopContribution, key: &str, file: &'static str) -> Bun
 
 fn unappliable(row: &DesktopContribution, reason: String) -> DesktopBuildError {
     DesktopBuildError::ContributionUnappliable {
-        plugin_id: row.plugin_id,
+        plugin_id: row.plugin_id.to_string(),
         description: row.contribution.describe(),
         reason,
     }
@@ -598,69 +598,70 @@ fn append_to_entry_group(text: &str, block: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::manifest;
+    use std::borrow::Cow;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     // Synthetic contributions: the real registry carries zero desktop rows
-    // (this feature is the seam, not a backfill), and `DesktopContribution`
-    // borrows `&'static Contribution`, so the fixtures are `static` items.
+    // (this feature is the seam, not a backfill), so the fixtures are
+    // `static` items each `row` copies from.
     static CAMERA_USAGE: Contribution = Contribution::MacosPlistEntry {
-        key: "NSCameraUsageDescription",
-        value: "Scan a document & <sign> it",
-        comment: "Camera access",
+        key: Cow::Borrowed("NSCameraUsageDescription"),
+        value: Cow::Borrowed("Scan a document & <sign> it"),
+        comment: Cow::Borrowed("Camera access"),
     };
     static MIC_USAGE: Contribution = Contribution::MacosPlistEntry {
-        key: "NSMicrophoneUsageDescription",
-        value: "Record a voice note",
-        comment: "Microphone access",
+        key: Cow::Borrowed("NSMicrophoneUsageDescription"),
+        value: Cow::Borrowed("Record a voice note"),
+        comment: Cow::Borrowed("Microphone access"),
     };
     static NETWORK_ENTITLEMENT: Contribution = Contribution::MacosEntitlement {
-        key: "com.apple.security.network.client",
-        comment: "Outbound network access",
+        key: Cow::Borrowed("com.apple.security.network.client"),
+        comment: Cow::Borrowed("Outbound network access"),
     };
     static CAMERA_ENTITLEMENT: Contribution = Contribution::MacosEntitlement {
-        key: "com.apple.security.device.camera",
-        comment: "Camera device access",
+        key: Cow::Borrowed("com.apple.security.device.camera"),
+        comment: Cow::Borrowed("Camera device access"),
     };
     static MIME_TYPE: Contribution = Contribution::LinuxDesktopEntry {
-        key: "MimeType",
-        value: "image/png;",
-        comment: "Handled file types",
+        key: Cow::Borrowed("MimeType"),
+        value: Cow::Borrowed("image/png;"),
+        comment: Cow::Borrowed("Handled file types"),
     };
     static CATEGORIES: Contribution = Contribution::LinuxDesktopEntry {
-        key: "Categories",
-        value: "Graphics;",
-        comment: "Launcher categories",
+        key: Cow::Borrowed("Categories"),
+        value: Cow::Borrowed("Graphics;"),
+        comment: Cow::Borrowed("Launcher categories"),
     };
     static CARGO_DEP: Contribution = Contribution::CargoDep {
-        name: "frust-camera",
+        name: Cow::Borrowed("frust-camera"),
     };
     static IOS_ENTITLEMENT: Contribution = Contribution::IosEntitlement {
-        key: "aps-environment",
-        value: crate::plugin::IosEntitlementValue::String("development"),
-        comment: "Push",
+        key: Cow::Borrowed("aps-environment"),
+        value: crate::plugin::IosEntitlementValue::String(Cow::Borrowed("development")),
+        comment: Cow::Borrowed("Push"),
     };
     static COMMENT_WITH_DASHES: Contribution = Contribution::MacosPlistEntry {
-        key: "NSFooUsageDescription",
-        value: "ok",
-        comment: "a -- b --> c",
+        key: Cow::Borrowed("NSFooUsageDescription"),
+        value: Cow::Borrowed("ok"),
+        comment: Cow::Borrowed("a -- b --> c"),
     };
     static MULTILINE_ENTRY: Contribution = Contribution::LinuxDesktopEntry {
-        key: "MimeType",
-        value: "image/png;\nExec=/bin/sh",
-        comment: "Handled\ntypes",
+        key: Cow::Borrowed("MimeType"),
+        value: Cow::Borrowed("image/png;\nExec=/bin/sh"),
+        comment: Cow::Borrowed("Handled\ntypes"),
     };
     /// A key whose own spelling needs XML escaping: the file can only ever
     /// carry it escaped, so the presence check has to compare escaped too.
     static ESCAPED_KEY: Contribution = Contribution::MacosPlistEntry {
-        key: "NSFoo&Bar",
-        value: "ok",
-        comment: "Escaped key",
+        key: Cow::Borrowed("NSFoo&Bar"),
+        value: Cow::Borrowed("ok"),
+        comment: Cow::Borrowed("Escaped key"),
     };
 
     fn row(contribution: &'static Contribution) -> DesktopContribution {
         DesktopContribution {
-            plugin_id: "camera",
-            contribution,
+            plugin_id: "camera".into(),
+            contribution: contribution.clone(),
         }
     }
 

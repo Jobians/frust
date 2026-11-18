@@ -1,0 +1,22 @@
+[package]
+name = "frust-ext-plugin-fixture"
+version = "0.1.0"
+edition = "2024"
+description = "Fixture: an out-of-tree frust plugin described by its own Cargo metadata."
+publish = false
+
+# Everything below `[package.metadata.frust.plugin]` is read by `frust` from the app's
+# resolved dependency graph; `path`s are relative to this package.
+[package.metadata.frust.plugin]
+id = "ext-fixture"
+summary = "Fixture out-of-tree plugin"
+
+[package.metadata.frust.plugin.android]
+gradle-module = { name = "frust-ext-fixture", path = "platform/android" }
+permissions = ["android.permission.NFC"]
+
+[package.metadata.frust.plugin.ios]
+swift-package = { name = "ExtPlugin", path = "platform/ios" }
+frameworks = ["CoreNFC"]
+plist = { NSExtFixtureUsageDescription = "Reads the fixture tag." }
+plist-arrays = { "dev.example.extplugin.formats" = ["NDEF", "TEXT"] }

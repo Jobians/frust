@@ -21,7 +21,7 @@
 
 use std::path::PathBuf;
 
-use frust_drive::plugin::known_plugins;
+use frust_drive::plugin::PluginCatalog;
 
 pub use frust_drive::plugin::AddReport;
 
@@ -34,8 +34,8 @@ pub use frust_drive::plugin::AddReport;
 /// retries or steps back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddPluginStep {
-    /// The plugin selection cards, enumerated from
-    /// [`frust_drive::plugin::known_plugins`].
+    /// The plugin selection cards, enumerated from the built-in
+    /// [`PluginCatalog`].
     Select,
     /// The selected plugin's optional-feature checkboxes.
     Options,
@@ -290,12 +290,12 @@ const SIBLING_ABSENT: &str = "needs a sibling checkout";
 /// probe resolves.
 const SIBLING_PENDING: &str = "checking for the required sibling checkout…";
 
-/// Build the selection cards from the static plugin registry
-/// ([`known_plugins`]). A card that requires a sibling checkout starts disabled
+/// Build the selection cards from the built-in plugin catalog
+/// ([`PluginCatalog::built_in`]). A card that requires a sibling checkout starts disabled
 /// pending the probe; every other card is immediately selectable.
 fn build_entries() -> Vec<PluginEntry> {
-    known_plugins()
-        .into_iter()
+    PluginCatalog::built_in()
+        .specs()
         .map(|spec| {
             let sibling_gated = spec.requires_sibling.is_some();
             PluginEntry {
@@ -321,7 +321,7 @@ fn build_entries() -> Vec<PluginEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frust_drive::plugin::{AddItem, AddOutcome};
+    use frust_drive::plugin::{AddItem, AddOutcome, known_plugins};
 
     fn dialog() -> AddPluginDialog {
         AddPluginDialog::new(PathBuf::from("/tmp/proj"))

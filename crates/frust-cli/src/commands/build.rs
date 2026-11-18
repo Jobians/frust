@@ -3,14 +3,15 @@
 //! enum, resolves the project root (mirrors `run`'s `frust.toml`
 //! detection), and dispatches to the `android_build`/`ios_build`/
 //! `desktop_build`/`web_build` pipelines — the Android/iOS lanes after
-//! refreshing the project's embedding wiring
-//! ([`super::run::refresh_platform_wiring`]).
+//! refreshing the project's embedding and plugin wiring, and stopping when a
+//! manifest-described plugin's project edits are still pending
+//! ([`super::run::prepare_native_build`]).
 
 use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use super::run::refresh_platform_wiring;
+use super::run::prepare_native_build;
 use crate::cli::{BuildFlags, BuildTarget, validate_feature_token_charset};
 use frust_drive::android_build::{self, AndroidArtifact};
 use frust_drive::android_run;
@@ -299,7 +300,12 @@ fn build_android(
 ) -> Result<u8> {
     let project = android_run::project::detect_flavor(project_dir, info.flavor.as_deref())?;
     android_run::project::require_android_dir(&project.root)?;
-    refresh_platform_wiring(runner, project_dir, &mut |line| println!("{line}"));
+    prepare_native_build(
+        runner,
+        project_dir,
+        &mut |line| println!("{line}"),
+        &mut |line| eprintln!("{line}"),
+    )?;
     println!("{}", android_banner(&project.app_id, info));
     // The drive core is print-free (its `on_line` sink was added by the
     // tty-garbling fix); the CLI restores today's behavior by `println!`ing
@@ -325,7 +331,12 @@ fn build_ios(
 ) -> Result<u8> {
     let project = ios_run::project::detect_flavor(project_dir, info.flavor.as_deref())?;
     ios_run::project::require_ios_dir(&project.root)?;
-    refresh_platform_wiring(runner, project_dir, &mut |line| println!("{line}"));
+    prepare_native_build(
+        runner,
+        project_dir,
+        &mut |line| println!("{line}"),
+        &mut |line| eprintln!("{line}"),
+    )?;
     println!("{}", ios_banner(&project.bundle_id, info));
     // Print-free drive core (see `build_android` above); the CLI `println!`s
     // each streamed line to keep its stdout verbatim.
@@ -1335,5 +1346,86 @@ mod tests {
             "{err}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// `frust build`'s Android and iOS lanes over an app depending on a plugin
+/// its dependency describes in its own manifest ([`super::plugin::fixture`]).
+#[cfg(test)]
+mod discovered_plugin_tests {
+    use super::*;
+    use crate::commands::plugin::fixture::Fixture;
+
+    fn apk() -> BuildTarget {
+        BuildTarget::Apk {
+            build: BuildFlags::default(),
+            split_per_abi: false,
+            target_platform: None,
+        }
+    }
+
+    fn release_info() -> BuildInfo {
+        BuildInfo::from_args(Default::default(), BuildMode::Release).unwrap()
+    }
+
+    fn ios_app() -> IosArtifact {
+        IosArtifact::App {
+            simulator: true,
+            codesign: false,
+        }
+    }
+
+    const STOP: &str = "plugin acme-ble (frust-acme-ble) is not wired into this project: \
+                        4 change(s) pending. Run `frust plugin sync` and re-run.\n  - ";
+
+    /// Both lanes stop on a pending plugin with the one message block before
+    /// Gradle or Xcode is asked for anything — the only process run is the
+    /// single `cargo metadata` — and leave every tracked file as it was.
+    #[test]
+    fn a_pending_discovered_plugin_stops_both_lanes_before_any_build_process() {
+        let fx = Fixture::new("build-pending");
+        let before = fx.tracked();
+
+        let runner = fx.runner();
+        let err = run_in(&runner, &fx.app, apk()).unwrap_err();
+        assert!(err.to_string().starts_with(STOP), "{err}");
+        assert_eq!(runner.calls(), [fx.metadata_key()]);
+
+        // `build ios` is host-locked to macOS before its lane runs; the lane
+        // itself is host-independent up to the pipeline.
+        let runner = fx.runner();
+        let err = build_ios(&runner, &fx.app, &release_info(), ios_app(), &[]).unwrap_err();
+        assert!(err.to_string().starts_with(STOP), "{err}");
+        assert_eq!(runner.calls(), [fx.metadata_key()]);
+
+        assert_eq!(fx.tracked(), before);
+    }
+
+    /// After `frust plugin sync` both lanes reach their pipelines, rewriting
+    /// the plugin's `local.properties` key and `ios/` link on the way.
+    #[test]
+    fn after_sync_both_lanes_proceed_and_wire_the_discovered_plugin() {
+        let fx = Fixture::new("build-synced");
+        let catalog = fx.catalog();
+        let code =
+            super::super::plugin::sync_with(&catalog, &fx.app, &mut Vec::new(), &mut Vec::new())
+                .unwrap();
+        assert_eq!(code, 0);
+        let tracked = fx.tracked();
+
+        fx.unwire();
+        let runner = fx.runner();
+        let err = run_in(&runner, &fx.app, apk()).unwrap_err();
+        assert!(err.to_string().contains("rustup target add"), "{err}");
+        assert_eq!(fx.wired(), (true, true));
+
+        fx.unwire();
+        let runner = fx.runner();
+        let err = build_ios(&runner, &fx.app, &release_info(), ios_app(), &[]).unwrap_err();
+        assert!(!err.to_string().contains("is not wired"), "{err}");
+        assert!(runner.calls().len() > 1, "{:?}", runner.calls());
+        assert_eq!(fx.wired(), (true, true));
+
+        assert_eq!(fx.tracked(), tracked);
     }
 }

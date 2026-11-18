@@ -6,7 +6,7 @@ members = ["crates/*", "examples/*", "plugins/shared-preferences", "plugins/secu
 # Standalone workspaces (gate each from its dir). huddle, plugins/clean-signals-frust: keep crates.io clean-signals
 # out of the root graph (Version-Pin Policy); hotpatch-spike: dx/subsecond pins likewise. shadertoy, glyph-catalog,
 # playground, material3-demo, beui-demo, native-widgets-demo: `frust create` scaffolds. design-system-sample: facade-only. web-*: wasm-only.
-exclude = ["examples/huddle", "examples/shadertoy", "examples/web-spike", "examples/web-gallery", "examples/glyph-catalog", "examples/playground", "examples/design-system-sample", "examples/material3-demo", "examples/beui-demo", "examples/native-widgets-demo", "examples/hotpatch-spike", "plugins/clean-signals-frust"]
+exclude = ["examples/huddle", "examples/shadertoy", "examples/web-spike", "examples/web-gallery", "examples/glyph-catalog", "examples/playground", "examples/design-system-sample", "examples/material3-demo", "examples/beui-demo", "examples/native-widgets-demo", "examples/hotpatch-spike", "plugins/clean-signals-frust", "crates/frust-drive/tests/fixtures/external-plugin"]
 
 [workspace.package]
 version = "0.6.6"
