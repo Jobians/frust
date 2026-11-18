@@ -401,6 +401,78 @@ documented as a known constraint, not a regression.
 
 ---
 
+### `plugin-platform-floor-checked-not-raised` — a plugin's minimum iOS / Android version is checked and reported, never raised, and the check reads two settings
+
+**Observed**: `frust plugin add` compares a plugin's (and each requested feature's) `min_ios` and
+`min_android_sdk` with the app and refuses with `PlatformFloorTooLow` when the app is lower; it
+never edits the app's floor. The author raises it by hand and re-runs. The check reads only
+the lowest `IPHONEOS_DEPLOYMENT_TARGET` over every build configuration of `ios/Runner.xcodeproj`
+(project-level and target-level, so it is conservative), and `minSdkValue` or else a literal
+`minSdk` in `android/app/build.gradle.kts`. It does not read a product flavor's own `minSdk`, an
+`[sdk=...]`-conditioned deployment target, or a Swift package's own minimum. A floor it cannot
+read is refused as a malformed project file, never guessed. A platform the app has no directory for
+is skipped.
+
+**Applies to**: any `frust plugin add` of a plugin that declares a floor, into an app whose floor
+is lower or is set somewhere the check does not read.
+
+**Why accepted**: raising a deployment target or `minSdk` drops devices, which is the app author's
+decision, not a tooling side effect. Reading only the two canonical settings keeps the check
+predictable; a flavor or SDK-conditioned override can still sit below the plugin's floor and fail
+later in the platform build.
+
+**Evidence**: `crates/frust-drive/src/plugin/apply.rs`'s `check_platform_floors`,
+`lowest_ios_deployment_target` and `android_min_sdk`; `crates/frust-drive/src/plugin/mod.rs`'s
+`PluginAddError::PlatformFloorTooLow` and `PluginSpec::min_ios` / `min_android_sdk`. Not run
+through Gradle or Xcode.
+
+---
+
+### `plugin-repositories-marker-hand-added` — an app created before the Maven repository contribution must add one marker line by hand
+
+**Observed**: a `Contribution::MavenRepository` is inserted at the `// frust:plugin-repositories`
+line of `android/settings.gradle.kts`. An app created before that contribution existed has no such
+line, so adding a plugin that contributes a Maven repository is refused with a
+`MalformedProjectFile` error that quotes it: add `// frust:plugin-repositories` inside
+`dependencyResolutionManagement { repositories { ... } }`, after `mavenCentral()`, then re-run.
+
+**Applies to**: apps scaffolded before this change, adding a plugin whose registry entry carries a
+Maven repository. Only the app template and `examples/playground` carry the marker.
+
+**Why accepted**: the add edits by anchor insertion and never rewrites app-owned Gradle, so a file
+without the anchor is refused rather than guessed at.
+
+**Evidence**: `crates/frust-drive/src/plugin/apply.rs`'s `REPOSITORIES_ANCHOR`,
+`missing_repositories_marker` and `apply_maven_repository`;
+`crates/frust-drive/templates/app/android.tmpl/settings.gradle.kts.tmpl`;
+`examples/playground/android/settings.gradle.kts`. A Gradle evaluation of a settings file with an
+`exclusiveContent` block has not been run.
+
+---
+
+### `plugin-add-partially-atomic` — `frust plugin add` validates some contributions before its first write, and the older kinds are not
+
+**Observed**: the add is not atomic across files. These checks run before the first write, so a
+refusal leaves the tree untouched: unknown feature, `Cargo.toml` parse, the platform floors, the
+native-path-inside-package rule, the iOS entitlement plan (when `ios/` exists; the pbxproj Runner
+target and entitlements file are resolved in memory), the Maven repository url, groups and marker
+(when `android/settings.gradle.kts` exists), and a missing sibling checkout. The older kinds
+(manifest permission, plist entry, Gradle module, scaffold file, Swift package, iOS framework)
+validate only as they apply, after `Cargo.toml` has been written. For example, in a project without
+`ios/` a plugin with an iOS contribution fails with a missing-file error after `Cargo.toml` was
+already edited. Re-running after fixing the project is safe, because every contribution is
+idempotent.
+
+**Applies to**: a project missing a platform tree or an anchor an older-kind contribution needs.
+
+**Why accepted**: each applier is idempotent and writes its own file from an in-memory edit, so a
+partial add is completed by a re-run; a project-wide pre-validation of every kind was not built.
+
+**Evidence**: `crates/frust-drive/src/plugin/apply.rs`'s `add_spec_with` (the checks precede the
+`Cargo.toml` write; `apply_contribution` runs the rest after it) and `plan_ios_entitlement`.
+
+---
+
 ### `ime-ios-content-type-unverified` — iOS secure-entry IME path is device-unverified
 
 **Observed**: `FrustViewController.swift`'s IME reconcile path — the

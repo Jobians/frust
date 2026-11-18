@@ -15,6 +15,12 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 
 ### Breaking
 
+- `frust-drive`: `PluginSpec` and `FeatureSpec` gained the public fields `min_ios` and
+  `min_android_sdk`, so a struct literal written outside the crate no longer compiles. Migration: end
+  it with `..PluginSpec::DEFAULT` (`..FeatureSpec::DEFAULT` for a feature). `Contribution` and
+  `PluginAddError` are not `#[non_exhaustive]` and gained variants (`IosEntitlement`,
+  `PlistArrayEntry`, `MavenRepository`; `InvalidContribution`, `PlatformFloorTooLow`), so an
+  exhaustive `match` on either needs the new arms.
 - The minimum supported Rust version is now 1.89 (was 1.88), because rusqlite 0.43.0 requires it.
 - `accesskit::Tree` (re-exported through frust) is now `TreeInfo`; the old name is a deprecated alias.
 - `frust-i18n` typed keys (`locales!`'s `keys` module): a message with two or more `$variable`s now
@@ -106,6 +112,14 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 
 ### Added
 
+- `frust-drive` plugin contributions: `Contribution::IosEntitlement` (a key written to
+  `ios/Runner/Runner.entitlements`, with `IosEntitlementValue` as Bool, String or StringArray),
+  `Contribution::PlistArrayEntry` (a string array in `Info.plist`) and `Contribution::MavenRepository`
+  (a url with its groups, added to `android/settings.gradle.kts`). `PluginSpec::DEFAULT` and
+  `FeatureSpec::DEFAULT` are the struct-update bases for registry entries.
+- `frust plugin add` checks the plugin's minimum platform versions (`min_ios`, `min_android_sdk`)
+  against the app before writing anything, and refuses with `PluginAddError::PlatformFloorTooLow`
+  (naming `FloorPlatform`) when the app's floor is lower. The app's floor is never raised for it.
 - `ScrollView::dismiss_keyboard_on_drag(bool)` (default off): when the vertical scroll view contains
   the focused field, a user drag whose first movement past the slop is downward ends the focus session
   (the soft keyboard goes away) and keeps scrolling; an upward drag, a wheel, a fling, a controller
@@ -329,6 +343,8 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 
 ### Changed
 
+- `frust-drive`: `Info.plist` keys and values written by a plugin add are now XML-escaped, and `--`
+  in their comments is collapsed. No existing registry entry is affected.
 - New apps build with NDK 28.2.13676358, and `frust doctor` recommends r28 (earlier NDKs produce
   libraries that are not 16 KB aligned).
 - accesskit 0.25, `accesskit_winit` 0.34, `accesskit_android` 0.9, `accesskit_ios` 0.2.2.
