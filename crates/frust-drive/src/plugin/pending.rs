@@ -88,7 +88,10 @@ fn platform_dir(contribution: &Contribution) -> Option<&'static str> {
 /// `entry` as it applies to the project at `project_root`: a built-in entry
 /// unchanged, a manifest-described one without its contributions (base and
 /// features alike) for a platform whose directory the project lacks.
-fn for_project<'e>(project_root: &Path, entry: &'e CatalogEntry) -> Cow<'e, CatalogEntry> {
+pub(super) fn for_project<'e>(
+    project_root: &Path,
+    entry: &'e CatalogEntry,
+) -> Cow<'e, CatalogEntry> {
     let absent = |contribution: &Contribution| {
         platform_dir(contribution).is_some_and(|dir| !project_root.join(dir).is_dir())
     };
@@ -839,6 +842,135 @@ mod tests {
             "{err:?}"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Adding a manifest plugin to an app without `ios/` (or `android/`)
+    /// skips that platform's items as sync does: nothing of it is applied,
+    /// written or an error, and nothing stays pending.
+    #[test]
+    fn adding_a_manifest_plugin_skips_a_platform_directory_the_app_lacks() {
+        for (absent, kept) in [("ios", "android"), ("android", "ios")] {
+            let root = temp_root(&format!("add-no-{absent}"));
+            let app = scaffold_app(&root);
+            fs::remove_dir_all(app.join(absent)).unwrap();
+            let entry = plugin_entry(&root, "acme-ble", PACKAGE, None, MANIFEST);
+            depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+            let catalog = catalog(vec![entry.clone()]);
+
+            let report = apply::add_plugin_from_with(
+                &StubLocator::failing("a manifest plugin is never located"),
+                &app,
+                &catalog,
+                "acme-ble",
+                &[],
+            )
+            .unwrap();
+            assert_eq!(report.items.len(), 3, "{absent}: {report:?}");
+            assert!(
+                report
+                    .items
+                    .iter()
+                    .skip(1)
+                    .all(|i| i.outcome == AddOutcome::Applied),
+                "{report:?}"
+            );
+            assert!(!app.join(absent).exists(), "{absent}/ is never created");
+            if kept == "android" {
+                assert!(read(&app, apply::SETTINGS_GRADLE_REL).contains("frust-acme-ble"));
+            } else {
+                assert!(read(&app, apply::PLIST_REL).contains("NSBluetoothAlwaysUsageDescription"));
+            }
+            assert_eq!(pending_contributions(&app, &entry, &[]).unwrap(), []);
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// A built-in plugin's add on an app without `ios/` is unchanged: it
+    /// fails exactly as applying the entry unfiltered does.
+    #[test]
+    fn adding_a_built_in_plugin_on_an_app_without_ios_is_unchanged() {
+        let root = temp_root("add-built-in-no-ios");
+        let pkg = root.join("pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        let a = scaffold_app(&root);
+        fs::remove_dir_all(a.join("ios")).unwrap();
+        let catalog = PluginCatalog::built_in();
+        let through_add = apply::add_plugin_from_with(
+            &StubLocator::new().with("frust-camera", &pkg),
+            &a,
+            &catalog,
+            "camera",
+            &[],
+        );
+        let b = root.join("b");
+        fs::create_dir_all(&b).unwrap();
+        let ctx_app = scaffold_app(&b);
+        fs::remove_dir_all(ctx_app.join("ios")).unwrap();
+        let direct = apply::add_entry_with(
+            &StubLocator::new().with("frust-camera", &pkg),
+            &ctx_app,
+            catalog.find("camera").unwrap(),
+            &[],
+        );
+        let (
+            Err(PluginAddError::MissingProjectFile(a)),
+            Err(PluginAddError::MissingProjectFile(b)),
+        ) = (&through_add, &direct)
+        else {
+            panic!("{through_add:?} vs {direct:?}");
+        };
+        assert_eq!(a, b);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_installed_follows_one_rule_for_built_in_and_manifest_entries() {
+        let root = temp_root("is-installed");
+        let app = scaffold_app(&root);
+        let built_in = CatalogEntry::built_in(crate::plugin::PluginSpec {
+            id: Cow::Borrowed("acme-tag"),
+            crate_dir: Cow::Borrowed("acme-tag"),
+            base: Cow::Owned(vec![Contribution::CargoDep {
+                name: Cow::Borrowed("frust-acme-tag"),
+            }]),
+            ..crate::plugin::PluginSpec::DEFAULT
+        });
+        let manifest = plugin_entry(&root, "acme-ble", PACKAGE, None, MANIFEST);
+        assert!(!apply::is_installed(&app, &built_in).unwrap());
+        assert!(!apply::is_installed(&app, &manifest).unwrap());
+
+        depend(&app, "frust-acme-tag = \"1\"");
+        assert!(apply::is_installed(&app, &built_in).unwrap());
+
+        depend(&app, "frust-acme-ble = \"0.3\"");
+        assert!(apply::is_installed(&app, &manifest).unwrap());
+        let _ = fs::remove_dir_all(&root);
+
+        for (line, expected) in [
+            (
+                "frust-acme-ble = { version = \"0.3\", optional = true }",
+                false,
+            ),
+            (
+                "ble = { package = \"frust-acme-ble\", version = \"0.3\" }",
+                true,
+            ),
+            (
+                "ble = { package = \"frust-acme-ble\", version = \"0.3\", optional = true }",
+                false,
+            ),
+        ] {
+            let root = temp_root("is-installed-forms");
+            let app = scaffold_app(&root);
+            let manifest = plugin_entry(&root, "acme-ble", PACKAGE, None, MANIFEST);
+            depend(&app, line);
+            assert_eq!(
+                apply::is_installed(&app, &manifest).unwrap(),
+                expected,
+                "{line}"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
     }
 
     #[test]

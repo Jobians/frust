@@ -14,18 +14,16 @@
 //! never shadows a built-in one — so adding one runs no `cargo metadata` of
 //! its own, as before.
 
-use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Result;
 
 use frust_drive::packages::{CargoLocator, PackagesError};
 use frust_drive::plugin::{
-    AddOutcome, AddReport, CatalogEntry, Contribution, DepSource, PluginAddError, PluginCatalog,
-    PluginOrigin, PluginSpec, add_plugin_from, desktop_contributions_in, discover,
-    pending_contributions, sync_plugins,
+    AddOutcome, AddReport, CatalogEntry, DepSource, PluginAddError, PluginCatalog, PluginOrigin,
+    add_plugin_from, discover, is_installed, pending_contributions, sync_plugins,
 };
 use frust_drive::process::ProcessRunner;
 
@@ -116,68 +114,20 @@ pub(crate) fn origin_label(entry: &CatalogEntry) -> String {
     }
 }
 
-/// The marker contribution [`installed_plugin_ids`] probes with.
-fn probe_marker() -> Contribution {
-    Contribution::LinuxDesktopEntry {
-        key: Cow::Borrowed("X-Frust-Dependency-Probe"),
-        value: Cow::Borrowed(""),
-        comment: Cow::Borrowed(""),
-    }
-}
-
-/// The ids of the plugins of `catalog` the app at `project_root` depends on.
-///
-/// frust-drive applies its "the app depends on this plugin" rule inside its
-/// add, sync and wiring code and exposes it through one public seam,
-/// [`desktop_contributions_in`], which returns the desktop-lane rows of
-/// exactly the plugins the app depends on. Each entry is re-entered into a
-/// probe catalog under a numbered id with a single marker row, so every
-/// marker that comes back names a plugin the app depends on. A
-/// manifest-described entry keeps its origin, so its answer is the very one
-/// `sync_plugins` and the wiring use (a non-optional entry on its package in
-/// `[dependencies]` or a target table); a built-in one is probed as an entry
-/// on its Cargo dependency, by the same rule.
+/// The ids of the plugins of `catalog` the app at `project_root` depends on,
+/// by frust-drive's one rule ([`is_installed`]), the one `sync`, the wiring
+/// and the add use.
 pub(crate) fn installed_plugin_ids(
     project_root: &Path,
     catalog: &PluginCatalog,
 ) -> Result<BTreeSet<String>, PluginAddError> {
-    let mut ids = Vec::new();
-    let mut probes = Vec::new();
+    let mut ids = BTreeSet::new();
     for entry in catalog {
-        let origin = match &entry.origin {
-            PluginOrigin::Manifest { .. } => entry.origin.clone(),
-            PluginOrigin::BuiltIn => {
-                let Some(package) = entry.spec.base.iter().find_map(|c| match c {
-                    Contribution::CargoDep { name } => Some(name.to_string()),
-                    _ => None,
-                }) else {
-                    continue;
-                };
-                PluginOrigin::Manifest {
-                    package,
-                    package_dir: PathBuf::new(),
-                    version: String::new(),
-                    source: DepSource::Path,
-                }
-            }
-        };
-        probes.push(CatalogEntry {
-            spec: PluginSpec {
-                id: Cow::Owned(ids.len().to_string()),
-                base: Cow::Owned(vec![probe_marker()]),
-                ..PluginSpec::DEFAULT
-            },
-            origin,
-        });
-        ids.push(entry.spec.id.to_string());
+        if is_installed(project_root, entry)? {
+            ids.insert(entry.spec.id.to_string());
+        }
     }
-    let (probe_catalog, _) = PluginCatalog::with_discovered(PluginCatalog::built_in(), probes);
-    let marker = probe_marker();
-    Ok(desktop_contributions_in(project_root, &probe_catalog)?
-        .into_iter()
-        .filter(|row| row.contribution == marker)
-        .filter_map(|row| ids.get(row.plugin_id.parse::<usize>().ok()?).cloned())
-        .collect())
+    Ok(ids)
 }
 
 /// The message `frust run` and `frust build` stop with, before any build

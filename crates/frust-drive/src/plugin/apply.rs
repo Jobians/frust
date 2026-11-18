@@ -173,7 +173,10 @@ pub fn add_plugin_from_with(
     let entry = catalog
         .find(id)
         .ok_or_else(|| PluginAddError::UnknownPlugin(id.to_string()))?;
-    add_entry_with(locator, project_root, entry, features)
+    // A manifest-described plugin's items for a platform the app lacks are
+    // skipped, as `pending_contributions` and `sync_plugins` skip them.
+    let entry = super::pending::for_project(project_root, entry);
+    add_entry_with(locator, project_root, &entry, features)
 }
 
 /// Read Cargo.toml: never rewritten (nor read further) if it can't parse.
@@ -1050,6 +1053,18 @@ pub(crate) fn entry_is_installed(entry: &CatalogEntry, doc: &DocumentMut) -> boo
             find_package_entry(*deps, package).is_some_and(|(_, v)| !dep_is_optional(v))
         }),
     }
+}
+
+/// Whether the app at `project_root` depends on the plugin of `entry` — the
+/// one rule `sync_plugins`, the machine-local wiring and
+/// [`desktop_contributions_in`] pick plugins by. A built-in entry counts when
+/// its own Cargo dependency is a non-optional `[dependencies]` entry, by key
+/// or `package = "…"` rename; a manifest-described one when a non-optional
+/// entry on its package sits in `[dependencies]` or any
+/// `[target.<cfg>.dependencies]` table, by key or rename. Reads only; a
+/// missing or unparseable `Cargo.toml` is the error an add would give.
+pub fn is_installed(project_root: &Path, entry: &CatalogEntry) -> Result<bool, PluginAddError> {
+    Ok(entry_is_installed(entry, &read_cargo_doc(project_root)?))
 }
 
 /// Where a plugin's dependency entry is looked for in the app's `Cargo.toml`.

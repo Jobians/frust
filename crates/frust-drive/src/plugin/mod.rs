@@ -53,7 +53,7 @@ pub mod registry;
 
 pub use apply::{
     DesktopContribution, add_plugin, add_plugin_from, add_plugin_from_with, add_plugin_with,
-    desktop_contributions, desktop_contributions_in,
+    desktop_contributions, desktop_contributions_in, is_installed,
 };
 pub use catalog::{CatalogEntry, DepSource, PluginCatalog, PluginOrigin};
 pub use manifest::{Discovery, ManifestError, discover};
