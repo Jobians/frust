@@ -1,7 +1,7 @@
 use super::{DoctorCtx, Status, Validation, Validator};
 
 /// Minimum supported `rustc` version (matches the workspace `rust-version`).
-const MIN_RUST_VERSION: (u64, u64, u64) = (1, 88, 0);
+const MIN_RUST_VERSION: (u64, u64, u64) = (1, 89, 0);
 
 pub struct RustToolchainValidator;
 
@@ -123,6 +123,61 @@ mod tests {
         let result = RustToolchainValidator.validate(&ctx);
         assert_eq!(result.status, Status::Fail);
         assert!(result.messages.iter().any(|m| m.contains("rustup.rs")));
+    }
+
+    fn status_for(rustc_version_line: &str) -> Status {
+        let runner = FakeProcessRunner::new()
+            .with("rustc --version", ok(rustc_version_line))
+            .with("cargo --version", ok("cargo 1.91.1\n"));
+        let env = FakeEnv::new();
+        let ctx = DoctorCtx {
+            runner: &runner,
+            env: &env,
+            is_macos: true,
+        };
+        RustToolchainValidator.validate(&ctx).status
+    }
+
+    #[test]
+    fn fails_on_rustc_1_88() {
+        assert_eq!(
+            status_for("rustc 1.88.0 (6b00bc388 2025-06-23)\n"),
+            Status::Fail
+        );
+    }
+
+    #[test]
+    fn passes_on_rustc_1_89_and_newer() {
+        assert_eq!(
+            status_for("rustc 1.89.0 (29483883e 2025-08-04)\n"),
+            Status::Pass
+        );
+        assert_eq!(
+            status_for("rustc 1.98.1 (abcdef012 2026-09-01)\n"),
+            Status::Pass
+        );
+    }
+
+    #[test]
+    fn minimum_matches_workspace_rust_version() {
+        let manifest =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml"))
+                .expect("read root Cargo.toml");
+        let mut in_section = false;
+        let mut declared = None;
+        for line in manifest.lines().map(str::trim) {
+            if line.starts_with('[') {
+                in_section = line == "[workspace.package]";
+            } else if in_section && line.starts_with("rust-version") {
+                declared = line.split('"').nth(1).map(str::to_string);
+                break;
+            }
+        }
+        let declared = declared.expect("[workspace.package] rust-version");
+        assert_eq!(
+            declared,
+            format!("{}.{}", MIN_RUST_VERSION.0, MIN_RUST_VERSION.1)
+        );
     }
 
     #[test]

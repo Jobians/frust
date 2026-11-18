@@ -1292,9 +1292,10 @@ root cause is `devtools-screenshot-not-supported-v1`.
 ### `mcp-server-unauthenticated-v1` — the MCP server has no authentication beyond the loopback bind
 
 **Observed**: `frust-mcp` binds `127.0.0.1` only and relies on rmcp's default Host-header guard
-against DNS rebinding, but the MCP protocol layer itself has no login, token, or capability check
-— any local process that can reach the port can list, launch, drive, and stop sessions of the
-server's configured project. There is no per-call project override: that argument was removed
+against DNS rebinding and an Origin allowlist that refuses a browser page on any other origin, but
+the MCP protocol layer itself has no login, token, or capability check — any local process that can
+reach the port can list, launch, drive, and stop sessions of the server's configured project. There
+is no per-call project override: that argument was removed
 after review, so a session can never be pointed at an arbitrary filesystem path.
 
 **Applies to**: every `frust-mcp` session, on every platform.
@@ -1334,8 +1335,9 @@ binary consumer in this repo besides `crates/frust-tui/src/runner.rs`.
 ### `mcp-embedded-client-registry-coarse` — connected-MCP-client tracking is coarse and can go stale
 
 **Observed**: `frust-mcp`'s `ClientRegistry` (the TUI's MCP panel reads it live) tracks only
-a count, a mint-order opaque `id`, and a connect time per session — no client name, version, or
-capabilities. Disconnection has exactly one signal: the per-session `ClientGuard`'s `Drop`, fired
+a count (a sessionless 2026-07-28 request is one transient entry for the life of the request), a
+mint-order opaque `id`, and a connect time per session — no client name, version, or capabilities.
+Disconnection has exactly one signal: the per-session `ClientGuard`'s `Drop`, fired
 when rmcp tears the session down. The Streamable-HTTP transport exposes nothing lower-level to
 build a better signal from, so a client that vanishes without a clean teardown (a killed process, a
 network drop rmcp doesn't notice) leaves its entry — and the panel showing it as connected — until

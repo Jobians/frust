@@ -51,7 +51,8 @@ pub(crate) async fn serve(
 /// building or tearing down an engine on its behalf.
 ///
 /// `registry` is shared across every MCP session this call accepts: the
-/// service factory below registers a `ClientGuard` per session and moves it
+/// service factory below registers a `ClientGuard` per session (and per
+/// sessionless 2026-07-28 request) and moves it
 /// into that session's [`McpHandler`], so the guard's `Drop` — the *only*
 /// disconnect signal available (`clients.rs`'s module doc) — removes the
 /// entry again. Repeated start/stop cycles handing the same `registry` back
@@ -72,8 +73,35 @@ pub async fn serve_embedded(
     // port) is exactly the DNS-rebinding guard this loopback-only server
     // needs, left untouched rather than widened — unlike fdemon's
     // configurable-bind server, this one has no other address to allow.
-    let transport_config =
-        StreamableHttpServerConfig::default().with_cancellation_token(cancel.child_token());
+    //
+    // rmcp leaves Origin validation off while `allowed_origins` is empty
+    // (its default), so the allowlist is set here: a browser page on this
+    // server's own loopback origin is accepted, any other page's Origin is
+    // refused with 403, and a request with no Origin header (every
+    // non-browser MCP client) still passes. Each entry names the bound port
+    // explicitly, because a port-less entry matches any port.
+    //
+    // `legacy_session_mode` is set explicitly rather than taken from the
+    // default: a client that runs the `initialize` handshake (protocol
+    // versions before 2026-07-28) keeps a stateful session with an
+    // `Mcp-Session-Id`, one handler per session, as it always has.
+    //
+    // A 2026-07-28 request carries its protocol version, client info and
+    // capabilities in its own `_meta` and has no session. rmcp serves it
+    // statelessly with no code here, and the handler advertises every
+    // version rmcp knows, so it is served rather than refused. rmcp runs the
+    // factory below once per such request, so a sessionless request shows
+    // in the client registry as one transient entry for as long as its
+    // handler runs; the entry is removed when the handler is dropped at the
+    // end of the request, which keeps the registry's count accurate.
+    let port = addr.port();
+    let transport_config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(true)
+        .with_allowed_origins([
+            format!("http://127.0.0.1:{port}"),
+            format!("http://localhost:{port}"),
+        ])
+        .with_cancellation_token(cancel.child_token());
     let service = StreamableHttpService::new(
         move || {
             let guard = registry.register();
