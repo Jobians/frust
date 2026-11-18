@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 
 use toml_edit::{Array, DocumentMut, InlineTable, Item, Value};
 
-use super::catalog::PluginCatalog;
+use super::catalog::{CatalogEntry, DepSource, PluginCatalog, PluginOrigin};
 use super::{
     AddItem, AddOutcome, AddReport, Contribution, FloorPlatform, IosEntitlementValue, NativeKind,
     NativeModule, PluginAddError, PluginSpec,
@@ -22,13 +22,17 @@ use crate::platform_wiring::{self, SyncError};
 use crate::process::RealProcessRunner;
 
 /// Project-relative paths of the files a contribution edits.
-const CARGO_TOML_REL: &str = "Cargo.toml";
-const MANIFEST_REL: &str = "android/app/src/main/AndroidManifest.xml";
-const PLIST_REL: &str = "ios/Runner/Info.plist";
-const SETTINGS_GRADLE_REL: &str = "android/settings.gradle.kts";
-const APP_BUILD_GRADLE_REL: &str = "android/app/build.gradle.kts";
-const PBXPROJ_REL: &str = "ios/Runner.xcodeproj/project.pbxproj";
-const LIB_RS_REL: &str = "src/lib.rs";
+pub(super) const CARGO_TOML_REL: &str = "Cargo.toml";
+pub(super) const MANIFEST_REL: &str = "android/app/src/main/AndroidManifest.xml";
+pub(super) const PLIST_REL: &str = "ios/Runner/Info.plist";
+pub(super) const SETTINGS_GRADLE_REL: &str = "android/settings.gradle.kts";
+pub(super) const APP_BUILD_GRADLE_REL: &str = "android/app/build.gradle.kts";
+pub(super) const PBXPROJ_REL: &str = "ios/Runner.xcodeproj/project.pbxproj";
+pub(super) const LIB_RS_REL: &str = "src/lib.rs";
+
+/// The insertion anchors of `AndroidManifest.xml` and `Info.plist`.
+pub(super) const MANIFEST_ANCHOR: &str = "</manifest>";
+pub(super) const PLIST_ANCHOR: &str = "</dict>";
 
 /// The marker comments the Android app template ships for plugin-contributed
 /// Gradle wiring (`crates/frust-drive/templates/app/android.tmpl/settings.gradle.kts.tmpl` and
@@ -37,9 +41,9 @@ const LIB_RS_REL: &str = "src/lib.rs";
 /// [`PluginAddError::MalformedProjectFile`] and is never rewritten — guessing
 /// at `include(":app")` or a bare `dependencies {` would be a second,
 /// unpinned convention.
-const SETTINGS_ANCHOR: &str = "// frust:plugin-includes";
-const APP_DEPS_ANCHOR: &str = "// frust:plugin-dependencies";
-const REPOSITORIES_ANCHOR: &str = "// frust:plugin-repositories";
+pub(super) const SETTINGS_ANCHOR: &str = "// frust:plugin-includes";
+pub(super) const APP_DEPS_ANCHOR: &str = "// frust:plugin-dependencies";
+pub(super) const REPOSITORIES_ANCHOR: &str = "// frust:plugin-repositories";
 
 /// The `settings.gradle.kts` helper every machine-local module directory is
 /// resolved through: it loads the gitignored `local.properties` beside the
@@ -86,9 +90,16 @@ pub fn add_plugin(
 
 /// [`add_plugin`] for plugin `id` of `catalog` rather than of the built-in
 /// registry alone: the same edits, the same idempotency, the same locator.
-/// An id `catalog` lacks is [`PluginAddError::UnknownPlugin`]; an entry that
-/// is not built in ([`super::PluginOrigin::Manifest`]) is
-/// [`PluginAddError::UnsupportedOrigin`], refused before anything is read.
+/// An id `catalog` lacks is [`PluginAddError::UnknownPlugin`].
+///
+/// A manifest-described entry ([`PluginOrigin::Manifest`]) is applied from
+/// its own package: an app already depending on it (any table, any key)
+/// keeps its line; otherwise `{ path = "<relative path>" }` is written for a
+/// path package, `"<resolved version>"` for a crates.io one, never derived
+/// from `frust`'s; a git or alternate-registry package is refused
+/// ([`PluginAddError::DependencySourceNotWritable`]) before any write. Its
+/// native paths are relative to the package directory the entry carries,
+/// so the locator is never asked about it.
 pub fn add_plugin_from(
     project_root: &Path,
     catalog: &PluginCatalog,
@@ -162,64 +173,101 @@ pub fn add_plugin_from_with(
     let entry = catalog
         .find(id)
         .ok_or_else(|| PluginAddError::UnknownPlugin(id.to_string()))?;
-    if !entry.is_built_in() {
-        return Err(PluginAddError::UnsupportedOrigin(id.to_string()));
-    }
-    add_spec_with(locator, project_root, &entry.spec, features)
+    add_entry_with(locator, project_root, entry, features)
 }
 
-/// [`add_plugin_with`] for an already-resolved registry entry — the seam a
-/// test drives with a synthetic [`PluginSpec`] the static registry does not
-/// carry.
-fn add_spec_with(
-    locator: &dyn PackageLocator,
-    project_root: &Path,
-    spec: &PluginSpec,
-    features: &[&str],
-) -> Result<AddReport, PluginAddError> {
-    let id = &*spec.id;
+/// Read Cargo.toml: never rewritten (nor read further) if it can't parse.
+pub(super) fn read_cargo_doc(project_root: &Path) -> Result<DocumentMut, PluginAddError> {
+    fs::read_to_string(project_root.join(CARGO_TOML_REL))
+        .map_err(|_| PluginAddError::MissingProjectFile(CARGO_TOML_REL.to_string()))?
+        .parse::<DocumentMut>()
+        .map_err(|e| PluginAddError::UnparseableCargoToml(e.to_string()))
+}
 
-    // Validate every requested feature up front, before mutating anything.
+/// The contributions adding `spec` with `features` applies: the base, then
+/// the selected features' in registry order (a stable report regardless of
+/// the caller's feature ordering). An unknown feature is refused.
+pub(super) fn selected_contributions<'s>(
+    spec: &'s PluginSpec,
+    features: &[&str],
+) -> Result<Vec<&'s Contribution>, PluginAddError> {
     for feat in features {
         if !spec.optional_features.iter().any(|f| f.id == *feat) {
             return Err(PluginAddError::UnknownFeature {
-                plugin: id.to_string(),
+                plugin: spec.id.to_string(),
                 feature: (*feat).to_string(),
             });
         }
     }
-
-    // Read + parse Cargo.toml once: its `frust` dependency decides how every
-    // plugin dependency is written, and it is never rewritten if it can't
-    // parse.
-    let cargo_path = project_root.join(CARGO_TOML_REL);
-    let cargo_src = fs::read_to_string(&cargo_path)
-        .map_err(|_| PluginAddError::MissingProjectFile(CARGO_TOML_REL.to_string()))?;
-    let mut doc = cargo_src
-        .parse::<DocumentMut>()
-        .map_err(|e| PluginAddError::UnparseableCargoToml(e.to_string()))?;
-
-    let frust = FrustDep::read(&doc).ok_or(PluginAddError::NoFrustDependency)?;
-    let resolution = Resolution::new(locator, project_root, spec, &frust);
-
-    // Base contributions, then the selected features' (in registry order for
-    // a stable report regardless of the caller's feature ordering).
     let feature_contribs = spec
         .optional_features
         .iter()
         .filter(|f| features.contains(&&*f.id))
         .flat_map(|f| f.contributions.iter());
-    let contributions: Vec<&Contribution> = spec.base.iter().chain(feature_contribs).collect();
+    Ok(spec.base.iter().chain(feature_contribs).collect())
+}
+
+/// What an add of one entry resolved before its first write.
+pub(super) struct PreparedAdd<'e> {
+    /// The contributions to apply, in report order.
+    contributions: Vec<&'e Contribution>,
+    /// The parsed `Cargo.toml`.
+    doc: DocumentMut,
+    /// How a missing plugin dependency line is written.
+    form: DepForm,
+}
+
+/// Every check an add of `entry` with `features` makes before it writes
+/// anything — the requested features, the Cargo line it would write, the
+/// platform floors, the native-path rule, the iOS entitlement plan and the
+/// Maven repository marker — shared by [`add_plugin_from_with`] and
+/// [`super::sync_plugins`], which runs it for every plugin before the first
+/// write. Reads, never writes.
+pub(super) fn prepare_add<'e>(
+    project_root: &Path,
+    entry: &'e CatalogEntry,
+    features: &[&str],
+) -> Result<PreparedAdd<'e>, PluginAddError> {
+    let spec = &entry.spec;
+    let contributions = selected_contributions(spec, features)?;
+    let doc = read_cargo_doc(project_root)?;
+
+    // A built-in's dependency line follows the app's `frust` dependency; a
+    // manifest plugin's comes from its own package.
+    let form = match &entry.origin {
+        PluginOrigin::BuiltIn => {
+            DepForm::Facade(FrustDep::read(&doc).ok_or(PluginAddError::NoFrustDependency)?)
+        }
+        PluginOrigin::Manifest {
+            package,
+            package_dir,
+            version,
+            source,
+        } => {
+            check_manifest_expressible(spec)?;
+            if *source == DepSource::Other && !cargo_dep_present(&doc, package, &entry.origin) {
+                return Err(PluginAddError::DependencySourceNotWritable {
+                    plugin: spec.id.to_string(),
+                    package: package.clone(),
+                });
+            }
+            DepForm::Manifest {
+                package_dir: package_dir.clone(),
+                version: version.clone(),
+                source: *source,
+            }
+        }
+    };
 
     // The app's iOS / Android floors must meet the plugin's (and every
     // requested feature's); they are checked here and never raised.
     check_platform_floors(project_root, spec, features)?;
 
-    // A registry entry naming a platform path outside its own package cannot
-    // be located; refuse it before anything is written.
+    // A platform path outside the plugin's own package cannot be located;
+    // refuse it before anything is written.
     for contribution in &contributions {
         if let Some(rel_path) = native_rel_path(contribution) {
-            package_location(spec, rel_path)?;
+            package_location_in(spec, &entry.origin, rel_path)?;
         }
     }
 
@@ -256,6 +304,77 @@ fn add_spec_with(
         }
     }
 
+    Ok(PreparedAdd {
+        contributions,
+        doc,
+        form,
+    })
+}
+
+/// Manifest-described plugins carry no contribution their schema cannot
+/// express: an app-crate macro or a scaffolded file is refused, as is a
+/// sibling checkout (all three exist for built-in plugins only).
+fn check_manifest_expressible(spec: &PluginSpec) -> Result<(), PluginAddError> {
+    let all = spec.base.iter().chain(
+        spec.optional_features
+            .iter()
+            .flat_map(|f| f.contributions.iter()),
+    );
+    for contribution in all {
+        if matches!(
+            contribution,
+            Contribution::AppCrateMacro { .. } | Contribution::ScaffoldFile { .. }
+        ) {
+            return Err(PluginAddError::InvalidContribution(format!(
+                "plugin `{}` is described by a package manifest, which cannot carry {}",
+                spec.id,
+                contribution.describe()
+            )));
+        }
+    }
+    if spec.requires_sibling.is_some() {
+        return Err(PluginAddError::InvalidContribution(format!(
+            "plugin `{}` is described by a package manifest, which cannot require a sibling \
+             checkout",
+            spec.id
+        )));
+    }
+    Ok(())
+}
+
+/// [`add_entry_with`] for a synthetic built-in `spec` the static registry
+/// does not carry.
+#[cfg(test)]
+fn add_spec_with(
+    locator: &dyn PackageLocator,
+    project_root: &Path,
+    spec: &PluginSpec,
+    features: &[&str],
+) -> Result<AddReport, PluginAddError> {
+    add_entry_with(
+        locator,
+        project_root,
+        &CatalogEntry::built_in(spec.clone()),
+        features,
+    )
+}
+
+/// [`add_plugin_from_with`] for an already-resolved catalog entry — the seam
+/// a test drives with a synthetic entry the static registry does not carry.
+pub(super) fn add_entry_with(
+    locator: &dyn PackageLocator,
+    project_root: &Path,
+    entry: &CatalogEntry,
+    features: &[&str],
+) -> Result<AddReport, PluginAddError> {
+    let spec = &entry.spec;
+    let PreparedAdd {
+        contributions,
+        mut doc,
+        form,
+    } = prepare_add(project_root, entry, features)?;
+    let resolution = Resolution::new(locator, project_root, spec, &form);
+
     // Facade plugins need a sibling checkout present; check before any edit
     // so a missing sibling leaves the tree untouched.
     if let Some(sibling) = spec.requires_sibling.as_deref() {
@@ -284,7 +403,11 @@ fn add_spec_with(
         }
     }
     if cargo_changed {
-        write_file(&cargo_path, CARGO_TOML_REL, &doc.to_string())?;
+        write_file(
+            &project_root.join(CARGO_TOML_REL),
+            CARGO_TOML_REL,
+            &doc.to_string(),
+        )?;
     }
 
     // The native modules whose machine-local key or link is still missing,
@@ -294,7 +417,12 @@ fn add_spec_with(
     let unwired: Vec<(usize, NativeModule)> = contributions
         .iter()
         .enumerate()
-        .filter_map(|(at, contribution)| Some((at, native_module(spec, contribution)?.ok()?)))
+        .filter_map(|(at, contribution)| {
+            Some((
+                at,
+                native_module_in(spec, &entry.origin, contribution)?.ok()?,
+            ))
+        })
         .filter(|(_, module)| {
             platform_present(project_root, module)
                 && !platform_wiring::module_slot_present(project_root, module)
@@ -341,7 +469,7 @@ fn add_spec_with(
     }
 
     Ok(AddReport {
-        plugin_id: id.to_string(),
+        plugin_id: spec.id.to_string(),
         items,
     })
 }
@@ -613,10 +741,20 @@ fn native_rel_path(contribution: &Contribution) -> Option<&str> {
 }
 
 /// The [`NativeModule`] a Gradle module or Swift package contribution of
-/// `spec` wires, `None` for every other contribution; an error when its
-/// registry path lies outside the plugin's own package.
+/// built-in `spec` wires, `None` for every other contribution; an error when
+/// its registry path lies outside the plugin's own package.
 pub(crate) fn native_module(
     spec: &PluginSpec,
+    contribution: &Contribution,
+) -> Option<Result<NativeModule, PluginAddError>> {
+    native_module_in(spec, &PluginOrigin::BuiltIn, contribution)
+}
+
+/// [`native_module`] for a `spec` of `origin`, its path read by
+/// [`package_location_in`]'s rule for that origin.
+pub(crate) fn native_module_in(
+    spec: &PluginSpec,
+    origin: &PluginOrigin,
     contribution: &Contribution,
 ) -> Option<Result<NativeModule, PluginAddError>> {
     let (rel_path, kind) = match contribution {
@@ -641,7 +779,7 @@ pub(crate) fn native_module(
         _ => return None,
     };
     Some(
-        package_location(spec, rel_path).map(|(package, inside)| NativeModule {
+        package_location_in(spec, origin, rel_path).map(|(package, inside)| NativeModule {
             package: package.clone(),
             // `inside` is a suffix of `rel_path`: re-sliced from the
             // `'static` original it stays borrowed, so a built-in module
@@ -663,13 +801,27 @@ fn apply_contribution(
 ) -> Result<AddOutcome, PluginAddError> {
     let project_root = resolution.project_root;
     match contribution {
-        Contribution::CargoDep { name } => apply_cargo_dep(
-            doc,
-            cargo_changed,
-            name,
-            &resolution.spec.crate_dir,
-            resolution.frust,
-        ),
+        Contribution::CargoDep { name } => match resolution.form {
+            DepForm::Facade(frust) => {
+                apply_cargo_dep(doc, cargo_changed, name, &resolution.spec.crate_dir, frust)
+            }
+            DepForm::Manifest {
+                package_dir,
+                version,
+                source,
+            } => apply_manifest_cargo_dep(
+                doc,
+                cargo_changed,
+                name,
+                &resolution.spec.id,
+                project_root,
+                ManifestDep {
+                    package_dir,
+                    version,
+                    source: *source,
+                },
+            ),
+        },
         Contribution::ManifestPermission { permission } => {
             apply_manifest_permission(project_root, permission)
         }
@@ -706,7 +858,11 @@ fn apply_contribution(
             comment,
         } => apply_app_crate_macro(project_root, invocation, cfg.as_deref(), comment),
         Contribution::CargoFeature { name, feature } => {
-            apply_cargo_feature(doc, cargo_changed, name, feature)
+            let lookup = match resolution.form {
+                DepForm::Facade(_) => DepLookup::Dependencies,
+                DepForm::Manifest { .. } => DepLookup::AnyTable,
+            };
+            apply_cargo_feature(doc, cargo_changed, name, feature, lookup)
         }
         Contribution::ScaffoldFile {
             rel_path, contents, ..
@@ -779,23 +935,19 @@ pub fn desktop_contributions(
 }
 
 /// [`desktop_contributions`] over the plugins of `catalog`, in catalog order.
-/// Only built-in entries are scanned: an entry described by a package
-/// manifest ([`super::PluginOrigin::Manifest`]) contributes no row yet.
+/// A manifest-described plugin counts as installed through an entry in
+/// `[dependencies]` or a target table, but its schema carries no
+/// desktop-lane contribution, so it contributes no row.
 pub fn desktop_contributions_in(
     project_root: &Path,
     catalog: &PluginCatalog,
 ) -> Result<Vec<DesktopContribution>, PluginAddError> {
-    let cargo_path = project_root.join(CARGO_TOML_REL);
-    let cargo_src = fs::read_to_string(&cargo_path)
-        .map_err(|_| PluginAddError::MissingProjectFile(CARGO_TOML_REL.to_string()))?;
-    let doc = cargo_src
-        .parse::<DocumentMut>()
-        .map_err(|e| PluginAddError::UnparseableCargoToml(e.to_string()))?;
+    let doc = read_cargo_doc(project_root)?;
     let specs = catalog
         .iter()
-        .filter(|entry| entry.is_built_in())
+        .filter(|entry| entry_is_installed(entry, &doc))
         .map(|entry| &entry.spec);
-    Ok(desktop_contributions_for(specs, &doc))
+    Ok(desktop_rows(specs))
 }
 
 /// [`desktop_contributions`]'s pure inner logic, parameterized over the
@@ -803,13 +955,22 @@ pub fn desktop_contributions_in(
 /// synthetic [`PluginSpec`]s, so the detection logic is testable independently
 /// of which desktop-lane rows (`MacosPlistEntry`, `MacosEntitlement`) the
 /// real registry carries at any given time.
+#[cfg(test)]
 fn desktop_contributions_for<'s>(
     specs: impl IntoIterator<Item = &'s PluginSpec>,
     doc: &DocumentMut,
 ) -> Vec<DesktopContribution> {
+    desktop_rows(
+        specs
+            .into_iter()
+            .filter(|spec| plugin_is_installed(spec, doc)),
+    )
+}
+
+/// The desktop-lane rows of `specs`' base contributions, in order.
+fn desktop_rows<'s>(specs: impl IntoIterator<Item = &'s PluginSpec>) -> Vec<DesktopContribution> {
     specs
         .into_iter()
-        .filter(|spec| plugin_is_installed(spec, doc))
         .flat_map(|spec| {
             spec.base
                 .iter()
@@ -876,6 +1037,140 @@ fn dep_renamed_package(value: &Item) -> Option<&str> {
     value.as_table_like()?.get("package")?.as_str()
 }
 
+/// Whether the app `doc` describes depends on `entry`'s plugin: for a
+/// built-in, [`plugin_is_installed`]; for a manifest-described plugin, a
+/// non-optional entry on its package in `[dependencies]` or any
+/// `[target.<cfg>.dependencies]` table, by key or `package = …` — discovery
+/// found the package in the resolved graph, which a transitive dependency
+/// also puts there.
+pub(crate) fn entry_is_installed(entry: &CatalogEntry, doc: &DocumentMut) -> bool {
+    match &entry.origin {
+        PluginOrigin::BuiltIn => plugin_is_installed(&entry.spec, doc),
+        PluginOrigin::Manifest { package, .. } => dependency_tables(doc).iter().any(|deps| {
+            find_package_entry(*deps, package).is_some_and(|(_, v)| !dep_is_optional(v))
+        }),
+    }
+}
+
+/// Where a plugin's dependency entry is looked for in the app's `Cargo.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DepLookup {
+    /// `[dependencies].<name>` only: the line a built-in add writes.
+    Dependencies,
+    /// Any entry on the package — `[dependencies]` or a
+    /// `[target.<cfg>.dependencies]` table, by key or `package = …`: the
+    /// line a manifest-described plugin is found by.
+    AnyTable,
+}
+
+impl DepLookup {
+    /// The lookup a plugin of `origin` is found by.
+    pub(super) fn of(origin: &PluginOrigin) -> Self {
+        match origin {
+            PluginOrigin::BuiltIn => Self::Dependencies,
+            PluginOrigin::Manifest { .. } => Self::AnyTable,
+        }
+    }
+}
+
+/// `[dependencies]`, then every `[target.<cfg>.dependencies]`, in document
+/// order.
+fn dependency_tables(doc: &DocumentMut) -> Vec<&dyn toml_edit::TableLike> {
+    let mut tables: Vec<&dyn toml_edit::TableLike> = Vec::new();
+    if let Some(deps) = doc.get("dependencies").and_then(Item::as_table_like) {
+        tables.push(deps);
+    }
+    if let Some(targets) = doc.get("target").and_then(Item::as_table_like) {
+        for (_, target) in targets.iter() {
+            if let Some(deps) = target.get("dependencies").and_then(Item::as_table_like) {
+                tables.push(deps);
+            }
+        }
+    }
+    tables
+}
+
+/// The entry of `deps` on `package`: keyed by its name, or renamed onto it.
+fn find_package_entry<'d>(
+    deps: &'d dyn toml_edit::TableLike,
+    package: &str,
+) -> Option<(&'d str, &'d Item)> {
+    deps.iter()
+        .find(|(key, value)| *key == package || dep_renamed_package(value) == Some(package))
+}
+
+/// The dependency entry a [`Contribution::CargoDep`] / [`Contribution::CargoFeature`]
+/// for `name` reads, found by `lookup`.
+fn dependency_entry<'d>(doc: &'d DocumentMut, name: &str, lookup: DepLookup) -> Option<&'d Item> {
+    match lookup {
+        DepLookup::Dependencies => doc.get("dependencies")?.as_table_like()?.get(name),
+        DepLookup::AnyTable => dependency_tables(doc)
+            .into_iter()
+            .find_map(|deps| find_package_entry(deps, name).map(|(_, item)| item)),
+    }
+}
+
+/// [`dependency_entry`], mutably.
+fn dependency_entry_mut<'d>(
+    doc: &'d mut DocumentMut,
+    name: &str,
+    lookup: DepLookup,
+) -> Option<&'d mut Item> {
+    let key = |deps: &dyn toml_edit::TableLike| {
+        find_package_entry(deps, name).map(|(key, _)| key.to_string())
+    };
+    if lookup == DepLookup::Dependencies {
+        return doc
+            .get_mut("dependencies")?
+            .as_table_like_mut()?
+            .get_mut(name);
+    }
+    if let Some(found) = doc
+        .get("dependencies")
+        .and_then(Item::as_table_like)
+        .and_then(key)
+    {
+        return doc
+            .get_mut("dependencies")?
+            .as_table_like_mut()?
+            .get_mut(&found);
+    }
+    let targets = doc.get("target").and_then(Item::as_table_like)?;
+    let (cfg, found) = targets.iter().find_map(|(cfg, target)| {
+        let deps = target.get("dependencies")?.as_table_like()?;
+        Some((cfg.to_string(), key(deps)?))
+    })?;
+    doc.get_mut("target")?
+        .as_table_like_mut()?
+        .get_mut(&cfg)?
+        .as_table_like_mut()?
+        .get_mut("dependencies")?
+        .as_table_like_mut()?
+        .get_mut(&found)
+}
+
+/// Whether the [`Contribution::CargoDep`] for `name` of a plugin of `origin`
+/// is in place — the predicate [`apply_cargo_dep`] and
+/// [`apply_manifest_cargo_dep`] skip by.
+pub(super) fn cargo_dep_present(doc: &DocumentMut, name: &str, origin: &PluginOrigin) -> bool {
+    dependency_entry(doc, name, DepLookup::of(origin)).is_some()
+}
+
+/// Whether `feature` is enabled on the dependency entry `lookup` finds for
+/// `name` — the predicate [`apply_cargo_feature`] skips by.
+pub(super) fn cargo_feature_present(
+    doc: &DocumentMut,
+    name: &str,
+    feature: &str,
+    lookup: DepLookup,
+) -> bool {
+    dependency_entry(doc, name, lookup)
+        .and_then(|dep| dep.as_table_like())
+        .and_then(|dep| dep.get("features"))
+        .and_then(Item::as_array)
+        .is_some_and(|features| features.iter().any(|v| v.as_str() == Some(feature)))
+}
+
 /// Append a macro invocation to the app crate's `src/lib.rs`
 /// ([`Contribution::AppCrateMacro`]).
 ///
@@ -897,7 +1192,7 @@ fn apply_app_crate_macro(
 ) -> Result<AddOutcome, PluginAddError> {
     let path = project_root.join(LIB_RS_REL);
     let src = read_required(&path, LIB_RS_REL)?;
-    if src.contains(invocation) {
+    if app_crate_macro_present(&src, invocation) {
         return Ok(AddOutcome::AlreadyPresent);
     }
     let mut block = String::new();
@@ -915,11 +1210,16 @@ fn apply_app_crate_macro(
     Ok(AddOutcome::Applied)
 }
 
+/// Whether `src/lib.rs` text `src` already carries `invocation`.
+pub(super) fn app_crate_macro_present(src: &str, invocation: &str) -> bool {
+    src.contains(invocation)
+}
+
 /// How the project depends on the framework facade, read from its
 /// `[dependencies]` entry for the facade package under whichever key names
 /// it (`frust`, `frust-ui`, or a rename with `package = "frust-ui"`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum FrustDep {
+pub(super) enum FrustDep {
     /// A `path` is present: a local checkout (path mode). `path` is the value
     /// as written, relative to the project root or absolute.
     Path { path: String, package: String },
@@ -1011,8 +1311,21 @@ fn plugin_package(spec: &PluginSpec) -> Option<&Cow<'static, str>> {
 /// package ([`plugin_package`]) and the path inside it, e.g.
 /// `platform/android` — the part that stays the same wherever cargo finds
 /// the package.
+#[cfg(test)]
 fn package_location<'s, 'r>(
     spec: &'s PluginSpec,
+    rel_path: &'r str,
+) -> Result<(&'s Cow<'static, str>, &'r str), PluginAddError> {
+    package_location_in(spec, &PluginOrigin::BuiltIn, rel_path)
+}
+
+/// [`package_location`] for a `spec` of `origin`: a built-in path keeps the
+/// `plugins/<crate_dir>/` rule; a manifest-described one is already relative
+/// to its package (discovery checked it stays inside), so it is taken whole,
+/// refused only if it is not a plain relative path.
+fn package_location_in<'s, 'r>(
+    spec: &'s PluginSpec,
+    origin: &PluginOrigin,
     rel_path: &'r str,
 ) -> Result<(&'s Cow<'static, str>, &'r str), PluginAddError> {
     let outside = || PluginAddError::NativePathOutsidePackage {
@@ -1021,23 +1334,48 @@ fn package_location<'s, 'r>(
         crate_dir: spec.crate_dir.to_string(),
     };
     let package = plugin_package(spec).ok_or_else(outside)?;
-    let inside = rel_path
-        .strip_prefix("plugins/")
-        .and_then(|rest| rest.strip_prefix(&*spec.crate_dir))
-        .and_then(|rest| rest.strip_prefix('/'))
-        .filter(|rest| !rest.is_empty())
-        .ok_or_else(outside)?;
+    let inside = match origin {
+        PluginOrigin::BuiltIn => rel_path
+            .strip_prefix("plugins/")
+            .and_then(|rest| rest.strip_prefix(&*spec.crate_dir))
+            .and_then(|rest| rest.strip_prefix('/'))
+            .filter(|rest| !rest.is_empty()),
+        PluginOrigin::Manifest { .. } => {
+            let plain = !rel_path.is_empty()
+                && !rel_path.contains('\\')
+                && Path::new(rel_path)
+                    .components()
+                    .all(|c| matches!(c, Component::Normal(_)));
+            plain.then_some(rel_path)
+        }
+    }
+    .ok_or_else(outside)?;
     Ok((package, inside))
 }
 
+/// How an add writes a plugin dependency line the app lacks.
+pub(super) enum DepForm {
+    /// A built-in plugin: in the form of the app's own `frust` dependency.
+    Facade(FrustDep),
+    /// A manifest-described plugin: from its own package.
+    Manifest {
+        /// The directory cargo resolved the package to.
+        package_dir: PathBuf,
+        /// The version cargo resolved.
+        version: String,
+        /// How the package was resolved.
+        source: DepSource,
+    },
+}
+
 /// Where one `add_plugin` run resolves locations from: the project, the
-/// plugin, how the project depends on frust, and the locator that answers
-/// where a package lives.
+/// plugin, how its dependency line is written, and the locator that answers
+/// where a built-in plugin's package lives.
 struct Resolution<'a> {
     locator: &'a dyn PackageLocator,
     project_root: &'a Path,
     spec: &'a PluginSpec,
-    frust: &'a FrustDep,
+    form: &'a DepForm,
 }
 
 impl<'a> Resolution<'a> {
@@ -1045,26 +1383,32 @@ impl<'a> Resolution<'a> {
         locator: &'a dyn PackageLocator,
         project_root: &'a Path,
         spec: &'a PluginSpec,
-        frust: &'a FrustDep,
+        form: &'a DepForm,
     ) -> Self {
         Self {
             locator,
             project_root,
             spec,
-            frust,
+            form,
         }
     }
 
-    /// The directory of the plugin's `package`: where the locator finds it;
-    /// or — path mode only, when the locator cannot answer — the very path
-    /// the project's Cargo line names for the plugin ([`plugin_dep_path`],
-    /// made absolute against the project root and folded lexically), which
-    /// is where cargo will look once the checkout is in place. Registry mode
-    /// has no such fallback: the crate exists only where cargo unpacks it.
+    /// The directory of the plugin's `package`. A manifest-described plugin
+    /// carries it, so the locator is never asked. A built-in one is where
+    /// the locator finds it; or — path mode only, when the locator cannot
+    /// answer — the very path the project's Cargo line names for the plugin
+    /// ([`plugin_dep_path`], made absolute against the project root and
+    /// folded lexically), which is where cargo will look once the checkout
+    /// is in place. Registry mode has no such fallback: the crate exists only
+    /// where cargo unpacks it.
     fn package_dir(&self, package: &str) -> Result<PathBuf, PluginAddError> {
+        let frust = match self.form {
+            DepForm::Facade(frust) => frust,
+            DepForm::Manifest { package_dir, .. } => return Ok(package_dir.clone()),
+        };
         match self.locator.locate(self.project_root, package) {
             Ok(dir) => Ok(dir),
-            Err(source) => match self.frust {
+            Err(source) => match frust {
                 FrustDep::Path { path, .. } => {
                     let dep = plugin_dep_path(path, &self.spec.crate_dir);
                     let dep = host_path::simplify(Path::new(&dep));
@@ -1083,12 +1427,19 @@ impl<'a> Resolution<'a> {
     /// path mode a locator failure falls back to the `frust` path itself
     /// (simplified first: a project scaffolded on Windows before paths were
     /// written portably may carry a verbatim `\\?\C:\...` prefix, which
-    /// `..` cannot climb).
+    /// `..` cannot climb). Only a built-in plugin requires one.
     fn sibling(&self, sibling: &str) -> Result<PathBuf, PluginAddError> {
-        let package = self.frust.package();
+        let DepForm::Facade(frust) = self.form else {
+            return Err(PluginAddError::InvalidContribution(format!(
+                "plugin `{}` is described by a package manifest, which cannot require a \
+                 sibling checkout",
+                self.spec.id
+            )));
+        };
+        let package = frust.package();
         let facade = match self.locator.locate(self.project_root, package) {
             Ok(dir) => dir,
-            Err(source) => match self.frust {
+            Err(source) => match frust {
                 FrustDep::Path { path, .. } => {
                     let path = host_path::simplify(Path::new(path));
                     if path.is_absolute() {
@@ -1116,6 +1467,9 @@ fn apply_cargo_dep(
     crate_dir: &str,
     frust: &FrustDep,
 ) -> Result<AddOutcome, PluginAddError> {
+    if cargo_dep_present(doc, name, &PluginOrigin::BuiltIn) {
+        return Ok(AddOutcome::AlreadyPresent);
+    }
     let deps = doc
         .get_mut("dependencies")
         .and_then(Item::as_table_like_mut)
@@ -1123,10 +1477,6 @@ fn apply_cargo_dep(
         // facade entry in `[dependencies]` — but avoid an `unwrap` at an
         // FFI-free core.
         .ok_or(PluginAddError::NoFrustDependency)?;
-
-    if deps.contains_key(name) {
-        return Ok(AddOutcome::AlreadyPresent);
-    }
     let value = match frust {
         FrustDep::Path { path, .. } => {
             let mut inline = InlineTable::new();
@@ -1142,6 +1492,94 @@ fn apply_cargo_dep(
     Ok(AddOutcome::Applied)
 }
 
+/// Where a manifest-described plugin's package was resolved.
+struct ManifestDep<'a> {
+    package_dir: &'a Path,
+    version: &'a str,
+    source: DepSource,
+}
+
+/// [`Contribution::CargoDep`] for a manifest-described plugin: an app that
+/// already depends on the package (any table, any key) is left untouched;
+/// otherwise `[dependencies]` gains `{ path = "<package dir, relative to the
+/// app>" }` for a path package, or the resolved version for a crates.io one.
+/// A package from any other source is
+/// [`PluginAddError::DependencySourceNotWritable`].
+fn apply_manifest_cargo_dep(
+    doc: &mut DocumentMut,
+    changed: &mut bool,
+    name: &str,
+    plugin: &str,
+    project_root: &Path,
+    dep: ManifestDep<'_>,
+) -> Result<AddOutcome, PluginAddError> {
+    if dependency_entry(doc, name, DepLookup::AnyTable).is_some() {
+        return Ok(AddOutcome::AlreadyPresent);
+    }
+    let value = match dep.source {
+        DepSource::Path => {
+            let mut inline = InlineTable::new();
+            inline.insert(
+                "path",
+                Value::from(relative_dep_path(project_root, dep.package_dir)),
+            );
+            Value::InlineTable(inline)
+        }
+        DepSource::Registry => Value::from(dep.version),
+        DepSource::Other => {
+            return Err(PluginAddError::DependencySourceNotWritable {
+                plugin: plugin.to_string(),
+                package: name.to_string(),
+            });
+        }
+    };
+    if doc.get("dependencies").is_none() {
+        doc.insert("dependencies", toml_edit::table());
+    }
+    let deps = doc
+        .get_mut("dependencies")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| {
+            PluginAddError::UnparseableCargoToml("`dependencies` is not a table".into())
+        })?;
+    deps.insert(name, Item::Value(value));
+    *changed = true;
+    Ok(AddOutcome::Applied)
+}
+
+/// `to` as a `path` dependency value written in `from`'s `Cargo.toml`: a
+/// forward-slashed path relative to `from` (both canonicalized where they
+/// exist), or `to` itself when the two share no root (another Windows
+/// drive).
+fn relative_dep_path(from: &Path, to: &Path) -> String {
+    let resolve = |path: &Path| {
+        host_path::canonicalize_simplified(path).unwrap_or_else(|_| normalize_lexically(path))
+    };
+    let (from, to) = (resolve(from), resolve(to));
+    let from_parts: Vec<Component> = from.components().collect();
+    let to_parts: Vec<Component> = to.components().collect();
+    let common = from_parts
+        .iter()
+        .zip(&to_parts)
+        .take_while(|(a, b)| a == b)
+        .count();
+    if common == 0 {
+        return host_path::to_portable_string(&to);
+    }
+    let mut rel = PathBuf::new();
+    for _ in common..from_parts.len() {
+        rel.push("..");
+    }
+    for part in &to_parts[common..] {
+        rel.push(part.as_os_str());
+    }
+    if rel.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        host_path::to_portable_string(&rel)
+    }
+}
+
 /// Enable a cargo feature on an already-contributed dependency's inline table
 /// ([`Contribution::CargoFeature`]): get-or-create the dep's `features` array
 /// and push `feature` if it isn't already there.
@@ -1152,24 +1590,24 @@ fn apply_cargo_dep(
 /// doesn't, never a silently minted dep. A registry-mode dependency written
 /// as the `name = "<version>"` shorthand is promoted in place to
 /// `{ version = "<version>", features = [...] }`, the only form that can
-/// carry a feature.
+/// carry a feature. `lookup` says which entry is the plugin's (a
+/// manifest-described plugin's may sit in a target table or be renamed).
 fn apply_cargo_feature(
     doc: &mut DocumentMut,
     changed: &mut bool,
     name: &str,
     feature: &str,
+    lookup: DepLookup,
 ) -> Result<AddOutcome, PluginAddError> {
     let no_such_dep = || PluginAddError::NoSuchCargoDep {
         name: name.to_string(),
         feature: feature.to_string(),
     };
+    if cargo_feature_present(doc, name, feature, lookup) {
+        return Ok(AddOutcome::AlreadyPresent);
+    }
 
-    let deps = doc
-        .get_mut("dependencies")
-        .and_then(Item::as_table_like_mut)
-        .ok_or_else(no_such_dep)?;
-
-    let dep = deps.get_mut(name).ok_or_else(no_such_dep)?;
+    let dep = dependency_entry_mut(doc, name, lookup).ok_or_else(no_such_dep)?;
     if let Some(version) = dep.as_str().map(str::to_string) {
         let mut inline = InlineTable::new();
         inline.insert("version", Value::from(version));
@@ -1197,13 +1635,18 @@ fn apply_manifest_permission(
 ) -> Result<AddOutcome, PluginAddError> {
     let path = project_root.join(MANIFEST_REL);
     let src = read_required(&path, MANIFEST_REL)?;
-    if src.contains(&format!("android:name=\"{permission}\"")) {
+    if manifest_permission_present(&src, permission) {
         return Ok(AddOutcome::AlreadyPresent);
     }
     let line = format!("    <uses-permission android:name=\"{permission}\" />\n");
-    let out = insert_before_anchor(&src, "</manifest>", &line, MANIFEST_REL)?;
+    let out = insert_before_anchor(&src, MANIFEST_ANCHOR, &line, MANIFEST_REL)?;
     write_file(&path, MANIFEST_REL, &out)?;
     Ok(AddOutcome::Applied)
+}
+
+/// Whether `AndroidManifest.xml` text `src` already names `permission`.
+pub(super) fn manifest_permission_present(src: &str, permission: &str) -> bool {
+    src.contains(&format!("android:name=\"{permission}\""))
 }
 
 fn apply_plist_entry(
@@ -1241,13 +1684,17 @@ fn apply_plist_block(
 ) -> Result<AddOutcome, PluginAddError> {
     let path = project_root.join(PLIST_REL);
     let src = read_required(&path, PLIST_REL)?;
-    let key = xml_escape(key);
-    if src.contains(&format!("<key>{key}</key>")) {
+    if plist_key_present(&src, key) {
         return Ok(AddOutcome::AlreadyPresent);
     }
-    let out = insert_before_anchor(&src, "</dict>", &block(&key), PLIST_REL)?;
+    let out = insert_before_anchor(&src, PLIST_ANCHOR, &block(&xml_escape(key)), PLIST_REL)?;
     write_file(&path, PLIST_REL, &out)?;
     Ok(AddOutcome::Applied)
+}
+
+/// Whether plist text `src` already carries `<key>` (XML-escaped) `key`.
+pub(super) fn plist_key_present(src: &str, key: &str) -> bool {
+    src.contains(&format!("<key>{}</key>", xml_escape(key)))
 }
 
 /// The tab-indented comment / key / `<string>` lines of one
@@ -1307,11 +1754,10 @@ fn apply_scaffold_file(
     rel_path: &str,
     contents: &str,
 ) -> Result<AddOutcome, PluginAddError> {
-    let safe_rel = safe_scaffold_rel_path(rel_path)?;
-    let path = project_root.join(safe_rel);
-    if path.exists() {
+    if scaffold_file_present(project_root, rel_path)? {
         return Ok(AddOutcome::AlreadyPresent);
     }
+    let path = project_root.join(safe_scaffold_rel_path(rel_path)?);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| PluginAddError::Io {
             path: rel_path.to_string(),
@@ -1320,6 +1766,17 @@ fn apply_scaffold_file(
     }
     write_file(&path, rel_path, contents)?;
     Ok(AddOutcome::Applied)
+}
+
+/// Whether the [`Contribution::ScaffoldFile`] at `rel_path` exists — by
+/// presence alone; an unsafe `rel_path` is refused.
+pub(super) fn scaffold_file_present(
+    project_root: &Path,
+    rel_path: &str,
+) -> Result<bool, PluginAddError> {
+    Ok(project_root
+        .join(safe_scaffold_rel_path(rel_path)?)
+        .exists())
 }
 
 /// Reject an absolute `rel_path` or one carrying a `..` component before it
@@ -1376,7 +1833,7 @@ fn apply_gradle_module(
     let build_path = project_root.join(APP_BUILD_GRADLE_REL);
     let build_src = read_required(&build_path, APP_BUILD_GRADLE_REL)?;
 
-    let settings_out = if settings_src.contains(&format!("include(\"{gradle_name}\")")) {
+    let settings_out = if settings_include_present(&settings_src, gradle_name) {
         None
     } else {
         // The helper goes *above* the anchor line, so it is defined before
@@ -1403,7 +1860,7 @@ fn apply_gradle_module(
         )?)
     };
 
-    let build_out = if build_src.contains(&format!("project(\"{gradle_name}\")")) {
+    let build_out = if app_dependency_present(&build_src, gradle_name) {
         None
     } else {
         Some(insert_after_anchor_line(
@@ -1424,6 +1881,16 @@ fn apply_gradle_module(
         write_file(&build_path, APP_BUILD_GRADLE_REL, &out)?;
     }
     Ok(AddOutcome::Applied)
+}
+
+/// Whether `settings.gradle.kts` text `src` already includes `gradle_name`.
+pub(super) fn settings_include_present(src: &str, gradle_name: &str) -> bool {
+    src.contains(&format!("include(\"{gradle_name}\")"))
+}
+
+/// Whether `app/build.gradle.kts` text `src` already depends on `gradle_name`.
+pub(super) fn app_dependency_present(src: &str, gradle_name: &str) -> bool {
+    src.contains(&format!("project(\"{gradle_name}\")"))
 }
 
 /// Refuse a [`Contribution::MavenRepository`] that can never be applied: no
@@ -1496,7 +1963,7 @@ fn apply_maven_repository(
     validate_maven_repository(url, groups)?;
     let settings_path = project_root.join(SETTINGS_GRADLE_REL);
     let src = read_required(&settings_path, SETTINGS_GRADLE_REL)?;
-    if src.contains(&format!("uri(\"{}\")", kotlin_string_escape(url))) {
+    if maven_repository_present(&src, url) {
         return Ok(AddOutcome::AlreadyPresent);
     }
     if !src.contains(REPOSITORIES_ANCHOR) {
@@ -1510,6 +1977,11 @@ fn apply_maven_repository(
     )?;
     write_file(&settings_path, SETTINGS_GRADLE_REL, &out)?;
     Ok(AddOutcome::Applied)
+}
+
+/// Whether `settings.gradle.kts` text `src` already names repository `url`.
+pub(super) fn maven_repository_present(src: &str, url: &str) -> bool {
+    src.contains(&format!("uri(\"{}\")", kotlin_string_escape(url)))
 }
 
 /// The `settings.gradle.kts` block one [`Contribution::GradleModule`] adds —
@@ -1709,12 +2181,7 @@ fn apply_swift_package_ref(
     let path = project_root.join(PBXPROJ_REL);
     let src = read_required(&path, PBXPROJ_REL)?;
 
-    let mut missing = Vec::new();
-    for site in PBX_SITES {
-        if !pbx_site_body(&src, site)?.contains(&site.needle(package_name)) {
-            missing.push(site);
-        }
-    }
+    let missing = swift_package_missing_sites(&src, package_name)?;
     if missing.is_empty() {
         return Ok(AddOutcome::AlreadyPresent);
     }
@@ -1741,6 +2208,28 @@ fn apply_swift_package_ref(
     Ok(AddOutcome::Applied)
 }
 
+/// The pbxproj sites of Swift package `package_name` that pbxproj text `src`
+/// lacks, in [`PBX_SITES`] order; a section a site lives in being absent is
+/// [`PluginAddError::MalformedProjectFile`].
+fn swift_package_missing_sites(
+    src: &str,
+    package_name: &str,
+) -> Result<Vec<PbxSite>, PluginAddError> {
+    let mut missing = Vec::new();
+    for site in PBX_SITES {
+        if !pbx_site_body(src, site)?.contains(&site.needle(package_name)) {
+            missing.push(site);
+        }
+    }
+    Ok(missing)
+}
+
+/// Whether pbxproj text `src` wires Swift package `package_name` at all six
+/// sites.
+pub(super) fn swift_package_present(src: &str, package_name: &str) -> Result<bool, PluginAddError> {
+    Ok(swift_package_missing_sites(src, package_name)?.is_empty())
+}
+
 /// Append `"-framework", <name>,` to every `OTHER_LDFLAGS` list of the
 /// `XCBuildConfiguration` section that does not already link `name` — one
 /// list per build configuration. Lists are edited back to front so the
@@ -1748,18 +2237,10 @@ fn apply_swift_package_ref(
 /// memory, re-scanned, and written once; a project with no `OTHER_LDFLAGS`
 /// list at all is [`PluginAddError::MalformedProjectFile`].
 fn apply_ios_framework(project_root: &Path, name: &str) -> Result<AddOutcome, PluginAddError> {
-    const SECTION: &str = "XCBuildConfiguration";
-    const KEY: &str = "OTHER_LDFLAGS";
     let path = project_root.join(PBXPROJ_REL);
     let src = read_required(&path, PBXPROJ_REL)?;
 
-    let lists = pbx_list_ranges(&src, SECTION, KEY)?;
-    if lists.is_empty() {
-        return Err(PluginAddError::MalformedProjectFile(
-            PBXPROJ_REL.to_string(),
-        ));
-    }
-
+    let lists = ldflags_lists(&src)?;
     let mut out = src.clone();
     let mut changed = false;
     for range in lists.into_iter().rev() {
@@ -1788,18 +2269,39 @@ fn apply_ios_framework(project_root: &Path, name: &str) -> Result<AddOutcome, Pl
 
     // All-or-nothing: every list must link the framework before a byte is
     // written.
-    for range in pbx_list_ranges(&out, SECTION, KEY)? {
-        if !ldflags_link_framework(&out[range], name) {
-            return Err(PluginAddError::PbxWiringNotVerified {
-                file: PBXPROJ_REL.to_string(),
-                package: name.to_string(),
-                site: KEY.to_string(),
-            });
-        }
+    if !framework_linked(&out, name)? {
+        return Err(PluginAddError::PbxWiringNotVerified {
+            file: PBXPROJ_REL.to_string(),
+            package: name.to_string(),
+            site: LDFLAGS_KEY.to_string(),
+        });
     }
 
     write_file(&path, PBXPROJ_REL, &out)?;
     Ok(AddOutcome::Applied)
+}
+
+/// The build setting a framework is linked through.
+const LDFLAGS_KEY: &str = "OTHER_LDFLAGS";
+
+/// Every `OTHER_LDFLAGS` list of pbxproj text `src` (one per build
+/// configuration); none at all is [`PluginAddError::MalformedProjectFile`].
+fn ldflags_lists(src: &str) -> Result<Vec<Range<usize>>, PluginAddError> {
+    let lists = pbx_list_ranges(src, "XCBuildConfiguration", LDFLAGS_KEY)?;
+    if lists.is_empty() {
+        return Err(PluginAddError::MalformedProjectFile(
+            PBXPROJ_REL.to_string(),
+        ));
+    }
+    Ok(lists)
+}
+
+/// Whether every `OTHER_LDFLAGS` list of pbxproj text `src` links framework
+/// `name`.
+pub(super) fn framework_linked(src: &str, name: &str) -> Result<bool, PluginAddError> {
+    Ok(ldflags_lists(src)?
+        .into_iter()
+        .all(|range| ldflags_link_framework(&src[range], name)))
 }
 
 /// Whether an `OTHER_LDFLAGS` entry region already links `name`: a
@@ -1857,6 +2359,28 @@ struct EntitlementPlan {
     pbxproj: Option<String>,
 }
 
+impl EntitlementPlan {
+    /// Whether nothing needs writing: every entitlements file the Runner
+    /// configurations sign with has the key, and every configuration names
+    /// one.
+    fn is_noop(&self) -> bool {
+        self.files.is_empty() && self.pbxproj.is_none()
+    }
+}
+
+/// Whether entitlement `key` is fully in place: in every entitlements file
+/// a Runner configuration signs with, whatever its value's type, and
+/// `CODE_SIGN_ENTITLEMENTS` set in every Runner configuration (a flavored
+/// project's included). Computed by [`plan_ios_entitlement`], never written.
+pub(super) fn ios_entitlement_present(
+    project_root: &Path,
+    key: &str,
+    value: &IosEntitlementValue,
+    comment: &str,
+) -> Result<bool, PluginAddError> {
+    Ok(plan_ios_entitlement(project_root, key, value, comment)?.is_noop())
+}
+
 /// Request entitlement `key` on the Runner target: the key in the
 /// entitlements file every Runner configuration signs with, and
 /// `CODE_SIGN_ENTITLEMENTS` in every configuration lacking it (see
@@ -1869,7 +2393,7 @@ fn apply_ios_entitlement(
     comment: &str,
 ) -> Result<AddOutcome, PluginAddError> {
     let plan = plan_ios_entitlement(project_root, key, value, comment)?;
-    if plan.files.is_empty() && plan.pbxproj.is_none() {
+    if plan.is_noop() {
         return Ok(AddOutcome::AlreadyPresent);
     }
     for (rel, contents) in &plan.files {
@@ -2733,7 +3257,7 @@ fn insert_before_anchor_line(
     Ok(out)
 }
 
-fn read_required(path: &Path, rel: &str) -> Result<String, PluginAddError> {
+pub(super) fn read_required(path: &Path, rel: &str) -> Result<String, PluginAddError> {
     fs::read_to_string(path).map_err(|_| PluginAddError::MissingProjectFile(rel.to_string()))
 }
 
@@ -3870,9 +4394,14 @@ mod tests {
         .unwrap();
         assert!(changed);
 
-        let outcome =
-            apply_cargo_feature(&mut doc, &mut changed, "frust-secure-storage", "biometric")
-                .unwrap();
+        let outcome = apply_cargo_feature(
+            &mut doc,
+            &mut changed,
+            "frust-secure-storage",
+            "biometric",
+            DepLookup::Dependencies,
+        )
+        .unwrap();
         assert_eq!(outcome, AddOutcome::Applied);
 
         let rendered = doc.to_string();
@@ -3907,15 +4436,25 @@ mod tests {
         )
         .unwrap();
 
-        let first =
-            apply_cargo_feature(&mut doc, &mut changed, "frust-secure-storage", "biometric")
-                .unwrap();
+        let first = apply_cargo_feature(
+            &mut doc,
+            &mut changed,
+            "frust-secure-storage",
+            "biometric",
+            DepLookup::Dependencies,
+        )
+        .unwrap();
         assert_eq!(first, AddOutcome::Applied);
         let after_first = doc.to_string();
 
-        let second =
-            apply_cargo_feature(&mut doc, &mut changed, "frust-secure-storage", "biometric")
-                .unwrap();
+        let second = apply_cargo_feature(
+            &mut doc,
+            &mut changed,
+            "frust-secure-storage",
+            "biometric",
+            DepLookup::Dependencies,
+        )
+        .unwrap();
         assert_eq!(second, AddOutcome::AlreadyPresent);
         let after_second = doc.to_string();
 
@@ -3944,8 +4483,14 @@ mod tests {
             .unwrap();
         let mut changed = false;
 
-        let err = apply_cargo_feature(&mut doc, &mut changed, "frust-not-a-real-dep", "biometric")
-            .unwrap_err();
+        let err = apply_cargo_feature(
+            &mut doc,
+            &mut changed,
+            "frust-not-a-real-dep",
+            "biometric",
+            DepLookup::Dependencies,
+        )
+        .unwrap_err();
         assert!(
             matches!(
                 &err,
@@ -3972,7 +4517,7 @@ mod tests {
             .unwrap();
         let mut changed = false;
         let spec = find_plugin("secure-storage").unwrap();
-        let frust = path_dep("/nonexistent/frust/checkout");
+        let frust = DepForm::Facade(path_dep("/nonexistent/frust/checkout"));
         let locator = StubLocator::new();
         let resolution = Resolution::new(&locator, &root, &spec, &frust);
 
@@ -4139,7 +4684,7 @@ mod tests {
             .unwrap();
         let mut changed = false;
         let spec = find_plugin("secure-storage").unwrap();
-        let frust = path_dep("/nonexistent/frust/checkout");
+        let frust = DepForm::Facade(path_dep("/nonexistent/frust/checkout"));
         let locator = StubLocator::new();
         let resolution = Resolution::new(&locator, &root, &spec, &frust);
         let contribution = Contribution::ScaffoldFile {
@@ -4195,7 +4740,7 @@ mod tests {
             .unwrap();
         let mut changed = false;
         let spec = find_plugin("secure-storage").unwrap();
-        let frust = path_dep("/nonexistent/frust/checkout");
+        let frust = DepForm::Facade(path_dep("/nonexistent/frust/checkout"));
         let locator = StubLocator::new();
         let resolution = Resolution::new(&locator, &root, &spec, &frust);
         let before = snapshot_tree(&root);

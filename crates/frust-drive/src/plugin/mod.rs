@@ -36,8 +36,11 @@
 //! Every plugin is looked up through a [`PluginCatalog`], which holds the
 //! static in-crate registry ([`PluginCatalog::built_in`], [`known_plugins`])
 //! and can carry plugins described at run time beside it, each entry tagged
-//! with its [`PluginOrigin`]. Discovering run-time plugins from a package's
-//! own manifest metadata is implemented in `plugin/manifest.rs`.
+//! with its [`PluginOrigin`]. [`discover`] finds the plugins a package
+//! describes in its own manifest metadata; [`add_plugin_from`] applies one,
+//! [`pending_contributions`] says which of its tracked edits are still
+//! missing, and [`sync_plugins`] applies every discovered plugin the app
+//! depends on.
 //! Every mutation is format-preserving and never rewrites a file it can't
 //! parse; this module is **print-free** like every other drive core — the
 //! front-end (CLI/TUI) owns all output (see `docs/CODE_STANDARDS.md`).
@@ -45,6 +48,7 @@
 pub mod apply;
 pub mod catalog;
 mod manifest;
+mod pending;
 pub mod registry;
 
 pub use apply::{
@@ -53,6 +57,9 @@ pub use apply::{
 };
 pub use catalog::{CatalogEntry, DepSource, PluginCatalog, PluginOrigin};
 pub use manifest::{Discovery, ManifestError, discover};
+pub use pending::{
+    ModuleCollision, PendingContribution, SyncReport, pending_contributions, sync_plugins,
+};
 pub use registry::known_plugins;
 
 use std::borrow::Cow;
@@ -76,7 +83,9 @@ pub struct PluginSpec {
     /// repo root and down into this directory to write the plugin's own path
     /// dep; every [`Contribution::GradleModule`]/[`Contribution::SwiftPackageRef`]
     /// `rel_path` must sit under `plugins/<crate_dir>/`, since only the part
-    /// below it is carried over to wherever cargo locates the package.
+    /// below it is carried over to wherever cargo locates the package. A
+    /// manifest-described plugin ([`PluginOrigin::Manifest`]) sets it to its
+    /// package name and states its native paths relative to that package.
     pub crate_dir: Cow<'static, str>,
     /// Contributions applied unconditionally when this plugin is added
     /// (always at least its own Cargo.toml dependency).
@@ -121,8 +130,10 @@ impl PluginSpec {
 
     /// Every native module this plugin can contribute — its base
     /// contributions' and every optional feature's — located inside the
-    /// package its base [`Contribution::CargoDep`] adds. A registry path
-    /// outside that package (which [`add_plugin`] refuses) is left out.
+    /// package its base [`Contribution::CargoDep`] adds, read as a built-in
+    /// registry entry. A registry path outside that package (which
+    /// [`add_plugin`] refuses) is left out; for a plugin of any origin use
+    /// [`CatalogEntry::native_modules`].
     pub fn native_modules(&self) -> Vec<NativeModule> {
         self.base
             .iter()
@@ -200,7 +211,9 @@ pub enum Contribution {
     /// dependency takes: a path into the same checkout (path mode), or the
     /// same version requirement (registry mode — the plugin crates release in
     /// lockstep with the facade). `name` is the crate/dependency name, and
-    /// the package the plugin's platform files are located in.
+    /// the package the plugin's platform files are located in. A
+    /// manifest-described plugin's line is written from its own package
+    /// instead (see [`add_plugin_from`]).
     CargoDep { name: Cow<'static, str> },
     /// A `<uses-permission android:name="..."/>` line inserted into the app's
     /// own `AndroidManifest.xml` before `</manifest>`.
@@ -719,11 +732,16 @@ pub enum PluginAddError {
     /// than assuming that forever.
     #[error("scaffold file path `{0}` must be a relative path with no `..` component")]
     UnsafeScaffoldPath(String),
-    /// The catalog entry for this id did not come from the built-in registry
-    /// ([`PluginOrigin::Manifest`]), and this version applies only built-in
-    /// plugins. Raised before anything is written.
-    #[error("plugin `{0}` is described by a package manifest, which `add_plugin` cannot apply yet")]
-    UnsupportedOrigin(String),
+    /// A manifest-described plugin's package comes from git or an alternate
+    /// registry ([`DepSource::Other`]) and the app has no dependency line on
+    /// it: a bare version would name crates.io instead, so none is written.
+    /// Raised before anything is written.
+    #[error(
+        "plugin `{plugin}` comes from package `{package}`, which cargo resolved from git or an \
+         alternate registry; add `{package}` to the app's Cargo.toml yourself (with that same \
+         source), then re-run"
+    )]
+    DependencySourceNotWritable { plugin: String, package: String },
     /// The app's platform floor is below what the plugin — or one of the
     /// requested features — needs ([`PluginSpec::min_ios`] /
     /// [`PluginSpec::min_android_sdk`]). Raised before anything is written;

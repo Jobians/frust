@@ -10,8 +10,8 @@
 
 use std::path::PathBuf;
 
-use super::PluginSpec;
 use super::registry::known_plugins;
+use super::{NativeModule, PluginSpec};
 
 /// Where a [`CatalogEntry`] came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,8 +37,30 @@ pub enum PluginOrigin {
 pub enum DepSource {
     /// A `path` dependency.
     Path,
-    /// A registry (crates.io or alternate registry) dependency.
+    /// A crates.io dependency: a bare version requirement names it.
     Registry,
+    /// A git dependency or one from an alternate registry: a bare version
+    /// requirement would name a different source, so `add_plugin` never
+    /// writes its dependency line.
+    Other,
+}
+
+impl DepSource {
+    /// The source cargo metadata reports for a package: `None` is a path
+    /// dependency (or a workspace member), a crates.io index (git or sparse
+    /// protocol) is [`DepSource::Registry`], anything else is
+    /// [`DepSource::Other`].
+    pub(crate) fn from_cargo_source(source: Option<&str>) -> Self {
+        const CRATES_IO: [&str; 2] = [
+            "registry+https://github.com/rust-lang/crates.io-index",
+            "sparse+https://index.crates.io/",
+        ];
+        match source {
+            None => Self::Path,
+            Some(source) if CRATES_IO.contains(&source) => Self::Registry,
+            Some(_) => Self::Other,
+        }
+    }
 }
 
 /// One plugin in a [`PluginCatalog`]: its description and where that
@@ -63,6 +85,26 @@ impl CatalogEntry {
     /// Whether this entry came from the built-in registry.
     pub fn is_built_in(&self) -> bool {
         self.origin == PluginOrigin::BuiltIn
+    }
+
+    /// Every native module this plugin can contribute, base and optional
+    /// features alike, like [`PluginSpec::native_modules`] — but located by
+    /// this entry's origin: a built-in path sits under `plugins/<crate_dir>/`,
+    /// a manifest-described one is already relative to its package.
+    pub fn native_modules(&self) -> Vec<NativeModule> {
+        self.spec
+            .base
+            .iter()
+            .chain(
+                self.spec
+                    .optional_features
+                    .iter()
+                    .flat_map(|f| f.contributions.iter()),
+            )
+            .filter_map(|contribution| {
+                super::apply::native_module_in(&self.spec, &self.origin, contribution)?.ok()
+            })
+            .collect()
     }
 }
 
@@ -226,5 +268,56 @@ mod tests {
     #[test]
     fn an_unknown_id_is_not_found() {
         assert!(PluginCatalog::built_in().find("nope").is_none());
+    }
+
+    #[test]
+    fn only_a_crates_io_source_is_a_registry_dependency() {
+        let cases = [
+            (None, DepSource::Path),
+            (
+                Some("registry+https://github.com/rust-lang/crates.io-index"),
+                DepSource::Registry,
+            ),
+            (Some("sparse+https://index.crates.io/"), DepSource::Registry),
+            (
+                Some("git+https://example.com/acme/frust-acme-ble?branch=main#0123abcd"),
+                DepSource::Other,
+            ),
+            (
+                Some("sparse+https://registry.example.com/index/"),
+                DepSource::Other,
+            ),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(DepSource::from_cargo_source(source), expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_entry_locates_its_modules_inside_its_package() {
+        let mut spec = owned_spec("acme-ble");
+        spec.base = Cow::Owned(vec![
+            Contribution::CargoDep {
+                name: Cow::Owned("frust-acme-ble".into()),
+            },
+            Contribution::GradleModule {
+                gradle_name: Cow::Owned(":frust-acme-ble".into()),
+                rel_path: Cow::Owned("platform/android".into()),
+            },
+        ]);
+        let entry = manifest(spec.clone());
+        assert_eq!(
+            entry.native_modules(),
+            [NativeModule {
+                package: Cow::Owned("frust-acme-ble".into()),
+                dir_in_package: Cow::Owned("platform/android".into()),
+                kind: crate::plugin::NativeKind::GradleModule {
+                    gradle_name: Cow::Owned(":frust-acme-ble".into()),
+                },
+            }]
+        );
+        // The same path read as a built-in one lies outside `plugins/<dir>/`.
+        assert!(spec.native_modules().is_empty());
+        assert!(CatalogEntry::built_in(spec).native_modules().is_empty());
     }
 }

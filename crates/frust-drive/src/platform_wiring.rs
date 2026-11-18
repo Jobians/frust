@@ -40,7 +40,10 @@ use toml_edit::DocumentMut;
 use crate::android_build::local_properties::{self, Change, Missing};
 use crate::host_path;
 use crate::packages::{CargoLocator, PackageLocator, PackagesError};
-use crate::plugin::{NativeKind, NativeModule, PluginCatalog, apply::plugin_is_installed};
+use crate::plugin::{
+    ModuleCollision, NativeKind, NativeModule, PluginCatalog, PluginOrigin,
+    apply::entry_is_installed,
+};
 use crate::process::RealProcessRunner;
 
 /// The package shipping the Android embedding module.
@@ -162,6 +165,9 @@ pub struct Report {
     /// [`EMBEDDING_DIR_KEY`] in [`GRADLE_PROPERTIES`], refreshed only where an
     /// earlier template put it; [`Wiring::Skipped`] when absent.
     pub legacy_gradle_property: Wiring,
+    /// Each module left unwired because another installed plugin declares
+    /// the same name (see [`ModuleCollision`]), in catalog order.
+    pub collisions: Vec<ModuleCollision>,
 }
 
 impl Report {
@@ -171,6 +177,7 @@ impl Report {
             ios: Wiring::Skipped,
             plugins: Vec::new(),
             legacy_gradle_property: Wiring::Skipped,
+            collisions: Vec::new(),
         }
     }
 
@@ -210,6 +217,7 @@ impl Report {
             };
             lines.extend(describe(&label, &location, &module.wiring));
         }
+        lines.extend(self.collisions.iter().map(ModuleCollision::to_string));
         lines
     }
 }
@@ -275,15 +283,17 @@ pub fn sync_with(locator: &dyn PackageLocator, project_dir: &Path) -> Result<Rep
 }
 
 /// [`sync_with`] for the plugins of `catalog`: the modules of every installed
-/// plugin it holds are wired, in catalog order. Only built-in entries are
-/// wired; an entry described by a package manifest
-/// ([`crate::plugin::PluginOrigin::Manifest`]) wires nothing yet.
+/// plugin, built-in ones first in catalog order, then manifest-described ones
+/// by package name, each wired from the package directory its catalog entry
+/// carries. A module name two plugins claim is wired for one and reported in
+/// [`Report::collisions`].
 ///
-/// Every package — the shell crate of each present platform and every
-/// installed plugin's package with a module for one — is located in one
+/// Every other package — each present platform's shell crate, every installed
+/// built-in plugin's package with a module for one — is located in one
 /// [`PackageLocator::locate_many`] call, and every native directory is
-/// verified before anything is written, so a failure leaves the project as
-/// it was.
+/// verified before anything is written, so a failure leaves the project as it
+/// was. `android/local.properties` is merged key by key: a key this sync does
+/// not own (the SDK path, the app identity keys) is kept.
 pub fn sync_with_catalog(
     locator: &dyn PackageLocator,
     project_dir: &Path,
@@ -296,12 +306,24 @@ pub fn sync_with_catalog(
         return Ok(report);
     }
 
-    let modules: Vec<(String, NativeModule)> = installed_native_modules(project_dir, catalog)
+    let installed = installed_native_modules(project_dir, catalog);
+    let present = |kind: &NativeKind| match kind {
+        NativeKind::GradleModule { .. } => has_android,
+        NativeKind::SwiftPackage { .. } => has_ios,
+    };
+    report.collisions = installed
+        .collisions
         .into_iter()
-        .filter(|(_, module)| match module.kind {
-            NativeKind::GradleModule { .. } => has_android,
-            NativeKind::SwiftPackage { .. } => has_ios,
-        })
+        .filter(|collision| present(&collision.kind))
+        .collect();
+    let installed: Vec<InstalledModule> = installed
+        .modules
+        .into_iter()
+        .filter(|installed| present(&installed.module.kind))
+        .collect();
+    let modules: Vec<(String, NativeModule)> = installed
+        .iter()
+        .map(|m| (m.plugin_id.clone(), m.module.clone()))
         .collect();
 
     let mut packages: Vec<&str> = Vec::new();
@@ -311,9 +333,9 @@ pub fn sync_with_catalog(
     if has_ios {
         packages.push(IOS_SHELL_PACKAGE);
     }
-    for (_, module) in &modules {
-        if !packages.contains(&&*module.package) {
-            packages.push(&module.package);
+    for m in installed.iter().filter(|m| m.package_dir.is_none()) {
+        if !packages.contains(&&*m.module.package) {
+            packages.push(&m.module.package);
         }
     }
     let package_dirs = locator.locate_many(project_dir, &packages)?;
@@ -344,11 +366,15 @@ pub fn sync_with_catalog(
         })
         .transpose()?;
     let mut module_targets = Vec::with_capacity(modules.len());
-    for (_, module) in &modules {
+    for m in &installed {
+        let dir = match &m.package_dir {
+            Some(dir) => dir.as_path(),
+            None => package_dir(&m.module.package),
+        };
         module_targets.push(native_dir(
-            &module.package,
-            package_dir(&module.package),
-            &module.dir_in_package,
+            &m.module.package,
+            dir,
+            &m.module.dir_in_package,
         )?);
     }
 
@@ -401,36 +427,99 @@ pub fn sync_with_catalog(
     Ok(report)
 }
 
-/// Every native module of every `catalog` plugin `project_dir`'s `Cargo.toml`
-/// depends on (a `[dependencies]` entry by name or `package = …`, either
-/// dependency form, never an `optional` one — cargo leaves a disabled
-/// optional dependency out of the resolve, so it could not be located),
-/// paired with its plugin's id. Base and optional-feature modules alike: an
-/// unused key or link is harmless, a missing one fails the build. An
-/// unreadable or unparseable manifest names no plugin — the locate that
-/// follows reports the manifest problem itself. Catalog order; a
-/// manifest-described entry contributes none yet (see [`sync_with_catalog`]).
-fn installed_native_modules(
-    project_dir: &Path,
-    catalog: &PluginCatalog,
-) -> Vec<(String, NativeModule)> {
+/// One native module [`installed_native_modules`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstalledModule {
+    /// The owning plugin's id.
+    plugin_id: String,
+    /// The module.
+    module: NativeModule,
+    /// A manifest-described plugin's package directory, from its catalog
+    /// entry; `None` for a built-in plugin, whose package is located.
+    package_dir: Option<PathBuf>,
+}
+
+/// The modules to wire, and the ones left out for a name collision.
+#[derive(Debug, Default)]
+struct InstalledModules {
+    modules: Vec<InstalledModule>,
+    collisions: Vec<ModuleCollision>,
+}
+
+/// Every native module, base and optional-feature alike (an unused key or
+/// link is harmless, a missing one fails the build), of every `catalog`
+/// plugin `project_dir`'s `Cargo.toml` depends on, never through an
+/// `optional` entry (cargo leaves that out of the resolve): a built-in by a
+/// `[dependencies]` entry, a manifest-described one by an entry there or in
+/// a target table, by key or `package = …`. An unreadable manifest names no
+/// plugin; the locate that follows reports it.
+///
+/// Built-in plugins come first, in catalog order and unfiltered; then the
+/// manifest-described ones by package name, each module dropped — into
+/// [`InstalledModules::collisions`] — when a plugin before it already
+/// claimed its Gradle module or Swift package name.
+fn installed_native_modules(project_dir: &Path, catalog: &PluginCatalog) -> InstalledModules {
+    let mut found = InstalledModules::default();
     let Ok(text) = fs::read_to_string(project_dir.join("Cargo.toml")) else {
-        return Vec::new();
+        return found;
     };
     let Ok(doc) = text.parse::<DocumentMut>() else {
-        return Vec::new();
+        return found;
     };
-    catalog
+    let installed: Vec<_> = catalog
         .iter()
-        .filter(|entry| entry.is_built_in())
-        .map(|entry| &entry.spec)
-        .filter(|spec| plugin_is_installed(spec, &doc))
-        .flat_map(|spec| {
-            spec.native_modules()
+        .filter(|entry| entry_is_installed(entry, &doc))
+        .collect();
+    for entry in installed.iter().filter(|entry| entry.is_built_in()) {
+        found.modules.extend(
+            entry
+                .native_modules()
                 .into_iter()
-                .map(move |module| (spec.id.to_string(), module))
+                .map(|module| InstalledModule {
+                    plugin_id: entry.spec.id.to_string(),
+                    module,
+                    package_dir: None,
+                }),
+        );
+    }
+    let mut described: Vec<(&str, &Path, _)> = installed
+        .iter()
+        .filter_map(|entry| match &entry.origin {
+            PluginOrigin::Manifest {
+                package,
+                package_dir,
+                ..
+            } => Some((package.as_str(), package_dir.as_path(), *entry)),
+            PluginOrigin::BuiltIn => None,
         })
-        .collect()
+        .collect();
+    described.sort_by_key(|(package, _, _)| *package);
+    for (_, package_dir, entry) in described {
+        let plugin_id = entry.spec.id.to_string();
+        for module in entry.native_modules() {
+            let claimed = found
+                .modules
+                .iter()
+                .find(|m| m.plugin_id != plugin_id && m.module.kind == module.kind);
+            if let Some(winner) = claimed {
+                let collision = ModuleCollision {
+                    kind: module.kind,
+                    kept_plugin_id: winner.plugin_id.clone(),
+                    dropped_plugin_id: plugin_id.clone(),
+                };
+                if !found.collisions.contains(&collision) {
+                    found.collisions.push(collision);
+                }
+                continue;
+            }
+            found.modules.push(InstalledModule {
+                plugin_id: plugin_id.clone(),
+                module,
+                package_dir: Some(package_dir.to_path_buf()),
+            });
+        }
+    }
+    found
 }
 
 /// Whether `module`'s machine-local slot — its `local.properties` key or its
@@ -641,7 +730,8 @@ fn is_unsupported(err: &io::Error) -> bool {
 mod tests {
     use super::*;
     use crate::packages::StubLocator;
-    use crate::plugin::known_plugins;
+    use crate::plugin::{CatalogEntry, Contribution, DepSource, PluginSpec, known_plugins};
+    use std::borrow::Cow;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -1147,6 +1237,247 @@ mod tests {
             second.iter().all(|w| matches!(w, Wiring::Unchanged { .. })),
             "{second:?}"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A manifest-described plugin in package `package` at `dir`, with a
+    /// Gradle module named `gradle_name` and a Swift package
+    /// `swift_name`, both under `platform/` of the package.
+    fn described(
+        id: &str,
+        package: &str,
+        dir: &Path,
+        gradle_name: &str,
+        swift_name: &str,
+    ) -> CatalogEntry {
+        fs::create_dir_all(dir.join("platform/android")).unwrap();
+        fs::create_dir_all(dir.join("platform/ios")).unwrap();
+        let owned = |text: &str| Cow::Owned(text.to_string());
+        CatalogEntry {
+            spec: PluginSpec {
+                id: owned(id),
+                summary: owned("described at run time"),
+                crate_dir: owned(package),
+                base: Cow::Owned(vec![
+                    Contribution::CargoDep {
+                        name: owned(package),
+                    },
+                    Contribution::GradleModule {
+                        gradle_name: owned(gradle_name),
+                        rel_path: owned("platform/android"),
+                    },
+                    Contribution::SwiftPackageRef {
+                        package_name: owned(swift_name),
+                        rel_path: owned("platform/ios"),
+                    },
+                ]),
+                ..PluginSpec::DEFAULT
+            },
+            origin: PluginOrigin::Manifest {
+                package: package.to_string(),
+                package_dir: dir.to_path_buf(),
+                version: "0.3.1".to_string(),
+                source: DepSource::Path,
+            },
+        }
+    }
+
+    fn catalog_with(discovered: Vec<CatalogEntry>) -> PluginCatalog {
+        PluginCatalog::with_discovered(PluginCatalog::built_in(), discovered).0
+    }
+
+    /// A discovered plugin the app depends on — here through a target
+    /// table — is wired from the package directory its entry carries, beside
+    /// the built-in ones, which come out exactly as before; cargo is asked
+    /// only about the shells and the built-in plugin.
+    #[cfg(unix)]
+    #[test]
+    fn a_discovered_plugin_is_wired_from_its_own_package() {
+        let root = temp_dir("discovered");
+        let (_, _, iap, stub) = checkout(&root);
+        let project = project_with_iap(
+            &root,
+            "frust-iap = \"0.5.0\"\n\n[target.'cfg(target_os = \"android\")'.dependencies]\n\
+             frust-acme-ble = { path = \"../acme-ble\" }",
+        );
+        let acme = root.join("acme-ble");
+        let entry = described(
+            "acme-ble",
+            "frust-acme-ble",
+            &acme,
+            ":frust-acme-ble",
+            "FrustAcmeBle",
+        );
+        let catalog = catalog_with(vec![entry]);
+
+        let installed = installed_native_modules(&project, &catalog);
+        let ids: Vec<(&str, bool)> = installed
+            .modules
+            .iter()
+            .map(|m| (m.plugin_id.as_str(), m.package_dir.is_some()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("iap", false),
+                ("iap", false),
+                ("acme-ble", true),
+                ("acme-ble", true)
+            ]
+        );
+        assert!(installed.collisions.is_empty());
+
+        let report = sync_with_catalog(&stub, &project, &catalog).unwrap();
+        assert_eq!(stub.calls(), 1);
+        assert_eq!(report.plugins.len(), 4, "{report:?}");
+        assert!(
+            report.plugins.iter().all(|m| m.wiring.changed()),
+            "{report:?}"
+        );
+        assert_eq!(
+            local_properties::read_value(
+                &project.join(LOCAL_PROPERTIES),
+                "frust.plugin.frust-acme-ble.dir"
+            )
+            .unwrap(),
+            Some(acme.join("platform/android").display().to_string())
+        );
+        assert_eq!(
+            fs::read_link(project.join("ios/FrustAcmeBle")).unwrap(),
+            acme.join("platform/ios")
+        );
+        assert_eq!(
+            fs::read_link(project.join("ios/FrustIap")).unwrap(),
+            iap.join(IAP_IOS_REL)
+        );
+        assert!(
+            !sync_with_catalog(&stub, &project, &catalog)
+                .unwrap()
+                .changed()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A discovered plugin the app does not depend on directly (discovery
+    /// also sees transitive packages) wires nothing.
+    #[test]
+    fn a_discovered_plugin_the_app_does_not_depend_on_is_not_wired() {
+        let root = temp_dir("discovered-transitive");
+        let project = project(&root);
+        let entry = described(
+            "acme-ble",
+            "frust-acme-ble",
+            &root.join("acme-ble"),
+            ":frust-acme-ble",
+            "FrustAcmeBle",
+        );
+        let installed = installed_native_modules(&project, &catalog_with(vec![entry]));
+        assert!(installed.modules.is_empty(), "{:?}", installed.modules);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two plugins declaring one module name: a built-in wins over a
+    /// discovered one, and among discovered ones the first by package name;
+    /// every loser is reported, never wired.
+    #[cfg(unix)]
+    #[test]
+    fn a_module_name_collision_wires_one_plugin_and_reports_the_other() {
+        let root = temp_dir("collision");
+        let (_, _, _, stub) = checkout(&root);
+        let project = project_with_iap(
+            &root,
+            "frust-iap = \"0.5.0\"\n\
+             frust-acme-a = { path = \"../acme-a\" }\n\
+             frust-acme-b = { path = \"../acme-b\" }",
+        );
+        let a = root.join("acme-a");
+        let b = root.join("acme-b");
+        // `acme-b` is listed first but loses on package name; its Swift
+        // package also collides with the built-in `iap`'s.
+        let catalog = catalog_with(vec![
+            described("acme-b", "frust-acme-b", &b, ":frust-acme", "FrustIap"),
+            described("acme-a", "frust-acme-a", &a, ":frust-acme", "FrustAcmeA"),
+        ]);
+
+        let report = sync_with_catalog(&stub, &project, &catalog).unwrap();
+        let wired: Vec<&str> = report
+            .plugins
+            .iter()
+            .map(|m| m.plugin_id.as_str())
+            .collect();
+        assert_eq!(wired, ["iap", "iap", "acme-a", "acme-a"]);
+        assert_eq!(
+            report.collisions,
+            [
+                ModuleCollision {
+                    kind: NativeKind::GradleModule {
+                        gradle_name: Cow::Borrowed(":frust-acme"),
+                    },
+                    kept_plugin_id: "acme-a".into(),
+                    dropped_plugin_id: "acme-b".into(),
+                },
+                ModuleCollision {
+                    kind: NativeKind::SwiftPackage {
+                        package_name: Cow::Borrowed("FrustIap"),
+                    },
+                    kept_plugin_id: "iap".into(),
+                    dropped_plugin_id: "acme-b".into(),
+                },
+            ]
+        );
+        assert_eq!(
+            local_properties::read_value(
+                &project.join(LOCAL_PROPERTIES),
+                "frust.plugin.frust-acme.dir"
+            )
+            .unwrap(),
+            Some(a.join("platform/android").display().to_string())
+        );
+        assert_eq!(
+            fs::read_link(project.join("ios/FrustIap")).unwrap(),
+            root.join("plugins/iap").join(IAP_IOS_REL)
+        );
+        let lines = report.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("declared by plugins `acme-a` and `acme-b`")),
+            "{lines:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `android/local.properties` also carries the app identity keys the
+    /// Android build writes; a sync updates its own keys one by one and
+    /// leaves those exactly as they were.
+    #[test]
+    fn the_app_identity_keys_survive_a_sync() {
+        let root = temp_dir("identity");
+        let (_, _, _, stub) = checkout(&root);
+        let project = project_with_iap(&root, "frust-iap = \"0.5.0\"");
+        let identity = "frust.applicationId=com.example.acme\nfrust.appLabel=Acme\n";
+        fs::write(project.join(LOCAL_PROPERTIES), format!("{LOCAL}{identity}")).unwrap();
+        let catalog = catalog_with(vec![described(
+            "acme-ble",
+            "frust-acme-ble",
+            &root.join("acme-ble"),
+            ":frust-acme-ble",
+            "FrustAcmeBle",
+        )]);
+
+        sync_with(&stub, &project).unwrap();
+        sync_with_catalog(&stub, &project, &catalog).unwrap();
+        let path = project.join(LOCAL_PROPERTIES);
+        assert_eq!(
+            local_properties::read_value(&path, "frust.applicationId").unwrap(),
+            Some("com.example.acme".to_string())
+        );
+        assert_eq!(
+            local_properties::read_value(&path, "frust.appLabel").unwrap(),
+            Some("Acme".to_string())
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with(&format!("{LOCAL}{identity}")), "{text}");
         let _ = fs::remove_dir_all(&root);
     }
 

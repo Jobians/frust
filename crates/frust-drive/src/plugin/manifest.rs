@@ -145,10 +145,7 @@ pub(crate) fn plugin_entry(
             package: package.name.clone(),
             package_dir: package.dir().to_path_buf(),
             version: package.version.clone(),
-            source: match package.source {
-                None => DepSource::Path,
-                Some(_) => DepSource::Registry,
-            },
+            source: DepSource::from_cargo_source(package.source.as_deref()),
         },
     })
 }
@@ -1081,6 +1078,22 @@ mod tests {
             "[package.metadata.frust.plugin.features.scan]\nsummary = \"a\\nb\"\n",
             ".features.scan.summary",
         );
+    }
+
+    #[test]
+    fn a_git_package_is_neither_a_path_nor_a_registry_dependency() {
+        let dir = package_dir("git-source");
+        let mut package = package("frust-acme-ble", &dir, FULL);
+        package.source = Some("git+https://example.com/acme/frust-acme-ble#0123abcd".into());
+        let entry = plugin_entry(&package, &package.metadata["frust"]["plugin"]).unwrap();
+        assert!(matches!(
+            entry.origin,
+            PluginOrigin::Manifest {
+                source: DepSource::Other,
+                ..
+            }
+        ));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
