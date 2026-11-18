@@ -5,7 +5,8 @@
 //! Instead, a plugin's contributions are applied to an existing generated
 //! project on demand: [`add_plugin`] performs the exact edits a plugin's
 //! README documents (a Cargo.toml dependency, an Info.plist key, a Gradle
-//! library-module include, an Android manifest permission), each **idempotent**
+//! library-module include, an Android manifest permission, an iOS
+//! entitlement), each **idempotent**
 //! — running it twice yields a byte-identical tree, every line item reported
 //! [`AddOutcome::AlreadyPresent`] the second time.
 //!
@@ -242,6 +243,37 @@ pub enum Contribution {
         /// `"AuthenticationServices"` — no `.framework` suffix.
         name: &'static str,
     },
+    /// An entitlement requested on the generated app's iOS Runner target:
+    /// a `<key>` + value pair (with an explanatory XML comment) inserted into
+    /// `ios/Runner/Runner.entitlements` before the root `</dict>`, and
+    /// `CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;` ensured in
+    /// every build configuration of the Runner target in
+    /// `ios/Runner.xcodeproj/project.pbxproj`.
+    ///
+    /// Unlike [`Contribution::MacosEntitlement`], this is a tracked edit made
+    /// at Add Plugin time, like [`Contribution::PlistEntry`]: the iOS project
+    /// is generated, and Xcode reads the entitlements file only through the
+    /// target's build setting. The file is created (a minimal plist) when
+    /// absent; a key already present is left alone. A configuration whose
+    /// `CODE_SIGN_ENTITLEMENTS` names a different file keeps that setting,
+    /// and the key is written into that file instead. Configurations are
+    /// resolved through the Runner target's configuration list, so a
+    /// flavored project's `<Mode>-<Flavor>` configurations are covered too;
+    /// project-level configurations are never touched.
+    ///
+    /// One contribution, one [`AddItem`]: a half-applied state completes the
+    /// rest and reports [`AddOutcome::Applied`]; a project that fails to
+    /// resolve its Runner configurations is refused before `add_plugin`
+    /// writes anything.
+    IosEntitlement {
+        /// The entitlement key, e.g. `"aps-environment"`.
+        key: &'static str,
+        /// The value written under the key.
+        value: IosEntitlementValue,
+        /// A short XML comment written above the key — it must not contain
+        /// `--`, which XML comments forbid.
+        comment: &'static str,
+    },
     /// A macro invocation appended to the app crate's `src/lib.rs`.
     ///
     /// The escape hatch for a plugin whose platform side needs something the
@@ -365,6 +397,17 @@ pub enum Contribution {
     },
 }
 
+/// The value of a [`Contribution::IosEntitlement`], as its plist element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IosEntitlementValue {
+    /// `<true/>` or `<false/>`.
+    Bool(bool),
+    /// One `<string>`, e.g. `aps-environment`'s `"development"`.
+    String(&'static str),
+    /// An `<array>` of `<string>`s, e.g. an app-group list.
+    StringArray(&'static [&'static str]),
+}
+
 impl Contribution {
     /// A stable, human-readable label for this edit — the vocabulary the
     /// `AddReport` line items and a report UI use.
@@ -383,6 +426,9 @@ impl Contribution {
             }
             Contribution::IosFramework { name } => {
                 format!("Xcode framework `{name}` (`OTHER_LDFLAGS`)")
+            }
+            Contribution::IosEntitlement { key, .. } => {
+                format!("iOS entitlement `{key}` (`CODE_SIGN_ENTITLEMENTS`)")
             }
             Contribution::AppCrateMacro { invocation, .. } => {
                 format!("app crate `src/lib.rs` invocation `{invocation}`")
@@ -610,6 +656,19 @@ mod tests {
             }
             .describe(),
             "desktop entry `Categories` (applied at `frust build linux`)"
+        );
+    }
+
+    #[test]
+    fn ios_entitlement_describe_names_the_build_setting() {
+        assert_eq!(
+            Contribution::IosEntitlement {
+                key: "aps-environment",
+                value: IosEntitlementValue::String("development"),
+                comment: "test",
+            }
+            .describe(),
+            "iOS entitlement `aps-environment` (`CODE_SIGN_ENTITLEMENTS`)"
         );
     }
 
