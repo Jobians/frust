@@ -16,7 +16,7 @@
 //! are the cargo-backed shorthand for a caller holding no runner.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -245,6 +245,15 @@ impl<'r> CargoLocator<'r> {
         let stdout = self.run_metadata(project_dir, MetadataScope::Members)?;
         root_dependencies_from_metadata(project_dir, &stdout)
     }
+
+    /// Every package of the resolved dependency graph of the project at
+    /// `project_dir`, from the same `cargo metadata` run (argv, lockfile
+    /// policy and runner) that [`locate_many`](PackageLocator::locate_many)
+    /// makes.
+    pub(crate) fn package_graph(&self, project_dir: &Path) -> Result<PackageGraph, PackagesError> {
+        let stdout = self.run_metadata(project_dir, MetadataScope::Graph)?;
+        package_graph_from_metadata(project_dir, &stdout)
+    }
 }
 
 /// How much of the project a `cargo metadata` run reads.
@@ -427,6 +436,110 @@ pub(crate) fn packages_from_metadata(
         dirs.push(dir.to_path_buf());
     }
     Ok(dirs)
+}
+
+/// One `packages[]` entry of a full-graph `cargo metadata` document, with
+/// the fields plugin discovery reads.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GraphPackage {
+    /// The package name.
+    pub(crate) name: String,
+    /// The resolved version.
+    pub(crate) version: String,
+    /// `None` for a path dependency or workspace member, otherwise cargo's
+    /// source string (`registry+…`, `git+…`).
+    pub(crate) source: Option<String>,
+    /// The package's `Cargo.toml`.
+    pub(crate) manifest_path: PathBuf,
+    /// The package's `[package.metadata]` table as JSON; `Null` when absent.
+    pub(crate) metadata: serde_json::Value,
+    /// The names of the package's `[features]`; `None` when cargo listed none.
+    pub(crate) features: Option<BTreeSet<String>>,
+}
+
+impl GraphPackage {
+    /// The directory holding the package's `Cargo.toml`.
+    pub(crate) fn dir(&self) -> &Path {
+        self.manifest_path.parent().unwrap_or(Path::new(""))
+    }
+}
+
+/// Every package of a resolved dependency graph, with the project's own root
+/// package marked.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PackageGraph {
+    /// The packages, in the order cargo listed them.
+    pub(crate) packages: Vec<GraphPackage>,
+    /// The index in `packages` of the project's root package: the one whose
+    /// manifest sits in the project directory, else `resolve.root`. `None`
+    /// for a virtual workspace.
+    pub(crate) root: Option<usize>,
+}
+
+/// Reads every package out of a `cargo metadata --format-version 1`
+/// document. Split from [`CargoLocator::package_graph`] so the parse is
+/// tested against canned JSON rather than a cargo run.
+pub(crate) fn package_graph_from_metadata(
+    project_dir: &Path,
+    metadata: &str,
+) -> Result<PackageGraph, PackagesError> {
+    let unreadable = |reason: String| PackagesError::MetadataUnreadable {
+        project_dir: project_dir.to_path_buf(),
+        reason,
+    };
+    let doc: serde_json::Value =
+        serde_json::from_str(metadata).map_err(|err| unreadable(err.to_string()))?;
+    let listed = doc
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| unreadable("no `packages` array".to_string()))?;
+    let str_of = |entry: &serde_json::Value, key: &str| {
+        entry
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let mut packages = Vec::with_capacity(listed.len());
+    let mut ids = Vec::with_capacity(listed.len());
+    for entry in listed {
+        let name =
+            str_of(entry, "name").ok_or_else(|| unreadable("a package has no `name`".into()))?;
+        let field = |key: &str| {
+            str_of(entry, key).ok_or_else(|| unreadable(format!("`{name}` carries no `{key}`")))
+        };
+        let version = field("version")?;
+        let manifest_path = PathBuf::from(field("manifest_path")?);
+        let features = entry
+            .get("features")
+            .and_then(serde_json::Value::as_object)
+            .map(|features| features.keys().cloned().collect());
+        ids.push(str_of(entry, "id"));
+        packages.push(GraphPackage {
+            source: str_of(entry, "source"),
+            metadata: entry
+                .get("metadata")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            name,
+            version,
+            manifest_path,
+            features,
+        });
+    }
+    let identity = |dir: &Path| dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let wanted = identity(project_dir);
+    let resolve_root = doc
+        .get("resolve")
+        .and_then(|resolve| resolve.get("root"))
+        .and_then(serde_json::Value::as_str);
+    let root = packages
+        .iter()
+        .position(|package| identity(package.dir()) == wanted)
+        .or_else(|| {
+            let root = resolve_root?;
+            ids.iter().position(|id| id.as_deref() == Some(root))
+        });
+    Ok(PackageGraph { packages, root })
 }
 
 /// The package ids reachable from the root package (every workspace member
@@ -869,6 +982,49 @@ mod tests {
             Vec::new()
         );
         let _ = fs::remove_dir_all(&project);
+    }
+
+    #[test]
+    fn the_package_graph_carries_metadata_source_features_and_the_root() {
+        let graph = package_graph_from_metadata(
+            Path::new("/work/app"),
+            r#"{"packages":[
+                {"name":"lib","version":"1.0.0","id":"lib 1.0.0","source":"registry+x",
+                 "manifest_path":"/reg/lib-1.0.0/Cargo.toml","metadata":{"frust":{"plugin":{}}},
+                 "features":{"default":[],"extra":[]}},
+                {"name":"app","version":"0.1.0","id":"app 0.1.0","source":null,
+                 "manifest_path":"/elsewhere/app/Cargo.toml","metadata":null}
+            ],"resolve":{"root":"app 0.1.0","nodes":[]},"version":1}"#,
+        )
+        .unwrap();
+        // No manifest sits in the project directory, so `resolve.root` names it.
+        assert_eq!(graph.root, Some(1));
+        let lib = &graph.packages[0];
+        assert_eq!(lib.dir(), Path::new("/reg/lib-1.0.0"));
+        assert_eq!(lib.source.as_deref(), Some("registry+x"));
+        assert!(lib.metadata["frust"]["plugin"].is_object());
+        assert_eq!(
+            lib.features,
+            Some(["default".to_string(), "extra".to_string()].into())
+        );
+        let app = &graph.packages[1];
+        assert_eq!(
+            (app.source.clone(), app.metadata.clone()),
+            (None, serde_json::Value::Null)
+        );
+        assert_eq!(app.features, None);
+        // A virtual workspace's graph has no root.
+        let graph = package_graph_from_metadata(
+            Path::new("/work/ws"),
+            r#"{"packages":[{"name":"a","version":"1","manifest_path":"/work/ws/a/Cargo.toml"}],
+                "resolve":{"root":null,"nodes":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(graph.root, None);
+        assert!(matches!(
+            package_graph_from_metadata(Path::new("/p"), r#"{"packages":[{"name":"x"}]}"#),
+            Err(PackagesError::MetadataUnreadable { .. })
+        ));
     }
 
     #[test]

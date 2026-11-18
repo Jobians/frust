@@ -44,6 +44,7 @@
 
 pub mod apply;
 pub mod catalog;
+mod manifest;
 pub mod registry;
 
 pub use apply::{
@@ -51,6 +52,7 @@ pub use apply::{
     desktop_contributions, desktop_contributions_in,
 };
 pub use catalog::{CatalogEntry, DepSource, PluginCatalog, PluginOrigin};
+pub use manifest::{Discovery, ManifestError, discover};
 pub use registry::known_plugins;
 
 use std::borrow::Cow;
