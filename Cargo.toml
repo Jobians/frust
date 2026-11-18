@@ -239,10 +239,11 @@ proptest = { version = "1.11.0", default-features = false, features = [
 # CRL-only roots) is never consulted. `stream` feeds the disk cache; charset/system-proxy stay off.
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "stream"] }
 # 0.23 is the line reqwest 0.13.5 resolves. Provider = ring (pure Rust); aws-lc-rs is a C/cmake build
-# unproven on cargo-ndk/iOS.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# unproven on cargo-ndk/iOS. Floor 0.23.46 is the first release clear of the 2026 rustls advisories.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 # Mozilla roots on every target (muxr lesson: the Android platform verifier's CRL bug).
-webpki-roots = "1.0.9"
+# Floor 1.0.12 is the first release clear of the 2026 webpki-roots advisories.
+webpki-roots = "1.0.12"
 # intra-workspace
 frust-core = { path = "crates/frust-core", version = "0.6.6" }
 frust-scene = { path = "crates/frust-scene", version = "0.6.6" }
