@@ -192,6 +192,16 @@ pub enum PluginCommand {
         #[arg(long = "feature", value_name = "FEATURE")]
         features: Vec<String>,
     },
+    /// List the plugins available to the project in the current directory:
+    /// the built-in ones, then those its dependencies describe in their own
+    /// package manifest, each with its origin. A plugin the app depends on
+    /// is marked `added`, or with the number of project edits still pending.
+    List,
+    /// Apply the pending project edits of every plugin the app depends on
+    /// that a dependency describes in its own package manifest (built-in
+    /// plugins are added with `frust plugin add`). Idempotent: a re-run
+    /// changes nothing.
+    Sync,
 }
 
 /// `frust create`'s platform options: which platform projects the scaffold

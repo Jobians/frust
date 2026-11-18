@@ -32,8 +32,11 @@ use frust_drive::ios_run::{self, IosLaunch, simctl};
 use frust_drive::manifest;
 use frust_drive::packages::CargoLocator;
 use frust_drive::platform_wiring;
-use frust_drive::process::{ProcessRunner, RealProcessRunner, StreamHandle, TryRecvError};
+use frust_drive::plugin::PluginCatalog;
+use frust_drive::process::{Output, ProcessRunner, RealProcessRunner, StreamHandle, TryRecvError};
 use frust_drive::web_build::{self, RequestLog};
+
+use super::plugin;
 
 /// The testable core of `run`, taking an injected [`ProcessRunner`].
 /// `commands::dispatch` constructs the real runner and calls this (the CLI's
@@ -153,8 +156,8 @@ fn run_in_with_hooks(
 }
 
 /// Dispatches a resolved [`Device`] to its platform's mode/flavor-aware
-/// drive pipeline, after [`refresh_platform_wiring`] has brought the
-/// project's Android/iOS embedding wiring up to date.
+/// drive pipeline for the project in the current directory
+/// ([`run_on_device_in`]).
 fn run_on_device(
     runner: &dyn ProcessRunner,
     device: &Device,
@@ -162,14 +165,32 @@ fn run_on_device(
     extra_features: &[String],
 ) -> Result<u8> {
     let cwd = std::env::current_dir().context("reading current directory")?;
-    refresh_platform_wiring(runner, &cwd, &mut |line| println!("{line}"));
+    run_on_device_in(runner, &cwd, device, info, extra_features)
+}
+
+/// [`run_on_device`] for the project at `project_dir`, after
+/// [`prepare_native_build`] has brought its Android/iOS wiring up to date and
+/// found no plugin edit pending.
+fn run_on_device_in(
+    runner: &dyn ProcessRunner,
+    project_dir: &Path,
+    device: &Device,
+    info: &BuildInfo,
+    extra_features: &[String],
+) -> Result<u8> {
+    prepare_native_build(
+        runner,
+        project_dir,
+        &mut |line| println!("{line}"),
+        &mut |line| eprintln!("{line}"),
+    )?;
     match (device.platform, device.kind) {
-        (Platform::Android, _) => run_android(runner, device, info, extra_features),
+        (Platform::Android, _) => run_android(runner, project_dir, device, info, extra_features),
         (Platform::Ios, Kind::Simulator) => {
-            ios_run::run(runner, &cwd, device, info, extra_features)
+            ios_run::run(runner, project_dir, device, info, extra_features)
         }
         (Platform::Ios, Kind::PhysicalDevice) => {
-            ios_run::run_physical(runner, &cwd, device, info, extra_features)
+            ios_run::run_physical(runner, project_dir, device, info, extra_features)
         }
         (Platform::Ios, Kind::Emulator) => {
             unreachable!("iOS devices are never discovered as Kind::Emulator")
@@ -280,29 +301,72 @@ fn run_watch_on_device(
         );
     }
     let cwd = std::env::current_dir().context("reading current directory")?;
-    refresh_platform_wiring(runner, &cwd, &mut |line| println!("{line}"));
+    prepare_native_build(runner, &cwd, &mut |line| println!("{line}"), &mut |line| {
+        eprintln!("{line}")
+    })?;
     match watched {
         WatchedDevice::Android => run_android_watch(&cwd, device, info, no_hot, hooks),
         WatchedDevice::Simulator => run_simulator_watch(&cwd, device, info, no_hot, hooks),
     }
 }
 
-/// Points `project_dir`'s `android/gradle.properties` and `ios/FrustEmbedding`
-/// at the embedding modules of the shell crates cargo resolves through
-/// `runner` — the step that keeps a project building after `cargo update`
-/// moves those crates, or when it was created with `--no-sync`. Shared by
-/// `frust run` and `frust build`'s Android/iOS lanes, ahead of Gradle/Xcode.
-///
-/// Emits one line per platform it rewrote (nothing when everything was
-/// already current). A failure is a warning, never an error: the project
-/// may still carry a valid wiring from an earlier run, and when it does not,
-/// the Gradle/Xcode failure that follows names the unresolved path.
+/// The step `frust run`'s device lanes and `frust build`'s Android/iOS lanes
+/// take before any build process: [`refresh_platform_wiring_with`], then
+/// [`plugin::pending_stop`] over the catalog it wired with. A
+/// manifest-described plugin the app depends on whose tracked project edits
+/// are still pending stops the command here, with one message block and
+/// nothing built — `frust run`/`frust build` never edit a tracked file
+/// themselves; `frust plugin sync` does. Wiring lines go to `on_line`,
+/// warnings to `on_warning`.
+pub(crate) fn prepare_native_build(
+    runner: &dyn ProcessRunner,
+    project_dir: &Path,
+    on_line: &mut dyn FnMut(&str),
+    on_warning: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let catalog = refresh_platform_wiring_with(runner, project_dir, on_line, on_warning);
+    match plugin::pending_stop(project_dir, &catalog, on_warning) {
+        Some(message) => bail!("{message}"),
+        None => Ok(()),
+    }
+}
+
+/// [`refresh_platform_wiring_with`], its warnings printed on stderr.
+#[cfg(test)]
 pub(crate) fn refresh_platform_wiring(
     runner: &dyn ProcessRunner,
     project_dir: &Path,
     on_line: &mut dyn FnMut(&str),
-) {
-    match platform_wiring::sync_with(&CargoLocator::new(runner), project_dir) {
+) -> PluginCatalog {
+    refresh_platform_wiring_with(runner, project_dir, on_line, &mut |line| {
+        eprintln!("{line}")
+    })
+}
+
+/// Points `project_dir`'s `android/local.properties` keys and `ios/` links
+/// at the embedding modules of the shell crates cargo resolves through
+/// `runner`, and at the native modules of every plugin the app depends on —
+/// built-in ones and those its dependencies describe in their own package
+/// manifest ([`plugin::project_catalog`]) — the step that keeps a project
+/// building after `cargo update` moves those crates, or when it was created
+/// with `--no-sync`. Discovery and the wiring share one `cargo metadata` run.
+/// Returns the catalog it wired with.
+///
+/// Emits one line per location it rewrote (nothing when everything was
+/// already current). A failure is a warning, never an error: the project
+/// may still carry a valid wiring from an earlier run, and when it does not,
+/// the Gradle/Xcode failure that follows names the unresolved path. A failed
+/// plugin discovery is one `on_warning` line and leaves the built-in plugins.
+fn refresh_platform_wiring_with(
+    runner: &dyn ProcessRunner,
+    project_dir: &Path,
+    on_line: &mut dyn FnMut(&str),
+    on_warning: &mut dyn FnMut(&str),
+) -> PluginCatalog {
+    let metadata = MetadataOnce::new(runner);
+    let locator = CargoLocator::new(&metadata);
+    let catalog = plugin::project_catalog_or_built_in(&locator, project_dir, on_warning);
+    match platform_wiring::sync_with_catalog(&locator, project_dir, &catalog) {
         Ok(report) => {
             for line in report.lines() {
                 on_line(&line);
@@ -311,6 +375,88 @@ pub(crate) fn refresh_platform_wiring(
         Err(err) => on_line(&format!(
             "warning: could not refresh the Android/iOS embedding wiring: {err}"
         )),
+    }
+    catalog
+}
+
+/// A [`ProcessRunner`] that runs each distinct `cargo metadata` invocation
+/// once and answers a repeat from memory — failures included — so plugin
+/// discovery and the wiring, which read the same dependency graph through
+/// the same argv, share one cargo run. Every other invocation is passed
+/// through unchanged.
+struct MetadataOnce<'r> {
+    inner: &'r dyn ProcessRunner,
+    answers: std::cell::RefCell<std::collections::HashMap<String, Result<Output, String>>>,
+}
+
+impl<'r> MetadataOnce<'r> {
+    fn new(inner: &'r dyn ProcessRunner) -> Self {
+        Self {
+            inner,
+            answers: Default::default(),
+        }
+    }
+}
+
+impl ProcessRunner for MetadataOnce<'_> {
+    fn run(&self, cmd: &str, args: &[&str]) -> Result<Output> {
+        if cmd != "cargo" || args.first() != Some(&"metadata") {
+            return self.inner.run(cmd, args);
+        }
+        let key = args.join("\u{0}");
+        if let Some(answer) = self.answers.borrow().get(&key) {
+            return answer.clone().map_err(anyhow::Error::msg);
+        }
+        let answer = self.inner.run(cmd, args).map_err(|err| format!("{err:#}"));
+        self.answers.borrow_mut().insert(key, answer.clone());
+        answer.map_err(anyhow::Error::msg)
+    }
+
+    fn run_streaming(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: Option<&Path>,
+        env: &[(&str, &str)],
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<Output> {
+        self.inner.run_streaming(cmd, args, cwd, env, on_line)
+    }
+
+    fn run_streaming_scrubbed(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: Option<&Path>,
+        env: &[(&str, &str)],
+        remove_env: &[&str],
+        on_line: &mut dyn FnMut(&str),
+    ) -> Result<Output> {
+        self.inner
+            .run_streaming_scrubbed(cmd, args, cwd, env, remove_env, on_line)
+    }
+
+    fn run_streaming_with_stderr(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: Option<&Path>,
+        env: &[(&str, &str)],
+        on_line: &mut dyn FnMut(&str),
+        on_stderr_line: &mut dyn FnMut(&str),
+    ) -> Result<Output> {
+        self.inner
+            .run_streaming_with_stderr(cmd, args, cwd, env, on_line, on_stderr_line)
+    }
+
+    fn spawn_streaming(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        cwd: Option<&Path>,
+        env: &[(&str, &str)],
+    ) -> Result<StreamHandle> {
+        self.inner.spawn_streaming(cmd, args, cwd, env)
     }
 }
 
@@ -2098,12 +2244,12 @@ fn select_from_prompt(
 /// the pipeline body (mirroring `ios_run::run`'s shape).
 fn run_android(
     runner: &dyn ProcessRunner,
+    project_dir: &Path,
     device: &Device,
     info: &BuildInfo,
     extra_features: &[String],
 ) -> Result<u8> {
-    let cwd = std::env::current_dir().context("reading current directory")?;
-    android_run::run(runner, &cwd, device, info, extra_features)
+    android_run::run(runner, project_dir, device, info, extra_features)
 }
 
 /// `frust run -d web`'s dev-server lane: builds through
@@ -5164,5 +5310,80 @@ mod tests {
             package_name_from_manifest("[workspace]\nmembers = []\n"),
             None
         );
+    }
+}
+
+/// `frust run`'s device lanes over an app depending on a plugin its
+/// dependency describes in its own manifest ([`plugin::fixture`]).
+#[cfg(test)]
+mod discovered_plugin_tests {
+    use super::*;
+    use crate::commands::plugin::fixture::Fixture;
+
+    fn android_emulator() -> Device {
+        Device {
+            id: "emulator-5554".to_string(),
+            name: "Acme Emulator".to_string(),
+            platform: Platform::Android,
+            kind: Kind::Emulator,
+            os_version: Some("14".to_string()),
+            connection_state: None,
+        }
+    }
+
+    fn debug_info() -> BuildInfo {
+        BuildInfo::from_args(Default::default(), BuildMode::Debug).unwrap()
+    }
+
+    /// A pending plugin stops the run with the one message block before any
+    /// device or build process is asked for — the only process run is the
+    /// single `cargo metadata` discovery and the wiring share — and no
+    /// tracked project file changes.
+    #[test]
+    fn a_pending_discovered_plugin_stops_the_run_before_any_build_process() {
+        let fx = Fixture::new("run-pending");
+        let before = fx.tracked();
+        let runner = fx.runner();
+        let err = run_on_device_in(&runner, &fx.app, &android_emulator(), &debug_info(), &[])
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.starts_with(
+                "plugin acme-ble (frust-acme-ble) is not wired into this project: 4 change(s) \
+                 pending. Run `frust plugin sync` and re-run.\n  - "
+            ),
+            "{message}"
+        );
+        assert_eq!(runner.calls(), [fx.metadata_key()]);
+        assert_eq!(fx.tracked(), before);
+    }
+
+    /// After `frust plugin sync` the run goes on into the device pipeline and
+    /// rewrites the plugin's machine-local wiring on its way.
+    #[test]
+    fn after_sync_the_run_proceeds_and_wires_the_discovered_plugin() {
+        let fx = Fixture::new("run-synced");
+        let catalog = fx.catalog();
+        let code = plugin::sync_with(&catalog, &fx.app, &mut Vec::new(), &mut Vec::new()).unwrap();
+        assert_eq!(code, 0);
+        fx.unwire();
+        let tracked = fx.tracked();
+        let runner = fx.runner();
+        let err = run_on_device_in(&runner, &fx.app, &android_emulator(), &debug_info(), &[])
+            .unwrap_err();
+        assert!(!err.to_string().contains("is not wired"), "{err}");
+        let calls = runner.calls();
+        assert_eq!(calls[0], fx.metadata_key());
+        assert!(calls.len() > 1, "the device pipeline ran: {calls:?}");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|c| c.starts_with("cargo metadata"))
+                .count(),
+            1,
+            "{calls:?}"
+        );
+        assert_eq!(fx.wired(), (true, true));
+        assert_eq!(fx.tracked(), tracked);
     }
 }

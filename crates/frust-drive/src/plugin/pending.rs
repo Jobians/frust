@@ -45,12 +45,16 @@ impl PendingContribution {
 /// them. Machine-local wiring (`local.properties` keys, `ios/` links) and
 /// the desktop lane, applied by every build, are never pending. A project
 /// file a contribution needs that is missing or unreadable fails exactly as
-/// adding the plugin would.
+/// adding the plugin would — except that a manifest-described plugin's
+/// contributions for a platform whose directory (`android/`, `ios/`) the
+/// project lacks are skipped, never pending, the way the machine-local
+/// wiring skips that platform.
 pub fn pending_contributions(
     project_root: &Path,
     entry: &CatalogEntry,
     features: &[&str],
 ) -> Result<Vec<PendingContribution>, PluginAddError> {
+    let entry = &*for_project(project_root, entry);
     let contributions = apply::selected_contributions(&entry.spec, features)?;
     let doc = apply::read_cargo_doc(project_root)?;
     let mut pending = Vec::new();
@@ -63,6 +67,62 @@ pub fn pending_contributions(
         }
     }
     Ok(pending)
+}
+
+/// The platform directory a contribution edits a file under, if it edits
+/// one: `android` or `ios`.
+fn platform_dir(contribution: &Contribution) -> Option<&'static str> {
+    match contribution {
+        Contribution::ManifestPermission { .. }
+        | Contribution::GradleModule { .. }
+        | Contribution::MavenRepository { .. } => Some("android"),
+        Contribution::PlistEntry { .. }
+        | Contribution::PlistArrayEntry { .. }
+        | Contribution::SwiftPackageRef { .. }
+        | Contribution::IosFramework { .. }
+        | Contribution::IosEntitlement { .. } => Some("ios"),
+        _ => None,
+    }
+}
+
+/// `entry` as it applies to the project at `project_root`: a built-in entry
+/// unchanged, a manifest-described one without its contributions (base and
+/// features alike) for a platform whose directory the project lacks.
+fn for_project<'e>(project_root: &Path, entry: &'e CatalogEntry) -> Cow<'e, CatalogEntry> {
+    let absent = |contribution: &Contribution| {
+        platform_dir(contribution).is_some_and(|dir| !project_root.join(dir).is_dir())
+    };
+    let mut all = entry.spec.base.iter().chain(
+        entry
+            .spec
+            .optional_features
+            .iter()
+            .flat_map(|f| f.contributions.iter()),
+    );
+    if entry.is_built_in() || !all.any(&absent) {
+        return Cow::Borrowed(entry);
+    }
+    let keep = |contributions: &[Contribution]| -> Vec<Contribution> {
+        contributions
+            .iter()
+            .filter(|c| !absent(c))
+            .cloned()
+            .collect()
+    };
+    let mut entry = entry.clone();
+    entry.spec.base = Cow::Owned(keep(&entry.spec.base));
+    let features = entry
+        .spec
+        .optional_features
+        .iter()
+        .map(|feature| {
+            let mut feature = feature.clone();
+            feature.contributions = Cow::Owned(keep(&feature.contributions));
+            feature
+        })
+        .collect();
+    entry.spec.optional_features = Cow::Owned(features);
+    Cow::Owned(entry)
 }
 
 /// The text of project file `rel`, failing as its applier would.
@@ -192,15 +252,18 @@ impl SyncReport {
 /// platform floors, native paths, entitlement plan, Maven marker and the
 /// insertion anchor of each pending contribution — so a refusal leaves the
 /// project untouched. Idempotent like `add_plugin`: a second run reports
-/// every item [`AddOutcome::AlreadyPresent`].
+/// every item [`AddOutcome::AlreadyPresent`]. A contribution for a platform
+/// whose directory the project lacks is skipped, as in
+/// [`pending_contributions`]: neither applied nor reported.
 pub fn sync_plugins(
     project_root: &Path,
     catalog: &PluginCatalog,
 ) -> Result<SyncReport, PluginAddError> {
     let doc = apply::read_cargo_doc(project_root)?;
-    let entries: Vec<&CatalogEntry> = catalog
+    let entries: Vec<Cow<'_, CatalogEntry>> = catalog
         .iter()
         .filter(|entry| !entry.is_built_in() && apply::entry_is_installed(entry, &doc))
+        .map(|entry| for_project(project_root, entry))
         .collect();
     for entry in &entries {
         apply::prepare_add(project_root, entry, &[])?;
@@ -210,7 +273,7 @@ pub fn sync_plugins(
         )?;
     }
     let mut plugins = Vec::with_capacity(entries.len());
-    for entry in entries {
+    for entry in &entries {
         plugins.push(apply::add_entry_with(
             &CatalogLocated,
             project_root,
@@ -704,6 +767,77 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(snapshot(&app), tree);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An app without `ios/` (or without `android/`) syncs a manifest plugin
+    /// that also carries items for that platform: they are never pending,
+    /// never applied, and the platform directory is not created.
+    #[test]
+    fn a_manifest_plugin_skips_a_platform_directory_the_app_lacks() {
+        for (absent, kept) in [("ios", "android"), ("android", "ios")] {
+            let root = temp_root(&format!("no-{absent}"));
+            let app = scaffold_app(&root);
+            fs::remove_dir_all(app.join(absent)).unwrap();
+            let entry = plugin_entry(&root, "acme-ble", PACKAGE, None, MANIFEST);
+            depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+
+            let pending = pending_contributions(&app, &entry, &[]).unwrap();
+            assert_eq!(pending.len(), 2, "{absent}: {pending:?}");
+            assert!(
+                pending
+                    .iter()
+                    .all(|p| platform_dir(&p.contribution) == Some(kept)),
+                "{absent}: {pending:?}"
+            );
+
+            let catalog = catalog(vec![entry.clone()]);
+            let report = sync_plugins(&app, &catalog).unwrap();
+            assert_eq!(report.plugins.len(), 1, "{report:?}");
+            assert_eq!(
+                report.plugins[0].items.len(),
+                3,
+                "the dependency line and the {kept} items only: {report:?}"
+            );
+            assert!(report.changed());
+            assert!(!app.join(absent).exists(), "{absent}/ is never created");
+            assert_eq!(pending_contributions(&app, &entry, &[]).unwrap(), []);
+
+            let tree = snapshot(&app);
+            let again = sync_plugins(&app, &catalog).unwrap();
+            assert!(!again.changed(), "{again:?}");
+            assert_eq!(snapshot(&app), tree);
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// The skip is for manifest-described plugins only: a built-in plugin's
+    /// iOS item on an app without `ios/` still fails as its add would.
+    #[test]
+    fn a_built_in_plugin_still_needs_the_platform_files_it_edits() {
+        let root = temp_root("built-in-no-ios");
+        let app = scaffold_app(&root);
+        fs::remove_dir_all(app.join("ios")).unwrap();
+        let entry = CatalogEntry::built_in(crate::plugin::PluginSpec {
+            id: Cow::Borrowed("acme-tag"),
+            crate_dir: Cow::Borrowed("acme-tag"),
+            base: Cow::Owned(vec![
+                Contribution::CargoDep {
+                    name: Cow::Borrowed("frust-acme-tag"),
+                },
+                Contribution::PlistEntry {
+                    key: Cow::Borrowed("NSBluetoothAlwaysUsageDescription"),
+                    value: Cow::Borrowed("Finds nearby Acme tags."),
+                    comment: Cow::Borrowed("test"),
+                },
+            ]),
+            ..crate::plugin::PluginSpec::DEFAULT
+        });
+        let err = pending_contributions(&app, &entry, &[]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::MissingProjectFile(rel) if rel == apply::PLIST_REL),
+            "{err:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
