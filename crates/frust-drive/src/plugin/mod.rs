@@ -284,6 +284,25 @@ pub enum Contribution {
         /// `--`, which XML comments forbid.
         comment: &'static str,
     },
+    /// A Maven repository, restricted to the groups a plugin's Gradle module
+    /// needs, declared in `android/settings.gradle.kts`.
+    ///
+    /// Written at the `// frust:plugin-repositories` marker inside
+    /// `dependencyResolutionManagement { repositories { .. } }` as an
+    /// `exclusiveContent` block whose filter names only `groups`, so the
+    /// repository can never serve (or shadow) any other artifact. An empty
+    /// `groups` is a registry bug and is refused: a repository is never added
+    /// unfiltered. Idempotent by `url`: when `uri("<url>")` already appears in
+    /// the file nothing changes. A project generated before the marker existed
+    /// is refused before `add_plugin` writes anything, with the line to add.
+    MavenRepository {
+        /// The repository URL; `http` or `https` only.
+        url: &'static str,
+        /// The Maven groups served from this repository; never empty.
+        groups: &'static [&'static str],
+        /// A short comment written above the block.
+        comment: &'static str,
+    },
     /// A macro invocation appended to the app crate's `src/lib.rs`.
     ///
     /// The escape hatch for a plugin whose platform side needs something the
@@ -442,6 +461,9 @@ impl Contribution {
             Contribution::IosEntitlement { key, .. } => {
                 format!("iOS entitlement `{key}` (`CODE_SIGN_ENTITLEMENTS`)")
             }
+            Contribution::MavenRepository { url, .. } => {
+                format!("Gradle Maven repository `{url}`")
+            }
             Contribution::AppCrateMacro { invocation, .. } => {
                 format!("app crate `src/lib.rs` invocation `{invocation}`")
             }
@@ -560,6 +582,11 @@ pub enum PluginAddError {
     /// (`</manifest>` / `</dict>`) — never rewritten.
     #[error("project file `{0}` is malformed (missing expected insertion anchor)")]
     MalformedProjectFile(String),
+    /// A registry entry carries a value that can never be applied (e.g. a
+    /// Maven repository with no groups or a non-http(s) url) — a registry
+    /// bug, refused before anything is written.
+    #[error("invalid plugin contribution: {0}")]
+    InvalidContribution(String),
     /// The project's Cargo.toml doesn't parse — never rewritten.
     #[error("failed to parse the project's Cargo.toml: {0}")]
     UnparseableCargoToml(String),
@@ -681,6 +708,38 @@ mod tests {
             }
             .describe(),
             "iOS entitlement `aps-environment` (`CODE_SIGN_ENTITLEMENTS`)"
+        );
+    }
+
+    #[test]
+    fn no_registry_maven_repository_has_empty_groups() {
+        for spec in crate::plugin::known_plugins() {
+            let all = spec
+                .base
+                .iter()
+                .chain(spec.optional_features.iter().flat_map(|f| f.contributions));
+            for c in all {
+                if let Contribution::MavenRepository { url, groups, .. } = c {
+                    assert!(
+                        !groups.is_empty(),
+                        "plugin `{}`: repository `{url}` has no groups",
+                        spec.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn maven_repository_describe_names_the_url() {
+        assert_eq!(
+            Contribution::MavenRepository {
+                url: "https://example.test/m",
+                groups: &["com.example"],
+                comment: "test",
+            }
+            .describe(),
+            "Gradle Maven repository `https://example.test/m`"
         );
     }
 

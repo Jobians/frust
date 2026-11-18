@@ -115,6 +115,7 @@ fn applies_to(contribution: &Contribution, target: DesktopBundleTarget) -> bool 
         | Contribution::PlistEntry { .. }
         | Contribution::PlistArrayEntry { .. }
         | Contribution::GradleModule { .. }
+        | Contribution::MavenRepository { .. }
         | Contribution::SwiftPackageRef { .. }
         | Contribution::IosFramework { .. }
         | Contribution::IosEntitlement { .. }

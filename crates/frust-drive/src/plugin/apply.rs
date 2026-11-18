@@ -38,6 +38,7 @@ const LIB_RS_REL: &str = "src/lib.rs";
 /// unpinned convention.
 const SETTINGS_ANCHOR: &str = "// frust:plugin-includes";
 const APP_DEPS_ANCHOR: &str = "// frust:plugin-dependencies";
+const REPOSITORIES_ANCHOR: &str = "// frust:plugin-repositories";
 
 /// The `settings.gradle.kts` helper every machine-local module directory is
 /// resolved through: it loads the gitignored `local.properties` beside the
@@ -189,6 +190,21 @@ fn add_spec_with(
             } = contribution
             {
                 plan_ios_entitlement(project_root, key, *value, comment)?;
+            }
+        }
+    }
+
+    // A Maven repository needs its marker in settings.gradle.kts and a
+    // well-formed url/group set; check both before the first write. A project
+    // without `android/settings.gradle.kts` is left to the applier, which
+    // answers it as every other Gradle contribution does.
+    for contribution in &contributions {
+        if let Contribution::MavenRepository { url, groups, .. } = contribution {
+            validate_maven_repository(url, groups)?;
+            if let Ok(settings) = fs::read_to_string(project_root.join(SETTINGS_GRADLE_REL))
+                && !settings.contains(REPOSITORIES_ANCHOR)
+            {
+                return Err(missing_repositories_marker());
             }
         }
     }
@@ -383,6 +399,11 @@ fn apply_contribution(
         Contribution::GradleModule { gradle_name, .. } => {
             apply_gradle_module(project_root, gradle_name)
         }
+        Contribution::MavenRepository {
+            url,
+            groups,
+            comment,
+        } => apply_maven_repository(project_root, url, groups, comment),
         Contribution::SwiftPackageRef { package_name, .. } => {
             apply_swift_package_ref(project_root, package_name)
         }
@@ -1093,6 +1114,92 @@ fn apply_gradle_module(
     if let Some(out) = build_out {
         write_file(&build_path, APP_BUILD_GRADLE_REL, &out)?;
     }
+    Ok(AddOutcome::Applied)
+}
+
+/// Refuse a [`Contribution::MavenRepository`] that can never be applied: no
+/// groups (a repository is never added unfiltered) or a url that is not
+/// `http(s)`.
+fn validate_maven_repository(url: &str, groups: &[&str]) -> Result<(), PluginAddError> {
+    if groups.is_empty() {
+        return Err(PluginAddError::InvalidContribution(format!(
+            "Maven repository `{url}` names no groups; a repository is never added unfiltered"
+        )));
+    }
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(PluginAddError::InvalidContribution(format!(
+            "Maven repository url `{url}` is not an http(s) url"
+        )));
+    }
+    Ok(())
+}
+
+/// The error for a settings file that predates the repositories marker,
+/// quoting the exact line to add and where.
+fn missing_repositories_marker() -> PluginAddError {
+    PluginAddError::MalformedProjectFile(format!(
+        "{SETTINGS_GRADLE_REL}: add the line `{REPOSITORIES_ANCHOR}` inside \
+         `dependencyResolutionManagement {{ repositories {{ ... }} }}`, after `mavenCentral()`"
+    ))
+}
+
+/// Escape `"` and `\` for a Kotlin string literal (`$` too, which would
+/// start a template).
+fn kotlin_string_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '"' | '\\' | '$') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// The `exclusiveContent` block one [`Contribution::MavenRepository`] adds.
+fn maven_repository_block(url: &str, groups: &[&str], comment: &str) -> String {
+    let comment = comment.replace(['\r', '\n'], " ");
+    let mut block = format!(
+        "        // {comment}\n\
+         \x20       exclusiveContent {{\n\
+         \x20           forRepository {{ maven {{ url = uri(\"{}\") }} }}\n\
+         \x20           filter {{\n",
+        kotlin_string_escape(url)
+    );
+    for group in groups {
+        block.push_str(&format!(
+            "                includeGroup(\"{}\")\n",
+            kotlin_string_escape(group)
+        ));
+    }
+    block.push_str("            }\n        }\n");
+    block
+}
+
+/// [`Contribution::MavenRepository`]: an `exclusiveContent` block at the
+/// `// frust:plugin-repositories` marker, idempotent by url.
+fn apply_maven_repository(
+    project_root: &Path,
+    url: &str,
+    groups: &[&str],
+    comment: &str,
+) -> Result<AddOutcome, PluginAddError> {
+    validate_maven_repository(url, groups)?;
+    let settings_path = project_root.join(SETTINGS_GRADLE_REL);
+    let src = read_required(&settings_path, SETTINGS_GRADLE_REL)?;
+    if src.contains(&format!("uri(\"{}\")", kotlin_string_escape(url))) {
+        return Ok(AddOutcome::AlreadyPresent);
+    }
+    if !src.contains(REPOSITORIES_ANCHOR) {
+        return Err(missing_repositories_marker());
+    }
+    let out = insert_after_anchor_line(
+        &src,
+        REPOSITORIES_ANCHOR,
+        &maven_repository_block(url, groups, comment),
+        SETTINGS_GRADLE_REL,
+    )?;
+    write_file(&settings_path, SETTINGS_GRADLE_REL, &out)?;
     Ok(AddOutcome::Applied)
 }
 
@@ -5109,6 +5216,156 @@ mod tests {
 
             let _ = fs::remove_dir_all(&dest);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // `Contribution::MavenRepository`
+    // -----------------------------------------------------------------------
+
+    fn maven_spec(contribs: &'static [Contribution]) -> PluginSpec {
+        PluginSpec {
+            id: "maven-test-plugin",
+            summary: "synthetic, test-only",
+            crate_dir: "maven-test-plugin",
+            base: contribs,
+            optional_features: &[],
+            requires_sibling: None,
+        }
+    }
+
+    const REPO_A: Contribution = Contribution::MavenRepository {
+        url: "https://repo.example.test/a",
+        groups: &["com.example.a", "com.example.b"],
+        comment: "Repo A",
+    };
+    const REPO_B: Contribution = Contribution::MavenRepository {
+        url: "https://repo.example.test/b",
+        groups: &["org.example"],
+        comment: "Repo B",
+    };
+
+    #[test]
+    fn maven_repository_lands_in_dependency_resolution_after_maven_central() {
+        let root = scaffold_project("maven-repo-lands");
+        let path = root.join(SETTINGS_GRADLE_REL);
+        assert_eq!(
+            apply_maven_repository(
+                &root,
+                "https://repo.example.test/a",
+                &["g.one", "g.two"],
+                "Repo A"
+            )
+            .unwrap(),
+            AddOutcome::Applied
+        );
+        let after = fs::read_to_string(&path).unwrap();
+        let drm = after.find("dependencyResolutionManagement").unwrap();
+        let central = drm + after[drm..].find("mavenCentral()").unwrap();
+        let marker = after.find(REPOSITORIES_ANCHOR).unwrap();
+        let block = after.find("exclusiveContent {").unwrap();
+        assert!(
+            drm < central && central < marker && marker < block,
+            "{after}"
+        );
+        assert!(after.contains("uri(\"https://repo.example.test/a\")"));
+        assert!(after.contains("includeGroup(\"g.one\")"));
+        assert!(after.contains("includeGroup(\"g.two\")"));
+        assert!(after.contains("// Repo A\n"));
+        // pluginManagement is untouched.
+        assert_eq!(after.matches("exclusiveContent").count(), 1);
+        assert_eq!(
+            apply_maven_repository(&root, "https://repo.example.test/a", &["g.one"], "Repo A")
+                .unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), after);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_maven_repositories_make_two_blocks() {
+        static SPEC_BASE: [Contribution; 3] = [
+            Contribution::CargoDep {
+                name: "frust-maven-test-plugin",
+            },
+            REPO_A,
+            REPO_B,
+        ];
+        let root = scaffold_project("maven-repo-two");
+        let spec = maven_spec(&SPEC_BASE);
+        let report = add_test_spec(&root, &spec).unwrap();
+        assert_eq!(report.items.len(), 3);
+        let after = fs::read_to_string(root.join(SETTINGS_GRADLE_REL)).unwrap();
+        assert_eq!(after.matches("exclusiveContent {").count(), 2, "{after}");
+        let again = add_test_spec(&root, &spec).unwrap();
+        assert!(
+            again
+                .items
+                .iter()
+                .all(|i| i.outcome == AddOutcome::AlreadyPresent)
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(SETTINGS_GRADLE_REL)).unwrap(),
+            after
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maven_repository_without_the_marker_fails_before_any_write() {
+        static SPEC_BASE: [Contribution; 2] = [
+            Contribution::CargoDep {
+                name: "frust-maven-test-plugin",
+            },
+            REPO_A,
+        ];
+        let root = scaffold_project("maven-repo-no-marker");
+        let path = root.join(SETTINGS_GRADLE_REL);
+        let mangled = fs::read_to_string(&path)
+            .unwrap()
+            .replace(REPOSITORIES_ANCHOR, "// (marker removed)");
+        fs::write(&path, &mangled).unwrap();
+        let cargo_before = fs::read(root.join(CARGO_TOML_REL)).unwrap();
+        let err = add_test_spec(&root, &maven_spec(&SPEC_BASE)).unwrap_err();
+        match &err {
+            PluginAddError::MalformedProjectFile(msg) => {
+                assert!(msg.contains(REPOSITORIES_ANCHOR), "{msg}");
+                assert!(msg.contains("mavenCentral()"), "{msg}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), mangled);
+        assert_eq!(fs::read(root.join(CARGO_TOML_REL)).unwrap(), cargo_before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maven_repository_rejects_empty_groups_and_non_http_urls() {
+        let root = scaffold_project("maven-repo-invalid");
+        let before = fs::read(root.join(SETTINGS_GRADLE_REL)).unwrap();
+        assert!(matches!(
+            apply_maven_repository(&root, "https://x.test/m", &[], "c"),
+            Err(PluginAddError::InvalidContribution(_))
+        ));
+        assert!(matches!(
+            apply_maven_repository(&root, "file:///tmp/m", &["g"], "c"),
+            Err(PluginAddError::InvalidContribution(_))
+        ));
+        assert_eq!(fs::read(root.join(SETTINGS_GRADLE_REL)).unwrap(), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn maven_repository_escapes_quotes_and_backslashes() {
+        let root = scaffold_project("maven-repo-escape");
+        apply_maven_repository(&root, "https://x.test/a\"b\\c", &["g\"h"], "c").unwrap();
+        let after = fs::read_to_string(root.join(SETTINGS_GRADLE_REL)).unwrap();
+        assert!(
+            after.contains("uri(\"https://x.test/a\\\"b\\\\c\")"),
+            "{after}"
+        );
+        assert!(after.contains("includeGroup(\"g\\\"h\")"), "{after}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     // -----------------------------------------------------------------------
