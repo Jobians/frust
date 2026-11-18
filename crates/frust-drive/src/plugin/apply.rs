@@ -375,6 +375,11 @@ fn apply_contribution(
             value,
             comment,
         } => apply_plist_entry(project_root, key, value, comment),
+        Contribution::PlistArrayEntry {
+            key,
+            values,
+            comment,
+        } => apply_plist_array_entry(project_root, key, values, comment),
         Contribution::GradleModule { gradle_name, .. } => {
             apply_gradle_module(project_root, gradle_name)
         }
@@ -880,17 +885,82 @@ fn apply_plist_entry(
     value: &str,
     comment: &str,
 ) -> Result<AddOutcome, PluginAddError> {
+    apply_plist_block(project_root, key, |key| {
+        plist_entry_block(key, value, comment)
+    })
+}
+
+/// [`Contribution::PlistArrayEntry`]: like [`apply_plist_entry`], with an
+/// `<array>` of `<string>`s as the value. An existing key is never merged
+/// into or reordered.
+fn apply_plist_array_entry(
+    project_root: &Path,
+    key: &str,
+    values: &[&str],
+    comment: &str,
+) -> Result<AddOutcome, PluginAddError> {
+    apply_plist_block(project_root, key, |key| {
+        plist_array_entry_block(key, values, comment)
+    })
+}
+
+/// Shared body of the two Info.plist appliers: skip when the (escaped) key
+/// is present, else insert the block before the root dict's close (the last
+/// `</dict>`, immediately preceding `</plist>`).
+fn apply_plist_block(
+    project_root: &Path,
+    key: &str,
+    block: impl FnOnce(&str) -> String,
+) -> Result<AddOutcome, PluginAddError> {
     let path = project_root.join(PLIST_REL);
     let src = read_required(&path, PLIST_REL)?;
+    let key = xml_escape(key);
     if src.contains(&format!("<key>{key}</key>")) {
         return Ok(AddOutcome::AlreadyPresent);
     }
-    // Insert before the root dict's close (the last `</dict>`, immediately
-    // preceding `</plist>`), tab-indented like the surrounding entries.
-    let block = format!("\t<!-- {comment} -->\n\t<key>{key}</key>\n\t<string>{value}</string>\n");
-    let out = insert_before_anchor(&src, "</dict>", &block, PLIST_REL)?;
+    let out = insert_before_anchor(&src, "</dict>", &block(&key), PLIST_REL)?;
     write_file(&path, PLIST_REL, &out)?;
     Ok(AddOutcome::Applied)
+}
+
+/// The tab-indented comment / key / `<string>` lines of one
+/// [`Contribution::PlistEntry`]. `escaped_key` is already XML-escaped.
+fn plist_entry_block(escaped_key: &str, value: &str, comment: &str) -> String {
+    format!(
+        "\t<!-- {} -->\n\t<key>{escaped_key}</key>\n\t<string>{}</string>\n",
+        xml_comment_safe(comment),
+        xml_escape(value)
+    )
+}
+
+/// The tab-indented comment / key / `<array>` lines of one
+/// [`Contribution::PlistArrayEntry`]; no values gives `<array>` and
+/// `</array>` on adjacent lines.
+fn plist_array_entry_block(escaped_key: &str, values: &[&str], comment: &str) -> String {
+    let mut out = format!(
+        "\t<!-- {} -->\n\t<key>{escaped_key}</key>\n\t<array>\n",
+        xml_comment_safe(comment)
+    );
+    for value in values {
+        out.push_str(&format!("\t\t<string>{}</string>\n", xml_escape(value)));
+    }
+    out.push_str("\t</array>\n");
+    out
+}
+
+/// `comment` with every `--` run collapsed to one `-`, so it cannot end or
+/// malform the XML comment around it.
+fn xml_comment_safe(comment: &str) -> String {
+    let mut out = String::with_capacity(comment.len());
+    let mut prev_dash = false;
+    for ch in comment.chars() {
+        if ch == '-' && prev_dash {
+            continue;
+        }
+        prev_dash = ch == '-';
+        out.push(ch);
+    }
+    out
 }
 
 /// Create a file at `rel_path` (relative to the project root) with exact
@@ -5039,5 +5109,142 @@ mod tests {
 
             let _ = fs::remove_dir_all(&dest);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // `Contribution::PlistArrayEntry` and Info.plist escaping
+    // -----------------------------------------------------------------------
+
+    fn read_plist(root: &Path) -> String {
+        fs::read_to_string(root.join(PLIST_REL)).unwrap()
+    }
+
+    #[test]
+    fn plist_array_entry_writes_a_well_formed_array_and_reapply_is_a_no_op() {
+        let root = scaffold_project("plist-array-two");
+        let before = read_plist(&root);
+        assert_eq!(
+            apply_plist_array_entry(&root, "TestIds", &["a.one", "a.two"], "Ids").unwrap(),
+            AddOutcome::Applied
+        );
+        let after = read_plist(&root);
+        assert!(
+            after.contains(
+                "\t<!-- Ids -->\n\t<key>TestIds</key>\n\t<array>\n\
+                 \t\t<string>a.one</string>\n\t\t<string>a.two</string>\n\t</array>\n</dict>"
+            ),
+            "{after}"
+        );
+        assert!(after.len() > before.len());
+        assert_eq!(
+            apply_plist_array_entry(&root, "TestIds", &["other"], "Ids").unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        assert_eq!(read_plist(&root), after);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plist_array_entry_with_no_values_is_an_empty_array() {
+        let root = scaffold_project("plist-array-empty");
+        assert_eq!(
+            apply_plist_array_entry(&root, "TestIds", &[], "Ids").unwrap(),
+            AddOutcome::Applied
+        );
+        assert!(read_plist(&root).contains("\t<key>TestIds</key>\n\t<array>\n\t</array>\n</dict>"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plist_values_and_keys_are_xml_escaped_for_both_kinds() {
+        let root = scaffold_project("plist-escape");
+        apply_plist_entry(&root, "k&<s>", "a&b<c", "x -- y --- z").unwrap();
+        apply_plist_array_entry(&root, "k&<a>", &["a&b<c", "d>e"], "arr").unwrap();
+        let plist = read_plist(&root);
+        assert!(
+            plist.contains("<key>k&amp;&lt;s&gt;</key>\n\t<string>a&amp;b&lt;c</string>"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains(
+                "<key>k&amp;&lt;a&gt;</key>\n\t<array>\n\t\t<string>a&amp;b&lt;c</string>\n\t\t<string>d&gt;e</string>"
+            ),
+            "{plist}"
+        );
+        let comment_line = plist.lines().find(|l| l.contains("x - y")).unwrap();
+        assert!(
+            !comment_line
+                .replace("<!--", "")
+                .replace("-->", "")
+                .contains("--")
+        );
+        // Escaped key is what the presence check looks for.
+        assert_eq!(
+            apply_plist_entry(&root, "k&<s>", "v", "c").unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plist_entries_without_a_dict_anchor_are_malformed_and_write_nothing() {
+        let root = scaffold_project("plist-no-anchor");
+        let broken = "<plist version=\"1.0\"></plist>\n";
+        fs::write(root.join(PLIST_REL), broken).unwrap();
+        assert!(matches!(
+            apply_plist_array_entry(&root, "K", &["v"], "c"),
+            Err(PluginAddError::MalformedProjectFile(_))
+        ));
+        assert!(matches!(
+            apply_plist_entry(&root, "K", "v", "c"),
+            Err(PluginAddError::MalformedProjectFile(_))
+        ));
+        assert_eq!(read_plist(&root), broken);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn every_registry_plist_entry_is_written_byte_identically_to_the_old_format() {
+        let mut checked = 0;
+        for spec in crate::plugin::known_plugins() {
+            let all = spec
+                .base
+                .iter()
+                .chain(spec.optional_features.iter().flat_map(|f| f.contributions));
+            for c in all {
+                if let Contribution::PlistEntry {
+                    key,
+                    value,
+                    comment,
+                } = c
+                {
+                    let golden = format!(
+                        "\t<!-- {comment} -->\n\t<key>{key}</key>\n\t<string>{value}</string>\n"
+                    );
+                    assert_eq!(
+                        plist_entry_block(&xml_escape(key), value, comment),
+                        golden,
+                        "{}: {key}",
+                        spec.id
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    #[test]
+    fn plist_writes_leave_existing_build_setting_references_unchanged() {
+        let root = scaffold_project("plist-build-setting");
+        let before = read_plist(&root);
+        assert!(before.contains("$(FRUST_DISPLAY_NAME)"), "{before}");
+        apply_plist_entry(&root, "K", "v", "c").unwrap();
+        apply_plist_array_entry(&root, "A", &["v"], "c").unwrap();
+        let after = read_plist(&root);
+        assert!(after.contains("$(FRUST_DISPLAY_NAME)"));
+        let tail = before.rfind("</dict>").unwrap();
+        assert_eq!(&after[..tail], &before[..tail]);
+        let _ = fs::remove_dir_all(&root);
     }
 }

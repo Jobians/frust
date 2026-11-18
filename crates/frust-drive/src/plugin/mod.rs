@@ -166,6 +166,16 @@ pub enum Contribution {
         value: &'static str,
         comment: &'static str,
     },
+    /// A `<key>` with an `<array>` of `<string>`s (with an explanatory XML
+    /// comment) inserted into `Info.plist` before the root `</dict>`. An
+    /// empty `values` writes an empty array for the app author to fill. A key
+    /// already present is left alone: the array is never merged into or
+    /// reordered. Key, values and comment are escaped like [`Contribution::PlistEntry`]'s.
+    PlistArrayEntry {
+        key: &'static str,
+        values: &'static [&'static str],
+        comment: &'static str,
+    },
     /// A Gradle library module included into the generated project: appends
     /// the `include(...)` + `projectDir` (+ build-directory redirect) lines to
     /// `android/settings.gradle.kts` and the `implementation(project(...))`
@@ -417,7 +427,9 @@ impl Contribution {
             Contribution::ManifestPermission { permission } => {
                 format!("AndroidManifest.xml permission `{permission}`")
             }
-            Contribution::PlistEntry { key, .. } => format!("Info.plist key `{key}`"),
+            Contribution::PlistEntry { key, .. } | Contribution::PlistArrayEntry { key, .. } => {
+                format!("Info.plist key `{key}`")
+            }
             Contribution::GradleModule { gradle_name, .. } => {
                 format!("Gradle module `{gradle_name}`")
             }

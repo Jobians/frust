@@ -113,6 +113,7 @@ fn applies_to(contribution: &Contribution, target: DesktopBundleTarget) -> bool 
         Contribution::CargoDep { .. }
         | Contribution::ManifestPermission { .. }
         | Contribution::PlistEntry { .. }
+        | Contribution::PlistArrayEntry { .. }
         | Contribution::GradleModule { .. }
         | Contribution::SwiftPackageRef { .. }
         | Contribution::IosFramework { .. }
