@@ -154,7 +154,7 @@ pub trait PackageLocator {
 
 /// A [`PackageLocator`] that also reads the project's whole resolved
 /// dependency graph — the seam plugin discovery takes. Both answers derive
-/// from one [`GraphMetadata`] document, so an implementor provides only
+/// from one [`GraphMetadata`] document, so an implementation provides only
 /// [`graph_metadata`](Self::graph_metadata).
 pub trait GraphLocator: PackageLocator {
     /// The full-graph `cargo metadata` document of the Cargo project at
