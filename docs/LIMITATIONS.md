@@ -1292,7 +1292,7 @@ root cause is `devtools-screenshot-not-supported-v1`.
 ### `mcp-server-unauthenticated-v1` — the MCP server has no authentication beyond the loopback bind
 
 **Observed**: `frust-mcp` binds `127.0.0.1` only and relies on rmcp's default Host-header guard
-against DNS rebinding and an Origin allowlist that refuses a browser page on any other origin, but
+against DNS rebinding and an Origin allowlist that accepts a browser page on a loopback http origin of any port and refuses one on any other origin, but
 the MCP protocol layer itself has no login, token, or capability check — any local process that can
 reach the port can list, launch, drive, and stop sessions of the server's configured project. There
 is no per-call project override: that argument was removed
