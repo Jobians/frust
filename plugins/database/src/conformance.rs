@@ -66,7 +66,7 @@
 //! stays a plain, standard-SQLite-tool-readable file regardless of which
 //! engine last touched it. The two engines are not the same SQLite build:
 //! turso self-reports `sqlite_version()` `3.50.4` against this crate's
-//! bundled `rusqlite` build of `3.53.2` (measured, `engine-turso` on) — the
+//! bundled `rusqlite` build of `3.54.1` (measured, `engine-turso` on) — the
 //! SQL dialect this suite exercises (the shared helpers above, plus
 //! whatever `cross_engine` adds) must stay inside the subset both versions
 //! agree on; the `CREATE INDEX` carve-out above is the first instance of

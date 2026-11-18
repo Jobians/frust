@@ -17,7 +17,7 @@ none — everything they need is here):
 
 ## Prerequisites
 
-- Rust 1.88+ (workspace `rust-version`), edition 2024.
+- Rust 1.89+ (workspace `rust-version`), edition 2024.
 - A real Metal or Vulkan adapter for the GPU smoke gate (`frust-render`'s `--ignored` test);
   headless Vulkan needs no display server. Other hosts build and run the non-GPU suite.
 - **Android** (only for `frust run`/`build`/`create`'s Android output): `rustup target add aarch64-linux-android`; `cargo install

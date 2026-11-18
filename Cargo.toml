@@ -11,7 +11,7 @@ exclude = ["examples/huddle", "examples/shadertoy", "examples/web-spike", "examp
 [workspace.package]
 version = "0.6.6"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/frust-rs/frust"
 homepage = "https://frust.dev"
@@ -61,8 +61,8 @@ pollster = "0.4"
 # Native file open/save dialogs (`plugins/file-dialogs`). Default features kept (`xdg-portal` + `wayland`); NOT `gtk3`.
 rfd = "0.17"
 bytemuck = { version = "1.25", features = ["derive"] }
-# Exact pin: 0.25.10 is the only 0.25.x release whose MSRV is exactly the workspace's 1.88;
-# re-verify the MSRV before any bump.
+# Exact pin: chosen when the workspace MSRV was 1.88, as the only 0.25.x release with exactly that
+# MSRV; the workspace is at 1.89 now. Re-verify the MSRV before any bump.
 image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
 # frust-tui only (never the render stack); pinned to minor for pre-1.0 churn (docs/TUI_DEVELOPMENT.md).
 ratatui = "0.30"
@@ -168,7 +168,7 @@ objc2-photos-ui = "0.3"
 arboard = { version = "=3.6.1", default-features = false }
 # Exact pin: pre-1.0 API churn; the tripwire is frust-database's cross-engine conformance suite.
 # `bundled` compiles SQLite from source, so no target needs a system libsqlite3.
-rusqlite = { version = "=0.40.1", default-features = false, features = [
+rusqlite = { version = "=0.43.0", default-features = false, features = [
     "bundled",
 ] }
 # Exact pin: a pre-1.0 rewrite whose API moves between minors (conformance suite, `--features engine-turso`).
@@ -234,7 +234,7 @@ proptest = { version = "1.11.0", default-features = false, features = [
     "std",
     "bit-set",
 ] }
-# reqwest 0.13.5 (MSRV 1.85 <= workspace 1.88) for frust-network-image only, no crypto provider: the
+# reqwest 0.13.5 (MSRV 1.85 <= workspace 1.89) for frust-network-image only, no crypto provider: the
 # plugin selects ring + the webpki roots below explicitly, so Android's platform verifier (Revoked for
 # CRL-only roots) is never consulted. `stream` feeds the disk cache; charset/system-proxy stay off.
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "http2", "stream"] }

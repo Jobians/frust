@@ -15,6 +15,7 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 
 ### Breaking
 
+- The minimum supported Rust version is now 1.89 (was 1.88), because rusqlite 0.43.0 requires it.
 - `accesskit::Tree` (re-exported through frust) is now `TreeInfo`; the old name is a deprecated alias.
 - `frust-i18n` typed keys (`locales!`'s `keys` module): a message with two or more `$variable`s now
   takes one generated `<PascalKey>Args` struct with a named field per variable, instead of
@@ -386,6 +387,9 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 
 ### Security
 
+- rusqlite moves from 0.40.1 to 0.43.0, which bundles SQLite 3.54.1 (was 3.53.2). This closes
+  RUSTSEC-2026-0459: bundled SQLite before 3.54.0 could return stale page-cache bytes when a
+  database is opened beside a `-wal` file that a less-trusted party could write.
 - `Cargo.lock` now locks tokio 1.53.3 (RUSTSEC-2026-0386, unsound `AsyncFd` constructors, which
   frust does not use), rustls 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349), rustls-webpki
   0.103.17 (RUSTSEC-2026-0382), webpki-roots 1.0.12 (RUSTSEC-2026-0381) and webpki-root-certs

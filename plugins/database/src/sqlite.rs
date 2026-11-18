@@ -135,7 +135,7 @@ impl EngineConn for SqliteConn {
         // `Statement::column_names`'s own doc for why this crate doesn't
         // defer the read past the first step (a concurrently-altered
         // schema mid-query is out of scope for this crate's v1 API).
-        let column_names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+        let column_names: Vec<String> = stmt.column_names().map(|s| s.to_string()).collect();
 
         let bound = rusqlite::params_from_iter(params.iter().map(to_sqlite_value));
         let mut rows = stmt.query(bound).map_err(sql_err)?;
