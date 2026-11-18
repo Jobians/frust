@@ -452,45 +452,45 @@ touching it. The pin rows themselves — pin, rationale, tripwire — live with 
 The rules below bind every pin, wherever its row lives:
 
 - **The toolchain is a pin too.** `rust-toolchain.toml` names the exact stable release the gates
-  run on; rustup installs it on first use. Bump it in its own change, only after `cargo clippy
-  --workspace --all-targets -- -D warnings` and `scripts/ci/hotpatch-canary.sh` (*Test*) pass on
-  the candidate — a stable auto-update once turned new lints on under untouched code and failed
-  the gate everywhere, and the hot-patch builder relies on rustc/cargo/linker output shapes that
-  are stable in practice, not by contract.
+  run on (rustup installs it on first use). Bump it in its own change, only after workspace clippy
+  `-D warnings` and `scripts/ci/hotpatch-canary.sh` (*Test*) pass on the candidate: an auto-update once
+  failed every gate on new lints, and the hot-patch builder relies on toolchain output shapes no contract fixes.
 - `examples/huddle` and `plugins/clean-signals-frust` are each a **standalone package** (own
   `[workspace]` root/`Cargo.lock`, excluded from the root `[workspace]`), depending on the
-  `clean-signals` core crate from crates.io (see
-  [CORE_DEVELOPMENT.md](CORE_DEVELOPMENT.md)) rather than a path dep — every consumer, including
-  `crates/frust-drive/templates/app`'s clean-signals scaffold variant, must declare the identical version requirement,
-  or Cargo builds two distinct crate identities; change all three sites together. Neither manifest can use `{ workspace = true }`;
-  gate each from its own directory (*Test*'s standalone chain above).
+  `clean-signals` core crate from crates.io (see [CORE_DEVELOPMENT.md](CORE_DEVELOPMENT.md)), not a
+  path dep. Every consumer, including `crates/frust-drive/templates/app`'s clean-signals scaffold
+  variant, must declare the identical version requirement or Cargo builds two crate identities;
+  change all three sites together. Neither manifest can use `{ workspace = true }`; gate each from
+  its own directory (*Test*'s standalone chain above).
 - **Never run a blind `cargo update`.** After any pinned-dependency manifest change, run
   `cargo generate-lockfile`, then confirm `cargo build --workspace --locked` succeeds **before
-  committing**. Removal-only changes — nothing added, no range widened — may use `cargo build`
-  instead (prunes orphaned entries); `cargo generate-lockfile` is for adding/widening; review the diff.
-  **Carve-out for a duplicate-collapsing bump.** When a pin moves specifically to collapse a
-  duplicate (e.g. `parley_engine` aligning `skrifa`/`read-fonts` onto `glifo`'s copies),
-  `cargo generate-lockfile` is the wrong tool — it re-resolves unrelated crates. Run `cargo update
-  -p <crate> --precise <version>` from inside each of the fifteen workspaces, then a plain
-  `cargo metadata` there to pick up missing path-dep edges, and audit every lock diff's
-  `name`/`version` lines.
+  committing**. Removal-only changes (nothing added, no range widened) may use `cargo build`
+  instead, which prunes orphaned entries (`cargo generate-lockfile` is for adding/widening); review the diff.
+  **Carve-out for a duplicate-collapsing bump** (e.g. `parley_engine` aligning `skrifa`/`read-fonts`
+  onto `glifo`'s copies): `cargo generate-lockfile` re-resolves unrelated crates, so run
+  `cargo update -p <crate> --precise <version>` inside each of the fifteen workspaces, then a plain
+  `cargo metadata` for missing path-dep edges; audit every lock diff's `name`/`version` lines.
+  **Carve-out for a security patch update** (a fixed release for an advisory, or the successor of
+  a yanked version, inside an unchanged manifest requirement). Same command, one crate at a time,
+  in every one of the fifteen workspaces whose lockfile carries the crate; take the smallest fixed
+  release unless the owner decides otherwise. Audit each lock diff the same way, re-run that pin's tripwire
+  and remove the matching `ignore` entry from `deny.toml` in the same change. Moving an exact pin or a
+  major version is not covered: it follows the pin row's tripwire with an owner decision.
 - **wgpu's GPU backends route per target; the `30.0.1` pin stays workspace-owned.** The
   `[workspace.dependencies]` row carries only `std`/`parking_lot`/`wgsl`; `crates/frust-gpu`'s
   `[target.'cfg(...)'.dependencies]` tables add `metal` (apple), `vulkan` (other unix: Android, Linux)
   and `dx12`+`vulkan` (windows). Every wgpu user (`frust-engine`, `frust-render`, `frust-testing`,
   `frust`'s `gpu` feature) depends on `frust-gpu` unconditionally, so it is the single choke point —
   never add a backend back to the row (it re-unions across every target). Moving features between row
-  and tables is not a bump, but target-only crates can still enter `Cargo.lock` (the wasm arm added
-  seven), so review the lock diff; verify with `cargo tree -e features --target <triple> -p frust-gpu`.
-- Use `cargo tree -d` after any manifest change, to catch duplicate/divergent versions of a crate.
-  Every workspace resolves with Cargo resolver 3: a fresh resolve prefers versions whose MSRV fits `rust-version`.
+  and tables is not a bump, but target-only crates can still enter `Cargo.lock`: review the diff and
+  verify with `cargo tree -e features --target <triple> -p frust-gpu`.
+- Run `cargo tree -d` after any manifest change to catch duplicate versions. Every workspace uses
+  resolver 3 (a fresh resolve prefers versions whose MSRV fits `rust-version`).
 - Android deps (`jni`, `ndk`, `ndk-sys`, `android_logger`) are target-gated (`--target
   *-linux-android`) but appear in `Cargo.lock` on all platforms (expected, not drift). `libc`
-  (unpinned `0.2`) is the same two-platform shape; android's/ios's render-thread priority
-  self-boosts (`docs/CODE_STANDARDS.md`'s sanctioned-unsafe zones). The `jni` row (`"0.22"`)
-  cannot drop to 0.21: `android-activity`, winit's Android backend, resolves 0.22.4, and
-  `frust-plugin`'s bridge uses 0.22's scoped attachment (`JavaVM::attach_current_thread_for_scope`).
-  A second copy, `jni 0.21.1`, rides `accesskit_android` until that crate moves.
+  (unpinned `0.2`) is the same shape. The `jni` row (`"0.22"`) cannot drop to 0.21: `android-activity`
+  resolves 0.22.4 and `frust-plugin`'s bridge uses `JavaVM::attach_current_thread_for_scope`. A
+  second copy, `jni 0.21.1`, rides `accesskit_android`.
 
 ## Platform-Support Policy
 

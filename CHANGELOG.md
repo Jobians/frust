@@ -384,6 +384,22 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 - `frust run` on a physical iPhone prints the app's stderr as it arrives, where it used to appear only
   once the launch command exited.
 
+### Security
+
+- `Cargo.lock` now locks tokio 1.53.3 (RUSTSEC-2026-0386, unsound `AsyncFd` constructors, which
+  frust does not use), rustls 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349), rustls-webpki
+  0.103.17 (RUSTSEC-2026-0382), webpki-roots 1.0.12 (RUSTSEC-2026-0381) and webpki-root-certs
+  1.0.12 (RUSTSEC-2026-0383). The `examples/shadertoy` workspace also moves quick-xml 0.39.4 to
+  0.41.0 (RUSTSEC-2026-0194, -0195) through wayland-scanner 0.31.11. The standalone example
+  workspaces' lockfiles were updated too.
+- Three yanked versions are replaced: async-executor 1.14.0 by 1.14.1 (fixes a use-after-free when
+  a `Waker` fires during `Executor::drop`), chacha20 0.10.1 by 0.10.2 (fixes use of an SSE4.1
+  intrinsic in the SSE2 backend), and clipboard-win 5.4.1 by 5.4.3.
+- The bundled TLS trust store now omits roots removed upstream between webpki-roots 1.0.9 and
+  1.0.12: the three emSign roots, Buypass Class 2 and Class 3, and Certigna Root CA, plus DigiCert
+  Trusted Root G4 and two QuoVadis G3 roots, which are no longer trusted for TLS. Images served from
+  a site chained only to one of them stop loading in `frust-network-image`.
+
 ## 0.6.6 — 2026-11-11
 
 A patch release (the 0.6.x line continues) with three breaks, listed under Breaking: `Router::go`
