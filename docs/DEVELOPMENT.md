@@ -473,9 +473,9 @@ The rules below bind every pin, wherever its row lives:
   **Carve-out for a security patch update** (a fixed release for an advisory, or the successor of
   a yanked version, inside an unchanged manifest requirement). Same command, one crate at a time,
   in every one of the fifteen workspaces whose lockfile carries the crate; take the smallest fixed
-  release unless the owner decides otherwise. Audit each lock diff the same way, re-run that pin's tripwire
-  and remove the matching `ignore` entry from `deny.toml` in the same change. Moving an exact pin or a
-  major version is not covered: it follows the pin row's tripwire with an owner decision.
+  release unless the owner decides otherwise. Audit each lock diff, re-run that pin's tripwire, remove the
+  matching `deny.toml` `ignore` entry in the same change, then run `scripts/ci/advisories.sh` (every tracked
+  lockfile). An exact-pin or major move follows the pin row's tripwire with an owner decision instead.
 - **wgpu's GPU backends route per target; the `30.0.1` pin stays workspace-owned.** The
   `[workspace.dependencies]` row carries only `std`/`parking_lot`/`wgsl`; `crates/frust-gpu`'s
   `[target.'cfg(...)'.dependencies]` tables add `metal` (apple), `vulkan` (other unix: Android, Linux)

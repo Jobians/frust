@@ -23,7 +23,7 @@ use frust_devtools_protocol::{
     HandshakeParams, Incoming, InputScrollParams, InputTapParams, InputTextParams, Method,
     Notification, PROTOCOL_VERSION, RectPx, Request, Response, ResponseOutcome, RpcError,
     WidgetNode, WidgetProps, WidgetPropsParams, WidgetTreeDump, decode_line, encode_line,
-    parse_discovery_line, serde_json, serde_json::Value,
+    parse_discovery_line, redact_discovery_token, serde_json, serde_json::Value,
 };
 
 // ───────────────────────────── fake backend ──────────────────────────────
@@ -869,27 +869,38 @@ fn the_discovery_line_is_formatted_so_the_protocol_parser_recovers_port_and_toke
     let port = harness.handle.port();
     let token = harness.handle.token().expect("auth is on by default");
 
-    let discovery = captured_lines()
+    // Tests in this binary run in parallel, and each server binds an
+    // OS-assigned ephemeral port that a sibling test may already have used and
+    // released. Port alone therefore cannot identify this server's line; the
+    // per-process token can. Exactly one captured line may carry this pair.
+    let lines = captured_lines();
+    let own: Vec<&String> = lines
         .iter()
-        .filter_map(|line| parse_discovery_line(line))
-        .find(|d| d.port == port)
-        .unwrap_or_else(|| {
-            panic!(
-                "no logged line parsed back to port {port}; captured: {:?}",
-                captured_lines()
-            )
-        });
+        .filter(|line| {
+            parse_discovery_line(line)
+                .is_some_and(|d| d.port == port && d.token.as_deref() == Some(token))
+        })
+        .collect();
+    assert_eq!(
+        own.len(),
+        1,
+        "expected exactly one logged discovery line for port {port} carrying this \
+         server's token; captured: {:?}",
+        lines
+            .iter()
+            .map(|line| redact_discovery_token(line))
+            .collect::<Vec<_>>()
+    );
 
-    // The token a client would recover is the one this process is checking
-    // against — the whole point of a single shared formatter/parser pair.
+    // The token a client would recover from that line is the one this process
+    // is checking against — the whole point of a single shared formatter/parser
+    // pair.
+    let discovery = parse_discovery_line(own[0]).expect("the matched line parses");
     assert_eq!(discovery.token.as_deref(), Some(token));
 
-    // ...and the line really is built from the shared constant, not a lookalike.
-    assert!(
-        captured_lines()
-            .iter()
-            .any(|line| line.contains(DISCOVERY_PREFIX) && line.contains(&port.to_string()))
-    );
+    // ...and that same line really is built from the shared constant, not a
+    // lookalike.
+    assert!(own[0].contains(DISCOVERY_PREFIX) && own[0].contains(&port.to_string()));
 }
 
 #[test]
@@ -897,11 +908,21 @@ fn a_service_with_auth_off_logs_a_tokenless_discovery_line() {
     let harness = unauthenticated_harness();
     let port = harness.handle.port();
 
-    let discovery = captured_lines()
+    // A tokenless line carries nothing but the port, so a dropped auth-off
+    // server from an earlier test may have logged the same port. This handle
+    // is alive and holds the port, so no other server can be bound to it now:
+    // this server logged its line at start, after any earlier one on that
+    // port, which makes its line the last tokenless line for the port.
+    let lines = captured_lines();
+    let own = lines
         .iter()
-        .filter_map(|line| parse_discovery_line(line))
-        .find(|d| d.port == port)
+        .rev()
+        .find(|line| {
+            parse_discovery_line(line).is_some_and(|d| d.port == port && d.token.is_none())
+        })
         .expect("the service logs a discovery line even with auth off");
+    assert!(own.contains(DISCOVERY_PREFIX) && own.contains(&port.to_string()));
+    let discovery = parse_discovery_line(own).expect("the matched line parses");
     assert_eq!(discovery.token, None);
 }
 

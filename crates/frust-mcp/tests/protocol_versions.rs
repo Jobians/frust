@@ -9,10 +9,13 @@
 //!   client capabilities in its own `_meta`) is served: `tools/list` returns
 //!   the same tools a session sees, `tools/call` runs, and the request leaves
 //!   no entry behind in the client registry.
-//! - Origin: none, this server's `127.0.0.1` origin and its `localhost` origin
-//!   are accepted; any other origin (including `null`) is refused with 403,
-//!   on the stateful and the sessionless path alike.
-//! - A refused request (400, 403) leaves no entry in the client registry.
+//! - Origin: none, and any loopback http origin (`127.0.0.1`, `localhost` or
+//!   `[::1]`, on any port) is accepted; any other origin (another host, `https`,
+//!   or `null`) is refused with 403, on the stateful and the sessionless path
+//!   alike.
+//! - A refused request (400, 403) leaves no entry in the client registry. Each
+//!   such check first opens a real session, so the registry starts at 1 and a
+//!   refused request that registered would be visible as a count change.
 //!
 //! Driven over raw `tokio` `TcpStream`s like the other transport tests (see
 //! `common/mcp.rs`). **No sleeps:** every wait is on an HTTP response or a
@@ -105,6 +108,33 @@ impl Server {
             );
             tokio::task::yield_now().await;
         }
+    }
+}
+
+/// Marker no HTTP response contains, so [`roundtrip`] reads a response to the
+/// end: until the server closes the connection (every request here asks for
+/// `Connection: close`), not merely until the status line arrives.
+const READ_TO_CLOSE: &str = "\u{0}read-to-close";
+
+/// Yields this many times when asserting the registry is steady, so a late
+/// registration or drop has a chance to show up in the count.
+const REGISTRY_SETTLE_YIELDS: usize = 64;
+
+/// Sends a request expected to be refused and returns the full response.
+async fn refused(server: &Server, request: &str) -> String {
+    roundtrip(server.addr, request, READ_TO_CLOSE).await
+}
+
+/// Asserts the registry holds exactly `expected` entries now and stays there
+/// across a bounded number of yields.
+async fn assert_registry_holds(server: &Server, expected: usize) {
+    for _ in 0..REGISTRY_SETTLE_YIELDS {
+        assert_eq!(
+            server.registry.count(),
+            expected,
+            "a refused request changed the client registry"
+        );
+        tokio::task::yield_now().await;
     }
 }
 
@@ -266,6 +296,9 @@ async fn an_unknown_session_id_is_answered_404() {
 #[tokio::test]
 async fn a_legacy_request_without_a_session_id_is_answered_400() {
     let server = Server::start().await;
+    open_session_at(&server, "2025-06-18").await;
+    server.wait_for_count(1).await;
+
     let body = r#"{"jsonrpc":"2.0","id":8,"method":"tools/list","params":{}}"#;
     let request = format!(
         "POST /mcp HTTP/1.1\r\n\
@@ -278,12 +311,12 @@ async fn a_legacy_request_without_a_session_id_is_answered_400() {
         server.host(),
         body.len(),
     );
-    let response = roundtrip(server.addr, &request, "\r\n\r\n").await;
+    let response = refused(&server, &request).await;
     assert!(
         response.starts_with("HTTP/1.1 400"),
         "expected 400 for a session-less non-initialize request, got: {response}"
     );
-    server.wait_for_count(0).await;
+    assert_registry_holds(&server, 1).await;
     server.shutdown().await;
 }
 
@@ -352,14 +385,19 @@ async fn a_2026_07_28_request_is_served_without_a_session() {
 }
 
 #[tokio::test]
-async fn origin_is_checked_against_this_servers_loopback_origin() {
+async fn origin_is_checked_against_loopback_http_origins() {
     let server = Server::start().await;
     let port = server.addr.port();
+    let mut sessions = 0;
 
+    // Accepted: no Origin, and any loopback http origin on any port.
     for origin in [
         None,
         Some(format!("http://127.0.0.1:{port}")),
         Some(format!("http://localhost:{port}")),
+        Some("http://localhost:6274".to_owned()),
+        Some("http://127.0.0.1:1".to_owned()),
+        Some("http://[::1]:5173".to_owned()),
     ] {
         let request = initialize_at(&server.host(), "2025-06-18", origin.as_deref());
         let response = roundtrip(server.addr, &request, "serverInfo").await;
@@ -368,19 +406,23 @@ async fn origin_is_checked_against_this_servers_loopback_origin() {
             "Origin {origin:?} should be accepted, got: {response}"
         );
         session_id_header(&response);
+        sessions += 1;
+        server.wait_for_count(sessions).await;
     }
 
+    // Refused: another host, another scheme on this server's own host.
     for origin in [
         "http://evil.example".to_owned(),
         format!("http://evil.example:{port}"),
+        format!("https://localhost:{port}"),
     ] {
         let request = initialize_at(&server.host(), "2025-06-18", Some(&origin));
-        let response = roundtrip(server.addr, &request, "\r\n\r\n").await;
+        let response = refused(&server, &request).await;
         assert!(
             response.starts_with("HTTP/1.1 403"),
             "Origin {origin} should be refused, got: {response}"
         );
-        server.wait_for_count(3).await;
+        assert_registry_holds(&server, sessions).await;
     }
 
     server.shutdown().await;
@@ -389,34 +431,39 @@ async fn origin_is_checked_against_this_servers_loopback_origin() {
 #[tokio::test]
 async fn origin_null_on_initialize_is_refused() {
     let server = Server::start().await;
+    open_session_at(&server, "2025-06-18").await;
+    server.wait_for_count(1).await;
+
     let request = initialize_at(&server.host(), "2025-06-18", Some("null"));
-    let response = roundtrip(server.addr, &request, "\r\n\r\n").await;
+    let response = refused(&server, &request).await;
     assert!(
         response.starts_with("HTTP/1.1 403"),
         "Origin: null should be refused, got: {response}"
     );
-    server.wait_for_count(0).await;
+    assert_registry_holds(&server, 1).await;
     server.shutdown().await;
 }
 
 #[tokio::test]
 async fn a_foreign_origin_on_a_sessionless_request_is_refused() {
     let server = Server::start().await;
-    let call = json!({ "name": "ping", "arguments": {} });
+    open_session_at(&server, "2025-06-18").await;
+    server.wait_for_count(1).await;
 
-    let refused = sessionless_with_origin(
+    let call = json!({ "name": "ping", "arguments": {} });
+    let refused_request = sessionless_with_origin(
         &server.host(),
         30,
         "tools/call",
         call.clone(),
         Some("http://evil.example"),
     );
-    let response = roundtrip(server.addr, &refused, "\r\n\r\n").await;
+    let response = refused(&server, &refused_request).await;
     assert!(
         response.starts_with("HTTP/1.1 403"),
         "a foreign Origin on a sessionless call should be refused, got: {response}"
     );
-    server.wait_for_count(0).await;
+    assert_registry_holds(&server, 1).await;
 
     let accepted = request_json(
         server.addr,
@@ -428,7 +475,7 @@ async fn a_foreign_origin_on_a_sessionless_request_is_refused() {
         accepted.get("error").is_none(),
         "the same call without an Origin should succeed: {accepted}"
     );
-    server.wait_for_count(0).await;
+    server.wait_for_count(1).await;
 
     server.shutdown().await;
 }

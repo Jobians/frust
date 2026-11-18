@@ -353,11 +353,10 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   not ellipsized.
 - The MCP server (`frust-mcp`) now also serves protocol 2026-07-28, which has no handshake or
   session id. Clients on any session version (2024-11-05 through 2025-11-25) keep their sessions
-  unchanged, and the tool set is unchanged. A request whose `Origin` header is not the server's own
-  loopback origin is now refused with 403. Clients that send no `Origin` header, which is every
-  non-browser client, have nothing to change; a browser-based client must be served from the server's
-  own loopback origin, and one on any other origin (another localhost port included, or
-  `Origin: null`) is now refused with 403.
+  unchanged, and the tool set is unchanged. A browser page on any loopback http origin
+  (`127.0.0.1`, `localhost`, `[::1]`, any port) is accepted; any other origin, an https origin, or
+  `Origin: null` is refused with 403. Clients that send no `Origin` header, which is every
+  non-browser client, are unaffected.
 - The pinned toolchain (`rust-toolchain.toml`) is now Rust 1.100.0 (was 1.98.1); rustup installs it
   on first use in a checkout. The minimum supported Rust version is not changed by this.
 
@@ -405,13 +404,17 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   1.0.12 (RUSTSEC-2026-0383). The `examples/shadertoy` workspace also moves quick-xml 0.39.4 to
   0.41.0 (RUSTSEC-2026-0194, -0195) through wayland-scanner 0.31.11. The standalone example
   workspaces' lockfiles were updated too.
+- The workspace now requires rustls 0.23.46 or later and webpki-roots 1.0.12 or later, so an app
+  that depends on frust gets the patched releases when it updates frust (before, only frust's own
+  lockfiles carried them).
 - Three yanked versions are replaced: async-executor 1.14.0 by 1.14.1 (fixes a use-after-free when
   a `Waker` fires during `Executor::drop`), chacha20 0.10.1 by 0.10.2 (fixes use of an SSE4.1
   intrinsic in the SSE2 backend), and clipboard-win 5.4.1 by 5.4.3.
 - The bundled TLS trust store now omits roots removed upstream between webpki-roots 1.0.9 and
   1.0.12: the three emSign roots, Buypass Class 2 and Class 3, and Certigna Root CA, plus DigiCert
   Trusted Root G4 and two QuoVadis G3 roots, which are no longer trusted for TLS. Images served from
-  a site chained only to one of them stop loading in `frust-network-image`.
+  a site chained only to one of them stop loading in `frust-network-image`. The current Mozilla store
+  (1.0.12) was taken on purpose rather than the smallest fixed release (1.0.10).
 - `frust-mcp` moves from rmcp 2.2.0 to 3.10.0, which drops the ignores for RUSTSEC-2026-0457 (OAuth
   client SSRF) and RUSTSEC-2026-0462 (Streamable HTTP clients buffering unbounded response bodies).
   Both advisories are in rmcp client code that frust never compiled: no `client`, `auth` or
