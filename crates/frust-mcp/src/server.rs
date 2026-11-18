@@ -75,11 +75,14 @@ pub async fn serve_embedded(
     // configurable-bind server, this one has no other address to allow.
     //
     // rmcp leaves Origin validation off while `allowed_origins` is empty
-    // (its default), so the allowlist is set here: a browser page on this
-    // server's own loopback origin is accepted, any other page's Origin is
-    // refused with 403, and a request with no Origin header (every
-    // non-browser MCP client) still passes. Each entry names the bound port
-    // explicitly, because a port-less entry matches any port.
+    // (its default), so the allowlist is set here. A page served from any
+    // loopback http origin, on any port (`127.0.0.1`, `localhost` or `[::1]`),
+    // is accepted, so a browser tool running on another localhost port can
+    // reach this server. Any other Origin (another site, `https`, `null`) is
+    // refused with 403, and a request with no Origin header (every non-browser
+    // MCP client) still passes. The `:*` form is used rather than a port-less
+    // entry: rmcp matches a port-less entry against any port only for now and
+    // is deprecating that, so `:*` states the intent that stays true.
     //
     // `legacy_session_mode` is set explicitly rather than taken from the
     // default: a client that runs the `initialize` handshake (protocol
@@ -94,13 +97,9 @@ pub async fn serve_embedded(
     // in the client registry as one transient entry for as long as its
     // handler runs; the entry is removed when the handler is dropped at the
     // end of the request, which keeps the registry's count accurate.
-    let port = addr.port();
     let transport_config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(true)
-        .with_allowed_origins([
-            format!("http://127.0.0.1:{port}"),
-            format!("http://localhost:{port}"),
-        ])
+        .with_allowed_origins(["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"])
         .with_cancellation_token(cancel.child_token());
     let service = StreamableHttpService::new(
         move || {
