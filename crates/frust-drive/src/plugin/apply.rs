@@ -10,8 +10,8 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Value};
 
 use super::registry::{find_plugin, known_plugins};
 use super::{
-    AddItem, AddOutcome, AddReport, Contribution, IosEntitlementValue, NativeKind, NativeModule,
-    PluginAddError, PluginSpec,
+    AddItem, AddOutcome, AddReport, Contribution, FloorPlatform, IosEntitlementValue, NativeKind,
+    NativeModule, PluginAddError, PluginSpec,
 };
 use crate::build_dirs::BuildLayout;
 use crate::facade_key;
@@ -115,6 +115,11 @@ pub fn add_plugin(
 /// whose key or link was just written reports [`AddOutcome::Applied`]. A run
 /// that finds every edit, key and link already in place never asks the
 /// locator.
+///
+/// A plugin or requested feature stating a platform floor
+/// ([`PluginSpec::min_ios`] / [`PluginSpec::min_android_sdk`]) is checked
+/// against the app's before anything is written, and refused with
+/// [`PluginAddError::PlatformFloorTooLow`] when the app is below it.
 pub fn add_plugin_with(
     locator: &dyn PackageLocator,
     project_root: &Path,
@@ -167,6 +172,10 @@ fn add_spec_with(
         .filter(|f| features.contains(&f.id))
         .flat_map(|f| f.contributions.iter());
     let contributions: Vec<&Contribution> = spec.base.iter().chain(feature_contribs).collect();
+
+    // The app's iOS / Android floors must meet the plugin's (and every
+    // requested feature's); they are checked here and never raised.
+    check_platform_floors(project_root, spec, features)?;
 
     // A registry entry naming a platform path outside its own package cannot
     // be located; refuse it before anything is written.
@@ -320,6 +329,230 @@ fn wiring_error(err: SyncError) -> PluginAddError {
         path,
         message: err.to_string(),
     }
+}
+
+/// The build setting an iOS floor is read from.
+const IOS_DEPLOYMENT_TARGET: &str = "IPHONEOS_DEPLOYMENT_TARGET";
+/// The Android app template's single floor variable, and the `defaultConfig`
+/// property read when a project has no such variable.
+const MIN_SDK_VALUE: &str = "minSdkValue";
+const MIN_SDK: &str = "minSdk";
+const ANDROID_DIR_REL: &str = "android";
+
+/// The highest floor over a plugin and its requested features: the iOS
+/// version as the registry writes it, and the Android API level.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct FloorRequirement {
+    ios: Option<&'static str>,
+    android_sdk: Option<u32>,
+}
+
+/// The [`FloorRequirement`] of adding `spec` with `features`: the maximum
+/// over the spec's floors and those of every requested feature. A registry
+/// `min_ios` that is not a dot-separated version is
+/// [`PluginAddError::InvalidContribution`].
+fn floor_requirement(
+    spec: &PluginSpec,
+    features: &[&str],
+) -> Result<FloorRequirement, PluginAddError> {
+    let requested = spec
+        .optional_features
+        .iter()
+        .filter(|f| features.contains(&f.id))
+        .map(|f| (f.min_ios, f.min_android_sdk));
+    let mut requirement = FloorRequirement::default();
+    let mut highest_ios: Option<Vec<u32>> = None;
+    for (ios, android_sdk) in std::iter::once((spec.min_ios, spec.min_android_sdk)).chain(requested)
+    {
+        if let Some(ios) = ios {
+            let version = parse_ios_version(ios).ok_or_else(|| {
+                PluginAddError::InvalidContribution(format!(
+                    "plugin `{}` declares minimum iOS version `{ios}`, which is not a \
+                     dot-separated version",
+                    spec.id
+                ))
+            })?;
+            if highest_ios
+                .as_ref()
+                .is_none_or(|highest| compare_versions(&version, highest).is_gt())
+            {
+                highest_ios = Some(version);
+                requirement.ios = Some(ios);
+            }
+        }
+        requirement.android_sdk = requirement.android_sdk.max(android_sdk);
+    }
+    Ok(requirement)
+}
+
+/// Refuse, before any write, an app whose iOS deployment target or Android
+/// `minSdk` is below what adding `spec` with `features` needs. A platform the
+/// app has no directory for is skipped; a floor that cannot be read is
+/// [`PluginAddError::MalformedProjectFile`] naming the key looked for, never a
+/// guess. Nothing is read when the add states no floor.
+fn check_platform_floors(
+    project_root: &Path,
+    spec: &PluginSpec,
+    features: &[&str],
+) -> Result<(), PluginAddError> {
+    let requirement = floor_requirement(spec, features)?;
+    if let Some(required) = requirement.ios
+        && project_root.join(IOS_DIR_REL).is_dir()
+    {
+        let src = read_required(&project_root.join(PBXPROJ_REL), PBXPROJ_REL)?;
+        let (found, found_version) = lowest_ios_deployment_target(&src)?;
+        let required_version = parse_ios_version(required).unwrap_or_default();
+        if compare_versions(&found_version, &required_version).is_lt() {
+            return Err(PluginAddError::PlatformFloorTooLow {
+                plugin: spec.id,
+                platform: FloorPlatform::Ios,
+                required: required.to_string(),
+                found,
+                key: IOS_DEPLOYMENT_TARGET,
+                file: PBXPROJ_REL,
+                hint: "Raise it in every build configuration (and keep it at or above every \
+                       Swift package's minimum), then re-run.",
+            });
+        }
+    }
+    if let Some(required) = requirement.android_sdk
+        && project_root.join(ANDROID_DIR_REL).is_dir()
+    {
+        let src = read_required(
+            &project_root.join(APP_BUILD_GRADLE_REL),
+            APP_BUILD_GRADLE_REL,
+        )?;
+        let (key, found) = android_min_sdk(&src)?;
+        if found < required {
+            return Err(PluginAddError::PlatformFloorTooLow {
+                plugin: spec.id,
+                platform: FloorPlatform::Android,
+                required: required.to_string(),
+                found: found.to_string(),
+                key,
+                file: APP_BUILD_GRADLE_REL,
+                hint: "Raise it (and any product flavor's own `minSdk` below it), then re-run.",
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A dot-separated version (`"16"`, `"16.4"`, `"17.0.1"`) as its numeric
+/// components; `None` for anything else.
+fn parse_ios_version(text: &str) -> Option<Vec<u32>> {
+    text.trim()
+        .split('.')
+        .map(|part| {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            part.parse().ok()
+        })
+        .collect()
+}
+
+/// Compare two versions component by component, a missing component counting
+/// as `0` (so `16` equals `16.0`).
+fn compare_versions(a: &[u32], b: &[u32]) -> std::cmp::Ordering {
+    (0..a.len().max(b.len()))
+        .map(|at| {
+            let left = a.get(at).copied().unwrap_or(0);
+            let right = b.get(at).copied().unwrap_or(0);
+            left.cmp(&right)
+        })
+        .find(|order| order.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// The lowest `IPHONEOS_DEPLOYMENT_TARGET` over every build configuration of
+/// the project, project-level and target-level alike (so a flavored project's
+/// extra configurations count too): its value as written, and that value
+/// parsed. No setting at all, or one that is not a version, is
+/// [`PluginAddError::MalformedProjectFile`].
+fn lowest_ios_deployment_target(src: &str) -> Result<(String, Vec<u32>), PluginAddError> {
+    let mut lowest: Option<(String, Vec<u32>)> = None;
+    let objects = pbx_objects(src, pbx_section_range(src, "XCBuildConfiguration")?)?;
+    for object in &objects {
+        let statements = pbx_statements(src, object.body.clone())?;
+        let Some(settings) = statements.iter().find(|s| s.key == "buildSettings") else {
+            continue;
+        };
+        let body = pbx_dict_body(src, settings.value.clone())?;
+        for setting in pbx_statements(src, body)? {
+            if setting.key != IOS_DEPLOYMENT_TARGET {
+                continue;
+            }
+            let raw = pbx_unquote(pbx_strip_comments(&src[setting.value.clone()]).trim());
+            let version = parse_ios_version(&raw).ok_or_else(|| {
+                PluginAddError::MalformedProjectFile(format!(
+                    "{PBXPROJ_REL}: `{IOS_DEPLOYMENT_TARGET} = {raw}` is not a version the \
+                     plugin's minimum iOS version can be compared with"
+                ))
+            })?;
+            if lowest
+                .as_ref()
+                .is_none_or(|(_, low)| compare_versions(&version, low).is_lt())
+            {
+                lowest = Some((raw, version));
+            }
+        }
+    }
+    lowest.ok_or_else(|| {
+        PluginAddError::MalformedProjectFile(format!(
+            "{PBXPROJ_REL}: no build configuration sets `{IOS_DEPLOYMENT_TARGET}`, so the \
+             plugin's minimum iOS version cannot be checked"
+        ))
+    })
+}
+
+/// The app's Android floor from `app/build.gradle.kts`: the integer assigned
+/// to `minSdkValue`, else a literal `minSdk = <n>` (the first one, which is
+/// `defaultConfig`'s in a generated project; per-flavor overrides are not
+/// read). Returns the key read and its value; a floor that is absent or not
+/// an integer literal is [`PluginAddError::MalformedProjectFile`].
+fn android_min_sdk(src: &str) -> Result<(&'static str, u32), PluginAddError> {
+    for key in [MIN_SDK_VALUE, MIN_SDK] {
+        if let Some(value) = gradle_assignment(src, key) {
+            return value.parse::<u32>().map(|level| (key, level)).map_err(|_| {
+                PluginAddError::MalformedProjectFile(format!(
+                    "{APP_BUILD_GRADLE_REL}: `{key} = {value}` is not an integer API level the \
+                     plugin's minimum Android SDK can be compared with"
+                ))
+            });
+        }
+    }
+    Err(PluginAddError::MalformedProjectFile(format!(
+        "{APP_BUILD_GRADLE_REL}: found neither `val {MIN_SDK_VALUE} = <n>` nor \
+         `{MIN_SDK} = <n>`, so the plugin's minimum Android SDK cannot be checked"
+    )))
+}
+
+/// The right-hand side of the first `key = …` assignment in a Kotlin build
+/// script (optionally `val`/`var`-declared, optionally typed), comments
+/// skipped; `None` when no line assigns `key`.
+fn gradle_assignment<'s>(src: &'s str, key: &str) -> Option<&'s str> {
+    src.lines().find_map(|line| {
+        let code = line.split("//").next().unwrap_or_default().trim();
+        if code.starts_with("/*") || code.starts_with('*') {
+            return None;
+        }
+        let declared = code
+            .strip_prefix("val ")
+            .or_else(|| code.strip_prefix("var "))
+            .unwrap_or(code)
+            .trim_start();
+        let rest = declared.strip_prefix(key)?.trim_start();
+        let rest = match rest.strip_prefix(':') {
+            Some(typed) => &typed[typed.find('=')?..],
+            None => rest,
+        };
+        let value = rest.strip_prefix('=')?;
+        if value.starts_with('=') {
+            return None;
+        }
+        Some(value.trim().trim_end_matches(';').trim_end())
+    })
 }
 
 /// Whether `contribution` edits `Cargo.toml` (applied before every other
@@ -1848,22 +2081,9 @@ fn build_settings_configuration(
     src: &str,
     value: Range<usize>,
 ) -> Result<RunnerConfiguration, PluginAddError> {
-    let malformed = || PluginAddError::MalformedProjectFile(PBXPROJ_REL.to_string());
-    let code = pbx_code_bytes(src, value);
-    let open = code
-        .iter()
-        .find(|(_, byte)| !byte.is_ascii_whitespace())
-        .filter(|(_, byte)| *byte == b'{')
-        .map(|(at, _)| *at)
-        .ok_or_else(malformed)?;
-    let close = code
-        .iter()
-        .rev()
-        .find(|(_, byte)| !byte.is_ascii_whitespace())
-        .filter(|(_, byte)| *byte == b'}')
-        .map(|(at, _)| *at)
-        .ok_or_else(malformed)?;
-    let statements = pbx_statements(src, open + 1..close)?;
+    let body = pbx_dict_body(src, value)?;
+    let (open, close) = (body.start - 1, body.end);
+    let statements = pbx_statements(src, body)?;
 
     let entitlements = statements
         .iter()
@@ -1906,6 +2126,28 @@ fn build_settings_configuration(
         entitlements,
         insert,
     })
+}
+
+/// The bytes between the braces of a statement value written `{ … }` (`value`
+/// is the text between its `=` and `;`); any other shape is
+/// [`PluginAddError::MalformedProjectFile`].
+fn pbx_dict_body(src: &str, value: Range<usize>) -> Result<Range<usize>, PluginAddError> {
+    let malformed = || PluginAddError::MalformedProjectFile(PBXPROJ_REL.to_string());
+    let code = pbx_code_bytes(src, value);
+    let open = code
+        .iter()
+        .find(|(_, byte)| !byte.is_ascii_whitespace())
+        .filter(|(_, byte)| *byte == b'{')
+        .map(|(at, _)| *at)
+        .ok_or_else(malformed)?;
+    let close = code
+        .iter()
+        .rev()
+        .find(|(_, byte)| !byte.is_ascii_whitespace())
+        .filter(|(_, byte)| *byte == b'}')
+        .map(|(at, _)| *at)
+        .ok_or_else(malformed)?;
+    Ok(open + 1..close)
 }
 
 /// The insertion point ahead of the statement starting at `start`: its own
@@ -3280,6 +3522,7 @@ mod tests {
             ],
             optional_features: &[],
             requires_sibling: None,
+            ..PluginSpec::DEFAULT
         };
         assert!(matches!(
             package_location(&STRAY, "plugins/other/platform/android"),
@@ -3943,6 +4186,7 @@ mod tests {
         ],
         optional_features: &[],
         requires_sibling: None,
+        ..PluginSpec::DEFAULT
     };
 
     const MOBILE_ONLY_PLUGIN: PluginSpec = PluginSpec {
@@ -3964,6 +4208,7 @@ mod tests {
         ],
         optional_features: &[],
         requires_sibling: None,
+        ..PluginSpec::DEFAULT
     };
 
     const MIXED_PLUGIN: PluginSpec = PluginSpec {
@@ -3999,6 +4244,7 @@ mod tests {
         ],
         optional_features: &[],
         requires_sibling: None,
+        ..PluginSpec::DEFAULT
     };
 
     /// Parse a freshly scaffolded project's `Cargo.toml` and insert a bare
@@ -4679,6 +4925,7 @@ mod tests {
         ],
         optional_features: &[],
         requires_sibling: None,
+        ..PluginSpec::DEFAULT
     };
 
     fn add_test_spec(root: &Path, spec: &PluginSpec) -> Result<AddReport, PluginAddError> {
@@ -5230,6 +5477,7 @@ mod tests {
             base: contribs,
             optional_features: &[],
             requires_sibling: None,
+            ..PluginSpec::DEFAULT
         }
     }
 
@@ -5503,5 +5751,459 @@ mod tests {
         let tail = before.rfind("</dict>").unwrap();
         assert_eq!(&after[..tail], &before[..tail]);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // Platform floors (`PluginSpec::min_ios` / `min_android_sdk`)
+    // -----------------------------------------------------------------------
+
+    use crate::plugin::FeatureSpec;
+
+    /// A synthetic plugin editing Cargo.toml, Info.plist, the pbxproj and both
+    /// Gradle files, so a refused add can be shown to have touched none.
+    const FLOOR_BASE: &[Contribution] = &[
+        Contribution::CargoDep {
+            name: "frust-floor-test-plugin",
+        },
+        Contribution::PlistEntry {
+            key: "NSFloorTestUsageDescription",
+            value: "test",
+            comment: "test",
+        },
+        Contribution::IosFramework {
+            name: "FloorTestKit",
+        },
+        Contribution::GradleModule {
+            gradle_name: ":frust-floor-test-plugin",
+            rel_path: "plugins/floor-test-plugin/platform/android",
+        },
+    ];
+
+    /// A feature needing iOS 17 / API 33, above any floor its spec states.
+    const FLOOR_FEATURES: &[FeatureSpec] = &[FeatureSpec {
+        id: "needs-17",
+        summary: "synthetic, test-only",
+        contributions: &[],
+        min_ios: Some("17.0"),
+        min_android_sdk: Some(33),
+    }];
+
+    /// The generated app's deployment-target line, in each of the three
+    /// build configurations.
+    const TARGET_15: &str = "IPHONEOS_DEPLOYMENT_TARGET = 15.0;";
+
+    fn floor_spec(
+        base: &'static [Contribution],
+        min_ios: Option<&'static str>,
+        min_android_sdk: Option<u32>,
+    ) -> PluginSpec {
+        PluginSpec {
+            id: "floor-test-plugin",
+            summary: "synthetic, test-only",
+            crate_dir: "floor-test-plugin",
+            base,
+            optional_features: FLOOR_FEATURES,
+            min_ios,
+            min_android_sdk,
+            ..PluginSpec::DEFAULT
+        }
+    }
+
+    fn add_floor_spec(
+        root: &Path,
+        spec: &PluginSpec,
+        features: &[&str],
+    ) -> Result<AddReport, PluginAddError> {
+        add_spec_with(&checkout_locator(root), root, spec, features)
+    }
+
+    /// Rewrite `rel` in place, asserting `from` was there to replace.
+    fn rewrite(root: &Path, rel: &str, from: &str, to: &str) {
+        let path = root.join(rel);
+        let src = fs::read_to_string(&path).unwrap();
+        assert!(src.contains(from), "`{from}` not in {rel}");
+        fs::write(&path, src.replace(from, to)).unwrap();
+    }
+
+    #[test]
+    fn ios_versions_compare_numerically_per_component() {
+        let ordered = ["15.0", "15.1", "16", "16.4", "17.0"];
+        for pair in ordered.windows(2) {
+            let (low, high) = (
+                parse_ios_version(pair[0]).unwrap(),
+                parse_ios_version(pair[1]).unwrap(),
+            );
+            assert!(compare_versions(&low, &high).is_lt(), "{pair:?}");
+            assert!(compare_versions(&high, &low).is_gt(), "{pair:?}");
+        }
+        assert!(
+            compare_versions(
+                &parse_ios_version("16").unwrap(),
+                &parse_ios_version("16.0").unwrap()
+            )
+            .is_eq()
+        );
+        assert!(
+            compare_versions(
+                &parse_ios_version("16.10").unwrap(),
+                &parse_ios_version("16.9").unwrap()
+            )
+            .is_gt()
+        );
+        for bad in ["", "16.", ".4", "a", "16.x", "16 .4", "-1"] {
+            assert_eq!(parse_ios_version(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_min_ios_above_the_generated_app_is_refused_and_writes_nothing() {
+        let root = scaffold_project("floor-ios-refused");
+        let before = snapshot_tree(&root);
+        let err =
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[]).unwrap_err();
+        match &err {
+            PluginAddError::PlatformFloorTooLow {
+                plugin,
+                platform,
+                required,
+                found,
+                key,
+                file,
+                ..
+            } => {
+                assert_eq!(*plugin, "floor-test-plugin");
+                assert_eq!(*platform, FloorPlatform::Ios);
+                assert_eq!(required, "16.4");
+                assert_eq!(found, "15.0");
+                assert_eq!(*key, IOS_DEPLOYMENT_TARGET);
+                assert_eq!(*file, PBXPROJ_REL);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "plugin `floor-test-plugin` needs iOS 16.4 or later; \
+             ios/Runner.xcodeproj/project.pbxproj sets IPHONEOS_DEPLOYMENT_TARGET = 15.0. \
+             Raise it in every build configuration (and keep it at or above every Swift \
+             package's minimum), then re-run."
+        );
+        // Cargo.toml, Info.plist, the pbxproj and both Gradle files — the whole
+        // tree — are byte-identical.
+        assert_eq!(snapshot_tree(&root), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn raising_every_configuration_to_the_floor_lets_the_add_proceed() {
+        for raised in ["16.4", "17.0", "16.4.1"] {
+            let root = scaffold_project("floor-ios-raised");
+            rewrite(
+                &root,
+                PBXPROJ_REL,
+                TARGET_15,
+                &format!("IPHONEOS_DEPLOYMENT_TARGET = {raised};"),
+            );
+            let report = add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[])
+                .unwrap_or_else(|e| panic!("{raised}: {e}"));
+            assert!(
+                report
+                    .items
+                    .iter()
+                    .all(|item| item.outcome == AddOutcome::Applied),
+                "{raised}: {report:?}"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn one_configuration_left_below_the_floor_still_refuses() {
+        let root = scaffold_project("floor-ios-partial");
+        let path = root.join(PBXPROJ_REL);
+        let src = fs::read_to_string(&path).unwrap();
+        assert_eq!(src.matches(TARGET_15).count(), 3);
+        // Raise the first two configurations only.
+        let raised = src
+            .replacen(TARGET_15, "IPHONEOS_DEPLOYMENT_TARGET = 17.0;", 2)
+            .replacen(TARGET_15, "IPHONEOS_DEPLOYMENT_TARGET = 16.0;", 1);
+        fs::write(&path, &raised).unwrap();
+        let err =
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::PlatformFloorTooLow { found, .. } if found == "16.0"),
+            "{err}"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), raised);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A project carrying a flavor natively has a fourth build configuration;
+    /// its deployment target counts like the other three.
+    #[test]
+    fn a_fourth_flavor_configuration_below_the_floor_refuses() {
+        let root = scaffold_project("floor-ios-flavor");
+        rewrite(
+            &root,
+            PBXPROJ_REL,
+            TARGET_15,
+            "IPHONEOS_DEPLOYMENT_TARGET = 17.0;",
+        );
+        rewrite(
+            &root,
+            PBXPROJ_REL,
+            "/* End XCBuildConfiguration section */",
+            "\t\tABCDABCDABCDABCDABCD00F0 /* Debug-dev */ = {\n\
+             \t\t\tisa = XCBuildConfiguration;\n\
+             \t\t\tbuildSettings = {\n\
+             \t\t\t\tIPHONEOS_DEPLOYMENT_TARGET = 15.1;\n\
+             \t\t\t};\n\
+             \t\t\tname = \"Debug-dev\";\n\
+             \t\t};\n\
+             /* End XCBuildConfiguration section */",
+        );
+        let pbxproj = fs::read_to_string(root.join(PBXPROJ_REL)).unwrap();
+        assert_eq!(pbxproj.matches("isa = XCBuildConfiguration;").count(), 7);
+        let err =
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::PlatformFloorTooLow { found, .. } if found == "15.1"),
+            "{err}"
+        );
+        // At 15.0 the flavor configuration meets the floor too.
+        add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("15.0"), None), &[]).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_min_android_sdk_above_min_sdk_value_is_refused_and_writes_nothing() {
+        let root = scaffold_project("floor-android-refused");
+        let before = snapshot_tree(&root);
+        let err = add_floor_spec(&root, &floor_spec(FLOOR_BASE, None, Some(31)), &[]).unwrap_err();
+        match &err {
+            PluginAddError::PlatformFloorTooLow {
+                platform,
+                required,
+                found,
+                key,
+                file,
+                ..
+            } => {
+                assert_eq!(*platform, FloorPlatform::Android);
+                assert_eq!(required, "31");
+                assert_eq!(found, "29");
+                assert_eq!(*key, MIN_SDK_VALUE);
+                assert_eq!(*file, APP_BUILD_GRADLE_REL);
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "plugin `floor-test-plugin` needs Android minSdk 31 or later; \
+             android/app/build.gradle.kts sets minSdkValue = 29. Raise it (and any product \
+             flavor's own `minSdk` below it), then re-run."
+        );
+        assert_eq!(snapshot_tree(&root), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn min_sdk_value_at_or_above_the_floor_lets_the_add_proceed() {
+        for raised in [31, 34] {
+            let root = scaffold_project("floor-android-raised");
+            rewrite(
+                &root,
+                APP_BUILD_GRADLE_REL,
+                "val minSdkValue = 29",
+                &format!("val minSdkValue = {raised}"),
+            );
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, None, Some(31)), &[])
+                .unwrap_or_else(|e| panic!("{raised}: {e}"));
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Without `minSdkValue`, a literal `defaultConfig` `minSdk` is read, and
+    /// the message names that key.
+    #[test]
+    fn a_literal_min_sdk_is_read_when_min_sdk_value_is_absent() {
+        let root = scaffold_project("floor-android-literal");
+        rewrite(
+            &root,
+            APP_BUILD_GRADLE_REL,
+            "val minSdkValue = 29",
+            "// floor below",
+        );
+        rewrite(
+            &root,
+            APP_BUILD_GRADLE_REL,
+            "minSdk = minSdkValue",
+            "minSdk = 30",
+        );
+        let err = add_floor_spec(&root, &floor_spec(FLOOR_BASE, None, Some(31)), &[]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::PlatformFloorTooLow { key, found, .. }
+                if *key == MIN_SDK && found == "30"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("sets minSdk = 30."), "{err}");
+        add_floor_spec(&root, &floor_spec(FLOOR_BASE, None, Some(30)), &[]).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_floor_that_cannot_be_read_is_malformed_naming_the_key() {
+        let root = scaffold_project("floor-unreadable");
+        rewrite(
+            &root,
+            APP_BUILD_GRADLE_REL,
+            "val minSdkValue = 29",
+            "val minSdkValue = libs.versions.minSdk.get().toInt()",
+        );
+        let cargo_before = fs::read(root.join(CARGO_TOML_REL)).unwrap();
+        let err = add_floor_spec(&root, &floor_spec(FLOOR_BASE, None, Some(31)), &[]).unwrap_err();
+        match &err {
+            PluginAddError::MalformedProjectFile(msg) => {
+                assert!(msg.starts_with(APP_BUILD_GRADLE_REL), "{msg}");
+                assert!(msg.contains("`minSdkValue = libs."), "{msg}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        rewrite(
+            &root,
+            PBXPROJ_REL,
+            TARGET_15,
+            "IPHONEOS_DEPLOYMENT_TARGET = \"$(BASE)\";",
+        );
+        let err =
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[]).unwrap_err();
+        match &err {
+            PluginAddError::MalformedProjectFile(msg) => {
+                assert!(msg.starts_with(PBXPROJ_REL), "{msg}");
+                assert!(
+                    msg.contains("`IPHONEOS_DEPLOYMENT_TARGET = $(BASE)`"),
+                    "{msg}"
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(fs::read(root.join(CARGO_TOML_REL)).unwrap(), cargo_before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_floor_key_missing_entirely_is_malformed_naming_the_key() {
+        let root = scaffold_project("floor-missing-key");
+        rewrite(&root, PBXPROJ_REL, TARGET_15, "SDKROOT = iphoneos;");
+        let err =
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::MalformedProjectFile(msg)
+                if msg.contains(IOS_DEPLOYMENT_TARGET)),
+            "{err}"
+        );
+        rewrite(&root, APP_BUILD_GRADLE_REL, "val minSdkValue = 29", "");
+        rewrite(&root, APP_BUILD_GRADLE_REL, "minSdk = minSdkValue", "");
+        let err = add_floor_spec(&root, &floor_spec(FLOOR_BASE, None, Some(31)), &[]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::MalformedProjectFile(msg)
+                if msg.contains(MIN_SDK_VALUE) && msg.contains("`minSdk = <n>`")),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A platform the app has no directory for has no floor to check.
+    #[test]
+    fn a_missing_platform_directory_skips_its_check() {
+        const CARGO_ONLY: &[Contribution] = &[Contribution::CargoDep {
+            name: "frust-floor-test-plugin",
+        }];
+        let root = scaffold_project("floor-no-platforms");
+        fs::remove_dir_all(root.join(IOS_DIR_REL)).unwrap();
+        fs::remove_dir_all(root.join(ANDROID_DIR_REL)).unwrap();
+        let report =
+            add_floor_spec(&root, &floor_spec(CARGO_ONLY, Some("99.0"), Some(99)), &[]).unwrap();
+        assert_eq!(report.items.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A feature's floor counts only when that feature is requested, and only
+    /// raises the requirement.
+    #[test]
+    fn a_feature_floor_raises_the_requirement_only_when_requested() {
+        let root = scaffold_project("floor-feature");
+        rewrite(
+            &root,
+            PBXPROJ_REL,
+            TARGET_15,
+            "IPHONEOS_DEPLOYMENT_TARGET = 16.4;",
+        );
+        rewrite(
+            &root,
+            APP_BUILD_GRADLE_REL,
+            "val minSdkValue = 29",
+            "val minSdkValue = 31",
+        );
+        let spec = floor_spec(FLOOR_BASE, Some("16.4"), Some(31));
+        let before = snapshot_tree(&root);
+        let err = add_floor_spec(&root, &spec, &["needs-17"]).unwrap_err();
+        assert!(
+            matches!(&err, PluginAddError::PlatformFloorTooLow { platform: FloorPlatform::Ios,
+                required, .. } if required == "17.0"),
+            "{err}"
+        );
+        assert_eq!(snapshot_tree(&root), before);
+        add_floor_spec(&root, &spec, &[]).unwrap();
+
+        assert_eq!(
+            floor_requirement(&spec, &["needs-17"]).unwrap(),
+            FloorRequirement {
+                ios: Some("17.0"),
+                android_sdk: Some(33),
+            }
+        );
+        assert_eq!(
+            floor_requirement(&spec, &[]).unwrap(),
+            FloorRequirement {
+                ios: Some("16.4"),
+                android_sdk: Some(31),
+            }
+        );
+        // A feature below its spec never lowers the requirement.
+        let high = floor_spec(FLOOR_BASE, Some("18.0"), Some(35));
+        assert_eq!(
+            floor_requirement(&high, &["needs-17"]).unwrap(),
+            FloorRequirement {
+                ios: Some("18.0"),
+                android_sdk: Some(35),
+            }
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_registry_min_ios_that_is_not_a_version_is_refused_before_any_write() {
+        let root = scaffold_project("floor-invalid");
+        let before = snapshot_tree(&root);
+        assert!(matches!(
+            add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("sixteen"), None), &[]),
+            Err(PluginAddError::InvalidContribution(msg)) if msg.contains("`sixteen`")
+        ));
+        assert_eq!(snapshot_tree(&root), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn gradle_assignment_reads_declarations_and_skips_comments() {
+        let src = "// val minSdkValue = 99\n\
+                   /* minSdk = 98 */\n\
+                   val minSdkValue: Int = 30 // the floor\n\
+                   minSdkVersion = 12\n\
+                   minSdk == 5\n\
+                   minSdk = 24;\n";
+        assert_eq!(gradle_assignment(src, MIN_SDK_VALUE), Some("30"));
+        assert_eq!(gradle_assignment(src, MIN_SDK), Some("24"));
+        assert_eq!(gradle_assignment(src, "targetSdk"), None);
     }
 }

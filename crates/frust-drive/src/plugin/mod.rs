@@ -81,9 +81,32 @@ pub struct PluginSpec {
     /// dependency (see `registry.rs`'s `CLEAN_SIGNALS_FRUST`) — but the
     /// mechanism stays in place for a future facade-tier plugin that does.
     pub requires_sibling: Option<&'static str>,
+    /// The lowest iOS version the plugin supports, e.g. `"16.4"` (dot-separated
+    /// numbers). [`add_plugin`] refuses, before any write, an app whose lowest
+    /// `IPHONEOS_DEPLOYMENT_TARGET` is below it
+    /// ([`PluginAddError::PlatformFloorTooLow`]); the app's floor is checked,
+    /// never raised. `None`: no requirement.
+    pub min_ios: Option<&'static str>,
+    /// The lowest Android API level the plugin supports, checked against the
+    /// app's `minSdkValue` like [`Self::min_ios`]. `None`: no requirement.
+    pub min_android_sdk: Option<u32>,
 }
 
 impl PluginSpec {
+    /// Every field empty and every option `None` — the base a registry entry
+    /// struct-updates from (`..PluginSpec::DEFAULT`), so a field added later
+    /// defaults to "no requirement" without touching each entry.
+    pub const DEFAULT: PluginSpec = PluginSpec {
+        id: "",
+        summary: "",
+        crate_dir: "",
+        base: &[],
+        optional_features: &[],
+        requires_sibling: None,
+        min_ios: None,
+        min_android_sdk: None,
+    };
+
     /// Every native module this plugin can contribute — its base
     /// contributions' and every optional feature's — located inside the
     /// package its base [`Contribution::CargoDep`] adds. A registry path
@@ -134,6 +157,23 @@ pub struct FeatureSpec {
     pub summary: &'static str,
     /// The extra contributions enabling this feature applies.
     pub contributions: &'static [Contribution],
+    /// The lowest iOS version this feature needs; when requested, it raises
+    /// the add's requirement above its plugin's [`PluginSpec::min_ios`].
+    pub min_ios: Option<&'static str>,
+    /// The lowest Android API level this feature needs, like [`Self::min_ios`].
+    pub min_android_sdk: Option<u32>,
+}
+
+impl FeatureSpec {
+    /// Every field empty and every option `None` — the struct-update base of a
+    /// registry feature (`..FeatureSpec::DEFAULT`), like [`PluginSpec::DEFAULT`].
+    pub const DEFAULT: FeatureSpec = FeatureSpec {
+        id: "",
+        summary: "",
+        contributions: &[],
+        min_ios: None,
+        min_android_sdk: None,
+    };
 }
 
 /// A single idempotent edit a plugin makes to a generated project. Each maps
@@ -662,6 +702,49 @@ pub enum PluginAddError {
     /// than assuming that forever.
     #[error("scaffold file path `{0}` must be a relative path with no `..` component")]
     UnsafeScaffoldPath(String),
+    /// The app's platform floor is below what the plugin — or one of the
+    /// requested features — needs ([`PluginSpec::min_ios`] /
+    /// [`PluginSpec::min_android_sdk`]). Raised before anything is written;
+    /// the app's floor is never raised for it.
+    #[error(
+        "plugin `{plugin}` needs {platform} {required} or later; {file} sets {key} = {found}. {hint}"
+    )]
+    PlatformFloorTooLow {
+        /// The plugin's registry id. The fixed texts are `&'static str`,
+        /// which keeps this variant within the error-size budget.
+        plugin: &'static str,
+        platform: FloorPlatform,
+        /// The requirement, as the registry states it (`"16.4"`, `"31"`).
+        required: String,
+        /// The app's floor, as its project file writes it.
+        found: String,
+        /// The setting the floor was read from (`IPHONEOS_DEPLOYMENT_TARGET`,
+        /// `minSdkValue`, or a literal `minSdk`).
+        key: &'static str,
+        /// The project-relative file the floor was read from.
+        file: &'static str,
+        /// What to change, as a sentence.
+        hint: &'static str,
+    },
+}
+
+/// The platform a [`PluginAddError::PlatformFloorTooLow`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloorPlatform {
+    /// The iOS deployment target.
+    Ios,
+    /// The Android `minSdk` API level.
+    Android,
+}
+
+impl std::fmt::Display for FloorPlatform {
+    /// The phrase the requirement is named by: `iOS 16.4`, `Android minSdk 31`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FloorPlatform::Ios => "iOS",
+            FloorPlatform::Android => "Android minSdk",
+        })
+    }
 }
 
 #[cfg(test)]
