@@ -3,9 +3,10 @@
 //!
 //! Every subcommand looks plugins up in one [`PluginCatalog`]: the built-in
 //! registry plus the plugins the packages of the app's resolved dependency
-//! graph describe in their own manifest ([`project_catalog`], one
-//! `cargo metadata` run). `frust run` and `frust build` use the same catalog
-//! for the machine-local wiring and for [`pending_stop`].
+//! graph describe in their own manifest, assembled by frust-drive
+//! ([`project_catalog`], one `cargo metadata` run). This module prints what
+//! frust-drive returns and picks the exit code; `frust run` and `frust build`
+//! use the same catalog for the machine-local wiring and the pending stop.
 //!
 //! `add` delegates to [`frust_drive::plugin::add_plugin_from`], so it
 //! inherits that function's behaviour unchanged, including resolving packages
@@ -14,82 +15,23 @@
 //! never shadows a built-in one — so adding one runs no `cargo metadata` of
 //! its own, as before.
 
-use std::collections::BTreeSet;
+use std::fmt::Display;
 use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
 
-use frust_drive::packages::{CargoLocator, PackagesError};
+use frust_drive::packages::CargoLocator;
 use frust_drive::plugin::{
     AddOutcome, AddReport, CatalogEntry, DepSource, PluginAddError, PluginCatalog, PluginOrigin,
-    add_plugin_from, discover, is_installed, pending_contributions, sync_plugins,
+    add_plugin_from, plugin_statuses, project_catalog, project_catalog_or_built_in, sync_plugins,
 };
 use frust_drive::process::ProcessRunner;
 
-/// The plugin catalog of the project at `project_dir`: the built-in registry
-/// followed by every plugin a package of its resolved dependency graph
-/// describes in its own manifest, from one `cargo metadata` run through
-/// `locator`. Each package whose description was refused, and each
-/// discovered plugin dropped because a built-in one has its id, is one
-/// `warn` line; neither fails the caller. A failed discovery is the
-/// locator's error.
-pub(crate) fn project_catalog(
-    locator: &CargoLocator<'_>,
-    project_dir: &Path,
-    warn: &mut dyn FnMut(&str),
-) -> Result<PluginCatalog, PackagesError> {
-    let discovery = discover(project_dir, locator)?;
-    for problem in &discovery.problems {
-        warn(&format!("warning: {problem}"));
-    }
-    let packages: Vec<(String, String)> = discovery
-        .plugins
-        .iter()
-        .map(|entry| (entry.spec.id.to_string(), package_of(entry).to_string()))
-        .collect();
-    let (catalog, dropped) =
-        PluginCatalog::with_discovered(PluginCatalog::built_in(), discovery.plugins);
-    for id in dropped {
-        let package = packages
-            .iter()
-            .find(|(found, _)| *found == id)
-            .map_or("", |(_, package)| package.as_str());
-        warn(&format!(
-            "warning: plugin `{id}` described by package `{package}` is ignored: a built-in \
-             plugin has the same id"
-        ));
-    }
-    Ok(catalog)
-}
-
-/// [`project_catalog`], falling back to the built-in registry when discovery
-/// fails, with one `warn` line saying so. A project without a `Cargo.toml`
-/// falls back silently: there is nothing to discover, and the caller reports
-/// the missing manifest itself.
-pub(crate) fn project_catalog_or_built_in(
-    locator: &CargoLocator<'_>,
-    project_dir: &Path,
-    warn: &mut dyn FnMut(&str),
-) -> PluginCatalog {
-    match project_catalog(locator, project_dir, warn) {
-        Ok(catalog) => catalog,
-        Err(PackagesError::NoManifest { .. }) => PluginCatalog::built_in(),
-        Err(err) => {
-            warn(&format!(
-                "warning: could not discover the plugins this project's dependencies describe: \
-                 {err}"
-            ));
-            PluginCatalog::built_in()
-        }
-    }
-}
-
-/// The package a manifest-described entry comes from; empty for a built-in.
-fn package_of(entry: &CatalogEntry) -> &str {
-    match &entry.origin {
-        PluginOrigin::BuiltIn => "",
-        PluginOrigin::Manifest { package, .. } => package,
+/// Prints each of `warnings` on its own stderr line.
+fn print_warnings(warnings: &[impl Display]) {
+    for warning in warnings {
+        eprintln!("{warning}");
     }
 }
 
@@ -114,124 +56,38 @@ pub(crate) fn origin_label(entry: &CatalogEntry) -> String {
     }
 }
 
-/// The ids of the plugins of `catalog` the app at `project_root` depends on,
-/// by frust-drive's one rule ([`is_installed`]), the one `sync`, the wiring
-/// and the add use.
-pub(crate) fn installed_plugin_ids(
-    project_root: &Path,
-    catalog: &PluginCatalog,
-) -> Result<BTreeSet<String>, PluginAddError> {
-    let mut ids = BTreeSet::new();
-    for entry in catalog {
-        if is_installed(project_root, entry)? {
-            ids.insert(entry.spec.id.to_string());
-        }
-    }
-    Ok(ids)
-}
-
-/// The message `frust run` and `frust build` stop with, before any build
-/// process, when a manifest-described plugin the app depends on still lacks
-/// some of its tracked project edits — one block naming every such plugin
-/// and listing its pending items; `None` when nothing is pending. Reads
-/// only. A plugin whose check fails is one `warn` line, never a stop; built-in
-/// plugins are not checked.
-pub(crate) fn pending_stop(
-    project_root: &Path,
-    catalog: &PluginCatalog,
-    warn: &mut dyn FnMut(&str),
-) -> Option<String> {
-    if catalog.iter().all(CatalogEntry::is_built_in) {
-        return None;
-    }
-    let installed = match installed_plugin_ids(project_root, catalog) {
-        Ok(installed) => installed,
-        Err(err) => {
-            warn(&format!(
-                "warning: could not check the project's plugins for pending changes: {err}"
-            ));
-            return None;
-        }
-    };
-    let mut lines = Vec::new();
-    for entry in catalog
-        .iter()
-        .filter(|entry| !entry.is_built_in() && installed.contains(&*entry.spec.id))
-    {
-        let id = &entry.spec.id;
-        match pending_contributions(project_root, entry, &[]) {
-            Ok(pending) if pending.is_empty() => {}
-            Ok(pending) => {
-                lines.push(format!(
-                    "plugin {id} ({}) is not wired into this project: {} change(s) pending. \
-                     Run `frust plugin sync` and re-run.",
-                    package_of(entry),
-                    pending.len()
-                ));
-                lines.extend(pending.iter().map(|p| format!("  - {}", p.describe())));
-            }
-            Err(err) => warn(&format!(
-                "warning: could not check plugin `{id}` for pending changes: {err}"
-            )),
-        }
-    }
-    (!lines.is_empty()).then(|| lines.join("\n"))
-}
-
 /// `frust plugin list` for the project rooted at `project_root`: discovers
 /// its catalog through `runner` and prints it ([`list_with`]).
 pub fn list(runner: &dyn ProcessRunner, project_root: &Path) -> Result<u8> {
-    let catalog =
-        project_catalog_or_built_in(&CargoLocator::new(runner), project_root, &mut |line| {
-            eprintln!("{line}")
-        });
+    let found = project_catalog_or_built_in(&CargoLocator::new(runner), project_root);
+    print_warnings(&found.warnings);
     list_with(
-        &catalog,
+        &found.catalog,
         project_root,
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     )
 }
 
-/// The testable core of [`list`]: one line per plugin of `catalog` — the
-/// built-in ones in registry order, then the discovered ones by id — with its
-/// origin and, for a plugin the app depends on, `added` or `<n> pending`
-/// (base contributions only). Exit code 1 when the app's `Cargo.toml` cannot
-/// be read.
+/// The testable core of [`list`]: one line per plugin of `catalog`, in the
+/// order and with the status [`plugin_statuses`] gives, and its origin. Exit
+/// code 1 when the app's `Cargo.toml` cannot be read.
 pub(crate) fn list_with(
     catalog: &PluginCatalog,
     project_root: &Path,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<u8> {
-    let installed = match installed_plugin_ids(project_root, catalog) {
-        Ok(installed) => installed,
+    let statuses = match plugin_statuses(project_root, catalog) {
+        Ok(statuses) => statuses,
         Err(error) => {
             writeln!(err, "Error: {error}")?;
             return Ok(1);
         }
     };
-    let mut discovered: Vec<&CatalogEntry> = catalog
+    let rows: Vec<(&str, String, String)> = statuses
         .iter()
-        .filter(|entry| !entry.is_built_in())
-        .collect();
-    discovered.sort_by(|a, b| a.spec.id.cmp(&b.spec.id));
-    let rows: Vec<(&str, String, String)> = catalog
-        .iter()
-        .filter(|entry| entry.is_built_in())
-        .chain(discovered)
-        .map(|entry| {
-            let status = if installed.contains(&*entry.spec.id) {
-                match pending_contributions(project_root, entry, &[]) {
-                    Ok(pending) if pending.is_empty() => "added".to_string(),
-                    Ok(pending) => format!("{} pending", pending.len()),
-                    Err(error) => format!("pending check failed: {error}"),
-                }
-            } else {
-                String::new()
-            };
-            (&*entry.spec.id, origin_label(entry), status)
-        })
+        .map(|(entry, status)| (&*entry.spec.id, origin_label(entry), status.to_string()))
         .collect();
     let id_width = rows.iter().map(|(id, ..)| id.len()).max().unwrap_or(0);
     let origin_width = rows
@@ -251,10 +107,11 @@ pub(crate) fn list_with(
 /// discovery fails the command, since there is nothing to sync without it.
 pub fn sync(runner: &dyn ProcessRunner, project_root: &Path) -> Result<u8> {
     let mut err = std::io::stderr();
-    let catalog = match project_catalog(&CargoLocator::new(runner), project_root, &mut |line| {
-        eprintln!("{line}")
-    }) {
-        Ok(catalog) => catalog,
+    let catalog = match project_catalog(&CargoLocator::new(runner), project_root) {
+        Ok(found) => {
+            print_warnings(&found.warnings);
+            found.catalog
+        }
         Err(error) => {
             writeln!(
                 err,
@@ -330,9 +187,9 @@ pub fn add(
     let catalog = if built_in.find(id).is_some() {
         built_in
     } else {
-        project_catalog_or_built_in(&CargoLocator::new(runner), project_root, &mut |line| {
-            eprintln!("{line}")
-        })
+        let found = project_catalog_or_built_in(&CargoLocator::new(runner), project_root);
+        print_warnings(&found.warnings);
+        found.catalog
     };
     run_with(
         |root, id, features| add_plugin_from(root, &catalog, id, features),
@@ -556,10 +413,11 @@ pub(crate) mod fixture {
         /// The app's catalog, discovered through a fresh [`Self::runner`].
         pub(crate) fn catalog(&self) -> PluginCatalog {
             let runner = self.runner();
-            super::project_catalog(&CargoLocator::new(&runner), &self.app, &mut |line| {
-                panic!("unexpected warning: {line}")
-            })
-            .unwrap()
+            let found = super::project_catalog(&CargoLocator::new(&runner), &self.app).unwrap();
+            if let Some(warning) = found.warnings.first() {
+                panic!("unexpected warning: {warning}")
+            }
+            found.catalog
         }
 
         /// The bytes of every [`TRACKED`] file.
@@ -839,11 +697,23 @@ mod discovered_tests {
     use super::fixture::{Fixture, ID, PACKAGE};
     use super::*;
     use frust_drive::packages::StubLocator;
-    use frust_drive::plugin::{add_plugin_from_with, add_plugin_with};
+    use frust_drive::plugin::{
+        add_plugin_from_with, add_plugin_with, installed_plugin_ids, pending_contributions,
+    };
     use frust_drive::process::{FakeProcessRunner, Output};
 
     fn text(bytes: Vec<u8>) -> String {
         String::from_utf8(bytes).unwrap()
+    }
+
+    /// The message a native build stops with ([`frust_drive::plugin::pending_stop`]),
+    /// `None` when nothing is pending; any warning fails the test.
+    fn pending_stop(app: &Path, catalog: &PluginCatalog) -> Option<String> {
+        let stop = frust_drive::plugin::pending_stop(app, catalog);
+        if let Some(warning) = stop.warnings.first() {
+            panic!("unexpected warning: {warning}")
+        }
+        stop.stops().then(|| stop.to_string())
     }
 
     fn list(fx: &Fixture, catalog: &PluginCatalog) -> String {
@@ -1007,11 +877,9 @@ mod discovered_tests {
                 stderr: String::new(),
             },
         );
-        let mut warnings = Vec::new();
-        let catalog = project_catalog(&CargoLocator::new(&runner), &fx.app, &mut |line| {
-            warnings.push(line.to_string())
-        })
-        .unwrap();
+        let found = project_catalog(&CargoLocator::new(&runner), &fx.app).unwrap();
+        let warnings: Vec<String> = found.warnings.iter().map(ToString::to_string).collect();
+        let catalog = found.catalog;
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             warnings[0].starts_with("warning: plugin manifest of package `frust-acme-bad`: "),
@@ -1037,11 +905,9 @@ mod discovered_tests {
                 stderr: "error: no matching package named `frust-ui` found".to_string(),
             },
         );
-        let mut warnings = Vec::new();
-        let catalog =
-            project_catalog_or_built_in(&CargoLocator::new(&runner), &fx.app, &mut |line| {
-                warnings.push(line.to_string())
-            });
+        let found = project_catalog_or_built_in(&CargoLocator::new(&runner), &fx.app);
+        let warnings: Vec<String> = found.warnings.iter().map(ToString::to_string).collect();
+        let catalog = found.catalog;
         assert_eq!(catalog, PluginCatalog::built_in());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("no matching package"), "{warnings:?}");
@@ -1051,8 +917,7 @@ mod discovered_tests {
     fn the_pending_stop_names_the_plugin_and_lists_every_item() {
         let fx = Fixture::new("stop");
         let catalog = fx.catalog();
-        let mut warn = |line: &str| panic!("unexpected warning: {line}");
-        let message = pending_stop(&fx.app, &catalog, &mut warn).unwrap();
+        let message = pending_stop(&fx.app, &catalog).unwrap();
         let lines: Vec<&str> = message.lines().collect();
         assert_eq!(
             lines,
@@ -1066,7 +931,7 @@ mod discovered_tests {
             ]
         );
         sync(&fx, &catalog);
-        assert_eq!(pending_stop(&fx.app, &catalog, &mut warn), None);
+        assert_eq!(pending_stop(&fx.app, &catalog), None);
     }
 
     /// Only a plugin `frust plugin sync` would apply can stop a build: one the
@@ -1079,12 +944,11 @@ mod discovered_tests {
         let text = std::fs::read_to_string(&manifest).unwrap();
         let line = format!("{PACKAGE} = {{ path = \"../acme-ble\" }}\n");
         let optional = format!("{PACKAGE} = {{ path = \"../acme-ble\", optional = true }}\n");
-        let mut warn = |line: &str| panic!("unexpected warning: {line}");
         for replacement in [optional.as_str(), ""] {
             std::fs::write(&manifest, text.replacen(&line, replacement, 1)).unwrap();
             let installed = installed_plugin_ids(&fx.app, &catalog).unwrap();
             assert!(!installed.contains(ID), "{installed:?}");
-            assert_eq!(pending_stop(&fx.app, &catalog, &mut warn), None);
+            assert_eq!(pending_stop(&fx.app, &catalog), None);
             let mut out = Vec::new();
             assert_eq!(
                 sync_with(&catalog, &fx.app, &mut out, &mut Vec::new()).unwrap(),

@@ -30,13 +30,11 @@ use frust_drive::hotpatch::session::{
 use frust_drive::hotpatch::watch::{WATCH_DEBOUNCE, WatchSet, is_relevant, watch_set_in};
 use frust_drive::ios_run::{self, IosLaunch, simctl};
 use frust_drive::manifest;
-use frust_drive::packages::CargoLocator;
+use frust_drive::packages::{CachedLocator, CargoLocator};
 use frust_drive::platform_wiring;
-use frust_drive::plugin::PluginCatalog;
-use frust_drive::process::{Output, ProcessRunner, RealProcessRunner, StreamHandle, TryRecvError};
+use frust_drive::plugin::{PluginCatalog, pending_stop, project_catalog_or_built_in};
+use frust_drive::process::{ProcessRunner, RealProcessRunner, StreamHandle, TryRecvError};
 use frust_drive::web_build::{self, RequestLog};
-
-use super::plugin;
 
 /// The testable core of `run`, taking an injected [`ProcessRunner`].
 /// `commands::dispatch` constructs the real runner and calls this (the CLI's
@@ -312,12 +310,9 @@ fn run_watch_on_device(
 
 /// The step `frust run`'s device lanes and `frust build`'s Android/iOS lanes
 /// take before any build process: [`refresh_platform_wiring_with`], then
-/// [`plugin::pending_stop`] over the catalog it wired with. A
-/// manifest-described plugin the app depends on whose tracked project edits
-/// are still pending stops the command here, with one message block and
-/// nothing built — `frust run`/`frust build` never edit a tracked file
-/// themselves; `frust plugin sync` does. Wiring lines go to `on_line`,
-/// warnings to `on_warning`.
+/// frust-drive's [`pending_stop`] over the catalog it wired with. When it
+/// stops, the command stops here with its message and nothing built. Wiring
+/// lines go to `on_line`, warnings to `on_warning`.
 pub(crate) fn prepare_native_build(
     runner: &dyn ProcessRunner,
     project_dir: &Path,
@@ -325,32 +320,25 @@ pub(crate) fn prepare_native_build(
     on_warning: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let catalog = refresh_platform_wiring_with(runner, project_dir, on_line, on_warning);
-    match plugin::pending_stop(project_dir, &catalog, on_warning) {
-        Some(message) => bail!("{message}"),
-        None => Ok(()),
+    let stop = pending_stop(project_dir, &catalog);
+    for warning in &stop.warnings {
+        on_warning(&warning.to_string());
     }
-}
-
-/// [`refresh_platform_wiring_with`], its warnings printed on stderr.
-#[cfg(test)]
-pub(crate) fn refresh_platform_wiring(
-    runner: &dyn ProcessRunner,
-    project_dir: &Path,
-    on_line: &mut dyn FnMut(&str),
-) -> PluginCatalog {
-    refresh_platform_wiring_with(runner, project_dir, on_line, &mut |line| {
-        eprintln!("{line}")
-    })
+    if stop.stops() {
+        bail!("{stop}");
+    }
+    Ok(())
 }
 
 /// Points `project_dir`'s `android/local.properties` keys and `ios/` links
 /// at the embedding modules of the shell crates cargo resolves through
 /// `runner`, and at the native modules of every plugin the app depends on —
 /// built-in ones and those its dependencies describe in their own package
-/// manifest ([`plugin::project_catalog`]) — the step that keeps a project
-/// building after `cargo update` moves those crates, or when it was created
-/// with `--no-sync`. Discovery and the wiring share one `cargo metadata` run.
-/// Returns the catalog it wired with.
+/// manifest ([`project_catalog_or_built_in`]) — the step that keeps a
+/// project building after `cargo update` moves those crates, or when it was
+/// created with `--no-sync`. Discovery and the wiring read through one
+/// [`CachedLocator`], so they share one `cargo metadata` run. Returns the
+/// catalog it wired with.
 ///
 /// Emits one line per location it rewrote (nothing when everything was
 /// already current). A failure is a warning, never an error: the project
@@ -363,10 +351,13 @@ fn refresh_platform_wiring_with(
     on_line: &mut dyn FnMut(&str),
     on_warning: &mut dyn FnMut(&str),
 ) -> PluginCatalog {
-    let metadata = MetadataOnce::new(runner);
-    let locator = CargoLocator::new(&metadata);
-    let catalog = plugin::project_catalog_or_built_in(&locator, project_dir, on_warning);
-    match platform_wiring::sync_with_catalog(&locator, project_dir, &catalog) {
+    let cargo = CargoLocator::new(runner);
+    let locator = CachedLocator::new(&cargo);
+    let found = project_catalog_or_built_in(&locator, project_dir);
+    for warning in &found.warnings {
+        on_warning(&warning.to_string());
+    }
+    match platform_wiring::sync_with_catalog(&locator, project_dir, &found.catalog) {
         Ok(report) => {
             for line in report.lines() {
                 on_line(&line);
@@ -376,88 +367,7 @@ fn refresh_platform_wiring_with(
             "warning: could not refresh the Android/iOS embedding wiring: {err}"
         )),
     }
-    catalog
-}
-
-/// A [`ProcessRunner`] that runs each distinct `cargo metadata` invocation
-/// once and answers a repeat from memory — failures included — so plugin
-/// discovery and the wiring, which read the same dependency graph through
-/// the same argv, share one cargo run. Every other invocation is passed
-/// through unchanged.
-struct MetadataOnce<'r> {
-    inner: &'r dyn ProcessRunner,
-    answers: std::cell::RefCell<std::collections::HashMap<String, Result<Output, String>>>,
-}
-
-impl<'r> MetadataOnce<'r> {
-    fn new(inner: &'r dyn ProcessRunner) -> Self {
-        Self {
-            inner,
-            answers: Default::default(),
-        }
-    }
-}
-
-impl ProcessRunner for MetadataOnce<'_> {
-    fn run(&self, cmd: &str, args: &[&str]) -> Result<Output> {
-        if cmd != "cargo" || args.first() != Some(&"metadata") {
-            return self.inner.run(cmd, args);
-        }
-        let key = args.join("\u{0}");
-        if let Some(answer) = self.answers.borrow().get(&key) {
-            return answer.clone().map_err(anyhow::Error::msg);
-        }
-        let answer = self.inner.run(cmd, args).map_err(|err| format!("{err:#}"));
-        self.answers.borrow_mut().insert(key, answer.clone());
-        answer.map_err(anyhow::Error::msg)
-    }
-
-    fn run_streaming(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: Option<&Path>,
-        env: &[(&str, &str)],
-        on_line: &mut dyn FnMut(&str),
-    ) -> Result<Output> {
-        self.inner.run_streaming(cmd, args, cwd, env, on_line)
-    }
-
-    fn run_streaming_scrubbed(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: Option<&Path>,
-        env: &[(&str, &str)],
-        remove_env: &[&str],
-        on_line: &mut dyn FnMut(&str),
-    ) -> Result<Output> {
-        self.inner
-            .run_streaming_scrubbed(cmd, args, cwd, env, remove_env, on_line)
-    }
-
-    fn run_streaming_with_stderr(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: Option<&Path>,
-        env: &[(&str, &str)],
-        on_line: &mut dyn FnMut(&str),
-        on_stderr_line: &mut dyn FnMut(&str),
-    ) -> Result<Output> {
-        self.inner
-            .run_streaming_with_stderr(cmd, args, cwd, env, on_line, on_stderr_line)
-    }
-
-    fn spawn_streaming(
-        &self,
-        cmd: &str,
-        args: &[&str],
-        cwd: Option<&Path>,
-        env: &[(&str, &str)],
-    ) -> Result<StreamHandle> {
-        self.inner.spawn_streaming(cmd, args, cwd, env)
-    }
+    found.catalog
 }
 
 /// Resolves the app's dependency graph under the `--features` the desktop
@@ -2547,6 +2457,17 @@ mod tests {
         let message = err.to_string();
         assert!(!message.contains("lands in Phase 5"), "{message}");
         assert!(message.contains("frust.toml"), "{message}");
+    }
+
+    /// [`refresh_platform_wiring_with`], its warnings printed on stderr.
+    fn refresh_platform_wiring(
+        runner: &dyn ProcessRunner,
+        project_dir: &Path,
+        on_line: &mut dyn FnMut(&str),
+    ) -> PluginCatalog {
+        refresh_platform_wiring_with(runner, project_dir, on_line, &mut |line| {
+            eprintln!("{line}")
+        })
     }
 
     fn wiring_project(tag: &str) -> std::path::PathBuf {
@@ -5318,6 +5239,7 @@ mod tests {
 #[cfg(test)]
 mod discovered_plugin_tests {
     use super::*;
+    use crate::commands::plugin;
     use crate::commands::plugin::fixture::Fixture;
 
     fn android_emulator() -> Device {

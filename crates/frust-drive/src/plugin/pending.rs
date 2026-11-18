@@ -5,15 +5,21 @@
 //! ([`ModuleCollision`]). Every "already present" answer here is the very
 //! predicate the matching applier in `apply.rs` skips by, so the two cannot
 //! drift. Reads only; [`sync_plugins`] writes through the appliers.
+//!
+//! Over a whole catalog: which plugins the app depends on
+//! ([`installed_plugin_ids`]), where each stands ([`plugin_statuses`], what
+//! `frust plugin list` shows) and whether a native build must stop because a
+//! manifest-described plugin is not wired in yet ([`pending_stop`]).
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use toml_edit::DocumentMut;
 
 use super::apply::{self, DepLookup};
-use super::catalog::{CatalogEntry, PluginCatalog};
+use super::catalog::{CatalogEntry, PluginCatalog, package_of};
 use super::{AddOutcome, AddReport, Contribution, NativeKind, PluginAddError};
 use crate::packages::{PackageLocator, PackagesError};
 
@@ -336,6 +342,213 @@ impl fmt::Display for ModuleCollision {
             self.dropped_plugin_id
         )
     }
+}
+
+/// The ids of the plugins of `catalog` the app at `project_root` depends on,
+/// by the one rule ([`apply::is_installed`]) `sync_plugins`, the wiring and
+/// the add use. A missing or unparseable `Cargo.toml` is the error an add
+/// would give.
+pub fn installed_plugin_ids(
+    project_root: &Path,
+    catalog: &PluginCatalog,
+) -> Result<BTreeSet<String>, PluginAddError> {
+    let mut ids = BTreeSet::new();
+    for entry in catalog {
+        if apply::is_installed(project_root, entry)? {
+            ids.insert(entry.spec.id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+/// Where one catalog plugin stands in an app ([`plugin_statuses`]).
+/// `Display` is the status as `frust plugin list` shows it; empty for a
+/// plugin the app does not depend on.
+#[derive(Debug)]
+pub enum PluginStatus {
+    /// The app does not depend on the plugin.
+    NotInstalled,
+    /// The app depends on it and carries every tracked base contribution.
+    Added,
+    /// The app depends on it; this many tracked base contributions are
+    /// pending.
+    Pending(usize),
+    /// The app depends on it, and checking its contributions failed.
+    CheckFailed(PluginAddError),
+}
+
+impl fmt::Display for PluginStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotInstalled => Ok(()),
+            Self::Added => f.write_str("added"),
+            Self::Pending(count) => write!(f, "{count} pending"),
+            Self::CheckFailed(err) => write!(f, "pending check failed: {err}"),
+        }
+    }
+}
+
+/// Every plugin of `catalog` with its [`PluginStatus`] in the app at
+/// `project_root` (base contributions only), in listing order: the built-in
+/// entries in catalog order, then the discovered ones by id. Fails only when
+/// the app's `Cargo.toml` cannot be read ([`installed_plugin_ids`]).
+pub fn plugin_statuses<'c>(
+    project_root: &Path,
+    catalog: &'c PluginCatalog,
+) -> Result<Vec<(&'c CatalogEntry, PluginStatus)>, PluginAddError> {
+    let installed = installed_plugin_ids(project_root, catalog)?;
+    let mut discovered: Vec<&CatalogEntry> = catalog
+        .iter()
+        .filter(|entry| !entry.is_built_in())
+        .collect();
+    discovered.sort_by(|a, b| a.spec.id.cmp(&b.spec.id));
+    Ok(catalog
+        .iter()
+        .filter(|entry| entry.is_built_in())
+        .chain(discovered)
+        .map(|entry| {
+            let status = if !installed.contains(&*entry.spec.id) {
+                PluginStatus::NotInstalled
+            } else {
+                match pending_contributions(project_root, entry, &[]) {
+                    Ok(pending) if pending.is_empty() => PluginStatus::Added,
+                    Ok(pending) => PluginStatus::Pending(pending.len()),
+                    Err(err) => PluginStatus::CheckFailed(err),
+                }
+            };
+            (entry, status)
+        })
+        .collect())
+}
+
+/// One installed manifest-described plugin whose tracked project edits are
+/// still pending — a [`PendingStop`] block. `Display` is the block: one line
+/// naming the plugin, then one `  - ` line per pending item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPlugin {
+    /// The plugin's id.
+    pub plugin_id: String,
+    /// The package describing it.
+    pub package: String,
+    /// Its pending base contributions, in report order; never empty.
+    pub pending: Vec<PendingContribution>,
+}
+
+impl fmt::Display for PendingPlugin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "plugin {} ({}) is not wired into this project: {} change(s) pending. \
+             Run `frust plugin sync` and re-run.",
+            self.plugin_id,
+            self.package,
+            self.pending.len()
+        )?;
+        for item in &self.pending {
+            write!(f, "\n  - {}", item.describe())?;
+        }
+        Ok(())
+    }
+}
+
+/// A pending check [`pending_stop`] could not make; never a stop. `Display`
+/// is the whole warning line, `warning: ` included.
+#[derive(Debug)]
+pub enum PendingWarning {
+    /// Which plugins the app depends on could not be read.
+    Unchecked(PluginAddError),
+    /// One installed plugin's contributions could not be checked.
+    PluginUnchecked {
+        /// The plugin's id.
+        plugin_id: String,
+        /// Why.
+        error: PluginAddError,
+    },
+}
+
+impl fmt::Display for PendingWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unchecked(err) => write!(
+                f,
+                "warning: could not check the project's plugins for pending changes: {err}"
+            ),
+            Self::PluginUnchecked { plugin_id, error } => write!(
+                f,
+                "warning: could not check plugin `{plugin_id}` for pending changes: {error}"
+            ),
+        }
+    }
+}
+
+/// What [`pending_stop`] found. A native build stops when
+/// [`stops`](Self::stops); `Display` is then the message it stops with, the
+/// [`PendingPlugin`] blocks one after another (empty when nothing stops).
+#[derive(Debug, Default)]
+pub struct PendingStop {
+    /// Every installed manifest-described plugin with pending edits, in
+    /// catalog order.
+    pub plugins: Vec<PendingPlugin>,
+    /// Every check that could not be made, in the order tried.
+    pub warnings: Vec<PendingWarning>,
+}
+
+impl PendingStop {
+    /// Whether a native build must stop: some plugin has pending edits.
+    pub fn stops(&self) -> bool {
+        !self.plugins.is_empty()
+    }
+}
+
+impl fmt::Display for PendingStop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, plugin) in self.plugins.iter().enumerate() {
+            if index > 0 {
+                f.write_str("\n")?;
+            }
+            write!(f, "{plugin}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether `frust run`/`frust build` must stop before any build process: the
+/// manifest-described plugins of `catalog` the app at `project_root` depends
+/// on whose tracked project edits ([`pending_contributions`], base only) are
+/// still pending — `frust run`/`frust build` never edit a tracked file
+/// themselves; `frust plugin sync` does. Reads only. A check that fails is a
+/// [`PendingWarning`], never a stop; built-in plugins are not checked, and a
+/// catalog of built-ins alone reads nothing.
+pub fn pending_stop(project_root: &Path, catalog: &PluginCatalog) -> PendingStop {
+    let mut stop = PendingStop::default();
+    if catalog.iter().all(CatalogEntry::is_built_in) {
+        return stop;
+    }
+    let installed = match installed_plugin_ids(project_root, catalog) {
+        Ok(installed) => installed,
+        Err(err) => {
+            stop.warnings.push(PendingWarning::Unchecked(err));
+            return stop;
+        }
+    };
+    for entry in catalog
+        .iter()
+        .filter(|entry| !entry.is_built_in() && installed.contains(&*entry.spec.id))
+    {
+        match pending_contributions(project_root, entry, &[]) {
+            Ok(pending) if pending.is_empty() => {}
+            Ok(pending) => stop.plugins.push(PendingPlugin {
+                plugin_id: entry.spec.id.to_string(),
+                package: package_of(entry).to_string(),
+                pending,
+            }),
+            Err(error) => stop.warnings.push(PendingWarning::PluginUnchecked {
+                plugin_id: entry.spec.id.to_string(),
+                error,
+            }),
+        }
+    }
+    stop
 }
 
 #[cfg(test)]
@@ -987,5 +1200,173 @@ mod tests {
             "Android module `:frust-acme`: declared by plugins `acme-a` and `acme-b`; \
              `acme-a`'s is wired, `acme-b`'s is not"
         );
+    }
+
+    /// The text of every warning of `stop`.
+    fn warning_lines(stop: &PendingStop) -> Vec<String> {
+        stop.warnings.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn nothing_pending_does_not_stop() {
+        let root = temp_root("stop-none");
+        let app = scaffold_app(&root);
+        // Built-ins alone: nothing is read, not even the manifest.
+        let stop = pending_stop(&root.join("absent"), &PluginCatalog::built_in());
+        assert!(!stop.stops() && stop.warnings.is_empty(), "{stop:?}");
+
+        // A manifest plugin the app does not depend on is never checked.
+        let ble = plugin_entry(&root, "acme-ble", PACKAGE, None, MANIFEST);
+        let stop = pending_stop(&app, &catalog(vec![ble.clone()]));
+        assert!(!stop.stops() && stop.warnings.is_empty(), "{stop:?}");
+        assert_eq!(stop.to_string(), "");
+
+        // One the app depends on and carries in full does not stop either.
+        depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+        sync_plugins(&app, &catalog(vec![ble.clone()])).unwrap();
+        let stop = pending_stop(&app, &catalog(vec![ble]));
+        assert!(!stop.stops() && stop.warnings.is_empty(), "{stop:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn one_pending_plugin_stops_with_its_block() {
+        let root = temp_root("stop-one");
+        let app = scaffold_app(&root);
+        let ble = plugin_entry(&root, "acme-ble", PACKAGE, None, MANIFEST);
+        depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+        let stop = pending_stop(&app, &catalog(vec![ble]));
+        assert!(stop.stops());
+        assert!(stop.warnings.is_empty(), "{stop:?}");
+        assert_eq!(stop.plugins.len(), 1);
+        assert_eq!(stop.plugins[0].plugin_id, "acme-ble");
+        assert_eq!(stop.plugins[0].package, PACKAGE);
+        assert_eq!(
+            stop.to_string(),
+            "plugin acme-ble (frust-acme-ble) is not wired into this project: 4 change(s) \
+             pending. Run `frust plugin sync` and re-run.\n\
+             \x20 - Gradle module `:frust-acme-ble`\n\
+             \x20 - AndroidManifest.xml permission `android.permission.BLUETOOTH_CONNECT`\n\
+             \x20 - Xcode Swift package `FrustAcmeBle`\n\
+             \x20 - Info.plist key `NSBluetoothAlwaysUsageDescription`"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_pending_plugins_are_two_blocks_in_catalog_order() {
+        let root = temp_root("stop-two");
+        let app = scaffold_app(&root);
+        let ble = plugin_entry(&root, "acme-ble", PACKAGE, None, MANIFEST);
+        let push = plugin_entry(
+            &root,
+            "acme-push",
+            "frust-acme-push",
+            None,
+            ENTITLEMENT_MANIFEST,
+        );
+        depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+        depend(&app, "frust-acme-push = { path = \"../acme-push\" }");
+        let stop = pending_stop(&app, &catalog(vec![ble, push]));
+        assert!(stop.warnings.is_empty(), "{stop:?}");
+        let ids: Vec<&str> = stop.plugins.iter().map(|p| &*p.plugin_id).collect();
+        assert_eq!(ids, ["acme-ble", "acme-push"]);
+        let message = stop.to_string();
+        let heads: Vec<&str> = message
+            .lines()
+            .filter(|line| !line.starts_with("  - "))
+            .collect();
+        assert_eq!(
+            heads,
+            [
+                "plugin acme-ble (frust-acme-ble) is not wired into this project: 4 change(s) \
+                 pending. Run `frust plugin sync` and re-run.",
+                "plugin acme-push (frust-acme-push) is not wired into this project: 1 change(s) \
+                 pending. Run `frust plugin sync` and re-run.",
+            ]
+        );
+        assert_eq!(message.lines().count(), 7, "{message}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A check that fails is a warning, never a stop, and the other plugins
+    /// are still checked.
+    #[test]
+    fn a_failing_pending_check_is_a_warning() {
+        let root = temp_root("stop-fails");
+        let app = scaffold_app(&root);
+        let ble = plugin_entry(&root, "acme-ble", PACKAGE, None, MANIFEST);
+        let push = plugin_entry(
+            &root,
+            "acme-push",
+            "frust-acme-push",
+            None,
+            ENTITLEMENT_MANIFEST,
+        );
+        depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+        depend(&app, "frust-acme-push = { path = \"../acme-push\" }");
+        fs::remove_file(app.join(apply::MANIFEST_REL)).unwrap();
+        let stop = pending_stop(&app, &catalog(vec![ble.clone(), push]));
+        let ids: Vec<&str> = stop.plugins.iter().map(|p| &*p.plugin_id).collect();
+        assert_eq!(ids, ["acme-push"]);
+        let warnings = warning_lines(&stop);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .starts_with("warning: could not check plugin `acme-ble` for pending changes: "),
+            "{warnings:?}"
+        );
+
+        // An unreadable manifest leaves nothing checkable: one warning.
+        fs::remove_file(app.join("Cargo.toml")).unwrap();
+        let stop = pending_stop(&app, &catalog(vec![ble]));
+        assert!(!stop.stops());
+        let warnings = warning_lines(&stop);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with(
+                "warning: could not check the project's plugins for pending changes: "
+            ),
+            "{warnings:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn statuses_list_built_ins_then_discovered_by_id() {
+        let root = temp_root("statuses");
+        let app = scaffold_app(&root);
+        let ble = plugin_entry(&root, "acme-ble", PACKAGE, None, MANIFEST);
+        let push = plugin_entry(
+            &root,
+            "acme-push",
+            "frust-acme-push",
+            None,
+            ENTITLEMENT_MANIFEST,
+        );
+        depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+        let catalog = catalog(vec![push, ble]);
+        let statuses = plugin_statuses(&app, &catalog).unwrap();
+        assert_eq!(statuses.len(), catalog.iter().count());
+        let tail: Vec<(&str, String)> = statuses[statuses.len() - 2..]
+            .iter()
+            .map(|(entry, status)| (&*entry.spec.id, status.to_string()))
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                ("acme-ble", "4 pending".to_string()),
+                ("acme-push", String::new())
+            ]
+        );
+        assert!(
+            statuses[..statuses.len() - 2]
+                .iter()
+                .all(|(e, _)| e.is_built_in())
+        );
+        let installed = installed_plugin_ids(&app, &catalog).unwrap();
+        assert!(installed.contains("acme-ble"), "{installed:?}");
+        assert!(!installed.contains("acme-push"), "{installed:?}");
+        let _ = fs::remove_dir_all(&root);
     }
 }

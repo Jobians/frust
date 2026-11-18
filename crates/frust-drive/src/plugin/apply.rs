@@ -1043,9 +1043,10 @@ fn dep_renamed_package(value: &Item) -> Option<&str> {
 /// Whether the app `doc` describes depends on `entry`'s plugin: for a
 /// built-in, [`plugin_is_installed`]; for a manifest-described plugin, a
 /// non-optional entry on its package in `[dependencies]` or any
-/// `[target.<cfg>.dependencies]` table, by key or `package = …` — discovery
-/// found the package in the resolved graph, which a transitive dependency
-/// also puts there.
+/// `[target.<cfg>.dependencies]` table, by key or `package = …`. Discovery
+/// keeps only a package the app's root package reaches, preferring the
+/// root's direct normal dependency; whether the app itself declares that
+/// package is this check's to answer.
 pub(crate) fn entry_is_installed(entry: &CatalogEntry, doc: &DocumentMut) -> bool {
     match &entry.origin {
         PluginOrigin::BuiltIn => plugin_is_installed(&entry.spec, doc),

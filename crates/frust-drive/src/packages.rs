@@ -14,11 +14,18 @@
 //! `test` or the `test-util` feature) answers from a map, so a fixture test
 //! never spawns cargo against a fake project. [`locate`] and [`locate_many`]
 //! are the cargo-backed shorthand for a caller holding no runner.
+//!
+//! [`GraphLocator`] is the wider seam plugin discovery reads through: the
+//! whole resolved graph ([`PackageGraph`]) as well as package directories,
+//! both derived from one [`GraphMetadata`] document. A [`CachedLocator`] over
+//! a graph-reading locator keeps that document per project, so discovery and
+//! the wiring a build runs after it share one `cargo metadata` run.
 
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::facade_key;
 use crate::process::{ProcessRunner, RealProcessRunner};
@@ -135,6 +142,61 @@ pub trait PackageLocator {
             reason: format!("no directory came back for `{package}`"),
         })
     }
+
+    /// This locator as a [`GraphLocator`], when it reads the whole dependency
+    /// graph itself; `None` by default. [`CachedLocator::new`] asks, so a
+    /// cache over a graph-reading locator serves the graph and every
+    /// directory from one document.
+    fn as_graph_locator(&self) -> Option<&dyn GraphLocator> {
+        None
+    }
+}
+
+/// A [`PackageLocator`] that also reads the project's whole resolved
+/// dependency graph — the seam plugin discovery takes. Both answers derive
+/// from one [`GraphMetadata`] document, so an implementor provides only
+/// [`graph_metadata`](Self::graph_metadata).
+pub trait GraphLocator: PackageLocator {
+    /// The full-graph `cargo metadata` document of the Cargo project at
+    /// `project_dir`.
+    fn graph_metadata(&self, project_dir: &Path) -> Result<GraphMetadata, PackagesError>;
+
+    /// Every package of the resolved dependency graph of the project at
+    /// `project_dir`, read from [`graph_metadata`](Self::graph_metadata).
+    fn package_graph(&self, project_dir: &Path) -> Result<PackageGraph, PackagesError> {
+        self.graph_metadata(project_dir)?.package_graph()
+    }
+}
+
+/// One project's full-graph `cargo metadata --format-version 1` document, as
+/// cargo printed it: the read a package directory and the package graph are
+/// both answered from. Cheap to clone; the text is shared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphMetadata {
+    project_dir: PathBuf,
+    document: Arc<str>,
+}
+
+impl GraphMetadata {
+    /// The document `document` printed for the project at `project_dir`.
+    pub fn new(project_dir: impl Into<PathBuf>, document: impl Into<Arc<str>>) -> Self {
+        Self {
+            project_dir: project_dir.into(),
+            document: document.into(),
+        }
+    }
+
+    /// The directory of each of `packages`, in the order given — exactly the
+    /// answer [`CargoLocator`]'s [`locate_many`](PackageLocator::locate_many)
+    /// gives for this document, errors included.
+    pub fn locate_many(&self, packages: &[&str]) -> Result<Vec<PathBuf>, PackagesError> {
+        packages_from_metadata(&self.project_dir, &self.document, packages)
+    }
+
+    /// Every package of the document's resolved graph.
+    pub fn package_graph(&self) -> Result<PackageGraph, PackagesError> {
+        package_graph_from_metadata(&self.project_dir, &self.document)
+    }
 }
 
 /// How [`CargoLocator`] treats the project's `Cargo.lock`.
@@ -245,15 +307,6 @@ impl<'r> CargoLocator<'r> {
         let stdout = self.run_metadata(project_dir, MetadataScope::Members)?;
         root_dependencies_from_metadata(project_dir, &stdout)
     }
-
-    /// Every package of the resolved dependency graph of the project at
-    /// `project_dir`, from the same `cargo metadata` run (argv, lockfile
-    /// policy and runner) that [`locate_many`](PackageLocator::locate_many)
-    /// makes.
-    pub(crate) fn package_graph(&self, project_dir: &Path) -> Result<PackageGraph, PackagesError> {
-        let stdout = self.run_metadata(project_dir, MetadataScope::Graph)?;
-        package_graph_from_metadata(project_dir, &stdout)
-    }
 }
 
 /// How much of the project a `cargo metadata` run reads.
@@ -271,8 +324,21 @@ impl PackageLocator for CargoLocator<'_> {
         project_dir: &Path,
         packages: &[&str],
     ) -> Result<Vec<PathBuf>, PackagesError> {
+        self.graph_metadata(project_dir)?.locate_many(packages)
+    }
+
+    fn as_graph_locator(&self) -> Option<&dyn GraphLocator> {
+        Some(self)
+    }
+}
+
+/// The package graph comes from the same `cargo metadata` run (argv,
+/// lockfile policy and runner) that [`locate_many`](PackageLocator::locate_many)
+/// makes.
+impl GraphLocator for CargoLocator<'_> {
+    fn graph_metadata(&self, project_dir: &Path) -> Result<GraphMetadata, PackagesError> {
         let stdout = self.run_metadata(project_dir, MetadataScope::Graph)?;
-        packages_from_metadata(project_dir, &stdout, packages)
+        Ok(GraphMetadata::new(project_dir, stdout))
     }
 }
 
@@ -439,9 +505,9 @@ pub(crate) fn packages_from_metadata(
 }
 
 /// One `packages[]` entry of a full-graph `cargo metadata` document, with
-/// the fields plugin discovery reads.
+/// the fields plugin discovery reads. Opaque outside this crate.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct GraphPackage {
+pub struct GraphPackage {
     /// The package name.
     pub(crate) name: String,
     /// The resolved version.
@@ -465,9 +531,11 @@ impl GraphPackage {
 }
 
 /// Every package of a resolved dependency graph, with the project's own root
-/// package marked and, when cargo resolved the graph, what the root reaches.
+/// package marked and, when cargo resolved the graph, what the root reaches —
+/// what [`GraphLocator::package_graph`] answers and plugin discovery reads.
+/// Opaque outside this crate.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PackageGraph {
+pub struct PackageGraph {
     /// The packages, in the order cargo listed them.
     pub(crate) packages: Vec<GraphPackage>,
     /// The index in `packages` of the project's root package: the one whose
@@ -512,7 +580,7 @@ impl PackageGraph {
 }
 
 /// Reads every package out of a `cargo metadata --format-version 1`
-/// document. Split from [`CargoLocator::package_graph`] so the parse is
+/// document. Split from [`GraphMetadata::package_graph`] so the parse is
 /// tested against canned JSON rather than a cargo run.
 pub(crate) fn package_graph_from_metadata(
     project_dir: &Path,
@@ -711,12 +779,21 @@ pub fn describe_frust_dependency(project_dir: &Path) -> String {
     declared.unwrap_or_else(|| "absent — its `[dependencies]` has no `frust` entry".to_string())
 }
 
-/// Wraps another locator and remembers each `(project, package)` answer —
-/// errors included — for its own lifetime, so one pipeline run that needs
-/// the same location from several places spawns cargo once.
+/// Wraps another locator and remembers its answers — errors included, as the
+/// same typed [`PackagesError`] — for its own lifetime, so one pipeline run
+/// that needs the same location from several places spawns cargo once.
+///
+/// Over a graph-reading locator ([`PackageLocator::as_graph_locator`], e.g.
+/// [`CargoLocator`]) it keeps one [`GraphMetadata`] document per project and
+/// answers both [`GraphLocator::package_graph`] and every
+/// [`locate_many`](PackageLocator::locate_many) from it: discovery and the
+/// wiring share one `cargo metadata` run. Over any other locator it
+/// remembers each `(project, package)` answer, and has no package graph.
 pub struct CachedLocator<'a> {
     inner: &'a dyn PackageLocator,
     answers: RefCell<HashMap<(PathBuf, String), Result<PathBuf, PackagesError>>>,
+    documents: RefCell<HashMap<PathBuf, Result<GraphMetadata, PackagesError>>>,
+    graphs: RefCell<HashMap<PathBuf, Result<PackageGraph, PackagesError>>>,
 }
 
 impl<'a> CachedLocator<'a> {
@@ -724,7 +801,25 @@ impl<'a> CachedLocator<'a> {
         Self {
             inner,
             answers: RefCell::new(HashMap::new()),
+            documents: RefCell::new(HashMap::new()),
+            graphs: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// The remembered document of `project_dir`, read through `graph` once.
+    fn document(
+        &self,
+        graph: &dyn GraphLocator,
+        project_dir: &Path,
+    ) -> Result<GraphMetadata, PackagesError> {
+        if let Some(answer) = self.documents.borrow().get(project_dir) {
+            return answer.clone();
+        }
+        let answer = graph.graph_metadata(project_dir);
+        self.documents
+            .borrow_mut()
+            .insert(project_dir.to_path_buf(), answer.clone());
+        answer
     }
 }
 
@@ -734,6 +829,9 @@ impl PackageLocator for CachedLocator<'_> {
         project_dir: &Path,
         packages: &[&str],
     ) -> Result<Vec<PathBuf>, PackagesError> {
+        if let Some(graph) = self.inner.as_graph_locator() {
+            return self.document(graph, project_dir)?.locate_many(packages);
+        }
         let key = |package: &str| (project_dir.to_path_buf(), package.to_string());
         let unanswered: Vec<&str> = {
             let answers = self.answers.borrow();
@@ -771,6 +869,39 @@ impl PackageLocator for CachedLocator<'_> {
                 })
             })
             .collect()
+    }
+
+    fn as_graph_locator(&self) -> Option<&dyn GraphLocator> {
+        self.inner
+            .as_graph_locator()
+            .map(|_| self as &dyn GraphLocator)
+    }
+}
+
+/// Over a locator that reads no graph, every read fails with
+/// [`PackagesError::MetadataUnreadable`] naming why.
+impl GraphLocator for CachedLocator<'_> {
+    fn graph_metadata(&self, project_dir: &Path) -> Result<GraphMetadata, PackagesError> {
+        match self.inner.as_graph_locator() {
+            Some(graph) => self.document(graph, project_dir),
+            None => Err(PackagesError::MetadataUnreadable {
+                project_dir: project_dir.to_path_buf(),
+                reason: "the cached locator wraps one that reads no dependency graph".to_string(),
+            }),
+        }
+    }
+
+    fn package_graph(&self, project_dir: &Path) -> Result<PackageGraph, PackagesError> {
+        if let Some(answer) = self.graphs.borrow().get(project_dir) {
+            return answer.clone();
+        }
+        let answer = self
+            .graph_metadata(project_dir)
+            .and_then(|document| document.package_graph());
+        self.graphs
+            .borrow_mut()
+            .insert(project_dir.to_path_buf(), answer.clone());
+        answer
     }
 }
 
@@ -1436,6 +1567,152 @@ mod tests {
         assert!(cached.locate(&project, "frust-camera").is_err());
         assert!(cached.locate(&project, "frust-camera").is_err());
         assert_eq!(stub.calls(), 2);
+        assert!(cached.as_graph_locator().is_none());
+        assert!(matches!(
+            cached.package_graph(&project),
+            Err(PackagesError::MetadataUnreadable { .. })
+        ));
+        assert_eq!(stub.calls(), 2);
+        let _ = fs::remove_dir_all(&project);
+    }
+
+    /// A [`FakeProcessRunner`] counting the `run` calls that reach it.
+    struct Counting {
+        inner: FakeProcessRunner,
+        runs: std::cell::Cell<usize>,
+    }
+
+    impl Counting {
+        fn new(inner: FakeProcessRunner) -> Self {
+            Self {
+                inner,
+                runs: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl ProcessRunner for Counting {
+        fn run(&self, cmd: &str, args: &[&str]) -> anyhow::Result<Output> {
+            self.runs.set(self.runs.get() + 1);
+            self.inner.run(cmd, args)
+        }
+
+        fn run_streaming(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: Option<&Path>,
+            env: &[(&str, &str)],
+            on_line: &mut dyn FnMut(&str),
+        ) -> anyhow::Result<Output> {
+            self.inner.run_streaming(cmd, args, cwd, env, on_line)
+        }
+
+        fn spawn_streaming(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            cwd: Option<&Path>,
+            env: &[(&str, &str)],
+        ) -> anyhow::Result<crate::process::StreamHandle> {
+            self.inner.spawn_streaming(cmd, args, cwd, env)
+        }
+    }
+
+    /// Over a [`CargoLocator`], the graph and every package directory of one
+    /// project come from a single `cargo metadata` run, answered exactly as
+    /// the uncached locator answers.
+    #[test]
+    fn the_cache_serves_the_graph_and_directories_from_one_metadata_run() {
+        let project = project_with("cache-graph", "[package]\nname = \"app\"\n");
+        let runner =
+            Counting::new(FakeProcessRunner::new().with(metadata_key(&project), ok(METADATA)));
+        let cargo = CargoLocator::new(&runner);
+        let cached = CachedLocator::new(&cargo);
+        assert!(cached.as_graph_locator().is_some());
+
+        let graph = cached.package_graph(&project).unwrap();
+        assert_eq!(graph.packages.len(), 3);
+        assert_eq!(
+            cached
+                .locate_many(&project, &["frust-iap", "frust-ui"])
+                .unwrap(),
+            [
+                PathBuf::from("/work/frust/plugins/iap"),
+                PathBuf::from("/work/frust/crates/frust")
+            ]
+        );
+        assert!(matches!(
+            cached.locate(&project, "frust-camera"),
+            Err(PackagesError::PackageAbsent { .. })
+        ));
+        assert_eq!(cached.package_graph(&project).unwrap(), graph);
+        assert_eq!(runner.runs.get(), 1);
+
+        // The uncached locator gives the same answers, one run each.
+        assert_eq!(cargo.package_graph(&project).unwrap(), graph);
+        assert_eq!(
+            cargo.locate(&project, "frust-iap").unwrap(),
+            PathBuf::from("/work/frust/plugins/iap")
+        );
+        assert_eq!(runner.runs.get(), 3);
+        let _ = fs::remove_dir_all(&project);
+    }
+
+    /// A failed run is remembered as the same typed error, for the graph and
+    /// for a directory alike, and cargo is not asked again.
+    #[test]
+    fn the_cache_returns_the_same_typed_error_for_a_failed_run() {
+        let project = project_with("cache-fails", "[package]\nname = \"app\"\n");
+        let runner = Counting::new(FakeProcessRunner::new().with(
+            metadata_key(&project),
+            Output {
+                success: false,
+                stdout: String::new(),
+                stderr: "error: failed to download from the index".to_string(),
+            },
+        ));
+        let cargo = CargoLocator::new(&runner);
+        let cached = CachedLocator::new(&cargo);
+        let first = cached.package_graph(&project).unwrap_err();
+        assert!(
+            matches!(&first, PackagesError::MetadataFailed { stderr, .. } if stderr.contains("failed to download")),
+            "{first:?}"
+        );
+        assert_eq!(cached.package_graph(&project).unwrap_err(), first);
+        assert_eq!(cached.locate(&project, "frust-ui").unwrap_err(), first);
+        assert_eq!(runner.runs.get(), 1);
+        let _ = fs::remove_dir_all(&project);
+    }
+
+    /// The document answers `Ambiguous` exactly as the uncached parse does.
+    #[test]
+    fn the_cached_document_keeps_the_ambiguity_error() {
+        let project = project_with("cache-ambiguous", "[package]\nname = \"app\"\n");
+        let twice = METADATA.replacen(
+            r#""packages": ["#,
+            r#""packages": [
+            {
+                "name": "frust-iap",
+                "version": "0.4.0",
+                "id": "path+file:///old/plugins/iap#frust-iap@0.4.0",
+                "source": null,
+                "manifest_path": "/old/plugins/iap/Cargo.toml"
+            },"#,
+            1,
+        );
+        let runner =
+            Counting::new(FakeProcessRunner::new().with(metadata_key(&project), ok(&twice)));
+        let cargo = CargoLocator::new(&runner);
+        let cached = CachedLocator::new(&cargo);
+        let expected = packages_from_metadata(&project, &twice, &["frust-iap"]).unwrap_err();
+        assert!(
+            matches!(expected, PackagesError::Ambiguous { .. }),
+            "{expected:?}"
+        );
+        assert_eq!(cached.locate(&project, "frust-iap").unwrap_err(), expected);
+        assert!(cached.package_graph(&project).is_ok());
+        assert_eq!(runner.runs.get(), 1);
         let _ = fs::remove_dir_all(&project);
     }
 

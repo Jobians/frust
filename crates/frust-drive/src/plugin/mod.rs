@@ -37,10 +37,11 @@
 //! static in-crate registry ([`PluginCatalog::built_in`], [`known_plugins`])
 //! and can carry plugins described at run time beside it, each entry tagged
 //! with its [`PluginOrigin`]. [`discover`] finds the plugins a package
-//! describes in its own manifest metadata; [`add_plugin_from`] applies one,
+//! describes in its own manifest metadata and [`project_catalog`] assembles
+//! a project's catalog from them; [`add_plugin_from`] applies one,
 //! [`pending_contributions`] says which of its tracked edits are still
-//! missing, and [`sync_plugins`] applies every discovered plugin the app
-//! depends on.
+//! missing, [`pending_stop`] whether a native build must stop for them, and
+//! [`sync_plugins`] applies every discovered plugin the app depends on.
 //! Every mutation is format-preserving and never rewrites a file it can't
 //! parse; this module is **print-free** like every other drive core — the
 //! front-end (CLI/TUI) owns all output (see `docs/CODE_STANDARDS.md`).
@@ -55,10 +56,15 @@ pub use apply::{
     DesktopContribution, add_plugin, add_plugin_from, add_plugin_from_with, add_plugin_with,
     desktop_contributions, desktop_contributions_in, is_installed,
 };
-pub use catalog::{CatalogEntry, DepSource, PluginCatalog, PluginOrigin};
+pub use catalog::{
+    CatalogEntry, CatalogWarning, DepSource, PluginCatalog, PluginOrigin, ProjectCatalog,
+    project_catalog, project_catalog_or_built_in,
+};
 pub use manifest::{Discovery, ManifestError, discover};
 pub use pending::{
-    ModuleCollision, PendingContribution, SyncReport, pending_contributions, sync_plugins,
+    ModuleCollision, PendingContribution, PendingPlugin, PendingStop, PendingWarning, PluginStatus,
+    SyncReport, installed_plugin_ids, pending_contributions, pending_stop, plugin_statuses,
+    sync_plugins,
 };
 pub use registry::known_plugins;
 

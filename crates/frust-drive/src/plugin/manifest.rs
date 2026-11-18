@@ -33,7 +33,7 @@ use serde_json::Value;
 
 use super::catalog::{CatalogEntry, DepSource, PluginOrigin};
 use super::{Contribution, FeatureSpec, IosEntitlementValue, PluginSpec};
-use crate::packages::{CargoLocator, GraphPackage, PackageGraph, PackagesError};
+use crate::packages::{GraphLocator, GraphPackage, PackageGraph, PackagesError};
 
 /// The table a package describes itself as a plugin in.
 const ROOT_KEY: &str = "package.metadata.frust.plugin";
@@ -82,7 +82,7 @@ pub struct Discovery {
 /// module's `rel_path` is relative to the package directory.
 pub fn discover(
     project_dir: &Path,
-    locator: &CargoLocator<'_>,
+    locator: &dyn GraphLocator,
 ) -> Result<Discovery, PackagesError> {
     Ok(discover_in(&locator.package_graph(project_dir)?))
 }
@@ -698,6 +698,7 @@ fn owned_list(items: Vec<String>) -> Cow<'static, [Cow<'static, str>]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packages::CargoLocator;
     use crate::process::{FakeProcessRunner, Output};
     use std::fs;
     use std::path::PathBuf;
