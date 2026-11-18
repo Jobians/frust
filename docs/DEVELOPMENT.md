@@ -447,7 +447,7 @@ touching it. The pin rows themselves — pin, rationale, tripwire — live with 
 | `muda`, `windows-sys` (desktop shells' native menu-bar/Win32 bindings; `objc2-app-kit` rides the objc2 pin family above); web shell tier: `wasm-bindgen` (=0.2.128 exact — must equal the host `wasm-bindgen-cli`), `wasm-bindgen-futures`, `js-sys`/`web-sys`, `web-time` (every crate in the web graph, not only the shell), `console_log`, `console_error_panic_hook`, `wasm-bindgen-test` (=0.3.78 exact — crate-local, bumps in lockstep with `wasm-bindgen`) | [SHELLS_DEVELOPMENT.md](SHELLS_DEVELOPMENT.md) |
 | `notify`, `rmcp`, `axum`, `base64`, `tokio-util`, `icns`, the hot-patch builder's `object`/`ar`/`gimli`/`rustc-demangle`/`pdb` (+ `cargo-packager`/`winresource`, external-tool/template-side, not `[workspace.dependencies]`) | [CLI_DEVELOPMENT.md](CLI_DEVELOPMENT.md) |
 | `ratatui`/`crossterm`/`ansi-to-tui`, `toml_edit` | [TUI_DEVELOPMENT.md](TUI_DEVELOPMENT.md) |
-| The Rust toolchain itself (`rust-toolchain.toml`: stable 1.98.1 with `rustfmt` + `clippy`) | this section, rule below |
+| The Rust toolchain itself (`rust-toolchain.toml`: stable 1.100.0 with `rustfmt` + `clippy`) | this section, rule below |
 
 The rules below bind every pin, wherever its row lives:
 
