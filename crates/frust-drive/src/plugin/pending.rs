@@ -1123,8 +1123,8 @@ mod tests {
         for covered in [
             "/ios/AcmeLink",
             "ios/AcmeLink",
-            "/ios/AcmeLink/",
-            "ios/AcmeLink/",
+            "/ios/AcmeLink  ",
+            "/ios/AcmeLink\r",
         ] {
             let root = temp_root("gitignore-covered");
             let app = scaffold_app(&root);
@@ -1136,6 +1136,35 @@ mod tests {
             assert_eq!(gitignore_rows(&app, &entry), Vec::<String>::new());
             sync_plugins(&app, &catalog(vec![entry])).unwrap();
             assert_eq!(read(&app, ".gitignore"), text, "{covered}");
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// The link is a symlink: git applies a trailing-slash line to
+    /// directories only and keeps leading whitespace in the pattern, so
+    /// neither form ignores it and the line is still appended.
+    #[test]
+    fn a_line_git_would_not_apply_to_the_link_does_not_cover_it() {
+        for uncovered in [
+            "/ios/AcmeLink/",
+            "ios/AcmeLink/",
+            "  /ios/AcmeLink",
+            "/ios/AcmeLink\t",
+        ] {
+            let root = temp_root("gitignore-uncovered");
+            let app = scaffold_app(&root);
+            let entry = link_entry(&root);
+            depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+            let text = format!("/target\n{uncovered}\n");
+            fs::write(app.join(".gitignore"), &text).unwrap();
+
+            assert_eq!(gitignore_rows(&app, &entry).len(), 1, "{uncovered:?}");
+            sync_plugins(&app, &catalog(vec![entry])).unwrap();
+            assert_eq!(
+                read(&app, ".gitignore"),
+                format!("{text}/ios/AcmeLink\n"),
+                "{uncovered:?}"
+            );
             let _ = fs::remove_dir_all(&root);
         }
     }

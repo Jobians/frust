@@ -2235,20 +2235,24 @@ fn apply_swift_package_ref(
 pub(super) const GITIGNORE_REL: &str = ".gitignore";
 
 /// Whether ignore-file text `src` already covers the `ios/<package_name>`
-/// link: a line equal to `/ios/<package_name>`, `ios/<package_name>`, either
-/// with a trailing slash, or `/ios/Frust*` for a package named `Frust...`.
-/// No general pattern matching.
+/// link: a line equal to `/ios/<package_name>` or `ios/<package_name>`, or
+/// `/ios/Frust*` for a package named `Frust...`. No general pattern matching.
+///
+/// The link is a symlink, so a line is read the way git reads it for a
+/// non-directory entry: a trailing-slash form matches directories only and
+/// does not count, leading whitespace is part of the pattern and does not
+/// count, and only trailing spaces (and a CRLF line ending) are dropped.
 pub(super) fn gitignore_covers_ios_link(src: &str, package_name: &str) -> bool {
     let exact = [
         format!("/ios/{package_name}"),
         format!("ios/{package_name}"),
-        format!("/ios/{package_name}/"),
-        format!("ios/{package_name}/"),
     ];
-    src.lines().map(str::trim).any(|line| {
-        exact.iter().any(|e| e == line)
-            || (package_name.starts_with("Frust") && line == "/ios/Frust*")
-    })
+    src.lines()
+        .map(|line| line.trim_end_matches(' '))
+        .any(|line| {
+            exact.iter().any(|e| e == line)
+                || (package_name.starts_with("Frust") && line == "/ios/Frust*")
+        })
 }
 
 /// Whether the app's root `.gitignore` exists and lacks an entry for the
