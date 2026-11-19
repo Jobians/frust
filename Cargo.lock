@@ -2215,6 +2215,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "frust-charts"
+version = "0.6.6"
+dependencies = [
+ "frust-core",
+ "frust-reactive",
+ "frust-ui",
+ "frust-widgets",
+]
+
+[[package]]
 name = "frust-cli"
 version = "0.6.6"
 dependencies = [
