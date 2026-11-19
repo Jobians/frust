@@ -153,3 +153,12 @@ fn press_detail_types_resolve_through_the_facade() {
         .on_tap_up(|_: &mut (), _: frust::TapUpDetails| {})
         .on_tap_cancel(|_: &mut ()| {});
 }
+
+/// A plugin asks for a repaint and binds a signal to one through `frust::authoring` alone.
+#[test]
+fn repaint_request_and_bridge_resolve_through_the_facade() {
+    let _request: fn() = frust::authoring::request_repaint;
+    let _bridge: fn(fn() -> u32) -> frust::authoring::RepaintBinding =
+        frust::authoring::repaint_on::<u32>;
+    let _flat: fn() = frust::request_repaint;
+}
