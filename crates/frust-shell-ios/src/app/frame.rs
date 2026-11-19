@@ -45,6 +45,13 @@ impl IosAppHandle {
     /// startup span is recorded render-side inside
     /// [`render_scene`](super::render_scene) (the render thread is the single perf
     /// emitter), so this method no longer returns anything.
+    ///
+    /// A Run whose only cause is a repaint request
+    /// ([`FrameInputs::is_repaint_only_frame`], with the last layout still
+    /// current) is a paint-only frame: no rebuild, no change-flag drain, no
+    /// layout, and semantics published after paint rather than before. The
+    /// AppTree-level model of that path is host-tested in `frust-shell-common`'s
+    /// `app_tree` tests (this module is never host-compiled).
     pub(crate) fn frame(&mut self, timestamp_ns: u64) {
         // Pump the UI-thread reactive local-task queue BEFORE the ready/paused
         // gate below: placed after it, queued `spawn_local` completions (e.g. a
@@ -255,8 +262,13 @@ impl IosAppHandle {
             a11y_action_performed,
             // Driven by the gate's own warmup countdown (`note_resumed`).
             resumed_recently: false,
-            // Not gathered yet; the shells start honouring it in a later change.
-            repaint_owed: false,
+            // A `frust_core::request_repaint` landed since the tree's last paint.
+            // A non-draining peek: only paint clears it, so a skipped tick
+            // leaves it for the next. No wake hook is installed here — the
+            // display link ticks every vsync while active, and a request made
+            // while paused is read by the first tick after resume. Mirrors the
+            // Android shell.
+            repaint_owed: self.app.repaint_pending(),
         };
         // The events latch has now been read into this frame's decision; reset it
         // so the next frame only sees events that arrive from here on. Clearing
@@ -330,6 +342,29 @@ impl IosAppHandle {
         // shell's commit site seam-for-seam.
         self.last_focus_ime_gen = focus_ime_gen;
 
+        // Drain the repaint debt now that the frame is committed to run (never
+        // before a possible Skip), re-arming the request's wake edge. The
+        // frame's own repaint decision reads `repaint_owed`, gathered above.
+        frust_core::take_repaint_owed();
+
+        // Sanitize once per frame; layout and the paint transform below MUST
+        // consume this identical value (an untrusted `f32` scale from the FFI
+        // boundary must never let the two passes disagree — see `sanitize_scale`).
+        let scale = sanitize_scale(self.scale);
+        // The surface (re)install or a new size/scale owes this frame a layout;
+        // read from shell fields the rebuild never touches.
+        let force_layout = surface_reinstalled || self.laid_out_for != Some((self.physical, scale));
+
+        // A paint-only frame: a repaint request is this frame's sole cause, so
+        // it paints without rebuild or layout. Decided from the SAME inputs the
+        // gate just saw. Skipping the rebuild is safe only then — every debt a
+        // rebuild settles (dirty signals, events, a deferred result flush,
+        // pending change flags, a focus/IME edge, last paint's frame request)
+        // is an input that vetoes it — and only while the last layout is
+        // current: a surface change, a resize or the first layout still owes
+        // the pass. Mirrors the Android shell.
+        let repaint_only = inputs.is_repaint_only_frame() && !force_layout;
+
         // Perf instrumentation: read the cached
         // switch exactly once per frame and gate every `Instant::now()` read
         // below behind it — a disabled build takes zero clock reads on this
@@ -382,14 +417,21 @@ impl IosAppHandle {
         // captures only what the rebuild needs, not all of `self`. Degrade
         // gracefully to an unwrapped rebuild if the runtime is somehow absent —
         // the frame path must never panic across the C-ABI boundary.
+        //
+        // A paint-only frame skips the rebuild and so does not re-track the
+        // scope. That is correct: its subscriptions and dirty flag are left as
+        // the last rebuild set them, so a later signal write still sets
+        // `signals_dirty` and forces a normal frame.
         let rebuild_start = perf_on.then(Instant::now);
-        match ReactiveRuntime::get() {
-            Some(rt) => {
-                let scope = &self.scope;
-                let app = &mut self.app;
-                rt.with_owner(|| scope.track(|| app.rebuild()));
+        if !repaint_only {
+            match ReactiveRuntime::get() {
+                Some(rt) => {
+                    let scope = &self.scope;
+                    let app = &mut self.app;
+                    rt.with_owner(|| scope.track(|| app.rebuild()));
+                }
+                None => self.app.rebuild(),
             }
-            None => self.app.rebuild(),
         }
         let rebuild = rebuild_start.map(|t| t.elapsed()).unwrap_or_default();
 
@@ -402,9 +444,12 @@ impl IosAppHandle {
         // it — that asymmetry is the camera keep-alive contract. Mirrors the
         // Android shell's placement exactly; the resulting batch is a lifecycle
         // command, deliberately NOT paired with a frame (like `suspend_all`), so
-        // the present-sync release gate never holds it.
-        for slot_id in self.app.take_retired_platform_views() {
-            self.platform_views.retire(slot_id);
+        // the present-sync release gate never holds it. A paint-only frame ran
+        // no rebuild, so it has nothing to retire.
+        if !repaint_only {
+            for slot_id in self.app.take_retired_platform_views() {
+                self.platform_views.retire(slot_id);
+            }
         }
 
         // Change-flag DRAIN — the fix for "the iOS frame
@@ -427,15 +472,14 @@ impl IosAppHandle {
         // Anything that marks flags between frames (`set_theme`, `set_insets`,
         // `set_surface_translucent`, a rebuild) still forces the next frame to
         // run and to relayout.
-        let needs_layout = self.app.take_change_flags().needs_layout();
+        //
+        // A paint-only frame drains nothing (pending flags veto it) and runs no
+        // layout: `repaint_only` already excludes `force_layout`, so the layout
+        // condition below is false for it.
+        let needs_layout = !repaint_only && self.app.take_change_flags().needs_layout();
 
-        // Sanitize once per frame; layout and the paint transform below MUST
-        // consume this identical value (an untrusted `f32` scale from the FFI
-        // boundary must never let the two passes disagree — see `sanitize_scale`).
-        let scale = sanitize_scale(self.scale);
         let (lw, lh) = logical_size(self.physical.0, self.physical.1, scale);
         let logical = Size::new(lw, lh);
-        let force_layout = surface_reinstalled || self.laid_out_for != Some((self.physical, scale));
         let layout_start = perf_on.then(Instant::now);
         if needs_layout || force_layout {
             if self.laid_out_for.is_none() {
@@ -454,8 +498,12 @@ impl IosAppHandle {
         // post-layout geometry), generation-gated so an unchanged tree
         // is never re-walked or re-pushed (see [`Self::publish_semantics`]).
         // Not folded into either pass's timing above/below — it is a11y-conditional
-        // work orthogonal to the rebuild/layout/paint/encode split.
-        self.publish_semantics();
+        // work orthogonal to the rebuild/layout/paint/encode split. A paint-only
+        // frame publishes after paint instead (below), matching the desktop
+        // shell.
+        if !repaint_only {
+            self.publish_semantics();
+        }
 
         // Push the render side's presented-frame count so a widget measuring FPS
         // reports the presented rate, not its `CADisplayLink` paint cadence.
@@ -474,6 +522,10 @@ impl IosAppHandle {
             self.app.set_retained_ledger(&ledger);
         }
 
+        // A paint honouring a repaint request bumps the semantics generation
+        // (`RenderRoot::paint`), after the publication above on a normal frame.
+        // Recorded so the frame can publish again once paint returns.
+        let semantics_before_paint = self.app.semantics_generation();
         self.scene.reset();
         let paint_outcome = {
             let mut builder = SceneBuilder::new(&mut self.scene);
@@ -489,6 +541,16 @@ impl IosAppHandle {
             outcome
         };
         let paint = paint_start.map(|t| t.elapsed()).unwrap_or_default();
+
+        // Publish after paint whenever paint moved the semantics generation:
+        // always on a paint-only frame (it skipped the post-layout publish), and
+        // on a normal frame a repaint request was also pending for. Without this
+        // the published tree would keep this frame's stale values until some
+        // later frame happens to run, since an idle screen produces none.
+        // Outside the paint span, like the post-layout publish.
+        if self.app.semantics_generation() != semantics_before_paint {
+            self.publish_semantics();
+        }
 
         // Platform-view differ ingest: feed this RUN
         // frame's published frames into the command backlog

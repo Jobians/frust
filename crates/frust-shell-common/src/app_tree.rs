@@ -55,6 +55,23 @@ pub trait AppTree {
     /// [`AppTree::take_change_flags`].
     fn has_pending_change_flags(&self) -> bool;
 
+    /// Non-draining peek at whether a [`frust_core::request_repaint`] landed
+    /// since this tree's last paint (delegates to
+    /// [`RenderRoot::repaint_pending`]).
+    ///
+    /// The frame gate reads this as its `repaint_owed` [`crate::FrameInputs`]
+    /// entry *before* deciding, the same peek contract as
+    /// [`AppTree::has_pending_change_flags`]: only [`AppTree::paint`] clears
+    /// it, so a frame the gate skips leaves it set for the next tick. When it
+    /// is the frame's only cause
+    /// ([`FrameInputs::is_repaint_only_frame`](crate::FrameInputs::is_repaint_only_frame)),
+    /// a shell paints without [`AppTree::rebuild`] or [`AppTree::layout`].
+    ///
+    /// Deliberately **not** defaulted: the mobile shells install no repaint
+    /// wake and rely on this peek each tick, so a constant `false` would strand
+    /// every request.
+    fn repaint_pending(&self) -> bool;
+
     /// Whether a captured pointer gesture is currently in flight (delegates to
     /// [`RenderRoot::is_pointer_captured`]).
     ///
@@ -453,6 +470,10 @@ where
         self.root.has_pending_change_flags()
     }
 
+    fn repaint_pending(&self) -> bool {
+        self.root.repaint_pending()
+    }
+
     fn is_pointer_captured(&self) -> bool {
         self.root.is_pointer_captured()
     }
@@ -670,6 +691,9 @@ mod tests {
             unimplemented!()
         }
         fn has_pending_change_flags(&self) -> bool {
+            unimplemented!()
+        }
+        fn repaint_pending(&self) -> bool {
             unimplemented!()
         }
         fn is_pointer_captured(&self) -> bool {
@@ -1348,6 +1372,338 @@ mod tests {
             !rt.take_signals_dirty(),
             "without the scope.track wrap the read subscribes nothing, so the \
              write trips no signals_dirty — the device-only stuck-on-loading stall"
+        );
+    }
+
+    // --- Mobile paint-only frame (repaint request) ---------------------------
+    //
+    // The Android and iOS frame functions decide a paint-only frame the same
+    // way: gather `repaint_owed` from `AppTree::repaint_pending` before the
+    // gate decides, drain `take_repaint_owed` once the frame runs, then skip
+    // rebuild, the change-flag drain and layout when
+    // `FrameInputs::is_repaint_only_frame` holds and the last layout is
+    // current, and publish semantics after paint whenever paint moved the
+    // semantics generation. Their `app` modules are target-gated and never
+    // host-compiled, so `MobileFrames` below drives that exact sequence over
+    // the shared `AppTree` seam with a real `RenderRoot` and `FrameGate`. The
+    // shells' own gather sites (their handle latches) are what stays untested
+    // here; the mobile compile gates check that wiring.
+
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    use crate::{FrameGate, FrameInputs, FramePacing};
+
+    /// The repaint generation is process-wide: the tests that request one take
+    /// turns, so one test's request never lands inside another's frame.
+    static REPAINT_SLOT: Mutex<()> = Mutex::new(());
+
+    fn hold_repaint_slot() -> MutexGuard<'static, ()> {
+        REPAINT_SLOT.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A leaf counting its paints.
+    struct PaintCountWidget {
+        paints: Rc<Cell<u32>>,
+    }
+    impl Widget for PaintCountWidget {
+        fn layout(&mut self, _ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
+            bc.constrain(Size::new(10.0, 10.0))
+        }
+        fn paint(&mut self, _ctx: &mut PaintCtx, _scene: &mut dyn PaintScene) {
+            self.paints.set(self.paints.get() + 1);
+        }
+    }
+
+    struct PaintCountView {
+        paints: Rc<Cell<u32>>,
+    }
+    impl View<()> for PaintCountView {
+        type Element = PaintCountWidget;
+        fn build(&self, _ctx: &mut BuildCtx<'_>) -> PaintCountWidget {
+            PaintCountWidget {
+                paints: self.paints.clone(),
+            }
+        }
+        fn rebuild(
+            &self,
+            _prev: &Self,
+            _element: &mut PaintCountWidget,
+            _ctx: &mut BuildCtx<'_>,
+        ) -> ChangeFlags {
+            ChangeFlags::NONE
+        }
+    }
+
+    /// What one running frame did.
+    #[derive(Debug, Clone, Copy)]
+    struct FrameRun {
+        /// The frame took the paint-only path.
+        repaint_only: bool,
+        /// The build closure ran.
+        built: bool,
+        /// Layout ran.
+        laid_out: bool,
+        /// The tree's widget painted.
+        painted: bool,
+        /// Semantics were published again after paint.
+        published_after_paint: bool,
+    }
+
+    /// The mobile frame sequence over the `AppTree` seam: the handle-side
+    /// state a shell keeps, reduced to what the paint-only decision reads.
+    struct MobileFrames {
+        app: Box<dyn AppTree>,
+        gate: FrameGate,
+        builds: Rc<Cell<u32>>,
+        paints: Rc<Cell<u32>>,
+        /// Whether the last layout is current (Android: `first_layout_done`
+        /// and no surface change; iOS: `laid_out_for` matches the surface).
+        layout_current: bool,
+        last_needs_frame: bool,
+        last_needs_frame_paced_only: bool,
+        /// The semantics generation an assistive-technology adapter last
+        /// received (the shells' `last_pushed_gen`).
+        published_gen: u64,
+    }
+
+    impl MobileFrames {
+        /// A handle after construction (which rebuilds once, as the shells'
+        /// constructors do), settled past its first frames so an idle tick
+        /// skips.
+        fn settled() -> Self {
+            let builds = Rc::new(Cell::new(0u32));
+            let paints = Rc::new(Cell::new(0u32));
+            let (b, p) = (builds.clone(), paints.clone());
+            let mut app: Box<dyn AppTree> = new_boxed_app_with(
+                || (),
+                move |_s: &mut ()| {
+                    b.set(b.get() + 1);
+                    PaintCountView { paints: p.clone() }
+                },
+            );
+            app.rebuild();
+            let mut frames = Self {
+                app,
+                gate: FrameGate::with_enabled(true),
+                builds,
+                paints,
+                layout_current: false,
+                last_needs_frame: false,
+                last_needs_frame_paced_only: false,
+                published_gen: u64::MAX,
+            };
+            for _ in 0..32 {
+                if frames.tick(FrameInputs::default()).is_none() {
+                    return frames;
+                }
+            }
+            panic!("an unchanged tree must settle to skipped frames");
+        }
+
+        /// Publish semantics if they moved since the last push.
+        fn publish(&mut self) {
+            if self.app.semantics_if_changed(self.published_gen).is_some() {
+                self.published_gen = self.app.semantics_generation();
+            }
+        }
+
+        /// One tick. `extra` carries the inputs a shell gathers from its own
+        /// latches; the tree peeks and the paint latches are read here, as the
+        /// shells read them. `None` is a skipped tick.
+        fn tick(&mut self, extra: FrameInputs) -> Option<FrameRun> {
+            let inputs = FrameInputs {
+                change_flags_pending: extra.change_flags_pending
+                    || self.app.has_pending_change_flags(),
+                last_needs_frame: self.last_needs_frame,
+                last_needs_frame_paced_only: self.last_needs_frame_paced_only,
+                repaint_owed: self.app.repaint_pending(),
+                ..extra
+            };
+            let pacing = FramePacing {
+                now: FrameTime::ZERO,
+                interval: std::time::Duration::from_millis(16),
+                requested_interval: None,
+            };
+            if self.gate.decide_paced(inputs, pacing).is_skip() {
+                return None;
+            }
+            frust_core::take_repaint_owed();
+            let force_layout = !self.layout_current;
+            let repaint_only = inputs.is_repaint_only_frame() && !force_layout;
+
+            let (builds, paints) = (self.builds.get(), self.paints.get());
+            if !repaint_only {
+                self.app.rebuild();
+            }
+            let needs_layout = !repaint_only && self.app.take_change_flags().needs_layout();
+            let laid_out = needs_layout || force_layout;
+            if laid_out {
+                self.app.layout(Size::new(100.0, 100.0), &mut ());
+                self.layout_current = true;
+            }
+            if !repaint_only {
+                self.publish();
+            }
+            let semantics_before_paint = self.app.semantics_generation();
+            let mut scene = Scene::new();
+            let outcome = {
+                let mut builder = SceneBuilder::new(&mut scene);
+                self.app.paint(&mut builder, FrameTime::ZERO)
+            };
+            self.last_needs_frame = outcome.needs_frame;
+            self.last_needs_frame_paced_only = outcome.needs_frame_paced_only;
+            let published_after_paint = self.app.semantics_generation() != semantics_before_paint;
+            if published_after_paint {
+                self.publish();
+            }
+            Some(FrameRun {
+                repaint_only,
+                built: self.builds.get() != builds,
+                laid_out,
+                painted: self.paints.get() != paints,
+                published_after_paint,
+            })
+        }
+    }
+
+    #[test]
+    fn a_repaint_request_alone_paints_without_building() {
+        let _slot = hold_repaint_slot();
+        let mut frames = MobileFrames::settled();
+        frust_core::request_repaint();
+        assert!(frames.app.repaint_pending(), "the peek sees the request");
+
+        let run = frames
+            .tick(FrameInputs::default())
+            .expect("a repaint request runs the frame");
+        assert!(run.repaint_only, "the request was the frame's only cause");
+        assert!(!run.built, "a paint-only frame never calls the build");
+        assert!(!run.laid_out, "nor runs layout");
+        assert!(run.painted, "the request repaints the tree");
+        assert!(!frames.app.repaint_pending(), "paint honoured the request");
+        assert!(
+            run.published_after_paint,
+            "the paint moved the semantics generation, so semantics publish after it"
+        );
+        assert_eq!(
+            frames.published_gen,
+            frames.app.semantics_generation(),
+            "the published tree is the one this frame painted"
+        );
+        assert!(
+            frames.tick(FrameInputs::default()).is_none(),
+            "nothing is owed after the paint-only frame"
+        );
+    }
+
+    #[test]
+    fn a_repaint_request_with_dirty_signals_builds() {
+        let _slot = hold_repaint_slot();
+        let mut frames = MobileFrames::settled();
+        frust_core::request_repaint();
+        let run = frames
+            .tick(FrameInputs {
+                signals_dirty: true,
+                ..FrameInputs::default()
+            })
+            .expect("dirty signals run the frame");
+        assert!(!run.repaint_only && run.built, "{run:?}");
+        assert!(run.painted);
+        assert!(
+            !frames.app.repaint_pending(),
+            "the normal paint honours it too"
+        );
+    }
+
+    /// Sets up one rebuild debt on the handle and returns the shell-gathered
+    /// inputs that carry it.
+    type DebtSetup = fn(&mut MobileFrames) -> FrameInputs;
+
+    #[test]
+    fn a_repaint_request_with_any_rebuild_debt_builds() {
+        let _slot = hold_repaint_slot();
+        let cases: [(&str, DebtSetup); 3] = [
+            ("events_since_last_frame", |_| FrameInputs {
+                events_since_last_frame: true,
+                ..FrameInputs::default()
+            }),
+            // A real pending flag: a theme push marks LAYOUT | PAINT on the root,
+            // which the tree's own peek reports.
+            ("change_flags_pending", |frames| {
+                frames.app.set_theme(Box::new(BakeTheme { value: 1.0 }));
+                assert!(frames.app.has_pending_change_flags());
+                FrameInputs::default()
+            }),
+            ("deferred_callbacks_pending", |_| FrameInputs {
+                deferred_callbacks_pending: true,
+                ..FrameInputs::default()
+            }),
+        ];
+        for (name, extra) in cases {
+            let mut frames = MobileFrames::settled();
+            frust_core::request_repaint();
+            let extra = extra(&mut frames);
+            let run = frames.tick(extra).expect("the frame runs");
+            assert!(!run.repaint_only && run.built, "{name}: {run:?}");
+            assert!(run.painted, "{name}");
+        }
+    }
+
+    #[test]
+    fn an_idle_tick_with_no_request_skips() {
+        let _slot = hold_repaint_slot();
+        let mut frames = MobileFrames::settled();
+        assert!(!frames.app.repaint_pending());
+        let (builds, paints) = (frames.builds.get(), frames.paints.get());
+        for _ in 0..4 {
+            assert!(frames.tick(FrameInputs::default()).is_none());
+        }
+        assert_eq!(frames.builds.get(), builds, "a skipped tick builds nothing");
+        assert_eq!(frames.paints.get(), paints, "and paints nothing");
+    }
+
+    #[test]
+    fn a_repaint_request_with_a_stale_layout_runs_the_normal_frame() {
+        let _slot = hold_repaint_slot();
+        let mut frames = MobileFrames::settled();
+        // A new surface size the gate saw no input for (iOS folds a resize
+        // into the gate's warmup, not a `FrameInputs` field).
+        frames.layout_current = false;
+        frust_core::request_repaint();
+        let run = frames.tick(FrameInputs::default()).expect("the frame runs");
+        assert!(!run.repaint_only, "the frame still owes a layout");
+        assert!(run.built && run.laid_out && run.painted, "{run:?}");
+    }
+
+    #[test]
+    fn a_normal_frame_with_a_repaint_pending_publishes_semantics_after_paint() {
+        let _slot = hold_repaint_slot();
+        let mut frames = MobileFrames::settled();
+
+        // Control: a normal frame with no request publishes once, before paint.
+        let run = frames
+            .tick(FrameInputs {
+                signals_dirty: true,
+                ..FrameInputs::default()
+            })
+            .expect("dirty signals run the frame");
+        assert!(!run.published_after_paint, "{run:?}");
+
+        // With a request pending the paint moves the generation after the
+        // post-layout publish; the second publish closes the gap, so an idle
+        // screen does not leave assistive technology with stale values.
+        frust_core::request_repaint();
+        let run = frames
+            .tick(FrameInputs {
+                signals_dirty: true,
+                ..FrameInputs::default()
+            })
+            .expect("dirty signals run the frame");
+        assert!(run.built && run.published_after_paint, "{run:?}");
+        assert_eq!(frames.published_gen, frames.app.semantics_generation());
+        assert!(
+            frames.tick(FrameInputs::default()).is_none(),
+            "nothing is owed afterwards"
         );
     }
 }

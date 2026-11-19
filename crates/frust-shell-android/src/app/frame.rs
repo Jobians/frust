@@ -45,6 +45,13 @@ impl AndroidAppHandle {
     /// reads a tree accessor or a handle-side latch cleared here — see the
     /// inline comments at each gather site for what each signal means.
     ///
+    /// A Run whose only cause is a repaint request
+    /// ([`FrameInputs::is_repaint_only_frame`], with the last layout still
+    /// current) is a paint-only frame: no rebuild, no change-flag drain, no
+    /// layout, and semantics published after paint rather than before. The
+    /// AppTree-level model of that path is host-tested in `frust-shell-common`'s
+    /// `app_tree` tests.
+    ///
     /// The pump → gather → decide ordering and the latch lifecycle are asserted
     /// only by inspection, not a unit test: this whole module is
     /// `#[cfg(target_os = "android")]` (it needs a live GPU surface + JNI handle
@@ -294,8 +301,12 @@ impl AndroidAppHandle {
             // the resume-warmup Run; leaving this `false` and relying on the
             // counter avoids double-counting (both force a Run identically).
             resumed_recently: false,
-            // Not gathered yet; the shells start honouring it in a later change.
-            repaint_owed: false,
+            // A `frust_core::request_repaint` landed since the tree's last paint.
+            // A non-draining peek: only paint clears it, so a skipped tick
+            // leaves it for the next. No wake hook is installed here — the
+            // Choreographer posts a callback every tick while resumed, and a
+            // request made while paused is read by the first tick after resume.
+            repaint_owed: self.app.repaint_pending(),
         };
 
         // The surface (re)creation / resize that set `surface_dirty` also forces
@@ -379,6 +390,20 @@ impl AndroidAppHandle {
         // wait against the same anchor; it can never double-fire.
         self.last_focus_ime_gen = focus_generation;
 
+        // Drain the repaint debt now that the frame is committed to run (never
+        // before a possible Skip), re-arming the request's wake edge. The
+        // frame's own repaint decision reads `repaint_owed`, gathered above.
+        frust_core::take_repaint_owed();
+
+        // A paint-only frame: a repaint request is this frame's sole cause, so
+        // it paints without rebuild or layout. Decided from the SAME inputs the
+        // gate just saw. Skipping the rebuild is safe only then — every debt a
+        // rebuild settles (dirty signals, events, a deferred result flush,
+        // pending change flags, a focus/IME edge, last paint's frame request)
+        // is an input that vetoes it — and only while the last layout is
+        // current: a surface change or the first layout still owes the pass.
+        let repaint_only = inputs.is_repaint_only_frame() && !force_layout;
+
         // Span clocks: on under tracing, and on a continuous loop while the
         // performance-hint session is armed — it reports these same spans as
         // the frame's UI work, tracing on or off. Off otherwise, so an idle or
@@ -434,14 +459,21 @@ impl AndroidAppHandle {
         // captures only what the rebuild needs, not all of `self`. Degrade
         // gracefully to an unwrapped rebuild if the runtime is somehow absent —
         // the frame path must never panic across the JNI boundary.
+        //
+        // A paint-only frame skips the rebuild and so does not re-track the
+        // scope. That is correct: its subscriptions and dirty flag are left as
+        // the last rebuild set them, so a later signal write still sets
+        // `signals_dirty` and forces a normal frame.
         let rebuild_start = span_clock.then(Instant::now);
-        match ReactiveRuntime::get() {
-            Some(rt) => {
-                let scope = &self.scope;
-                let app = &mut self.app;
-                rt.with_owner(|| scope.track(|| app.rebuild()));
+        if !repaint_only {
+            match ReactiveRuntime::get() {
+                Some(rt) => {
+                    let scope = &self.scope;
+                    let app = &mut self.app;
+                    rt.with_owner(|| scope.track(|| app.rebuild()));
+                }
+                None => self.app.rebuild(),
             }
-            None => self.app.rebuild(),
         }
         let rebuild_time = rebuild_start.map_or(Duration::ZERO, |t| t.elapsed());
 
@@ -454,9 +486,12 @@ impl AndroidAppHandle {
         // it — that asymmetry is the camera keep-alive contract. Emitted before
         // this frame's `ingest` below, so the Dispose leads the batch; it is a
         // lifecycle command, deliberately NOT paired with a frame (like
-        // `suspend_all`), so it releases immediately.
-        for slot_id in self.app.take_retired_platform_views() {
-            self.platform_view_state.retire(slot_id);
+        // `suspend_all`), so it releases immediately. A paint-only frame ran no
+        // rebuild, so it has nothing to retire.
+        if !repaint_only {
+            for slot_id in self.app.take_retired_platform_views() {
+                self.platform_view_state.retire(slot_id);
+            }
         }
 
         // Layout-skip seam (see the frame_gate module docs): drain the change
@@ -466,8 +501,10 @@ impl AndroidAppHandle {
         // glyph color correct across a bare theme swap (it marks LAYOUT pending,
         // so a theme change always relayouts even with no view change). Paint
         // still always runs below, replaying the last-baked geometry on a
-        // layout-skipped frame.
-        let needs_layout = self.app.take_change_flags().needs_layout();
+        // layout-skipped frame. A paint-only frame drains nothing (pending flags
+        // veto it) and runs no layout: `repaint_only` already excludes
+        // `force_layout`, so the layout condition below is false for it.
+        let needs_layout = !repaint_only && self.app.take_change_flags().needs_layout();
         // Sanitize once per frame; layout and the paint transform below MUST
         // consume this identical value (an untrusted JNI `jfloat` density
         // must never let the two passes disagree — see `sanitize_scale`).
@@ -490,8 +527,11 @@ impl AndroidAppHandle {
 
         // Publish the accessibility tree post-layout, so node
         // bounds are valid. A cheap no-op unless the tree changed AND a screen
-        // reader is active (double-gated inside).
-        self.publish_semantics();
+        // reader is active (double-gated inside). A paint-only frame publishes
+        // after paint instead (below), matching the desktop shell.
+        if !repaint_only {
+            self.publish_semantics();
+        }
 
         // Push the render side's presented-frame count so a widget measuring FPS
         // reports the presented rate, not its Choreographer paint cadence. A pure
@@ -509,6 +549,10 @@ impl AndroidAppHandle {
             self.app.set_retained_ledger(&ledger);
         }
 
+        // A paint honouring a repaint request bumps the semantics generation
+        // (`RenderRoot::paint`), after the publication above on a normal frame.
+        // Recorded so the frame can publish again once paint returns.
+        let semantics_before_paint = self.app.semantics_generation();
         self.scene.reset();
         let paint_start = span_clock.then(Instant::now);
         let paint_serial = {
@@ -540,6 +584,16 @@ impl AndroidAppHandle {
             outcome.paint_serial
         };
         let paint_time = paint_start.map_or(Duration::ZERO, |t| t.elapsed());
+
+        // Publish after paint whenever paint moved the semantics generation:
+        // always on a paint-only frame (it skipped the post-layout publish), and
+        // on a normal frame a repaint request was also pending for. Without this
+        // the published tree would keep this frame's stale values until some
+        // later frame happens to run, since an idle screen produces none.
+        // Outside the paint span, like the post-layout publish.
+        if self.app.semantics_generation() != semantics_before_paint {
+            self.publish_semantics();
+        }
 
         // Ingest this RUN frame's published platform-view frames into the
         // differ, right after paint — the source paint just
