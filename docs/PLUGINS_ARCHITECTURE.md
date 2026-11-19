@@ -395,8 +395,8 @@ host ignores the back press.
 ## Data Flow
 
 - Plugin catalog: `frust-drive`'s `PluginCatalog` is the one list every consumer looks a plugin up in
-  (`frust plugin add`/`list`/`sync`, the TUI's Add Plugin dialog, the machine-local wiring, the
-  desktop-lane scan). It holds the built-in registry's entries plus the plugins `project_catalog`
+  (`frust plugin add`/`list`/`sync`, the machine-local wiring, the desktop-lane scan; the TUI's
+  Add Plugin dialog uses its built-in half only). It holds the built-in registry's entries plus the plugins `project_catalog`
   discovers: packages in the app's resolved dependency graph that describe themselves under
   `[package.metadata.frust.plugin]`, read through one `cargo metadata` call. Each entry carries a
   `PluginOrigin` (`BuiltIn`, or `Manifest` with the package directory cargo resolved); a built-in id

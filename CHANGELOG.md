@@ -156,7 +156,9 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   `<n> pending`, the number of tracked project edits it still lacks.
 - `frust plugin sync`: applies the pending base edits of every declared plugin the app depends on
   and prints what it applied, or `up to date`. Every plugin is checked before the first write, so a
-  refusal leaves the project untouched, and a re-run changes nothing. Optional features are chosen
+  refusal leaves the project untouched, and a re-run changes nothing. For a declared plugin with a
+  Swift package, `sync` and `add` also append `/ios/<Package>` to the app's root `.gitignore`, and
+  that line counts as a pending edit until it is there. Optional features are chosen
   with `frust plugin add --feature`, and built-in plugins are still added with `frust plugin add`.
 - `frust run` (device lanes) and `frust build` (Android and iOS) stop before any build process when
   a declared plugin the app depends on has tracked edits pending. The message names the plugin and
