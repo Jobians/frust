@@ -38,15 +38,8 @@ pub use scale::{YDomain, nice_max};
 pub use series::{Series, SlotsView};
 pub use tone::Tone;
 
-// A glob over a module with no public items yet warns `unused_imports`; each allow can go
-// once its module exports something.
-#[allow(unused_imports)]
 pub use geometry::*;
-#[allow(unused_imports)]
 pub use heat::*;
-#[allow(unused_imports)]
 pub use meter::*;
-#[allow(unused_imports)]
 pub use sparkline::*;
-#[allow(unused_imports)]
 pub use time_series::*;
