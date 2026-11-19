@@ -81,6 +81,9 @@ frust-database = { path = "../../plugins/database" }
 frust-network-image = { path = "../../plugins/network-image" }
 frust-file-dialogs = { path = "../../plugins/file-dialogs" }
 
+# The Charts page: live charts over shared data handles written from a background thread.
+frust-charts = { path = "../../plugins/charts" }
+
 # The Photos page's Folders panel keeps the picked folder's grant token between launches.
 frust-shared-preferences = { path = "../../plugins/shared-preferences" }
 
