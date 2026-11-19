@@ -1,7 +1,7 @@
 //! The playground sections listed in [`SECTION_LABELS`], one module per section: `platform_views`,
 //! `camera`, `responsive`, `terminal`, `keys`, `i18n`, `video_player`,
 //! `url_launcher`, `auth_session`, `database`, `graph_canvas`,
-//! `scroll_control`, `drag_drop`, `tabs`, `images`, `slivers`, `desktop_services`, `shortcuts`, `network`, `glass`, `gpu_pass`, `device_memory`, `photos`, `accessibility` (the assistive-technology fixture page), and `forms` (the keyboard / back-swipe fixture page), and `start_gate` (the `StartGate` splash / error / ready page) — each one an
+//! `scroll_control`, `drag_drop`, `tabs`, `images`, `slivers`, `desktop_services`, `shortcuts`, `network`, `glass`, `gpu_pass`, `device_memory`, `photos`, `accessibility` (the assistive-technology fixture page), and `forms` (the keyboard / back-swipe fixture page), `start_gate` (the `StartGate` splash / error / ready page), and `charts` (live charts fed from a background thread) — each one an
 //! OS-facing capability (or, for `graph_canvas`/`scroll_control`/`drag_drop`/
 //! `slivers`, a widget demo: `CanvasView`/`PanZoomView` for the first, a keyed
 //! `ListView` bound to a `ScrollController` for the second,
@@ -42,6 +42,7 @@
 pub mod accessibility;
 pub mod auth_session;
 pub mod camera;
+pub mod charts;
 pub mod database;
 pub mod desktop_services;
 pub mod device_memory;
@@ -85,7 +86,7 @@ use crate::PlaygroundState;
 /// single line at that width. A page wanting a longer heading for itself
 /// (e.g. `platform_views`'s own on-page title) uses its own string literal
 /// rather than this array — see `pages/platform_views.rs`.
-pub const SECTION_LABELS: [&str; 26] = [
+pub const SECTION_LABELS: [&str; 27] = [
     "Platform",
     "Camera",
     "Layout",
@@ -112,6 +113,7 @@ pub const SECTION_LABELS: [&str; 26] = [
     "A11y",
     "Forms",
     "Gate",
+    "Charts",
 ];
 
 /// How many of [`SECTION_LABELS`], in order, count as "primary" — shown
@@ -156,6 +158,9 @@ pub fn current(section: usize, state: &PlaygroundState) -> AnyView<PlaygroundSta
         23 => any(accessibility::page(state)),
         24 => any(forms::page(state)),
         25 => any(start_gate::page(state)),
+        26 => any(frust::component(charts::ChartsPage {
+            nav: state.nav.clone(),
+        })),
         _ => any(platform_views::page(state)),
     }
 }
@@ -203,6 +208,8 @@ mod tests {
             "uppercase 'PLATFORM'"
         );
         assert_eq!(section_index_for("camera"), Some(1), "lowercase 'camera'");
+        assert_eq!(section_index_for("charts"), Some(26), "lowercase 'charts'");
+        assert_eq!(section_index_for("Charts"), Some(26), "appended last");
 
         // Test unknown label
         assert_eq!(section_index_for("unknown"), None, "unknown label");

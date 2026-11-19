@@ -1303,6 +1303,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "frust-charts"
+version = "0.6.6"
+dependencies = [
+ "frust-ui",
+]
+
+[[package]]
 name = "frust-clipboard"
 version = "0.6.6"
 dependencies = [
@@ -4258,6 +4265,7 @@ dependencies = [
  "frust-auth-session",
  "frust-background-task",
  "frust-camera",
+ "frust-charts",
  "frust-connectivity",
  "frust-core",
  "frust-database",
