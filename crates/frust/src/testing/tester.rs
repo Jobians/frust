@@ -392,6 +392,25 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
         self.frame_recorded().1
     }
 
+    /// Record one paint-only frame when a [`request_repaint`](crate::request_repaint) is
+    /// pending, and `None` otherwise: no rebuild, no layout, no clock advance.
+    ///
+    /// This mirrors the shells' repaint-only frame, which paints the tree as last laid out.
+    /// The frame is validated like every pumped one.
+    #[track_caller]
+    pub fn repaint(&mut self) -> Option<Scene> {
+        if !self.root.repaint_pending() {
+            return None;
+        }
+        let mut scene = Scene::new();
+        {
+            let mut builder = SceneBuilder::new(&mut scene);
+            let _outcome = self.root.paint(&mut builder, self.clock);
+        }
+        self.check(&scene);
+        Some(scene)
+    }
+
     /// The frames the engine's scene validation refused, in order. Always empty unless
     /// [`TesterOptions::allow_refused_frames`] was set.
     pub fn refused_frames(&self) -> &[RefusedFrame] {
@@ -463,6 +482,13 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
     #[track_caller]
     fn frame_recorded(&mut self) -> (PaintOutcome, Scene) {
         let (outcome, scene) = self.paint_frame();
+        self.check(&scene);
+        (outcome, scene)
+    }
+
+    /// Count `scene` as the next frame and run the engine's validation on it.
+    #[track_caller]
+    fn check(&mut self, scene: &Scene) {
         let ordinal = self.frames;
         self.frames += 1;
         // What a shell hands the renderer: it pushes `Affine::scale(scale)` over the logical
@@ -473,7 +499,7 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
             surface_extent(self.metrics.size.width * scale),
             surface_extent(self.metrics.size.height * scale),
         );
-        if let Err(error) = validate_scene(&scene, Affine::scale(scale), size) {
+        if let Err(error) = validate_scene(scene, Affine::scale(scale), size) {
             if !self.allow_refused_frames {
                 panic!("Tester: the engine would refuse frame {ordinal} \u{2014} {error}");
             }
@@ -482,7 +508,6 @@ impl<S: 'static, V: View<S>> Tester<S, V> {
                 error,
             });
         }
-        (outcome, scene)
     }
 
     fn paint_frame(&mut self) -> (PaintOutcome, Scene) {

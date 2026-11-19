@@ -284,6 +284,7 @@ a frame every tick nor blocks pacing, so a paced (`CosmeticLoop`) frame like a b
 throttles to the theme's `cosmetic_loop_rate` even while focused, while a focus/IME transition
 forces exactly one frame. `deferred_callbacks_pending` is the other run-forcing input, a peek at
 CORE's pending-result-flush flag so a Housekeeping flush owed with nothing else dirty still runs.
+`repaint_owed` (from the required `AppTree::repaint_pending`, gathered before the gate decides) is a run-forcing input too, and a disqualifier for `is_paced_only_frame`, so a repaint request is never held to the paced interval; `take_repaint_owed` drains once the frame is committed to run. When it is the sole input (`is_repaint_only_frame`) and no layout is forced, both shells run a **paint-only frame**: no tracked rebuild, change-flag drain, layout or pre-paint semantics publish, while presented-frames, the retained ledger, paint, the `needs_frame` latches and platform-view ingest still run, and semantics publish after paint whenever paint moved the semantics generation. There is no wake hook on mobile: the Choreographer/CADisplayLink tick every active frame.
 
 **Per-request paced interval:** a paced request may name its own cadence, reaching the shell as
 `PaintOutcome::paced_interval` — core's MIN-fold across every paced request in the pass. Each
@@ -414,6 +415,8 @@ main. Each overlay view sits directly above its own slot's view, so interleaved 
 frame gates OR `texture_bus::take_frame_owed` beside `take_retained_repaint`; desktop installs
 `set_frame_request_hook` around its loop, posting `ShellUserEvent::TextureFrameOwed`. The web shell
 does not poll it yet, and the hook assumes one shell per process.
+
+**Repaint wake.** `frust_core::request_repaint` (see [CORE_ARCHITECTURE.md](CORE_ARCHITECTURE.md)) is woken the same way: desktop and web install `set_repaint_hook` posting `ShellUserEvent::RepaintOwed` (desktop clears it beside the texture hook), and `take_repaint_owed` runs at the top of the frame. Desktop pushes semantics again after paint on every frame whose paint moved the semantics generation, and runs a frame paint-only (no rebuild, IME re-sync, change-flag drain, layout or pre-paint semantics push) exactly when `FrameCauses::paint_only` holds: a repaint pending and no other cause — no window or user event other than the repaint wake, nor self-requested redraw, since the last completed frame (`other_frame_cause`), tracked scope clean, no pending change flags or result flush, the last paint asked for no further frame, layout current. Web wakes on it but its rebuild stays unconditional.
 
 Apple limits (full-window overlay per cut, creation-order stacking, a transparent overlay above a
 hidden slot) are in [LIMITATIONS.md](LIMITATIONS.md) § `apple-overlay-limits`.

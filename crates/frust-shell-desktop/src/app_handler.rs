@@ -371,6 +371,11 @@ pub enum ShellUserEvent {
     /// from the producer's thread once per debt, and the UI thread takes the
     /// debt and requests a redraw, whose frame polls the bus's sources.
     TextureFrameOwed,
+    /// A `frust_core::request_repaint` owes the window a frame: the repaint hook posts this
+    /// from the requesting thread on the not-owed to owed edge, and the UI thread requests a
+    /// redraw. Every frame drains the debt (`frust_core::take_repaint_owed`); a frame this
+    /// wake alone caused paints without rebuild or layout (see `FrameCauses::paint_only`).
+    RepaintOwed,
     /// The clipboard worker thread read the host clipboard and got text (see
     /// [`ClipboardWorker`]): the UI thread turns it into exactly one
     /// top-level `EditCommand::Paste` dispatch. A read that failed — for any
@@ -1033,6 +1038,9 @@ where
             root
         },
         laid_out_for: None,
+        // The first frame is never paint-only.
+        other_frame_cause: true,
+        painted_needs_frame: false,
         text_ctx: TextContext::new(),
         background_flush: frust_shell_common::BackgroundFlush::new(),
         exit_flush: frust_shell_common::BackgroundFlush::new(),
@@ -1111,6 +1119,12 @@ where
     frust_render::texture_bus::set_frame_request_hook(Some(Arc::new(move || {
         let _ = texture_proxy.send_event(ShellUserEvent::TextureFrameOwed);
     })));
+    // The repaint request's wake, on the same terms: any thread, post only, cleared with the
+    // texture hook. A request already owed posts at once, so it is not stranded.
+    let repaint_proxy = event_loop.create_proxy();
+    frust_core::set_repaint_hook(Some(Arc::new(move || {
+        let _ = repaint_proxy.send_event(ShellUserEvent::RepaintOwed);
+    })));
 
     // The loop's own result is held rather than propagated with `?` so the
     // clipboard worker is always stopped — including on the error path. The
@@ -1118,6 +1132,7 @@ where
     // reach a clipboard manager; see `ShellHandler::shutdown_clipboard`.
     let loop_result = event_loop.run_app(&mut handler);
     frust_render::texture_bus::set_frame_request_hook(None);
+    frust_core::set_repaint_hook(None);
     handler.shutdown_clipboard();
     loop_result?;
     finish(handler.fatal)
@@ -2032,6 +2047,13 @@ struct ShellHandler<State: 'static, Build, V: View<State>, E> {
     /// The logical window size the last layout pass ran against (`None` before the
     /// first); a mismatch (resize or scale change) forces layout despite clean flags.
     laid_out_for: Option<Size>,
+    /// Whether anything but a repaint request happened since the last completed frame: a
+    /// window event other than `RedrawRequested`, a user event other than the repaint wake, a
+    /// dispatch, a top-of-frame drain that did work, or a redraw this handler asked for itself.
+    /// A completed frame leaves it set only when it asked for a follow-up (see [`FrameCauses`]).
+    other_frame_cause: bool,
+    /// Whether the last paint asked for another frame (`PaintOutcome::needs_frame`).
+    painted_needs_frame: bool,
     text_ctx: TextContext,
     /// The once-per-transition font-cache flush ([`font_cache_transition`]), driven from
     /// [`ShellHandler::sync_app_lifecycle`]: written when the derived lifecycle is `Hidden` (every
@@ -2351,6 +2373,7 @@ where
     ///
     /// [`Owner`]: frust_reactive::Owner
     fn dispatch(&mut self, window: &Window, event: InputEvent) {
+        self.other_frame_cause = true;
         let outcome = event_under_owner(self.runtime, &mut self.root, &mut self.state, &event);
         self.sync_ime(window);
         self.sync_cursor(window);
@@ -2360,6 +2383,19 @@ where
         self.close_pending |= self.drain_window_commands();
         if outcome.needs_redraw {
             window.request_redraw();
+        }
+    }
+
+    /// Push a fresh semantics tree to the accesskit adapter when the generation moved past the
+    /// last push (the dirty gate, [`RenderRoot::semantics_if_changed`]). Call with valid bounds
+    /// (post-layout). A no-op (`update_if_active` never runs the closure) while no AT client
+    /// has activated the adapter.
+    fn push_semantics_if_changed(&mut self, scale: f64) {
+        if let Some(adapter) = self.adapter.as_mut()
+            && let Some(update) = self.root.semantics_if_changed(self.semantics_seen)
+        {
+            self.semantics_seen = self.root.semantics_generation();
+            adapter.update_if_active(|| build_tree_update(&update, scale));
         }
     }
 
@@ -2698,6 +2734,7 @@ where
         let Some(close) = window_control::drain(&*window) else {
             return false;
         };
+        self.other_frame_cause = true;
         // A command that moved the state may raise no resize to carry it to a frame.
         if self.publish_window_state() {
             window.request_redraw();
@@ -2924,6 +2961,7 @@ where
     /// This loop idles under `ControlFlow::Wait`, so an answer parked on the
     /// next frame (a hot-patch outcome) needs one requested.
     fn request_frame(&mut self) {
+        self.other_frame_cause = true;
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
@@ -2945,6 +2983,9 @@ where
     /// background spawn), so a redraw is only requested when a window is present
     /// — the first rebuild after `resumed` re-tracks regardless.
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: ShellUserEvent) {
+        if !matches!(event, ShellUserEvent::RepaintOwed) {
+            self.other_frame_cause = true;
+        }
         self.runtime.pump_local();
         match event {
             // A signal write, or a render-thread redraw request (stale-swapchain
@@ -3036,6 +3077,13 @@ where
                     window.request_redraw();
                 }
             }
+            // A repaint request: a plain redraw. The frame drains the debt, and paints
+            // without rebuild or layout when nothing else happened since the last frame.
+            ShellUserEvent::RepaintOwed => {
+                if let Some(window) = self.window.as_ref() {
+                    window.request_redraw();
+                }
+            }
             // The devtools UI-thread hop: answer every queued request here, on
             // the thread that owns the tree. Injected events go through
             // `DevtoolsUi::dispatch` → this shell's own `dispatch`, i.e. the
@@ -3046,6 +3094,7 @@ where
     }
 
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.other_frame_cause = true;
         // The window is created once and reused; the surface, by contrast, is
         // (re)created here every time we resume — `suspended()` tears it down,
         // mirroring Android's surfaceDestroyed/surfaceCreated so the §8.1
@@ -3169,6 +3218,7 @@ where
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        self.other_frame_cause = true;
         // Hosted native views go before the surface they were composited with,
         // while the window is still intact for the host to detach them from. The
         // matching replay is queued in `resumed`, which is the only way back.
@@ -3229,10 +3279,12 @@ where
         let now = Instant::now();
         let decision = paced_wake_action(self.paced_wake, now);
         self.paced_wake = decision.paced_wake;
-        if decision.request_redraw
-            && let Some(window) = self.window.as_ref()
-        {
-            window.request_redraw();
+        if decision.request_redraw {
+            // A paced continuation (or a present retry) is never paint-only.
+            self.other_frame_cause = true;
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
         }
         // A debounced window-state save falls due here, and a still-pending one
         // must wake the parked loop when it does.
@@ -3258,6 +3310,9 @@ where
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            self.other_frame_cause = true;
+        }
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -3561,6 +3616,10 @@ where
             }
 
             WindowEvent::RedrawRequested => {
+                // Drain the repaint debt first, re-arming the hook edge: a request landing
+                // later in this frame posts a fresh wake instead of being swallowed.
+                frust_core::take_repaint_owed();
+
                 // Drain any UI-thread local tasks queued since the last turn
                 // before rebuilding, so their signal writes are visible to this
                 // frame. Cheap no-op when the queue is empty.
@@ -3593,6 +3652,7 @@ where
                         brightness_from_winit(window.theme())
                     })
                 {
+                    self.other_frame_cause = true;
                     self.theme = theme;
                     self.theme_override_active = override_active;
                     self.apply_theme(&window);
@@ -3618,6 +3678,7 @@ where
                 // the new faces this frame. When nothing is pending this is one
                 // cheap `Mutex` check returning an empty `Vec` (no allocation).
                 if self.font_registry.drain_into(&mut self.text_ctx) {
+                    self.other_frame_cause = true;
                     self.root.set_theme(Box::new(self.theme.clone()));
                 }
 
@@ -3625,8 +3686,29 @@ where
                 // text; widgets key their layout caches on its generation, so the same theme
                 // re-push forces the pass.
                 if self.locale_default.changed() {
+                    self.other_frame_cause = true;
                     self.root.set_theme(Box::new(self.theme.clone()));
                 }
+
+                // HiDPI: lay out in logical pixels, then scale
+                // the whole scene by the device pixel ratio so glyph outlines
+                // are re-rasterised sharp at physical resolution.
+                let physical = window.inner_size();
+                let scale = window.scale_factor();
+                let logical = Size::new(
+                    physical.width as f64 / scale,
+                    physical.height as f64 / scale,
+                );
+
+                // Gathered after every pump and drain above, any of which may have made work.
+                let paint_only = FrameCauses::gather(
+                    &self.root,
+                    &self.scope,
+                    self.other_frame_cause,
+                    self.painted_needs_frame,
+                    self.laid_out_for == Some(logical),
+                )
+                .paint_only();
 
                 // Rebuild the view tree every frame (build is cheap by
                 // construction); the on-demand `Wait` control flow keeps us
@@ -3639,57 +3721,51 @@ where
                 // `TrackedScope` (so every signal read subscribes this frame —
                 // a later write dirties the scope and wakes the loop). Fields
                 // are borrowed disjointly so the tracking closure captures only
-                // what the rebuild needs, not all of `self`.
+                // what the rebuild needs, not all of `self`. A paint-only frame
+                // skips it (`frame_rebuild`), and the IME re-sync with it.
                 let rebuild_start = Instant::now();
-                let runtime = self.runtime;
-                let scope = &self.scope;
-                let root = &mut self.root;
-                let build = &mut self.build;
-                let state = &mut self.state;
-                let _flags = runtime.with_owner(|| scope.track(|| root.rebuild(build, state)));
-                let rebuild_dur = rebuild_start.elapsed();
-                // Perf instrumentation: the app's first-ever rebuild,
-                // recorded once. Inline records it here; in the split path the
-                // render thread owns the startup line, so this is a no-op there
-                // (it records the milestone when the first scene arrives).
-                self.executor.record_first_rebuild();
-                // A rebuild can change which widget is focused / what it
-                // publishes without an intervening event (e.g. state-driven
-                // focus), so re-sync the platform IME here too.
-                self.sync_ime(&window);
-
-                // HiDPI: lay out in logical pixels, then scale
-                // the whole scene by the device pixel ratio so glyph outlines
-                // are re-rasterised sharp at physical resolution.
-                let physical = window.inner_size();
-                let scale = window.scale_factor();
-                let logical = Size::new(
-                    physical.width as f64 / scale,
-                    physical.height as f64 / scale,
+                let rebuilt = frame_rebuild(
+                    paint_only,
+                    self.runtime,
+                    &self.scope,
+                    &mut self.root,
+                    &mut self.build,
+                    &mut self.state,
                 );
+                let rebuild_dur = rebuild_start.elapsed();
+                if rebuilt {
+                    // Perf instrumentation: the app's first-ever rebuild,
+                    // recorded once. Inline records it here; in the split path the
+                    // render thread owns the startup line, so this is a no-op there
+                    // (it records the milestone when the first scene arrives).
+                    self.executor.record_first_rebuild();
+                    // A rebuild can change which widget is focused / what it
+                    // publishes without an intervening event (e.g. state-driven
+                    // focus), so re-sync the platform IME here too.
+                    self.sync_ime(&window);
+                }
+
                 let text_ctx: &mut dyn Any = &mut self.text_ctx;
                 let layout_start = Instant::now();
                 // Whole-frame layout gate (Android parity): drain the flags and
                 // lay out only when they need it, or the window size / scale
                 // changed, or this is the first layout. A static window thus
                 // makes zero layout calls between events (`layout_dur` is 0).
-                let needs_layout = self.root.take_change_flags().needs_layout();
-                if layout_needed(needs_layout, self.laid_out_for, logical) {
-                    self.root.layout_with_text(logical, text_ctx);
-                    self.laid_out_for = Some(logical);
+                // A paint-only frame has no flags to drain and a current layout.
+                if !paint_only {
+                    let needs_layout = self.root.take_change_flags().needs_layout();
+                    if layout_needed(needs_layout, self.laid_out_for, logical) {
+                        self.root.layout_with_text(logical, text_ctx);
+                        self.laid_out_for = Some(logical);
+                    }
                 }
                 let layout_dur = layout_start.elapsed();
 
-                // Push a fresh semantics tree to the accesskit adapter if it may
-                // have changed since the last push (the dirty gate —
-                // `RenderRoot::semantics_if_changed`); post-layout so bounds are
-                // valid. A no-op (`update_if_active` never runs the closure)
-                // while no AT client has activated the adapter.
-                if let Some(adapter) = self.adapter.as_mut()
-                    && let Some(update) = self.root.semantics_if_changed(self.semantics_seen)
-                {
-                    self.semantics_seen = self.root.semantics_generation();
-                    adapter.update_if_active(|| build_tree_update(&update, scale));
+                // Post-layout so bounds are valid. Paint can move the generation
+                // too (honouring a repaint request), so the push after paint
+                // covers every frame; a paint-only frame has only that one.
+                if !paint_only {
+                    self.push_semantics_if_changed(scale);
                 }
 
                 self.scene.reset();
@@ -3721,6 +3797,11 @@ where
                     outcome
                 };
                 let paint_dur = paint_start.elapsed();
+                // Whenever paint moved the generation past what was just pushed,
+                // publish again in the same frame, paint-only or not. The push is
+                // generation-gated, so a frame whose paint left it alone pushes
+                // nothing here.
+                self.push_semantics_if_changed(scale);
 
                 // Platform views: ingest the pass that just painted — retire the
                 // slots whose widgets were torn down, then diff this pass's
@@ -3798,6 +3879,8 @@ where
                     paint_outcome.paced_interval,
                 );
                 self.paced_wake = decision.paced_wake;
+                // Every follow-up this frame asks for itself is a cause for the next one.
+                let mut follow_up = decision.request_redraw;
                 if decision.request_redraw {
                     window.request_redraw();
                 }
@@ -3810,6 +3893,7 @@ where
                 // event will arrive for it — request the follow-up frame here,
                 // mirroring the `needs_frame` animation path above.
                 if self.scope.is_dirty() {
+                    follow_up = true;
                     window.request_redraw();
                 }
 
@@ -3847,6 +3931,7 @@ where
                 // Inline reports a transient-acquire skip synchronously; the
                 // split reports it later as `ShellUserEvent::RenderRetry`.
                 if self.executor.take_present_retry() {
+                    follow_up = true;
                     self.schedule_present_retry();
                 }
 
@@ -3873,6 +3958,11 @@ where
                 // for a host that needs to convert.
                 self.platform_views
                     .drain(&mut self.extensions, &window, scale);
+
+                // The frame completed: the causes it consumed are spent, and only
+                // the follow-ups it asked for carry into the next decision.
+                self.other_frame_cause = follow_up;
+                self.painted_needs_frame = paint_outcome.needs_frame;
             }
 
             // The adapter saw it above; app code needs the new `focused` flag, and a focus
@@ -3968,6 +4058,78 @@ fn font_cache_exit(
 /// change) differs from the one the last pass used.
 fn layout_needed(needs_layout: bool, laid_out_for: Option<Size>, logical: Size) -> bool {
     needs_layout || laid_out_for != Some(logical)
+}
+
+/// What a running frame's paint-only decision reads, gathered after the top-of-frame pumps
+/// and drains. Every field defaults to the must-rebuild answer when its signal is unsure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameCauses {
+    /// A repaint request landed since the root's last paint ([`RenderRoot::repaint_pending`]).
+    repaint_pending: bool,
+    /// Anything else happened since the last completed frame (`other_frame_cause`).
+    other_cause: bool,
+    /// A signal the last rebuild read was written since ([`TrackedScope::is_dirty`]).
+    scope_dirty: bool,
+    /// Change flags wait on the root ([`RenderRoot::has_pending_change_flags`]).
+    change_flags_pending: bool,
+    /// A deferred result flush is owed (`frust_core::has_pending_result_flush`), focus-handle
+    /// requests included.
+    result_flush_pending: bool,
+    /// The previous paint asked for another frame.
+    painted_needs_frame: bool,
+    /// The last layout ran against this frame's logical size.
+    layout_current: bool,
+}
+
+impl FrameCauses {
+    /// Read the live inputs; the shell-held ones are passed in.
+    fn gather<State: 'static, V: View<State>>(
+        root: &RenderRoot<State, V>,
+        scope: &TrackedScope,
+        other_cause: bool,
+        painted_needs_frame: bool,
+        layout_current: bool,
+    ) -> Self {
+        Self {
+            repaint_pending: root.repaint_pending(),
+            other_cause,
+            scope_dirty: scope.is_dirty(),
+            change_flags_pending: root.has_pending_change_flags(),
+            result_flush_pending: frust_core::has_pending_result_flush(),
+            painted_needs_frame,
+            layout_current,
+        }
+    }
+
+    /// Whether the frame paints without rebuild and layout: a repaint request is its sole
+    /// cause. Skipping the rebuild is safe only then — it is what clears a dirty scope,
+    /// drains the result flush and merges change flags, so any of those owes a full frame.
+    fn paint_only(self) -> bool {
+        self.repaint_pending
+            && !self.other_cause
+            && !self.scope_dirty
+            && !self.change_flags_pending
+            && !self.result_flush_pending
+            && !self.painted_needs_frame
+            && self.layout_current
+    }
+}
+
+/// The frame's rebuild: the tracked root rebuild under the root owner, unless the frame is
+/// paint-only. Returns whether `build` ran.
+fn frame_rebuild<State: 'static, V: View<State>>(
+    paint_only: bool,
+    runtime: &ReactiveRuntime,
+    scope: &TrackedScope,
+    root: &mut RenderRoot<State, V>,
+    build: &mut impl FnMut(&mut State) -> V,
+    state: &mut State,
+) -> bool {
+    if paint_only {
+        return false;
+    }
+    let _flags = runtime.with_owner(|| scope.track(|| root.rebuild(build, state)));
+    true
 }
 
 /// What a close request amounts to once the app has had its say.
@@ -6642,6 +6804,428 @@ mod tests {
             let answer = read(&mut reader).expect("the frame releases the answer");
             assert!(answer.contains("\"id\":3"), "{answer}");
             assert!(answer.contains("anchor"), "{answer}");
+        }
+    }
+
+    /// The paint-only frame. `RedrawRequested` needs a live window, so these drive its
+    /// window-free half against a real `RenderRoot` and `TrackedScope`: the same
+    /// `FrameCauses` decision, the same `frame_rebuild`, then layout and paint. A window or
+    /// user event is modelled by the `other_cause` flag it sets in the handler.
+    mod paint_only_frames {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+        use frust_core::accesskit::Role;
+        use frust_core::event::{
+            EventCtx, EventResult, InputEvent, PointerButton, PointerEvent, PointerPhase,
+        };
+        use frust_core::layout::BoxConstraints;
+        use frust_core::semantics::SemanticsCtx;
+        use frust_core::view::BuildCtx;
+        use frust_core::widget::{LayoutCtx, PaintCtx, Widget};
+        use frust_core::{ChangeFlags, DiscardScene, FrameTime, PaintScene, RenderRoot, View};
+        use frust_reactive::{FrameWaker, ReactiveRuntime, RwSignal, TrackedScope};
+        use kurbo::Size;
+        use reactive_graph::traits::{Get, Set};
+
+        use crate::app_handler::{FrameCauses, event_under_owner, frame_rebuild};
+
+        /// The repaint generation is process-wide: these tests take turns with it.
+        static REPAINT_SLOT: Mutex<()> = Mutex::new(());
+
+        fn hold_repaint_slot() -> MutexGuard<'static, ()> {
+            REPAINT_SLOT.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        const VIEWPORT: Size = Size::new(100.0, 100.0);
+
+        /// A leaf counting its paints.
+        struct Counted {
+            paints: Rc<Cell<usize>>,
+            /// Read by `semantics`, not by build: changing it dirties nothing.
+            label: Rc<Cell<u32>>,
+        }
+
+        impl Widget for Counted {
+            fn layout(&mut self, _ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
+                bc.constrain(Size::new(40.0, 20.0))
+            }
+            fn paint(&mut self, _ctx: &mut PaintCtx, _scene: &mut dyn PaintScene) {
+                self.paints.set(self.paints.get() + 1);
+            }
+            fn event(&mut self, _ctx: &mut EventCtx, _event: &InputEvent) -> EventResult {
+                EventResult::Handled
+            }
+            fn semantics(&self, ctx: &mut SemanticsCtx) {
+                let label = self.label.get().to_string();
+                ctx.push_node(Role::Label, |n| n.set_label(label));
+            }
+        }
+
+        struct CountedView {
+            paints: Rc<Cell<usize>>,
+            label: Rc<Cell<u32>>,
+        }
+
+        impl View<()> for CountedView {
+            type Element = Counted;
+            fn build(&self, _ctx: &mut BuildCtx<'_>) -> Counted {
+                Counted {
+                    paints: self.paints.clone(),
+                    label: self.label.clone(),
+                }
+            }
+            fn rebuild(
+                &self,
+                _prev: &Self,
+                _element: &mut Counted,
+                _ctx: &mut BuildCtx<'_>,
+            ) -> ChangeFlags {
+                ChangeFlags::NONE
+            }
+        }
+
+        /// What one frame did.
+        #[derive(Debug, PartialEq, Eq)]
+        struct FrameRun {
+            paint_only: bool,
+            built: bool,
+            painted: bool,
+            /// The scope was dirty after paint, i.e. the handler would request another frame.
+            scope_follow_up: bool,
+        }
+
+        /// The handler-shaped state: root, scope, a build closure reading `signal`, and the
+        /// two shell-held decision inputs.
+        struct Frames {
+            runtime: &'static ReactiveRuntime,
+            root: RenderRoot<(), CountedView>,
+            scope: TrackedScope,
+            signal: RwSignal<u32>,
+            build: Box<dyn FnMut(&mut ()) -> CountedView>,
+            builds: Rc<Cell<usize>>,
+            paints: Rc<Cell<usize>>,
+            label: Rc<Cell<u32>>,
+            /// Mirrors the handler's `semantics_seen`.
+            semantics_seen: u64,
+            /// The root label of each semantics push, in order.
+            pushes: Vec<String>,
+            laid_out: bool,
+            other_cause: bool,
+            painted_needs_frame: bool,
+        }
+
+        impl Frames {
+            /// A settled window: one full first frame has run and nothing happened since.
+            fn settled() -> Self {
+                let waker: FrameWaker = Arc::new(|| {});
+                let runtime = ReactiveRuntime::init(waker);
+                let signal = runtime.with_owner(|| RwSignal::new(0u32));
+                let builds = Rc::new(Cell::new(0));
+                let paints = Rc::new(Cell::new(0));
+                let label = Rc::new(Cell::new(0u32));
+                let (count, paints_for_view, label_for_view) =
+                    (builds.clone(), paints.clone(), label.clone());
+                let build = Box::new(move |_: &mut ()| {
+                    count.set(count.get() + 1);
+                    let _ = signal.get();
+                    CountedView {
+                        paints: paints_for_view.clone(),
+                        label: label_for_view.clone(),
+                    }
+                });
+                let mut frames = Self {
+                    runtime,
+                    root: RenderRoot::new(),
+                    scope: TrackedScope::new(),
+                    signal,
+                    build,
+                    builds,
+                    paints,
+                    label,
+                    semantics_seen: 0,
+                    pushes: Vec::new(),
+                    laid_out: false,
+                    other_cause: true,
+                    painted_needs_frame: false,
+                };
+                let first = frames.frame();
+                assert!(
+                    first.built && !first.paint_only,
+                    "the first frame is a full one"
+                );
+                frames.pushes.clear();
+                frames
+            }
+
+            /// `push_semantics_if_changed`: publish only when the generation moved.
+            fn push_semantics(&mut self) {
+                if let Some(update) = self.root.semantics_if_changed(self.semantics_seen) {
+                    self.semantics_seen = self.root.semantics_generation();
+                    let label = update
+                        .nodes
+                        .iter()
+                        .find_map(|(_, node)| node.label().map(str::to_owned))
+                        .unwrap_or_default();
+                    self.pushes.push(label);
+                }
+            }
+
+            /// One frame in `RedrawRequested`'s order, ending with its flag update.
+            fn frame(&mut self) -> FrameRun {
+                frust_core::take_repaint_owed();
+                let paint_only = FrameCauses::gather(
+                    &self.root,
+                    &self.scope,
+                    self.other_cause,
+                    self.painted_needs_frame,
+                    self.laid_out,
+                )
+                .paint_only();
+                let (builds, paints) = (self.builds.get(), self.paints.get());
+                let rebuilt = frame_rebuild(
+                    paint_only,
+                    self.runtime,
+                    &self.scope,
+                    &mut self.root,
+                    &mut self.build,
+                    &mut (),
+                );
+                assert_eq!(
+                    rebuilt,
+                    self.builds.get() > builds,
+                    "the helper reports the build"
+                );
+                if !paint_only && (self.root.take_change_flags().needs_layout() || !self.laid_out) {
+                    self.root.layout(VIEWPORT);
+                    self.laid_out = true;
+                }
+                if !paint_only {
+                    self.push_semantics();
+                }
+                let outcome = self.root.paint(&mut DiscardScene, FrameTime::from_nanos(0));
+                self.push_semantics();
+                let scope_follow_up = self.scope.is_dirty();
+                self.other_cause = scope_follow_up || outcome.needs_frame;
+                self.painted_needs_frame = outcome.needs_frame;
+                FrameRun {
+                    paint_only,
+                    built: rebuilt,
+                    painted: self.paints.get() > paints,
+                    scope_follow_up,
+                }
+            }
+        }
+
+        fn press() -> InputEvent {
+            InputEvent::Pointer(PointerEvent {
+                phase: PointerPhase::Down,
+                position: kurbo::Point::new(20.0, 10.0),
+                button: PointerButton::Primary,
+            })
+        }
+
+        /// A repaint request alone: paint runs, build does not.
+        #[test]
+        fn a_repaint_request_alone_paints_without_building() {
+            let _slot = hold_repaint_slot();
+            let mut frames = Frames::settled();
+
+            frust_core::request_repaint();
+            let run = frames.frame();
+
+            assert!(run.paint_only, "the request was the frame's only cause");
+            assert!(
+                !run.built,
+                "a paint-only frame never runs the build closure"
+            );
+            assert!(run.painted, "the request repaints the tree");
+            assert!(!run.scope_follow_up);
+            assert!(
+                !frames.root.repaint_pending(),
+                "the paint honoured the request"
+            );
+        }
+
+        /// A request beside a dirty tracked scope: build runs and the scope ends clean, so
+        /// no second frame is owed to the scope (no spin).
+        #[test]
+        fn a_repaint_request_with_a_dirty_scope_rebuilds_and_settles() {
+            let _slot = hold_repaint_slot();
+            let mut frames = Frames::settled();
+
+            frust_core::request_repaint();
+            frames.signal.set(1);
+            assert!(
+                frames.scope.is_dirty(),
+                "precondition: the write dirtied the scope"
+            );
+            let run = frames.frame();
+
+            assert!(
+                !run.paint_only && run.built,
+                "a dirty scope owes the rebuild"
+            );
+            assert!(
+                !frames.scope.is_dirty(),
+                "the tracked rebuild cleaned the scope"
+            );
+            assert!(
+                !run.scope_follow_up,
+                "no follow-up frame is owed to the scope"
+            );
+        }
+
+        /// A request beside an input event: build runs.
+        #[test]
+        fn a_repaint_request_with_an_input_event_rebuilds() {
+            let _slot = hold_repaint_slot();
+            let mut frames = Frames::settled();
+
+            frust_core::request_repaint();
+            // What `window_event` does for the press, before dispatching it.
+            frames.other_cause = true;
+            event_under_owner(frames.runtime, &mut frames.root, &mut (), &press());
+            let run = frames.frame();
+
+            assert!(
+                !run.paint_only && run.built,
+                "an input event owes the rebuild"
+            );
+        }
+
+        /// No request and no other cause: the full path, exactly as before.
+        #[test]
+        fn without_a_request_every_frame_takes_the_full_path() {
+            let _slot = hold_repaint_slot();
+            let mut frames = Frames::settled();
+
+            assert!(
+                !frames.root.repaint_pending(),
+                "precondition: nothing requested"
+            );
+            let run = frames.frame();
+            assert!(
+                !run.paint_only && run.built,
+                "an unrequested frame rebuilds as before"
+            );
+        }
+
+        /// A request beside another frame cause: the frame is a normal one (build runs) and
+        /// paint moves the generation after the pre-paint push, so the post-paint push
+        /// publishes a value only the semantics read can see.
+        #[test]
+        fn a_repaint_request_with_another_cause_publishes_semantics_after_paint() {
+            let _slot = hold_repaint_slot();
+            let mut frames = Frames::settled();
+
+            // Not a build input: only the semantics read sees it.
+            frames.label.set(7);
+            frust_core::request_repaint();
+            frames.signal.set(1);
+            let run = frames.frame();
+
+            assert!(
+                !run.paint_only && run.built,
+                "another cause takes the normal path"
+            );
+            assert_eq!(
+                frames.pushes.last().map(String::as_str),
+                Some("7"),
+                "the post-paint push carries the value read after the data change: {:?}",
+                frames.pushes
+            );
+            assert_eq!(
+                frames.semantics_seen,
+                frames.root.semantics_generation(),
+                "nothing is left unpublished"
+            );
+        }
+
+        /// Control: a normal frame with no request pending pushes at most once.
+        #[test]
+        fn a_normal_frame_without_a_request_pushes_at_most_once() {
+            let _slot = hold_repaint_slot();
+            let mut frames = Frames::settled();
+
+            frames.signal.set(1);
+            let run = frames.frame();
+
+            assert!(!run.paint_only && run.built);
+            assert!(
+                frames.pushes.len() <= 1,
+                "no second push after paint: {:?}",
+                frames.pushes
+            );
+            assert_eq!(frames.semantics_seen, frames.root.semantics_generation());
+        }
+
+        /// Every term vetoes on its own; only a lone request clears the decision.
+        #[test]
+        fn each_frame_cause_vetoes_a_paint_only_frame() {
+            let lone = FrameCauses {
+                repaint_pending: true,
+                other_cause: false,
+                scope_dirty: false,
+                change_flags_pending: false,
+                result_flush_pending: false,
+                painted_needs_frame: false,
+                layout_current: true,
+            };
+            assert!(lone.paint_only());
+            let vetoes = [
+                FrameCauses {
+                    repaint_pending: false,
+                    ..lone
+                },
+                FrameCauses {
+                    other_cause: true,
+                    ..lone
+                },
+                FrameCauses {
+                    scope_dirty: true,
+                    ..lone
+                },
+                FrameCauses {
+                    change_flags_pending: true,
+                    ..lone
+                },
+                FrameCauses {
+                    result_flush_pending: true,
+                    ..lone
+                },
+                FrameCauses {
+                    painted_needs_frame: true,
+                    ..lone
+                },
+                FrameCauses {
+                    layout_current: false,
+                    ..lone
+                },
+            ];
+            for causes in vetoes {
+                assert!(!causes.paint_only(), "{causes:?} must take the full path");
+            }
+        }
+
+        /// A queued focus-handle request owes the rebuild that grants it.
+        #[test]
+        fn a_pending_result_flush_is_read_without_draining() {
+            let _slot = hold_repaint_slot();
+            let mut frames = Frames::settled();
+
+            frust_core::request_repaint();
+            frust_core::mark_pending_result_flush();
+            let causes = FrameCauses::gather(&frames.root, &frames.scope, false, false, true);
+            assert!(causes.result_flush_pending && !causes.paint_only());
+            assert!(
+                frust_core::has_pending_result_flush(),
+                "the gather did not drain it"
+            );
+            let run = frames.frame();
+            assert!(run.built, "the rebuild drains the flush");
+            assert!(!frust_core::has_pending_result_flush());
         }
     }
 }

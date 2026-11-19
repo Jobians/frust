@@ -149,7 +149,7 @@ pub struct RenderRoot<State: 'static, V: View<State>> {
     /// the window node). A `Cell` because [`RenderRoot::semantics`] takes `&self`.
     semantics_alloc: Cell<u64>,
     root_semantics_id: Cell<Option<NonZeroU64>>,
-    /// Bumped when a rebuild, theme swap or inset change may have changed the semantics tree.
+    /// Bumped when a rebuild, theme swap, inset change or repaint request may change semantics.
     semantics_gen: u64,
     /// Set when the deferred-callback flush owes a frame; the next paint reports `needs_frame`.
     deferred_frame: bool,
@@ -176,6 +176,8 @@ pub struct RenderRoot<State: 'static, V: View<State>> {
     hover_link: Option<u64>,
     /// `(hover_link, focus_epoch)` as the last paint saw them; a change bumps `paint_epoch`.
     painted_links: (Option<u64>, u64),
+    /// The [`repaint_generation`](crate::repaint::repaint_generation) the last paint honoured.
+    painted_repaint: u64,
     retained_layers: bool,
     /// The renderer's resident-key ledger as of the previous frame.
     retained_ledger: crate::retained::RetainedLedger,
@@ -244,6 +246,7 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             animation_clock: AnimationClock::default(),
             hover_link: None,
             painted_links: (None, 1),
+            painted_repaint: crate::repaint::repaint_generation(),
             retained_layers: true,
             retained_ledger: crate::retained::RetainedLedger::empty(),
             layout_skip: true,
@@ -251,6 +254,12 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             overlay_pods: Vec::new(),
             _state: core::marker::PhantomData,
         }
+    }
+
+    /// Whether a [`request_repaint`](crate::repaint::request_repaint) landed since this root's
+    /// last paint (a fresh root owes none). Read-only, for a shell gathering frame inputs.
+    pub fn repaint_pending(&self) -> bool {
+        crate::repaint::repaint_generation() != self.painted_repaint
     }
 
     /// The last paint's shortcut declarations `filter` keeps, in paint order: a palette's list.

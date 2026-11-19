@@ -63,6 +63,13 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
             self.painted_links = links;
             self.paint_epoch = self.paint_epoch.wrapping_add(1);
         }
+        // A repaint request re-records every retained page (the epoch) and republishes semantics.
+        let repaint = crate::repaint::repaint_generation();
+        if repaint != self.painted_repaint {
+            self.painted_repaint = repaint;
+            self.paint_epoch = self.paint_epoch.wrapping_add(1);
+            self.semantics_gen = self.semantics_gen.wrapping_add(1);
+        }
 
         let clocks = Clocks {
             animation: self

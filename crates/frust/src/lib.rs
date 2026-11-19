@@ -348,6 +348,19 @@ pub use frust_core::{
     HapticFeedback, HapticSink, haptic_sink_installed, perform_haptic, set_haptic_sink,
 };
 
+/// The repaint request: [`request_repaint`] asks every live root to repaint on its next frame.
+/// Callable from any thread and process-wide, it means repaint only: no build, no layout, and
+/// no frame loop of its own. [`repaint_on`] bridges signals to it without a rebuild.
+///
+/// ```
+/// use frust::{Get, RwSignal, repaint_on, request_repaint};
+///
+/// request_repaint();
+/// let revision = RwSignal::new(0_u64);
+/// let _binding = repaint_on(move || revision.get());
+/// ```
+pub use frust_core::request_repaint;
+
 /// Platform-view embedding (platform-views feature): reserve
 /// layout space for a native view (a map, a video player, ...) composited
 /// alongside the frust surface. [`platform_view`] takes the
@@ -929,6 +942,12 @@ pub mod authoring {
         HapticFeedback, HapticSink, haptic_sink_installed, perform_haptic, set_haptic_sink,
     };
 
+    /// The repaint request a widget or plugin makes when its paint changed without a rebuild:
+    /// any thread, process-wide, repaint only. [`repaint_on`] bridges signals to it, guarded by a
+    /// [`RepaintBinding`]. Also flat at the crate root.
+    pub use crate::repaint_glue::{RepaintBinding, repaint_on};
+    pub use frust_core::request_repaint;
+
     /// The clipboard/selection vocabulary an editable widget matches on —
     /// [`InputEvent::EditCommand`] carries one of these four verbs, already
     /// decoded from whatever chord, hardware key or edit-menu tap produced it.
@@ -1480,8 +1499,14 @@ pub use peniko;
 pub mod testing;
 
 mod back_glue;
+mod repaint_glue;
 mod route_state;
 mod router_glue;
+
+/// Repaint on a signal change without a rebuild: [`repaint_on`] tracks the signals its closure
+/// reads and calls [`request_repaint`] on every change until its [`RepaintBinding`] drops. See
+/// `repaint_glue`'s module docs.
+pub use repaint_glue::{RepaintBinding, repaint_on};
 
 /// Android back-press ⇄ navigator auto-wiring:
 /// [`attach_back_handler`]/[`BackHandler`] pop a [`NavigatorController`] on a

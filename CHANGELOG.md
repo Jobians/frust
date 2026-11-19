@@ -15,6 +15,10 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 
 ### Breaking
 
+- `frust-shell-common`: `AppTree` gained the required method `repaint_pending`, and `FrameInputs`
+  gained the public field `repaint_owed`. Migration: a type that implements `AppTree` forwards the
+  new method to `RenderRoot::repaint_pending`; a `FrameInputs` literal that lists every field adds
+  `repaint_owed` or ends with `..FrameInputs::default()`.
 - `frust-drive`: `PluginSpec` and `FeatureSpec` gained the public fields `min_ios` and
   `min_android_sdk`, so a struct literal written outside the crate no longer compiles. Migration: end
   it with `..PluginSpec::DEFAULT` (`..FeatureSpec::DEFAULT` for a feature). `Contribution` and
@@ -128,6 +132,17 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 
 ### Added
 
+- `frust::request_repaint()` asks for the next frame to repaint without a rebuild or a layout. It
+  can be called from any thread and applies to the whole process: every live root repaints its tree
+  once, content behind a `repaint_boundary` included, and semantics are published again. Use it for
+  data a widget reads at paint time, such as a `canvas` fed from a background thread. When the
+  request is the only reason for a frame, the Android, iOS and desktop shells skip the rebuild and
+  the layout; the web shell wakes and runs its normal frame. In a test, `Tester::repaint()` records
+  that paint-only frame.
+- `frust::repaint_on(read)` requests a repaint whenever a signal that `read` reads changes, without
+  marking the tree for rebuild. It returns a `RepaintBinding`; dropping the binding stops it. Create
+  it in `Component::init` and keep it in the component's state. Both items are also under
+  `frust::authoring`.
 - `frust-drive` plugin contributions: `Contribution::IosEntitlement` (a key written to
   `ios/Runner/Runner.entitlements`, with `IosEntitlementValue` as Bool, String or StringArray),
   `Contribution::PlistArrayEntry` (a string array in `Info.plist`) and `Contribution::MavenRepository`

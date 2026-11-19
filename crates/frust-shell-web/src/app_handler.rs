@@ -1331,6 +1331,9 @@ mod browser_loop {
     pub enum ShellUserEvent {
         /// A tracked signal was written; rebuild and repaint.
         SignalsDirty,
+        /// A `frust_core::request_repaint` owes the page a frame: a plain redraw, whose frame
+        /// drains the debt. The rebuild stays unconditional here.
+        RepaintOwed,
         /// The page went away or hid (`pagehide`, `visibilitychange` to hidden): the font cache
         /// flush point. A browser keeps no font cache file today (the web tier's cache is
         /// disabled), so the flush call is gated off by `has_persistent_font_cache` (the
@@ -1387,6 +1390,18 @@ mod browser_loop {
                 }
             });
         })
+    }
+
+    /// The repaint request's wake through the same [`WAKE_PROXY`] slot, capturing nothing for
+    /// the same reason. Installing it posts at once when a request is already owed.
+    fn install_repaint_hook() {
+        frust_core::set_repaint_hook(Some(Arc::new(|| {
+            WAKE_PROXY.with(|slot| {
+                if let Some(proxy) = slot.borrow().as_ref() {
+                    let _ = proxy.send_event(ShellUserEvent::RepaintOwed);
+                }
+            });
+        })));
     }
 
     /// The page-lifecycle listeners and the closures behind them. Dropping the guard removes
@@ -1956,6 +1971,10 @@ mod browser_loop {
         /// inside the `requestAnimationFrame` callback winit services
         /// `RedrawRequested` from.
         fn frame(&mut self, event_loop: &ActiveEventLoop, window: &Arc<Window>) {
+            // Drain the repaint debt first, re-arming the hook edge; this frame's paint
+            // honours the request.
+            frust_core::take_repaint_owed();
+
             // Drain any local tasks queued since the last turn before
             // rebuilding, so their signal writes are visible to this frame.
             self.runtime.pump_local();
@@ -2170,7 +2189,7 @@ mod browser_loop {
         fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: ShellUserEvent) {
             self.runtime.pump_local();
             match event {
-                ShellUserEvent::SignalsDirty => {
+                ShellUserEvent::SignalsDirty | ShellUserEvent::RepaintOwed => {
                     if let Some(window) = self.window.as_ref() {
                         window.request_redraw();
                     }
@@ -2473,6 +2492,7 @@ mod browser_loop {
         event_loop.set_control_flow(ControlFlow::Wait);
 
         let waker = install_wake_proxy(event_loop.create_proxy());
+        install_repaint_hook();
         let runtime = ReactiveRuntime::init(waker);
         let page_listeners = install_page_lifecycle_listeners();
         // Initial lifecycle target from the document's current visibility and focus.
