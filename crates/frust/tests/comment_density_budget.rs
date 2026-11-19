@@ -87,6 +87,7 @@ const CAPS: &[(&str, f32)] = &[
     ("crates/frust-core/src/layout.rs", 19.0), // measured 16.0
     ("crates/frust-core/src/lib.rs", 20.9),  // measured 17.9
     ("crates/frust-core/src/overlay.rs", 25.0), // measured 24.6
+    ("crates/frust-core/src/repaint.rs", 25.0), // head under 80 lines, exempt
     ("crates/frust-core/src/shortcuts.rs", 19.0), // measured 16.0
     ("crates/frust-core/src/retained.rs", 25.0), // measured 23.4
     ("crates/frust-core/src/selection_toolbar.rs", 25.0), // measured 23.7
@@ -99,6 +100,7 @@ const CAPS: &[(&str, f32)] = &[
     ("crates/frust-core/tests/layout_audit.rs", 10.9), // measured 7.9
     ("crates/frust-core/tests/layout_skip.rs", 17.2), // measured 14.2
     ("crates/frust-core/tests/paint_dirty.rs", 14.4), // measured 11.4
+    ("crates/frust-core/tests/repaint_request.rs", 8.2), // measured 5.2
     ("crates/frust-core/tests/retained_paint.rs", 8.1), // measured 5.1
     ("crates/frust-core/tests/sliver_seam.rs", 12.6), // measured 9.6
 ];

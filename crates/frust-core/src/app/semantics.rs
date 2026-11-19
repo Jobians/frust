@@ -82,7 +82,8 @@ impl<State: 'static, V: View<State>> RenderRoot<State, V> {
     }
 
     /// The semantics dirty gate: bumped by a rebuild that returned change flags,
-    /// a theme swap, and an inset change. A shell records the value it last
+    /// a theme swap, an inset change, and a paint honouring a repaint request
+    /// ([`crate::repaint`]). A shell records the value it last
     /// pushed and compares ([`RenderRoot::semantics_if_changed`]).
     pub fn semantics_generation(&self) -> u64 {
         self.semantics_gen
