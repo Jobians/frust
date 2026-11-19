@@ -255,6 +255,8 @@ impl IosAppHandle {
             a11y_action_performed,
             // Driven by the gate's own warmup countdown (`note_resumed`).
             resumed_recently: false,
+            // Not gathered yet; the shells start honouring it in a later change.
+            repaint_owed: false,
         };
         // The events latch has now been read into this frame's decision; reset it
         // so the next frame only sees events that arrive from here on. Clearing

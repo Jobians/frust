@@ -294,6 +294,8 @@ impl AndroidAppHandle {
             // the resume-warmup Run; leaving this `false` and relying on the
             // counter avoids double-counting (both force a Run identically).
             resumed_recently: false,
+            // Not gathered yet; the shells start honouring it in a later change.
+            repaint_owed: false,
         };
 
         // The surface (re)creation / resize that set `surface_dirty` also forces
