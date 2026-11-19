@@ -107,6 +107,18 @@ is additional or different for a plugin.
   unfiltered), so it serves only the artifacts its plugin needs.
 - **An `IosEntitlement` is written to every Runner target configuration, so a capability-backed entitlement
   must be enabled for each bundle identifier a flavor signs with.**
+- **Manifest-described plugin data is untrusted input** (`[package.metadata.frust.plugin]`, read by
+  `frust-drive`'s `plugin::manifest`; the checked-key list is in its `ManifestError` rustdoc):
+  - a `path` is relative, free of `..`, and resolves (symlinks followed) to a directory inside its
+    package; nothing outside the package is ever wired;
+  - every value reaches a project file escaped for that file (XML for plist and entitlement text,
+    Kotlin/Gradle string escaping for repository urls and groups), and names are matched against a
+    narrow character set before they are used as an identifier or path component;
+  - a Maven repository always names its groups (an empty list is refused), so a plugin cannot add
+    an unfiltered repository;
+  - an unknown key is an error, never ignored, so a typo cannot silently drop a requirement;
+  - a broken manifest skips that whole plugin with a warning and is never applied in part; one bad
+    plugin does not fail discovery or the build of the others.
 - **A plugin host launches Activity Result contracts** through the resumed
   `ComponentActivity`'s `activityResultRegistry`, under a plugin-prefixed key.
 - **Content a plugin picks or shares is staged in a plugin-named cache subdirectory** (`frust-photo-library` picks, `frust-share/<uuid>/`

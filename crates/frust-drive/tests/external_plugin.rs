@@ -212,13 +212,14 @@ fn an_out_of_tree_plugin_is_discovered_applied_and_wired() {
         "dev.example.extplugin.formats",
         "ExtPlugin",
         "CoreNFC",
+        ".gitignore entry `/ios/ExtPlugin`",
     ] {
         assert!(
             joined.contains(needle),
             "`{needle}` not pending in:\n{joined}"
         );
     }
-    assert_eq!(pending.len(), 6, "{joined}");
+    assert_eq!(pending.len(), 7, "{joined}");
 
     // Sync applies them.
     let report = sync_plugins(&app, &catalog).expect("sync_plugins");
@@ -259,6 +260,13 @@ fn an_out_of_tree_plugin_is_discovered_applied_and_wired() {
         "{plist}"
     );
     assert!(plist.contains("<string>NDEF</string>"), "{plist}");
+    let ignore = read(".gitignore");
+    assert_eq!(
+        ignore.lines().filter(|l| *l == "/ios/ExtPlugin").count(),
+        1,
+        "{ignore}"
+    );
+    assert!(ignore.ends_with("/ios/ExtPlugin\n"), "{ignore}");
     let manifest = read("android/app/src/main/AndroidManifest.xml");
     assert!(manifest.contains("android.permission.NFC"), "{manifest}");
 
@@ -336,6 +344,7 @@ fn the_packaged_crate_ships_its_native_directories() {
     );
     for expected in [
         "platform/android/build.gradle.kts",
+        "platform/android/consumer-rules.pro",
         "platform/android/src/main/AndroidManifest.xml",
         "platform/android/src/main/kotlin/dev/example/extplugin/ExtPluginHost.kt",
         "platform/ios/Package.swift",
@@ -348,4 +357,39 @@ fn the_packaged_crate_ships_its_native_directories() {
     }
     let _ = fs::remove_dir_all(&target);
     let _ = fs::remove_dir_all(&copy);
+}
+
+/// A release build minifies the app, so the class the Rust side loads by name
+/// survives only through consumer keep rules. The Kotlin source, the rules and
+/// the Gradle reference are read from the fixture so the three cannot drift.
+#[test]
+fn the_fixture_keeps_its_jni_loaded_host_class_in_release_builds() {
+    let android = fixture_dir().join("platform/android");
+    let source =
+        fs::read_to_string(android.join("src/main/kotlin/dev/example/extplugin/ExtPluginHost.kt"))
+            .expect("read ExtPluginHost.kt");
+    let declared = |prefix: &str| -> String {
+        source
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(prefix))
+            .unwrap_or_else(|| panic!("no `{prefix}` line in:\n{source}"))
+            .trim_end_matches(['{', ' '])
+            .trim()
+            .to_string()
+    };
+    let class = format!("{}.{}", declared("package "), declared("object "));
+
+    let gradle = fs::read_to_string(android.join("build.gradle.kts")).expect("read gradle");
+    assert!(
+        gradle.contains("consumerProguardFiles(\"consumer-rules.pro\")"),
+        "{gradle}"
+    );
+    let rules = fs::read_to_string(android.join("consumer-rules.pro"))
+        .expect("the fixture ships platform/android/consumer-rules.pro");
+    assert!(
+        rules
+            .lines()
+            .any(|l| l.trim() == format!("-keep class {class} {{ *; }}")),
+        "`{class}` is not kept by:\n{rules}"
+    );
 }

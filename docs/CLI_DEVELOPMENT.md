@@ -184,6 +184,21 @@ In `AndroidManifest.xml`, `<application>` takes `android:label="${frustAppLabel}
 `$(PRODUCT_BUNDLE_IDENTIFIER)`; `project.pbxproj` gets `FRUST_DISPLAY_NAME = "<current name>";`
 beside `PRODUCT_BUNDLE_IDENTIFIER` in each Runner build configuration.
 
+## Plugin commands
+
+`frust plugin` works on the project in the current directory. `add <id> [--feature <f>]...` adds a
+built-in or discovered plugin; `list` shows the built-in plugins and those the app's dependencies
+describe in their own `[package.metadata.frust.plugin]`, each with its origin and, for one the app
+depends on, `added` or `N pending`; `sync` applies the pending tracked edits of every discovered
+plugin the app depends on and is idempotent. `frust run` and `frust build` (Android and iOS lanes)
+wire the machine-local locations of every plugin module (`android/local.properties`, `ios/<Package>`
+links) and then stop before any Gradle or `xcodebuild` run when a discovered plugin has tracked
+edits pending, naming the plugin and the items and telling you to run `frust plugin sync`. The
+authoring guide, the fixture and its device gate live in
+[PLUGINS_DEVELOPMENT.md](PLUGINS_DEVELOPMENT.md) (§ Writing a plugin outside this repository).
+Tests: `crates/frust-drive/tests/external_plugin.rs` drives discovery, sync and wiring against the
+fixture; `crates/frust-cli/tests/plugin_add.rs` covers the subcommands.
+
 ## Adding android/ and ios/ to an existing crate
 
 No command does this. The CLI commands are `create`, `doctor`, `devices`, `clean`, `plugin`,

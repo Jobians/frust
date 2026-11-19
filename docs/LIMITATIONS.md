@@ -473,6 +473,99 @@ partial add is completed by a re-run; a project-wide pre-validation of every kin
 
 ---
 
+### `plugin-tui-add-dialog-built-in-only` — the TUI's Add Plugin dialog lists built-in plugins only
+
+**Observed**: the dialog builds its selection cards from the built-in plugin catalog. A plugin that
+a dependency declares in its own package manifest (`[package.metadata.frust.plugin]`) is not
+listed, so it cannot be added or synced from the dialog. `frust plugin list` shows it, and
+`frust plugin add <id>` or `frust plugin sync` applies it from the command line.
+
+**Applies to**: `frust tui`'s Add Plugin flow, in a project that depends on a manifest-declared
+plugin.
+
+**Why accepted**: the dialog was left on the built-in catalog and does not run plugin discovery
+for the project; the command line covers declared plugins.
+
+**Evidence**: `crates/frust-tui/src/engine/add_plugin.rs`'s `build_entries`
+(`PluginCatalog::built_in()`); `crates/frust-cli/src/commands/plugin.rs`'s `add`, `list` and `sync`
+(the project catalog).
+
+---
+
+### `plugin-manifest-no-desktop-macro-scaffold` — a manifest-declared plugin cannot contribute desktop entries, an app-crate macro or a scaffold file
+
+**Observed**: the `[package.metadata.frust.plugin]` schema has Android and iOS tables only (a Gradle
+module, permissions, Maven repositories; a Swift package, frameworks, `Info.plist` keys and arrays,
+entitlements) plus a Cargo feature per optional feature. It has no key for a macOS `Info.plist`
+entry, a macOS entitlement, a Linux desktop entry, a macro invocation in the app crate, or a file
+written into the app. An unknown key is an error that skips the whole plugin with a warning, so
+such a key cannot be added by hand either. A declared plugin therefore contributes nothing to
+`frust build macos` / `frust build linux` bundles.
+
+**Applies to**: a plugin outside the frust repository that needs one of those contributions. The
+built-in registry can still express all of them.
+
+**Why accepted**: the manifest schema covers the Android and iOS project edits only. The app
+author adds a desktop key, a macro call or a file by hand, following the plugin's own
+documentation.
+
+**Evidence**: `crates/frust-drive/src/plugin/manifest.rs`'s module documentation, `PluginTable`,
+`AndroidTable` and `IosTable` (`deny_unknown_fields`) and its
+`unknown_keys_are_refused_at_every_level` test; `crates/frust-drive/src/plugin/apply.rs`'s
+`desktop_contributions_in`.
+
+---
+
+### `plugin-sync-applied-count-omits-gitignore` — `frust plugin sync` can report one fewer applied change than `frust plugin list` counted as pending
+
+**Observed**: for a manifest-declared plugin with a Swift package, the pending count has two rows
+for the package: the Xcode project reference and the `/ios/<Package>` line in the app's root
+`.gitignore`. `frust plugin list` and the `frust run` / `frust build` stop message count both.
+`frust plugin sync` applies both but reports them as one item, the Swift package reference, so it
+prints for example `6 applied` after `7 pending`. The `.gitignore` line is written; only the count
+and the item list differ. A second sync reports `up to date`.
+
+**Applies to**: `frust plugin sync` (and `frust plugin add`) of a manifest-declared plugin with an
+iOS Swift package, in an app that has `ios/` and a root `.gitignore` without the line.
+
+**Why accepted**: cosmetic. Nothing is left unapplied, and `git diff` shows the line.
+
+**Evidence**: `crates/frust-drive/src/plugin/pending.rs`'s `pending_contributions` (the
+`GitignoreLink` row) against `crates/frust-drive/src/plugin/apply.rs`'s `SwiftPackageRef` arm (one
+outcome for both writes) and `crates/frust-cli/src/commands/plugin.rs`'s `sync_with`; device gate
+2026-11-19, check 3 in
+[the external plugin fixture](../crates/frust-drive/tests/fixtures/external-plugin/README.md).
+
+---
+
+### `plugin-entitlement-capability-not-checked` — a plugin's iOS entitlement is written to the project, but the capability behind it is not checked
+
+**Observed**: an entitlement a plugin contributes is written to the entitlements file of every
+Runner build configuration, custom ones included, and `CODE_SIGN_ENTITLEMENTS` is set in each. An
+unsigned build then succeeds. A signed build is refused when the entitlement is backed by a
+capability (NFC tag reading, push, associated domains) that the provisioning profile does not
+carry. The capability has to be enabled in the Apple developer account for each bundle identifier
+the app signs with, flavor identifiers included: Xcode's automatic signing does that when an
+account is signed in, by creating an explicit App ID profile; otherwise a manual explicit profile
+is needed. frust does not check the account or the profile,
+and does not warn at add or sync time.
+
+**Applies to**: iOS, a signed build of an app with a plugin (built-in or manifest-declared) that
+contributes a capability-backed entitlement.
+
+**Why accepted**: capabilities and provisioning profiles live in the developer account, outside
+the project files the plugin tooling edits. The refusal comes from Xcode's signing step.
+
+**Evidence**: device gate 2026-11-19 (iPhone 13 mini), checks 8 and 9 in
+[the external plugin fixture](../crates/frust-drive/tests/fixtures/external-plugin/README.md): the
+unsigned build succeeded; the signed build with the NFC tag reading entitlement was refused with
+no account signed in to Xcode (the team's wildcard profile lacks the capability) and succeeded once
+an account was signed in and automatic signing created an explicit App ID profile; and the setting
+landed in Debug, Debug-Dev, Release
+and Profile. `crates/frust-drive/src/plugin/apply.rs`'s `apply_ios_entitlement`.
+
+---
+
 ### `ime-ios-content-type-unverified` — iOS secure-entry IME path is device-unverified
 
 **Observed**: `FrustViewController.swift`'s IME reconcile path — the

@@ -11,10 +11,7 @@ OS-capability plugins — `shared-preferences`, `secure-storage`, `camera`, `cli
 public API behind a per-platform backend. `url-launcher` opens an absolute `http`/`https` URL in the
 platform's default external browser, fire-and-forget, over Android `ACTION_VIEW`, iOS
 `openURL:options:completionHandler:`, or a desktop opener — the launch half of an RFC 8252 OAuth
-round trip, whose completion returns through `frust::deep_links()`. It also carries Maps https helpers
-(`Maps::directions` / `directions_to` / `show`: Apple Maps on iOS/macOS, Google Maps elsewhere, through
-the unchanged `url.rs` validator) and a native-scheme arm, `UrlLauncher::open_maps_native`, behind
-`deeplink.rs`'s allowlist (`geo`/`maps`/`comgooglemaps`/`google.navigation`; `NoHandler` on desktop).
+round trip, whose completion returns through `frust::deep_links()`. Maps helpers: see the module table.
 `share` opens the platform share sheet for text, a URL or files (Android chooser, iOS activity sheet, a
 clipboard copy of text and URLs on desktop, a macOS sharing picker for files). `photo-library` picks photos
 and videos through the system picker. `file-dialogs` shows native open, export and folder-choosing dialogs on desktop, Android and iOS, blocking
@@ -397,11 +394,26 @@ host ignores the back press.
 
 ## Data Flow
 
-- A plugin's native modules (Gradle module, Swift package) ship inside its own crate and are
-  located through `frust-drive`'s `packages::locate` in registry and `--frust-path` mode alike,
-  then wired by `platform_wiring::sync` as `frust.plugin.<module>.dir` in the project's gitignored
-  `android/local.properties` and an `ios/<Package>` symlink. Adding a plugin to an existing project
-  (`add_plugin`) writes its module location the same way, so no tracked file carries a machine path
+- Plugin catalog: `frust-drive`'s `PluginCatalog` is the one list every consumer looks a plugin up in
+  (`frust plugin add`/`list`/`sync`, the machine-local wiring, the desktop-lane scan; the TUI's
+  Add Plugin dialog uses its built-in half only). It holds the built-in registry's entries plus the plugins `project_catalog`
+  discovers: packages in the app's resolved dependency graph that describe themselves under
+  `[package.metadata.frust.plugin]`, read through one `cargo metadata` call. Each entry carries a
+  `PluginOrigin` (`BuiltIn`, or `Manifest` with the package directory cargo resolved); a built-in id
+  always wins over a discovered one, and a broken or ambiguous manifest skips that package with a
+  warning, never a failure. A manifest declares the same kinds an out-of-tree plugin needs on
+  mobile: Gradle module, permissions, Maven repositories, Swift package, frameworks, plist keys,
+  entitlements, optional features. It cannot contribute a desktop-lane entry, an app-crate macro
+  or a scaffold file, and trust rules bound its data ([PLUGINS_CODE_STANDARDS.md](PLUGINS_CODE_STANDARDS.md)).
+  The schema is the `frust-drive` `plugin::manifest` module rustdoc; the worked example is
+  `crates/frust-drive/tests/fixtures/external-plugin` ([README](../crates/frust-drive/tests/fixtures/external-plugin/README.md)).
+- A plugin's native modules (Gradle module, Swift package) ship inside its own crate and are located
+  from the directory cargo resolved the package to: a built-in one through `frust-drive`'s
+  `packages::locate` in registry and `--frust-path` mode alike, a manifest one from its catalog
+  entry's package directory (module paths are relative to it). `platform_wiring` wires them as
+  `frust.plugin.<module>.dir` in the project's gitignored `android/local.properties` and an
+  `ios/<Package>` symlink, so no tracked file carries a machine path; `frust run`/`frust build`
+  refresh that wiring and stop when a manifest plugin's tracked edits are still pending
   (see [CLI_ARCHITECTURE.md](CLI_ARCHITECTURE.md)).
 - `photo-library`'s `library` tier adds three reads, all blocking and refused on the mobile UI thread.
   `AssetQuery::with_details` fills file name, content type and `size_bytes`: Android reads them in the page's own
@@ -505,9 +517,6 @@ host ignores the back press.
   `// frust:plugin-repositories` marker of `android/settings.gradle.kts`, idempotent by url. A
   `PluginSpec`/`FeatureSpec` may state `min_ios`/`min_android_sdk`; the add checks the app's lowest
   `IPHONEOS_DEPLOYMENT_TARGET` and its `minSdk` against them and refuses rather than raising either.
-  `haptics` is the registry's first entry to add a manifest permission
-  (`android.permission.VIBRATE`) directly rather than folding it inside a plugin's own Gradle
-  module, since its Android backend is plain JNI with no Kotlin helper class to carry it.
 - `clean-signals-frust` wires a `clean_signals` controller into a Frust `Component`'s reactive
   `Owner`, surfacing failures and async state as `View`s; `Component` builds are coarse-grained,
   fully re-running on any tracked-signal write.
@@ -577,5 +586,6 @@ host ignores the back press.
 | `UrlLauncher` / `UrlLauncherError` | External-browser launch entry point and its error enum (`InvalidUrl`, `PlatformNotInitialized`, `NoHandler`, `Platform`) |
 | `FileDialog` / `FileFilter` / `FileDialogError` | Native file-dialog builder and its blocking terminal calls; a named extension filter (a display hint, not validation; extensions normalised); the error enum (`Unsupported`, never carrying a path) |
 | `AuthSession` / `AuthSessionRequest` / `AuthSessionOutcome` / `AuthSessionError` | Auth-user-agent entry point, its request (https URL, callback scheme, ephemeral), the two outcomes, and the error enum (`InvalidUrl`, `Busy`, `PlatformNotInitialized`, `NoHandler`, `Platform`) |
+| `PluginCatalog` / `CatalogEntry` / `PluginOrigin` | `frust-drive`'s plugin lookup list: built-in registry entries plus manifest-described ones, each entry a `PluginSpec` tagged with where it came from |
 | `DesktopViewFactory` / `DesktopViewHandle` | `frust-plugin`'s desktop-registry vocabulary: the main-thread-only create/update-params/dispose trait a plugin registers per `view_type`, and the `!Send`, +1-retained native-view pointer handed to a desktop shell on create and given back on dispose |
 | `ButtonDecoration` / `OverflowObserver` | `frust_material`'s button-family extension seams: pluggable gradient decoration and label-overflow-strategy observation |

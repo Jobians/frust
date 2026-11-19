@@ -21,6 +21,22 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   `PluginAddError` are not `#[non_exhaustive]` and gained variants (`IosEntitlement`,
   `PlistArrayEntry`, `MavenRepository`; `InvalidContribution`, `PlatformFloorTooLow`), so an
   exhaustive `match` on either needs the new arms.
+- `frust-drive`: the plugin model holds `Cow` data, so a plugin can be described at run time as well
+  as in the static registry. In `PluginSpec`, `FeatureSpec`, `Contribution`, `IosEntitlementValue`,
+  `NativeModule` and `NativeKind`, every `&'static str` field is now `Cow<'static, str>` and every
+  `&'static [T]` field `Cow<'static, [T]>` (a string list is `Cow<'static, [Cow<'static, str>]>`),
+  and none of these types is `Copy` any more. Migration: wrap each literal in `Cow::Borrowed(..)`
+  (it works in a `const` or `static`), match on a reference (`match &contribution`), and `.clone()`
+  where a value was copied.
+- `frust-drive`: plugin ids in reports and errors are owned. `DesktopContribution` is no longer
+  `Copy`: its `plugin_id` is `Cow<'static, str>` and its `contribution` an owned `Contribution` (was
+  `&'static Contribution`). `platform_wiring::ModuleWiring::plugin_id`, the `plugin_id` of
+  `BundleNote::PluginContribution` / `PluginEntryPresent` and of
+  `DesktopBuildError::ContributionUnappliable`, and `platform_wiring::SyncError::EmbeddingMissing`'s
+  `package` are `String` (were `&'static str`); `PluginAddError::PlatformFloorTooLow`'s `plugin` is
+  `Box<str>`. `platform_wiring::Report` gained the public field `collisions`, so a struct literal
+  needs it. `PluginAddError` gained the variant `DependencySourceNotWritable`, so an exhaustive
+  `match` needs the new arm.
 - The minimum supported Rust version is now 1.89 (was 1.88), because rusqlite 0.43.0 requires it.
 - `accesskit::Tree` (re-exported through frust) is now `TreeInfo`; the old name is a deprecated alias.
 - `frust-i18n` typed keys (`locales!`'s `keys` module): a message with two or more `$variable`s now
@@ -120,6 +136,48 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 - `frust plugin add` checks the plugin's minimum platform versions (`min_ios`, `min_android_sdk`)
   against the app before writing anything, and refuses with `PluginAddError::PlatformFloorTooLow`
   (naming `FloorPlatform`) when the app's floor is lower. The app's floor is never raised for it.
+- Manifest-declared plugins: a crate outside the frust repository describes its plugin in
+  `[package.metadata.frust.plugin]` of its own `Cargo.toml` (id, summary, minimum platform versions,
+  an Android Gradle module, permissions and Maven repositories, an iOS Swift package, frameworks,
+  `Info.plist` keys and entitlements, and optional features). frust finds every such package in the
+  app's resolved dependency graph with one `cargo metadata` run. A built-in plugin's id wins over a
+  declared one, and a description with an unknown key, a path that leaves the package or another
+  invalid value is skipped whole with a warning. `frust plugin add <id>` accepts a declared id, and
+  `frust run` / `frust build` point the machine-local Android and iOS wiring at a declared plugin's
+  native modules as they do for a built-in one. For a declared plugin, items for a platform
+  directory the app lacks are skipped. A manifest cannot declare desktop entries, an app-crate macro
+  or a scaffold file ([docs/LIMITATIONS.md](docs/LIMITATIONS.md),
+  `plugin-manifest-no-desktop-macro-scaffold`). The schema is the module documentation of
+  `crates/frust-drive/src/plugin/manifest.rs`; a worked example is
+  [the external plugin fixture](crates/frust-drive/tests/fixtures/external-plugin/README.md).
+- `frust plugin list`: the plugins available to the project in the current directory, the built-in
+  ones first and then the declared ones, each with its origin (`built-in`, or the package, its
+  version and `path`, `registry` or `other`). A plugin the app depends on is marked `added` or
+  `<n> pending`, the number of tracked project edits it still lacks.
+- `frust plugin sync`: applies the pending base edits of every declared plugin the app depends on
+  and prints what it applied, or `up to date`. Every plugin is checked before the first write, so a
+  refusal leaves the project untouched, and a re-run changes nothing. For a declared plugin with a
+  Swift package, `sync` and `add` also append `/ios/<Package>` to the app's root `.gitignore`, and
+  that line counts as a pending edit until it is there. Optional features are chosen
+  with `frust plugin add --feature`, and built-in plugins are still added with `frust plugin add`.
+- `frust run` (device lanes) and `frust build` (Android and iOS) stop before any build process when
+  a declared plugin the app depends on has tracked edits pending. The message names the plugin and
+  its package, lists each pending edit and says to run `frust plugin sync`. Neither command edits a
+  tracked file itself. A check that cannot be made is a warning, not a stop.
+- `frust-drive` plugin catalog API: `PluginCatalog` (`built_in`, `with_discovered`, `find`, `iter`,
+  `specs`) with `CatalogEntry`, `PluginOrigin` and `DepSource`; `plugin::discover` with `Discovery`
+  and `ManifestError`; `project_catalog` and `project_catalog_or_built_in` with `ProjectCatalog` and
+  `CatalogWarning`; `add_plugin_from` / `add_plugin_from_with`, `plugin::is_installed` and
+  `desktop_contributions_in`, which take a catalog or one of its entries;
+  `platform_wiring::sync_with_catalog`, whose report lists each `ModuleCollision` (a Gradle module
+  or Swift package name two installed plugins declare, wired for one of them).
+- `frust-drive` pending-change API: `pending_contributions` (rows of `PendingContribution`),
+  `sync_plugins` (`SyncReport`), `installed_plugin_ids`, `plugin_statuses` (`PluginStatus`) and
+  `pending_stop` (`PendingStop`, `PendingPlugin`, `PendingWarning`).
+- `frust-drive` `packages`: the `GraphLocator` trait (a `PackageLocator` that also reads the whole
+  resolved dependency graph) with `GraphMetadata` and `PackageGraph`; `CargoLocator` and
+  `CachedLocator` implement it, and `PackageLocator::as_graph_locator` (default `None`) lets a cache
+  serve the graph and every package directory from one `cargo metadata` document.
 - `ScrollView::dismiss_keyboard_on_drag(bool)` (default off): when the vertical scroll view contains
   the focused field, a user drag whose first movement past the slop is downward ends the focus session
   (the soft keyboard goes away) and keeps scrolling; an upward drag, a wheel, a fling, a controller

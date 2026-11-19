@@ -31,12 +31,30 @@ pub struct PendingContribution {
     pub plugin_id: Cow<'static, str>,
     /// The missing contribution, as the catalog states it.
     pub contribution: Contribution,
+    /// Which edit of `contribution` is missing.
+    step: PendingStep,
+}
+
+/// The edit of a contribution a [`PendingContribution`] row stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingStep {
+    /// The contribution itself, as the catalog states it.
+    Contribution,
+    /// The `.gitignore` line for the `ios/<package>` link a manifest-described
+    /// plugin's [`Contribution::SwiftPackageRef`] makes.
+    GitignoreLink,
 }
 
 impl PendingContribution {
-    /// The contribution's report label ([`Contribution::describe`]).
+    /// The missing edit's report label: [`Contribution::describe`], or for
+    /// the ignore-file line of a Swift package link, that line.
     pub fn describe(&self) -> String {
-        self.contribution.describe()
+        match (&self.contribution, self.step) {
+            (Contribution::SwiftPackageRef { package_name, .. }, PendingStep::GitignoreLink) => {
+                format!(".gitignore entry `/ios/{package_name}`")
+            }
+            _ => self.contribution.describe(),
+        }
     }
 }
 
@@ -46,7 +64,8 @@ impl PendingContribution {
 /// predicate its applier skips by: the dependency line, the Cargo feature,
 /// the `uses-permission`, the `Info.plist` `<key>`, both Gradle include
 /// lines, the repository url, all six pbxproj package sites, the framework
-/// in every `OTHER_LDFLAGS` list, and an entitlement's key in every file the
+/// in every `OTHER_LDFLAGS` list, a manifest-described plugin's `ios/<package>`
+/// link in the root `.gitignore` (when the app has one), and an entitlement's key in every file the
 /// Runner configurations sign with plus `CODE_SIGN_ENTITLEMENTS` in each of
 /// them. Machine-local wiring (`local.properties` keys, `ios/` links) and
 /// the desktop lane, applied by every build, are never pending. A project
@@ -69,6 +88,17 @@ pub fn pending_contributions(
             pending.push(PendingContribution {
                 plugin_id: entry.spec.id.clone(),
                 contribution: contribution.clone(),
+                step: PendingStep::Contribution,
+            });
+        }
+        if let Contribution::SwiftPackageRef { package_name, .. } = contribution
+            && !entry.is_built_in()
+            && apply::gitignore_ios_link_missing(project_root, package_name)?
+        {
+            pending.push(PendingContribution {
+                plugin_id: entry.spec.id.clone(),
+                contribution: contribution.clone(),
+                step: PendingStep::GitignoreLink,
             });
         }
     }
@@ -1025,6 +1055,158 @@ mod tests {
             assert_eq!(snapshot(&app), tree);
             let _ = fs::remove_dir_all(&root);
         }
+    }
+
+    const LINK_PACKAGE: &str = "AcmeLink";
+
+    /// The plugin of [`MANIFEST`] with a Swift package that is not named
+    /// `Frust...`, so the template's `/ios/Frust*` line does not cover its link.
+    fn link_entry(root: &Path) -> CatalogEntry {
+        plugin_entry(
+            root,
+            "acme-ble",
+            PACKAGE,
+            None,
+            &MANIFEST.replace("FrustAcmeBle", LINK_PACKAGE),
+        )
+    }
+
+    fn gitignore_rows(app: &Path, entry: &CatalogEntry) -> Vec<String> {
+        pending_contributions(app, entry, &[])
+            .unwrap()
+            .iter()
+            .map(PendingContribution::describe)
+            .filter(|d| d.starts_with(".gitignore"))
+            .collect()
+    }
+
+    #[test]
+    fn a_manifest_plugins_ios_link_is_pending_until_the_gitignore_lists_it() {
+        let root = temp_root("gitignore-link");
+        let app = scaffold_app(&root);
+        let entry = link_entry(&root);
+        depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+        let before = read(&app, ".gitignore");
+
+        assert_eq!(
+            gitignore_rows(&app, &entry),
+            [".gitignore entry `/ios/AcmeLink`"]
+        );
+        assert_eq!(pending_contributions(&app, &entry, &[]).unwrap().len(), 5);
+
+        let catalog = catalog(vec![entry.clone()]);
+        assert!(sync_plugins(&app, &catalog).unwrap().changed());
+        assert_eq!(read(&app, ".gitignore"), format!("{before}/ios/AcmeLink\n"));
+        assert_eq!(pending_contributions(&app, &entry, &[]).unwrap(), []);
+
+        let tree = snapshot(&app);
+        assert!(!sync_plugins(&app, &catalog).unwrap().changed());
+        assert_eq!(snapshot(&app), tree);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_gitignore_without_a_final_newline_gains_the_line_on_its_own_row() {
+        let root = temp_root("gitignore-no-newline");
+        let app = scaffold_app(&root);
+        let entry = link_entry(&root);
+        depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+        fs::write(app.join(".gitignore"), "/target").unwrap();
+
+        sync_plugins(&app, &catalog(vec![entry])).unwrap();
+        assert_eq!(read(&app, ".gitignore"), "/target\n/ios/AcmeLink\n");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_covered_ios_link_leaves_the_gitignore_alone() {
+        for covered in [
+            "/ios/AcmeLink",
+            "ios/AcmeLink",
+            "/ios/AcmeLink/",
+            "ios/AcmeLink/",
+        ] {
+            let root = temp_root("gitignore-covered");
+            let app = scaffold_app(&root);
+            let entry = link_entry(&root);
+            depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+            let text = format!("/target\n{covered}\n");
+            fs::write(app.join(".gitignore"), &text).unwrap();
+
+            assert_eq!(gitignore_rows(&app, &entry), Vec::<String>::new());
+            sync_plugins(&app, &catalog(vec![entry])).unwrap();
+            assert_eq!(read(&app, ".gitignore"), text, "{covered}");
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// The scaffolded `/ios/Frust*` line covers a `Frust...` package only.
+    #[test]
+    fn the_frust_wildcard_covers_a_frust_named_package_only() {
+        assert!(apply::gitignore_covers_ios_link(
+            "/ios/Frust*\n",
+            "FrustAcmeBle"
+        ));
+        assert!(!apply::gitignore_covers_ios_link(
+            "/ios/Frust*\n",
+            "AcmeLink"
+        ));
+        let root = temp_root("gitignore-frust");
+        let app = scaffold_app(&root);
+        let entry = plugin_entry(&root, "acme-ble", PACKAGE, None, MANIFEST);
+        assert_eq!(gitignore_rows(&app, &entry), Vec::<String>::new());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_app_without_a_gitignore_has_nothing_pending_and_gets_none() {
+        let root = temp_root("gitignore-absent");
+        let app = scaffold_app(&root);
+        let entry = link_entry(&root);
+        depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+        fs::remove_file(app.join(".gitignore")).unwrap();
+
+        assert_eq!(gitignore_rows(&app, &entry), Vec::<String>::new());
+        sync_plugins(&app, &catalog(vec![entry.clone()])).unwrap();
+        assert!(!app.join(".gitignore").exists());
+        assert_eq!(pending_contributions(&app, &entry, &[]).unwrap(), []);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_app_without_ios_has_no_gitignore_item_pending() {
+        let root = temp_root("gitignore-no-ios");
+        let app = scaffold_app(&root);
+        fs::remove_dir_all(app.join("ios")).unwrap();
+        let entry = link_entry(&root);
+        depend(&app, "frust-acme-ble = { path = \"../acme-ble\" }");
+        let before = read(&app, ".gitignore");
+
+        assert_eq!(gitignore_rows(&app, &entry), Vec::<String>::new());
+        sync_plugins(&app, &catalog(vec![entry])).unwrap();
+        assert_eq!(read(&app, ".gitignore"), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_built_in_plugin_never_reads_the_gitignore() {
+        let root = temp_root("gitignore-built-in");
+        let app = scaffold_app(&root);
+        let entry = CatalogEntry::built_in(crate::plugin::PluginSpec {
+            id: Cow::Borrowed("acme-link"),
+            crate_dir: Cow::Borrowed("acme-link"),
+            base: Cow::Owned(vec![Contribution::SwiftPackageRef {
+                package_name: Cow::Borrowed(LINK_PACKAGE),
+                rel_path: Cow::Borrowed("plugins/acme-link/platform/ios"),
+            }]),
+            ..crate::plugin::PluginSpec::DEFAULT
+        });
+        let before = read(&app, ".gitignore");
+        let pending = pending_contributions(&app, &entry, &[]).unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0].describe(), "Xcode Swift package `AcmeLink`");
+        assert_eq!(read(&app, ".gitignore"), before);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The skip is for manifest-described plugins only: a built-in plugin's
