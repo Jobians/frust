@@ -15,7 +15,8 @@
 //! signals-dirty flag (`ReactiveRuntime::take_signals_dirty`), tripped by
 //! [`TrackedScope`]'s dirty path, lets a shell ask synchronously and cheaply
 //! once per frame "did any tracked signal change since I last asked" — the
-//! reactive input to the mobile frame gate.
+//! reactive input to the mobile frame gate. [`RepaintScope`] is the subscriber that trips
+//! neither: a change only runs its callback (the facade's repaint bridge).
 //!
 //! The [`thread_policy`] module is the shells' scheduling shim: it states
 //! which side of the frame a framework thread is on (the render thread, or
@@ -33,6 +34,7 @@ mod deep_link;
 mod executor;
 mod menu;
 mod owner_id;
+mod repaint_scope;
 mod runtime;
 mod task;
 pub mod thread_policy;
@@ -55,6 +57,7 @@ pub use background_task::{
 pub use deep_link::{DeepLink, DeepLinks, deep_links, push_deep_link};
 pub use menu::{MenuEvent, MenuEvents, menu_events, push_menu_event};
 pub use owner_id::OwnerId;
+pub use repaint_scope::{OnChange, RepaintScope};
 pub use runtime::{FrameWaker, ReactiveRuntime, spawn_blocking};
 pub use task::{AsyncValue, TaskError, UseTask, use_task};
 pub use time::{Timer, sleep, spawn_local_scoped};
