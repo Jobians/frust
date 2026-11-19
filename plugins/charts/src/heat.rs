@@ -21,7 +21,7 @@ use frust::authoring::{
 };
 use frust::{Color, Theme};
 
-use crate::{Samples, Tone};
+use crate::{Samples, Tone, YDomain};
 
 const DEFAULT_CELL: (f32, f32) = (8.0, 18.0);
 const DEFAULT_GAP: f32 = 2.0;
@@ -101,7 +101,8 @@ impl<S: 'static> HeatCellsView<S> {
         self
     }
 
-    /// The value range the intensity runs over (default 0..100).
+    /// The value range the intensity runs over (default 0..100). A reversed range is swapped
+    /// and a degenerate or non-finite one widened, as the meters do.
     pub fn range(mut self, min: f32, max: f32) -> Self {
         self.range = (min, max);
         self
@@ -149,7 +150,10 @@ impl<S: 'static> HeatCellsView<S> {
     }
 
     fn layout_changed(&self, prev: &Self) -> bool {
-        self.cell != prev.cell || self.gap != prev.gap || self.columns != prev.columns
+        self.cell != prev.cell
+            || self.gap != prev.gap
+            || self.columns != prev.columns
+            || self.samples.len() != prev.samples.len()
     }
 
     fn widget(&self) -> HeatCellsWidget {
@@ -259,7 +263,10 @@ impl HeatCellsWidget {
             (None, Some(color)) => color,
             (None, None) => theme.map_or(Tone::FALLBACK_CALM, |t| t.scheme().primary),
         };
-        base.multiply_alpha(self.alpha(Tone::intensity_at(value, self.range)))
+        base.multiply_alpha(self.alpha(Tone::intensity_at(
+            value,
+            YDomain::fixed(self.range.0, self.range.1).resolve(None),
+        )))
     }
 
     fn alpha(&self, intensity: f32) -> f32 {
