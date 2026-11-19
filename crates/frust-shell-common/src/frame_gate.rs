@@ -348,6 +348,11 @@ pub struct FrameInputs {
     /// drive the same condition through the gate's own countdown — both force
     /// a `Run`.
     pub resumed_recently: bool,
+    /// *repaint request*. A process-wide repaint request is pending
+    /// (`frust_core::request_repaint`); alone, it asks for a frame that paints
+    /// without rebuild or layout. Peek it when gathering (it may be gathered
+    /// for a frame that is then skipped); the frame that runs consumes it.
+    pub repaint_owed: bool,
 }
 
 impl FrameInputs {
@@ -367,6 +372,32 @@ impl FrameInputs {
             || self.surface_changed_or_resized
             || self.a11y_action_performed
             || self.resumed_recently
+            || self.repaint_owed
+    }
+
+    /// Whether the *only* reason for this frame is a pending repaint request.
+    ///
+    /// True exactly when [`repaint_owed`](Self::repaint_owed) is set and every
+    /// other input is clear, including
+    /// [`last_needs_frame`](Self::last_needs_frame),
+    /// [`last_needs_frame_paced_only`](Self::last_needs_frame_paced_only) and
+    /// [`focus_or_ime_changed`](Self::focus_or_ime_changed). This is
+    /// deliberately stricter than [`is_paced_only_frame`](Self::is_paced_only_frame):
+    /// any other reason for the frame means the normal frame runs.
+    pub fn is_repaint_only_frame(&self) -> bool {
+        self.repaint_owed
+            && !self.signals_dirty
+            && !self.events_since_last_frame
+            && !self.pointer_capture_active
+            && !self.focus_or_ime_changed
+            && !self.last_needs_frame
+            && !self.last_needs_frame_paced_only
+            && !self.change_flags_pending
+            && !self.deferred_callbacks_pending
+            && !self.theme_or_appearance_changed
+            && !self.surface_changed_or_resized
+            && !self.a11y_action_performed
+            && !self.resumed_recently
     }
 
     /// Whether the *only* dirtiness this frame is a paced ([`CosmeticLoop`])
@@ -392,6 +423,9 @@ impl FrameInputs {
     /// per tick: the shells peek it, so it keeps reporting across every skipped
     /// tick in between and is cleared by the frame that finally runs.
     ///
+    /// A pending [`repaint_owed`](Self::repaint_owed) is a disqualifier too, so
+    /// a repaint request is never delayed by the paced interval.
+    ///
     /// [`CosmeticLoop`]: frust_core::TickClass::CosmeticLoop
     pub fn is_paced_only_frame(&self) -> bool {
         self.last_needs_frame
@@ -405,6 +439,7 @@ impl FrameInputs {
             && !self.surface_changed_or_resized
             && !self.a11y_action_performed
             && !self.resumed_recently
+            && !self.repaint_owed
     }
 }
 
@@ -933,6 +968,7 @@ mod tests {
             "surface_changed_or_resized" => i.surface_changed_or_resized = true,
             "a11y_action_performed" => i.a11y_action_performed = true,
             "resumed_recently" => i.resumed_recently = true,
+            "repaint_owed" => i.repaint_owed = true,
             other => panic!("unknown FrameInputs field {other:?}"),
         }
         i
@@ -954,6 +990,7 @@ mod tests {
         "surface_changed_or_resized",
         "a11y_action_performed",
         "resumed_recently",
+        "repaint_owed",
     ];
 
     // -----------------------------------------------------------------
@@ -1000,8 +1037,8 @@ mod tests {
         // deferred-callback peek (`deferred_callbacks_pending`).
         assert_eq!(
             ALL_INPUTS.len(),
-            12,
-            "the OR-list must have all eleven wake inputs plus the \
+            13,
+            "the OR-list must have all twelve wake inputs plus the \
              paced-only signal"
         );
         for field in ALL_INPUTS {
@@ -1156,6 +1193,39 @@ mod tests {
     /// far slower than any theme's cosmetic-loop cap.
     fn interval_500ms() -> Duration {
         Duration::from_millis(500)
+    }
+
+    #[test]
+    fn repaint_owed_alone_runs_and_is_repaint_only() {
+        let i = only("repaint_owed");
+        assert!(i.any_set());
+        assert!(i.is_repaint_only_frame());
+        assert!(FrameGate::with_enabled(true).decide(i).is_run());
+        assert!(!FrameInputs::default().is_repaint_only_frame());
+    }
+
+    #[test]
+    fn repaint_owed_plus_any_other_input_is_not_repaint_only() {
+        for field in ALL_INPUTS.iter().filter(|f| **f != "repaint_owed") {
+            let mut i = only(field);
+            i.repaint_owed = true;
+            assert!(!i.is_repaint_only_frame(), "{field}");
+        }
+    }
+
+    #[test]
+    fn repaint_owed_inside_paced_interval_runs() {
+        let mut gate = FrameGate::with_enabled(true);
+        let t0 = FrameTime::from_nanos(0);
+        let iv = interval_30hz();
+        assert!(gate.decide_paced(paced_only(), pacing(t0, iv)).is_run());
+        let mut i = paced_only();
+        i.repaint_owed = true;
+        assert!(!i.is_paced_only_frame());
+        let soon = FrameTime::from_nanos(1_000_000);
+        assert!(gate.decide_paced(i, pacing(soon, iv)).is_run());
+        let alone = only("repaint_owed");
+        assert!(gate.decide_paced(alone, pacing(soon, iv)).is_run());
     }
 
     #[test]
