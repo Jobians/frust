@@ -68,5 +68,5 @@ macOS 27.0.1) with frust at `0a22d568`.
 | 5 | n/a | PASS: signed debug build installed; `hello from ext-fixture (ios)` on screen |
 | 6 | PASS: release APK keeps `ExtPluginHost` (consumer keep rules) and shows the Kotlin string | PASS: `frust build ios --no-codesign` |
 | 7 | PASS: only `Cargo.toml` modified | PASS: link re-pointed, app relaunched, only `Cargo.toml` modified; the link is ignored |
-| 8 | (a) PASS: `./gradlew help --offline` succeeds with the repository block | (b) PASS: unsigned build with `CODE_SIGN_ENTITLEMENTS`, `Runner.entitlements` created. (c) REFUSED: the team wildcard profile has no NFC Tag Reading capability, and with no Xcode account signed in, automatic signing could not create an explicit App ID profile |
+| 8 | (a) PASS: `./gradlew help --offline` succeeds with the repository block | (b) PASS: unsigned build with `CODE_SIGN_ENTITLEMENTS`, `Runner.entitlements` created. (c) PASS: with an account signed in to Xcode, automatic signing created an explicit App ID profile and the signed app carries the entitlement. Without a signed-in account the build is refused, because the team wildcard profile has no NFC Tag Reading capability |
 | 9 | PASS: Android-only app, only the Android files changed | PASS: `CODE_SIGN_ENTITLEMENTS` written to Debug, Debug-Dev, Release and Profile |
