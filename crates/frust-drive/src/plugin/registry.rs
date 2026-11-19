@@ -1,4 +1,4 @@
-//! The static plugin registry (v1) — twenty-nine entries mirroring `plugins/`:
+//! The static plugin registry (v1) — thirty entries mirroring `plugins/`:
 //! `shared-preferences` (dependency only), `secure-storage` (dependency plus
 //! an optional `biometric-gate` feature wiring in the plugin's own Android
 //! library module and the iOS plist key its README documents),
@@ -821,6 +821,24 @@ const QR: PluginSpec = PluginSpec {
     ..PluginSpec::DEFAULT
 };
 
+/// `charts`' single base contribution: a Cargo dependency only (data handles
+/// and canvas-painted widgets; no permission, plist key or setup call).
+const CHARTS_BASE: &[Contribution] = &[Contribution::CargoDep {
+    name: Cow::Borrowed("frust-charts"),
+}];
+
+const CHARTS: PluginSpec = PluginSpec {
+    id: Cow::Borrowed("charts"),
+    summary: Cow::Borrowed(
+        "Live charts over shared Series and Samples handles that repaint on write (y-domain scale, threshold tones)",
+    ),
+    crate_dir: Cow::Borrowed("charts"),
+    base: Cow::Borrowed(CHARTS_BASE),
+    optional_features: Cow::Borrowed(&[]),
+    requires_sibling: None,
+    ..PluginSpec::DEFAULT
+};
+
 /// `file-dialogs`' base contributions: the Cargo dependency, the plugin's own
 /// Android library module (the Storage Access Framework host under
 /// `plugins/file-dialogs/platform/android`) and the `UniformTypeIdentifiers`
@@ -1522,6 +1540,7 @@ pub fn known_plugins() -> Vec<PluginSpec> {
         PERMISSIONS,
         PHOTO_LIBRARY,
         BACKGROUND_TASK,
+        CHARTS,
     ]
 }
 
@@ -1542,7 +1561,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
-    fn registry_lists_the_twenty_nine_v1_plugins() {
+    fn registry_lists_the_thirty_v1_plugins() {
         let plugins = known_plugins();
         let ids: Vec<&str> = plugins.iter().map(|p| &*p.id).collect();
         assert_eq!(
@@ -1577,6 +1596,7 @@ mod tests {
                 "permissions",
                 "photo-library",
                 "background-task",
+                "charts",
             ]
         );
     }
