@@ -20,3 +20,6 @@ frust = { package = "frust-ui", path = "../../crates/frust", version = "0.6.6", 
 frust-core = { workspace = true }
 frust-reactive = { workspace = true }
 frust-widgets = { path = "../../crates/frust-widgets", version = "0.6.6", features = ["test-support"] }
+# Test-only: `frust-testing` is `publish = false`, so it is a path-only dev-dependency (cargo drops it from the
+# packaged manifest). It runs the CPU golden corpus in `tests/goldens.rs`.
+frust-testing = { path = "../../crates/frust-testing" }

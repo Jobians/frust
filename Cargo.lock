@@ -2220,6 +2220,7 @@ version = "0.6.6"
 dependencies = [
  "frust-core",
  "frust-reactive",
+ "frust-testing",
  "frust-ui",
  "frust-widgets",
 ]
