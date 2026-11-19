@@ -3761,9 +3761,9 @@ where
                 }
                 let layout_dur = layout_start.elapsed();
 
-                // Post-layout so bounds are valid. A paint-only frame publishes
-                // after paint instead: the paint honouring the request moves the
-                // semantics generation, so the push reflects this frame.
+                // Post-layout so bounds are valid. Paint can move the generation
+                // too (honouring a repaint request), so the push after paint
+                // covers every frame; a paint-only frame has only that one.
                 if !paint_only {
                     self.push_semantics_if_changed(scale);
                 }
@@ -3797,9 +3797,11 @@ where
                     outcome
                 };
                 let paint_dur = paint_start.elapsed();
-                if paint_only {
-                    self.push_semantics_if_changed(scale);
-                }
+                // Whenever paint moved the generation past what was just pushed,
+                // publish again in the same frame, paint-only or not. The push is
+                // generation-gated, so a frame whose paint left it alone pushes
+                // nothing here.
+                self.push_semantics_if_changed(scale);
 
                 // Platform views: ingest the pass that just painted — retire the
                 // slots whose widgets were torn down, then diff this pass's
@@ -6814,10 +6816,12 @@ mod tests {
         use std::rc::Rc;
         use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+        use frust_core::accesskit::Role;
         use frust_core::event::{
             EventCtx, EventResult, InputEvent, PointerButton, PointerEvent, PointerPhase,
         };
         use frust_core::layout::BoxConstraints;
+        use frust_core::semantics::SemanticsCtx;
         use frust_core::view::BuildCtx;
         use frust_core::widget::{LayoutCtx, PaintCtx, Widget};
         use frust_core::{ChangeFlags, DiscardScene, FrameTime, PaintScene, RenderRoot, View};
@@ -6839,6 +6843,8 @@ mod tests {
         /// A leaf counting its paints.
         struct Counted {
             paints: Rc<Cell<usize>>,
+            /// Read by `semantics`, not by build: changing it dirties nothing.
+            label: Rc<Cell<u32>>,
         }
 
         impl Widget for Counted {
@@ -6851,10 +6857,15 @@ mod tests {
             fn event(&mut self, _ctx: &mut EventCtx, _event: &InputEvent) -> EventResult {
                 EventResult::Handled
             }
+            fn semantics(&self, ctx: &mut SemanticsCtx) {
+                let label = self.label.get().to_string();
+                ctx.push_node(Role::Label, |n| n.set_label(label));
+            }
         }
 
         struct CountedView {
             paints: Rc<Cell<usize>>,
+            label: Rc<Cell<u32>>,
         }
 
         impl View<()> for CountedView {
@@ -6862,6 +6873,7 @@ mod tests {
             fn build(&self, _ctx: &mut BuildCtx<'_>) -> Counted {
                 Counted {
                     paints: self.paints.clone(),
+                    label: self.label.clone(),
                 }
             }
             fn rebuild(
@@ -6894,6 +6906,11 @@ mod tests {
             build: Box<dyn FnMut(&mut ()) -> CountedView>,
             builds: Rc<Cell<usize>>,
             paints: Rc<Cell<usize>>,
+            label: Rc<Cell<u32>>,
+            /// Mirrors the handler's `semantics_seen`.
+            semantics_seen: u64,
+            /// The root label of each semantics push, in order.
+            pushes: Vec<String>,
             laid_out: bool,
             other_cause: bool,
             painted_needs_frame: bool,
@@ -6907,12 +6924,15 @@ mod tests {
                 let signal = runtime.with_owner(|| RwSignal::new(0u32));
                 let builds = Rc::new(Cell::new(0));
                 let paints = Rc::new(Cell::new(0));
-                let (count, paints_for_view) = (builds.clone(), paints.clone());
+                let label = Rc::new(Cell::new(0u32));
+                let (count, paints_for_view, label_for_view) =
+                    (builds.clone(), paints.clone(), label.clone());
                 let build = Box::new(move |_: &mut ()| {
                     count.set(count.get() + 1);
                     let _ = signal.get();
                     CountedView {
                         paints: paints_for_view.clone(),
+                        label: label_for_view.clone(),
                     }
                 });
                 let mut frames = Self {
@@ -6923,6 +6943,9 @@ mod tests {
                     build,
                     builds,
                     paints,
+                    label,
+                    semantics_seen: 0,
+                    pushes: Vec::new(),
                     laid_out: false,
                     other_cause: true,
                     painted_needs_frame: false,
@@ -6932,7 +6955,21 @@ mod tests {
                     first.built && !first.paint_only,
                     "the first frame is a full one"
                 );
+                frames.pushes.clear();
                 frames
+            }
+
+            /// `push_semantics_if_changed`: publish only when the generation moved.
+            fn push_semantics(&mut self) {
+                if let Some(update) = self.root.semantics_if_changed(self.semantics_seen) {
+                    self.semantics_seen = self.root.semantics_generation();
+                    let label = update
+                        .nodes
+                        .iter()
+                        .find_map(|(_, node)| node.label().map(str::to_owned))
+                        .unwrap_or_default();
+                    self.pushes.push(label);
+                }
             }
 
             /// One frame in `RedrawRequested`'s order, ending with its flag update.
@@ -6964,7 +7001,11 @@ mod tests {
                     self.root.layout(VIEWPORT);
                     self.laid_out = true;
                 }
+                if !paint_only {
+                    self.push_semantics();
+                }
                 let outcome = self.root.paint(&mut DiscardScene, FrameTime::from_nanos(0));
+                self.push_semantics();
                 let scope_follow_up = self.scope.is_dirty();
                 self.other_cause = scope_follow_up || outcome.needs_frame;
                 self.painted_needs_frame = outcome.needs_frame;
@@ -7069,6 +7110,55 @@ mod tests {
                 !run.paint_only && run.built,
                 "an unrequested frame rebuilds as before"
             );
+        }
+
+        /// A request beside another frame cause: the frame is a normal one (build runs) and
+        /// paint moves the generation after the pre-paint push, so the post-paint push
+        /// publishes a value only the semantics read can see.
+        #[test]
+        fn a_repaint_request_with_another_cause_publishes_semantics_after_paint() {
+            let _slot = hold_repaint_slot();
+            let mut frames = Frames::settled();
+
+            // Not a build input: only the semantics read sees it.
+            frames.label.set(7);
+            frust_core::request_repaint();
+            frames.signal.set(1);
+            let run = frames.frame();
+
+            assert!(
+                !run.paint_only && run.built,
+                "another cause takes the normal path"
+            );
+            assert_eq!(
+                frames.pushes.last().map(String::as_str),
+                Some("7"),
+                "the post-paint push carries the value read after the data change: {:?}",
+                frames.pushes
+            );
+            assert_eq!(
+                frames.semantics_seen,
+                frames.root.semantics_generation(),
+                "nothing is left unpublished"
+            );
+        }
+
+        /// Control: a normal frame with no request pending pushes at most once.
+        #[test]
+        fn a_normal_frame_without_a_request_pushes_at_most_once() {
+            let _slot = hold_repaint_slot();
+            let mut frames = Frames::settled();
+
+            frames.signal.set(1);
+            let run = frames.frame();
+
+            assert!(!run.paint_only && run.built);
+            assert!(
+                frames.pushes.len() <= 1,
+                "no second push after paint: {:?}",
+                frames.pushes
+            );
+            assert_eq!(frames.semantics_seen, frames.root.semantics_generation());
         }
 
         /// Every term vetoes on its own; only a lone request clears the decision.
