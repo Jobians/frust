@@ -3,7 +3,7 @@
 //! with no `unsafe`.
 //!
 //! * [`anim`] — the frame clock and its time scale, curves, tweens, springs and controllers.
-//! * [`app`] — the [`RenderRoot`] each platform shell drives through rebuild, layout and paint.
+//! * [`app`] — the [`RenderRoot`] a shell drives; [`repaint`] — any thread's repaint request.
 //! * [`mod@component`] — [`Component`], a subtree with retained local state and its own `Owner`.
 //! * [`event`] — input events and the [`EventCtx`] handlers mutate state through.
 //! * `hotpatch` (feature `hotpatch`) — the hot-patch seam every `Component::build` runs through.
@@ -36,6 +36,7 @@ pub mod input;
 pub mod insets;
 pub mod layout;
 pub mod overlay;
+pub mod repaint;
 pub mod retained;
 pub mod selection_toolbar;
 pub mod semantics;
@@ -197,6 +198,9 @@ pub use layout::BoxConstraints;
 pub use overlay::{
     OutsideTap, OverlayBand, OverlayEntry, OverlayHit, OverlayInput, OverlayKey, OverlayKeys,
     OverlayPod,
+};
+pub use repaint::{
+    RepaintHook, repaint_generation, request_repaint, set_repaint_hook, take_repaint_owed,
 };
 pub use retained::{RetainedEntry, RetainedKey, RetainedLedger};
 pub use selection_toolbar::{
