@@ -178,6 +178,21 @@ the Photos page's Picker panel (*Share picked*, see the Photo-library manual tes
 A gate for `frust-qr` (`plugins/qr`), against the same URL page: scan the 160 px tile with a phone
 camera and confirm it decodes to the payload field's text; edit the payload and rescan.
 
+## Charts manual test (desktop + Android + iOS)
+
+A gate for `frust-charts` (`plugins/charts`): open the **Charts** section of `examples/playground`
+(`examples/playground/src/pages/charts.rs`). One background thread feeds every chart.
+
+- **Live:** the charts keep moving. The `builds:` and `samples:` labels stay still while data flows;
+  they catch up only when a control rebuilds the page. Lines, bars and cells stay crisp.
+- **Gap:** tap `inject gap`. The time series show a gap for about two seconds, then resume.
+- **Idle:** tap `pause feed`. The charts stop and the page is idle; `resume feed` restarts them.
+- **Dim:** tick `dim`. The chart column fades to a stale look and back.
+- **Pushed page:** tap `open in page`. The pushed chart is live over the same handles; `Back` returns.
+- **Taps:** tap the block chart. `chart taps:` counts it, since charts take no input.
+
+Device record: not yet run.
+
 ## Auth-session manual test (Android + iOS + macOS)
 
 A device gate for `frust-auth-session` (`plugins/auth-session`), driven from `examples/playground`'s

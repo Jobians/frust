@@ -132,6 +132,14 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 
 ### Added
 
+- `frust-charts` (`plugins/charts`): live charts drawn on the facade alone, with no platform code.
+  Data lives in shared handles that any thread can write: `Series`, a fixed-capacity ring of evenly
+  spaced samples where `None` is a gap, and `Samples`, a fixed set of current values. A write
+  requests a repaint, so a chart updates with no rebuild and no frame loop. The views are
+  `time_series` (area, line or block columns, several series, a mirrored pair, grid rules and corner
+  labels), `sparkline`, `meter`, `meter_segments`, `meter_strip` and `heat_cells`. `YDomain` and
+  `nice_max` pick the y range and `Tone` maps a value to a threshold colour. Charts take no input,
+  so a tap reaches whatever is beneath them. `frust plugin add charts` adds it to an app.
 - `frust::request_repaint()` asks for the next frame to repaint without a rebuild or a layout. It
   can be called from any thread and applies to the whole process: every live root repaints its tree
   once, content behind a `repaint_boundary` included, and semantics are published again. Use it for
