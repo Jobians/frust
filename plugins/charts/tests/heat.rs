@@ -345,3 +345,74 @@ fn degenerate_inputs_do_not_panic() {
     });
     zero_cell.paint(100.0, 100.0);
 }
+
+fn extent(cells: &[Cell]) -> (f64, f64) {
+    cells.iter().fold((0.0, 0.0), |(w, h), c| {
+        (
+            f64::max(w, c.origin.x + c.size.width),
+            f64::max(h, c.origin.y + c.size.height),
+        )
+    })
+}
+
+#[test]
+fn swapping_to_a_longer_handle_relays_out_and_paints_every_cell() {
+    let _g = hold();
+    let small = Samples::new(8);
+    let large = Samples::new(64);
+    let mut rig = rig(|| heat_cells(small.clone()));
+    let before = rig.paint(200.0, 300.0);
+    assert_eq!(before.len(), 8);
+    assert_eq!(extent(&before), (78.0, 18.0));
+
+    let flags = rig.rebuild(|| heat_cells(large.clone()));
+    assert!(flags.contains(ChangeFlags::LAYOUT), "{flags:?}");
+    assert!(flags.contains(ChangeFlags::PAINT), "{flags:?}");
+    let after = rig.paint(200.0, 300.0);
+    assert_eq!(after.len(), 64);
+    // floor((200 + 2) / 10) = 20 columns, 4 rows.
+    assert_eq!(extent(&after), (198.0, 78.0));
+}
+
+#[test]
+fn swapping_to_a_shorter_handle_shrinks_the_grid() {
+    let _g = hold();
+    let small = Samples::new(8);
+    let large = Samples::new(64);
+    let mut rig = rig(|| heat_cells(large.clone()));
+    let before = rig.paint(200.0, 300.0);
+    assert_eq!(before.len(), 64);
+    assert_eq!(extent(&before), (198.0, 78.0));
+
+    let flags = rig.rebuild(|| heat_cells(small.clone()));
+    assert!(flags.contains(ChangeFlags::LAYOUT), "{flags:?}");
+    let after = rig.paint(200.0, 300.0);
+    assert_eq!(after.len(), 8);
+    assert_eq!(extent(&after), (78.0, 18.0));
+}
+
+#[test]
+fn swapping_to_an_equal_length_handle_stays_paint_only() {
+    let _g = hold();
+    let first = Samples::new(8);
+    let mut rig = rig(|| heat_cells(first.clone()));
+    let flags = rig.rebuild(|| heat_cells(Samples::new(8)));
+    assert!(flags.contains(ChangeFlags::PAINT), "{flags:?}");
+    assert!(!flags.contains(ChangeFlags::LAYOUT), "{flags:?}");
+}
+
+#[test]
+fn a_reversed_range_paints_like_the_ordered_one() {
+    let _g = hold();
+    let samples = Samples::new(5);
+    for (i, v) in [0.0, 25.0, 50.0, 100.0, 70.0].into_iter().enumerate() {
+        samples.set(i, v);
+    }
+    let colors = |lo: f32, hi: f32| -> Vec<Color> {
+        let mut rig = rig(|| heat_cells(samples.clone()).color(RED).range(lo, hi));
+        rig.paint(400.0, 100.0).iter().map(|c| c.color).collect()
+    };
+    let ordered = colors(0.0, 100.0);
+    assert_eq!(colors(100.0, 0.0), ordered);
+    assert!(alpha(ordered[3]) > alpha(ordered[0]));
+}
