@@ -23,6 +23,12 @@
 //!   every pod lays out on every pass); the header prints `arm: skip=on|off`.
 //! - [`retained_layer_cost`] — `#[ignore]`d; the retained-layer scenarios D/E/F with
 //!   a retained on/off arm (`FRUST_NO_RETAINED_LAYERS=1`), see the last section.
+//! - [`repaint_request_cost`] — `#[ignore]`d; the repaint-request page (200 rows plus 64
+//!   canvas leaves inside a `repaint_boundary`, flat and with the leaves in their own inner
+//!   boundary), driven three ways: R (rebuild), P (`request_repaint`, paint only) and N
+//!   (nothing, a retained replay). See the last section for how to read it.
+//! - [`repaint_request_repaints_retained_pages_without_rebuild`] — always on; the
+//!   correctness half of the above. No timing.
 //! - [`scene_builds_with_two_hundred_row_pods`] — always on; asserts the scene
 //!   actually materializes 200 row pods via `RenderRoot::inspect`. No timing.
 //!
@@ -209,20 +215,78 @@
 //! F_navigator_rest             steady (frame 150)      600        0        0
 //! F_navigator_rest             mean per frame       600.00     0.00     0.00
 //! ```
+//!
+//! # Repaint request versus rebuild ([`repaint_request_cost`])
+//!
+//! Run: `cargo test -p frust-widgets --test relayout_cost_bench --release -- --ignored --nocapture repaint_request_cost`
+//! (the profile is `--release`, not comparable with the A/B/C rows).
+//!
+//! The page is a `repaint_boundary` over 200 rows plus 64 small canvas leaves whose
+//! closures read a shared counter (`flat`), or the same page with the 64 leaves in an inner
+//! boundary of their own (`nested`). Three paths, 300 frames each after 3 settle frames:
+//! `R_rebuild` bumps the counter and every leaf's `repaint_key`, then rebuilds, takes the
+//! change flags and paints (no layout); `P_request` bumps the counter, calls
+//! `request_repaint` and paints (no rebuild, no layout); `N_quiet` only paints, which
+//! replays the retained pages.
+//!
+//! Reading the output: the first table is microseconds. `rebuild` times rebuild plus
+//! `take_change_flags`; `paint` times `RenderRoot::paint`; `semantics` times one
+//! `RenderRoot::semantics()` build of the same page, which a repaint-only frame republishes.
+//! The second table is per-frame means from the counting scene: `body_cmds` fill / stroke /
+//! text commands recorded, `canvas` canvas closures that ran, `re-record` retained pages
+//! recorded (`push_retained`), `replay` retained pages drawn from the cache
+//! (`draw_retained`). Compare `P_request` with `R_rebuild` row for row, and with `N_quiet`
+//! for the cost of re-recording against replaying. Nothing here is asserted.
+//!
+//! Measured at `febeff872` plus this harness, Linux workstation (i5-12600, 12 threads),
+//! release. Other builds were running on the host (1-minute load 15-18), so the numbers are
+//! noisy; three back-to-back runs, the middle one (by flat paint) recorded:
+//!
+//! ```text
+//! path                         pass            mean_us       p95_us       p99_us
+//! flat/R_rebuild               rebuild        162.71       174.64       194.71
+//! flat/R_rebuild               paint          112.13       119.19       145.74
+//! flat/P_request               paint          121.39       138.15       297.60
+//! flat/P_request               semantics       58.56        58.77        87.11
+//! flat/N_quiet                 paint            0.31         0.35         0.38
+//! nested/R_rebuild             rebuild        157.14       178.66       191.47
+//! nested/R_rebuild             paint          108.00       123.01       139.51
+//! nested/P_request             paint          106.78       117.34       137.68
+//! nested/P_request             semantics       50.05        55.45        70.37
+//! nested/N_quiet               paint            0.31         0.37         0.40
+//!
+//! path (per frame, mean)        body_cmds     canvas  re-record     replay
+//! flat/R_rebuild                  1176.00      64.00       1.00       0.00
+//! flat/P_request                  1176.00      64.00       1.00       0.00
+//! flat/N_quiet                       0.00       0.00       0.00       1.00
+//! nested/R_rebuild                1176.00      64.00       2.00       0.00
+//! nested/P_request                1176.00      64.00       2.00       0.00
+//! nested/N_quiet                     0.00       0.00       0.00       1.00
+//! ```
 
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use frust_core::{Curve, FrameTime, PaintScene, RenderRoot, RetainedLedger, View};
+use frust_core::{Curve, FrameTime, PaintScene, RenderRoot, RetainedLedger, View, request_repaint};
 use frust_text::TextContext;
 use frust_widgets::motion::animated_opacity;
 use frust_widgets::{
     Column, IconSource, NavigatorController, PageTransition, Row, ScaffoldView, ScrollController,
-    Timing, TransitionSpec, icon, navigator, scaffold, scroll_view, text,
+    Timing, TransitionSpec, canvas, icon, navigator, repaint_boundary, scaffold, scroll_view, text,
 };
 use kurbo::{Affine, Point, Rect, Size};
+
+/// The repaint request is process-wide: every live root honours it on its next
+/// paint. A test that requests one, or that asserts a retained page replays, holds
+/// this for the whole life of its root so no other test's request lands in between.
+static REPAINT_LOCK: Mutex<()> = Mutex::new(());
+
+fn serialise_repaint() -> MutexGuard<'static, ()> {
+    REPAINT_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 const ROWS: usize = 200;
 const FRAMES: usize = 300;
@@ -531,6 +595,7 @@ fn drive_retained<V: View<()>>(
     frames: usize,
     mut before: impl FnMut(usize),
 ) -> RetainedRun {
+    let _serial = serialise_repaint();
     let mut root: RenderRoot<(), V> = RenderRoot::new();
     if !retained_on {
         root.set_retained_layers(false);
@@ -757,4 +822,292 @@ fn scene_builds_with_two_hundred_row_pods() {
          among {} nodes",
         nodes.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Repaint request versus rebuild (paths R, P and N).
+// ---------------------------------------------------------------------------
+
+const LEAVES: usize = 64;
+/// Segments each canvas leaf strokes, standing in for a small sparkline.
+const SEGMENTS: usize = 8;
+
+/// Shared state of the repaint-request page: the counter the canvas closures read,
+/// what each leaf last painted, and how often the page painted and was rebuilt.
+struct Page {
+    counter: Rc<Cell<u64>>,
+    /// The counter value each leaf's paint closure last saw.
+    seen: Rc<Vec<Cell<u64>>>,
+    /// Canvas paint closures run (the widget paint calls that are countable from outside).
+    calls: Rc<Cell<usize>>,
+    /// Times the view closure ran.
+    builds: Rc<Cell<usize>>,
+}
+
+impl Page {
+    fn new() -> Self {
+        Self {
+            counter: Rc::new(Cell::new(0)),
+            seen: Rc::new((0..LEAVES).map(|_| Cell::new(u64::MAX)).collect()),
+            calls: Rc::new(Cell::new(0)),
+            builds: Rc::new(Cell::new(0)),
+        }
+    }
+
+    /// The 64 canvas leaves. Each repaint key follows the counter, so a rebuild at a new
+    /// counter value marks every leaf for paint (path R).
+    fn leaves(&self) -> impl View<()> + use<> {
+        let key = self.counter.get();
+        let leaves: Vec<_> = (0..LEAVES)
+            .map(|i| {
+                let (counter, seen, calls) =
+                    (self.counter.clone(), self.seen.clone(), self.calls.clone());
+                canvas(move |scene: &mut dyn PaintScene, size: Size, _ctx: &_| {
+                    calls.set(calls.get() + 1);
+                    let v = counter.get();
+                    seen[i].set(v);
+                    scene.fill_rect(Point::ORIGIN, size, peniko::Color::BLACK);
+                    for s in 0..SEGMENTS {
+                        let x = s as f64 * 7.0;
+                        let y = ((v + s as u64) % 20) as f64;
+                        scene.stroke_line(
+                            Point::new(x, 0.0),
+                            Point::new(x + 7.0, y),
+                            1.0,
+                            peniko::Color::BLACK,
+                        );
+                    }
+                })
+                .size(Size::new(60.0, 20.0))
+                .repaint_key(key)
+            })
+            .collect();
+        Column(leaves)
+    }
+
+    /// A page inside a boundary: rows, then the leaves directly beneath it.
+    fn flat(&self) -> impl View<()> + use<> {
+        self.builds.set(self.builds.get() + 1);
+        repaint_boundary(Column((rows_view(0), self.leaves())))
+    }
+
+    /// The same page with the leaves in an inner boundary of their own.
+    fn nested(&self) -> impl View<()> + use<> {
+        self.builds.set(self.builds.get() + 1);
+        repaint_boundary(Column((rows_view(0), repaint_boundary(self.leaves()))))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Variant {
+    Flat,
+    Nested,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Path {
+    /// Rebuild: bump the counter and the repaint keys, rebuild, take the change flags, paint.
+    Rebuild,
+    /// Repaint request: bump the counter, `request_repaint`, paint. No rebuild, no layout.
+    Request,
+    /// Nothing changes: paint only, which replays every retained page.
+    Quiet,
+}
+
+/// One frame of the page, as the counting scene and the page's own counters saw it.
+#[derive(Clone, Copy, Default, Debug)]
+struct PageFrame {
+    counts: Counts,
+    canvas_calls: usize,
+}
+
+struct PageRun {
+    rebuilds: Vec<f64>,
+    paints: Vec<f64>,
+    semantics: Vec<f64>,
+    frames: Vec<PageFrame>,
+}
+
+/// Drive `frames` measured frames of the page along `path`, after `WARMUP` settle frames
+/// that rebuild, lay out and paint. Holds the repaint lock for the whole run.
+fn run_page(
+    variant: Variant,
+    path: Path,
+    frames: usize,
+    semantics_samples: usize,
+    page: &Page,
+) -> PageRun {
+    let _serial = serialise_repaint();
+    match variant {
+        Variant::Flat => drive_page(
+            &mut |_: &mut ()| page.flat(),
+            path,
+            frames,
+            semantics_samples,
+            page,
+        ),
+        Variant::Nested => drive_page(
+            &mut |_: &mut ()| page.nested(),
+            path,
+            frames,
+            semantics_samples,
+            page,
+        ),
+    }
+}
+
+fn drive_page<V: View<()>>(
+    logic: &mut impl FnMut(&mut ()) -> V,
+    path: Path,
+    frames: usize,
+    semantics_samples: usize,
+    page: &Page,
+) -> PageRun {
+    let mut root: RenderRoot<(), V> = RenderRoot::new();
+    let mut tcx = TextContext::new();
+    let mut scene = CountScene::new();
+    let mut run = PageRun {
+        rebuilds: Vec::with_capacity(frames),
+        paints: Vec::with_capacity(frames),
+        semantics: Vec::with_capacity(semantics_samples),
+        frames: Vec::with_capacity(frames),
+    };
+    let micros = |t: Instant| t.elapsed().as_secs_f64() * 1_000_000.0;
+    for f in 0..WARMUP + frames {
+        let measured = f >= WARMUP;
+        let mut rebuild = 0.0;
+        if measured {
+            page.counter.set(page.counter.get() + 1);
+            match path {
+                Path::Rebuild => {
+                    let t = Instant::now();
+                    root.rebuild(logic, &mut ());
+                    let _ = root.take_change_flags();
+                    rebuild = micros(t);
+                }
+                Path::Request => request_repaint(),
+                Path::Quiet => {}
+            }
+        } else {
+            root.rebuild(logic, &mut ());
+            root.layout_with_text(window(), &mut tcx);
+        }
+        scene.counts = Counts::default();
+        let calls_before = page.calls.get();
+        let t = Instant::now();
+        let committed = root.paint(&mut scene, frame_ns(f)).paint_serial;
+        let paint = micros(t);
+        root.set_retained_ledger(&scene.ledger(committed));
+        if measured {
+            run.rebuilds.push(rebuild);
+            run.paints.push(paint);
+            run.frames.push(PageFrame {
+                counts: scene.counts,
+                canvas_calls: page.calls.get() - calls_before,
+            });
+        }
+    }
+    for _ in 0..semantics_samples {
+        let t = Instant::now();
+        let update = root.semantics();
+        run.semantics.push(micros(t));
+        std::hint::black_box(update);
+    }
+    run
+}
+
+fn mean_page(frames: &[PageFrame]) -> (f64, f64, f64, f64) {
+    let n = frames.len().max(1) as f64;
+    let sum = |f: fn(&PageFrame) -> usize| frames.iter().map(f).sum::<usize>() as f64 / n;
+    (
+        sum(|f| f.counts.body),
+        sum(|f| f.canvas_calls),
+        sum(|f| f.counts.push_retained),
+        sum(|f| f.counts.draw_retained),
+    )
+}
+
+#[test]
+#[ignore = "perf evidence, host-machine dependent (docs/TESTING.md T8): run via \
+            `cargo test -p frust-widgets --test relayout_cost_bench --release -- --ignored --nocapture repaint_request_cost`"]
+fn repaint_request_cost() {
+    println!(
+        "\nrepaint request versus rebuild: 200 rows + {LEAVES} canvas leaves, {FRAMES} frames"
+    );
+    println!(
+        "{:<28} {:<10} {:>12} {:>12} {:>12}",
+        "path", "pass", "mean_us", "p95_us", "p99_us"
+    );
+    let mut counted = Vec::new();
+    for (variant, vname) in [(Variant::Flat, "flat"), (Variant::Nested, "nested")] {
+        for (path, pname) in [
+            (Path::Rebuild, "R_rebuild"),
+            (Path::Request, "P_request"),
+            (Path::Quiet, "N_quiet"),
+        ] {
+            let name = format!("{vname}/{pname}");
+            let run = run_page(variant, path, FRAMES, FRAMES, &Page::new());
+            if path == Path::Rebuild {
+                print_row(&name, "rebuild", stats(run.rebuilds.clone()));
+            }
+            print_row(&name, "paint", stats(run.paints.clone()));
+            if path == Path::Request {
+                print_row(&name, "semantics", stats(run.semantics.clone()));
+            }
+            counted.push((name, mean_page(&run.frames)));
+        }
+    }
+    println!(
+        "\n{:<28} {:>10} {:>10} {:>10} {:>10}",
+        "path (per frame, mean)", "body_cmds", "canvas", "re-record", "replay"
+    );
+    for (name, (body, calls, push, draw)) in counted {
+        println!("{name:<28} {body:>10.2} {calls:>10.2} {push:>10.2} {draw:>10.2}");
+    }
+}
+
+/// After a repaint request every canvas leaf has painted the new counter value although the
+/// view closure never ran again, for both page shapes; without a request the same page
+/// replays its retained pages and paints no leaf. The retained boundary lives in
+/// frust-widgets, so this is the case the core tests cannot reach.
+#[test]
+fn repaint_request_repaints_retained_pages_without_rebuild() {
+    for variant in [Variant::Flat, Variant::Nested] {
+        let boundaries = if variant == Variant::Flat { 1 } else { 2 };
+
+        let page = Page::new();
+        let run = run_page(variant, Path::Request, 3, 1, &page);
+        assert_eq!(
+            page.builds.get(),
+            WARMUP,
+            "{variant:?}: only the settle frames build, the requests do not"
+        );
+        for (i, seen) in page.seen.iter().enumerate() {
+            assert_eq!(
+                seen.get(),
+                page.counter.get(),
+                "{variant:?}: leaf {i} painted the new counter value"
+            );
+        }
+        for frame in &run.frames {
+            assert_eq!(
+                frame.canvas_calls, LEAVES,
+                "{variant:?}: every leaf painted"
+            );
+            assert_eq!(
+                frame.counts.push_retained, boundaries,
+                "{variant:?}: every retained page was re-recorded: {frame:?}"
+            );
+            assert_eq!(frame.counts.draw_retained, 0, "{variant:?}: {frame:?}");
+        }
+
+        let page = Page::new();
+        let run = run_page(variant, Path::Quiet, 3, 0, &page);
+        for frame in &run.frames {
+            assert_eq!(frame.canvas_calls, 0, "{variant:?}: a quiet frame replays");
+            assert_eq!(frame.counts.push_retained, 0, "{variant:?}: {frame:?}");
+            assert_eq!(frame.counts.body, 0, "{variant:?}: {frame:?}");
+            assert!(frame.counts.draw_retained >= 1, "{variant:?}: {frame:?}");
+        }
+    }
 }
