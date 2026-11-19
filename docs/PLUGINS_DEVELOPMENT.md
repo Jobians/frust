@@ -425,6 +425,53 @@ A plugin test that sets or depends on the default locale holds the shared
 in a test binary, so no plugin keeps a private locale lock. Every test that reads or writes the
 default-locale slot must hold the guard: an unguarded writer still races the guarded tests.
 
+## Writing a plugin outside this repository
+
+A plugin crate outside this repository declares its native requirements in its own `Cargo.toml`
+and needs no registry entry. Layout: `platform/android` (a `com.android.library` Gradle module)
+and/or `platform/ios` (a Swift package), each named by a `path` relative to the package, plus the
+`[package.metadata.frust.plugin]` table. The schema is the `plugin::manifest` module rustdoc in
+`crates/frust-drive/src/plugin/manifest.rs`; the copyable worked example is
+`crates/frust-drive/tests/fixtures/external-plugin`
+([README](../crates/frust-drive/tests/fixtures/external-plugin/README.md)). Trust rules for the
+manifest data: [PLUGINS_CODE_STANDARDS.md](PLUGINS_CODE_STANDARDS.md).
+
+- **Discovery.** frust reads the app's resolved dependency graph with one `cargo metadata` call,
+  so the plugin package must be in it (a normal `[dependencies]` entry in the app is the supported
+  shape). Only a plugin the app lists in its own `[dependencies]` (or a target table), not
+  optional, is wired, synced or reported as added; where two versions or two packages claim one
+  id, the one the app depends on directly as a normal dependency is kept, and with no single
+  direct candidate neither is used and a warning says so.
+- **Consumer keep rules.** The app template minifies release builds. A class the Rust side loads
+  by name over JNI is never referenced from app code, so the module must ship
+  `consumer-rules.pro` with a `-keep` for it and declare `consumerProguardFiles("consumer-rules.pro")`
+  in its `defaultConfig`; otherwise a debug build works and the release APK loses the class.
+- **iOS bridge.** An `extern "C"` symbol defined only in the Runner target fails the app crate's
+  `cdylib` link. Bridge through an `@objc` class and look it up from Rust with `objc_getClass`.
+- **Entitlements.** An entitlement is written to every Runner target configuration, custom ones
+  such as `Debug-Dev` included. A capability-backed entitlement (NFC, push, associated domains)
+  must also be enabled in the Apple developer account for each bundle identifier the app signs
+  with, flavor identifiers included. A team wildcard provisioning profile does not carry it:
+  with an account signed in to Xcode, automatic signing creates an explicit App ID profile and
+  the signed build succeeds; without one (and without a manual explicit profile) it is refused.
+- **Commands** (all in the app directory): `frust plugin list` shows every built-in and discovered
+  plugin with its origin and `added` or `N pending`; `frust plugin add <id>` adds a plugin (for a
+  git or alternate-registry package it refuses until the app's `Cargo.toml` already depends on it);
+  `frust plugin sync` applies the pending tracked edits of every discovered plugin the app depends
+  on, idempotently. Each manifest plugin's iOS package link is ignored through a `/ios/<Package>`
+  line that add and sync append to the app's `.gitignore`.
+- **Pending changes.** `frust run` and `frust build` (Android/iOS lanes) refresh the machine-local
+  wiring, then stop before any Gradle or `xcodebuild` run when a discovered plugin still has
+  tracked edits pending, with `plugin <id> (<package>) is not wired into this project: N
+  change(s) pending`. They never edit a tracked file; run `frust plugin sync`, commit the diff,
+  re-run.
+
+The device gate (fixture scaffolded into a scratch app, steps 1 to 9, built from a checkout's
+`frust` binary) is in the fixture README with its dated results: Android on a Pixel 4a
+(2026-11-18) and iOS on an iPhone 13 mini (2026-11-19), checks 1 to 7 passing on both.
+Accepted gate findings (`sync` counting one item fewer than `list`, the unchecked entitlement
+capability) are in [LIMITATIONS.md](LIMITATIONS.md).
+
 ## Version Pins
 
 The pins this unit owns, under [DEVELOPMENT.md](DEVELOPMENT.md)'s Version-Pin Policy (pins are
