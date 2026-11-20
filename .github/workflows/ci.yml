@@ -571,6 +571,63 @@ jobs:
           [ -n "$so" ] || { echo "::error::libfrustbench.so was not built"; exit 1; }
           "$GITHUB_WORKSPACE/scripts/ci/page-size-check.sh" "$so"
 
+  kotlin-compile:
+    if: github.event_name != 'schedule'
+    # Compiles the Kotlin of every built-in plugin's Android module and of the
+    # embedding (scripts/ci/kotlin-compile.sh): no other job runs a Kotlin compiler.
+    # Outside `ci-ok`'s needs: it is advisory, and it only builds when the change
+    # touches the paths it covers (the scope step below).
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Does this change touch the Kotlin paths
+        id: scope
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+        run: |
+          # Every plugin's Android module, the embedding, the app template, and the script.
+          paths=('plugins/*/platform/android' crates/frust-shell-android/platform crates/frust-drive/templates/app/android.tmpl scripts/ci/kotlin-compile.sh)
+          # An unusable base (a new branch's all-zero `before`) runs the leg.
+          if changed="$(git diff --name-only "$BASE" HEAD -- "${paths[@]}" 2>/dev/null)" && [ -z "$changed" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "reason=no Kotlin paths changed" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "reason=Kotlin paths changed or base unusable" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.run == 'true'
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.scope.outputs.run == 'true'
+      - name: Set up JDK 17
+        if: steps.scope.outputs.run == 'true'
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: Cache Gradle
+        if: steps.scope.outputs.run == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-kotlin-${{ hashFiles('crates/frust-drive/templates/app/android.tmpl/**', 'plugins/*/platform/android/**/*.kts') }}
+          restore-keys: gradle-kotlin-
+      - name: Compile the plugins' Kotlin
+        if: steps.scope.outputs.run == 'true'
+        run: scripts/ci/kotlin-compile.sh
+      - name: Report a skipped leg
+        if: steps.scope.outputs.run != 'true'
+        env:
+          REASON: ${{ steps.scope.outputs.reason }}
+        run: |
+          echo "SKIPPED (scope: $REASON)" >> "$GITHUB_STEP_SUMMARY"
+
   hygiene:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
