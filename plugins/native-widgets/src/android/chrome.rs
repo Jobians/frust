@@ -1,9 +1,10 @@
 //! The Android chrome arm (decision C3): [`AndroidChromeHost`] drives the
 //! Kotlin `dev.frust.nativewidgets.FrustNativeChrome` object — Material 3
-//! bars (`AppBarLayout` + `MaterialToolbar` on top, `BottomNavigationView`
-//! at the bottom, the toolbar's floating action buttons over the body's
-//! bottom-end corner) placed beside the frust embedding's content root — over
-//! JNI, and this module exports the object's two callbacks.
+//! bars (`AppBarLayout` + `MaterialToolbar` on top, the medium collapsing
+//! bar for a large title, `BottomNavigationView` at the bottom, the toolbar's
+//! floating action buttons over the body's bottom-end corner) placed beside
+//! the frust embedding's content root — over JNI, and this module exports the
+//! object's two callbacks.
 //!
 //! # The frozen contract
 //!
@@ -15,9 +16,9 @@
 //! | Direction | Member | Notes |
 //! |---|---|---|
 //! | Rust → Kotlin | `@JvmStatic install(generation: Long, specJson: String): Int` | Every key ([`android_wire::install_json`]); answers an `INSTALL_*` code |
-//! | Rust → Kotlin | `@JvmStatic apply(diffJson: String)` | Only the changed keys plus a `changed` array ([`android_wire::apply_json`]) |
+//! | Rust → Kotlin | `@JvmStatic apply(diffJson: String)` | Only the changed keys plus a `changed` array ([`android_wire::apply_json`]); a `largeTitle` change swaps the top bar |
 //! | Rust → Kotlin | `@JvmStatic setIcon(slot: Int, index: Int, png: ByteArray)` | Icon bytes, never JSON; empty bytes clear the entry |
-//! | Rust → Kotlin | `@JvmStatic setScroll(offset: Float, max: Float)` | [`ChromeField::Scroll`], never JSON; drives `AppBarLayout.setLifted` on a lifted-state change only |
+//! | Rust → Kotlin | `@JvmStatic setScroll(offset: Float, max: Float)` | [`ChromeField::Scroll`], never JSON, sent before an apply's `apply` ([`APPLY_ORDER`]); drives `AppBarLayout.setLifted` and a large title's collapse on a state change only |
 //! | Rust → Kotlin | `@JvmStatic dispose()` | Idempotent; never calls back into Rust |
 //! | Kotlin → Rust | [`Java_dev_frust_nativewidgets_FrustNativeChrome_nativeOnChromeEvent`]`(env, class, generation: jlong, kind: jint, detail: jlong)` | A tap, `FrustNativeListener`'s `KIND_CHROME_*` kinds → [`chrome::deliver`] |
 //! | Kotlin → Rust | [`Java_dev_frust_nativewidgets_FrustNativeChrome_nativeOnChromeLost`]`(env, class, generation: jlong)` | The Activity or content root went away under the installed chrome |
@@ -94,6 +95,16 @@
 //! [`ChromeField::ActionBadges`] apply re-badges them in place. A prominent
 //! action is tinted with the theme's `colorPrimary` (a floating button is
 //! filled with it).
+//!
+//! # Large title
+//!
+//! `TopBarSpec::large_title` (wire key `largeTitle`) makes the top bar
+//! Material 3's medium collapsing bar, the title and subtitle drawn by its
+//! `CollapsingToolbarLayout`. The lifted state `setScroll` derives collapses
+//! it (animated) and back at the top expands it; the root's top padding — the
+//! height frust lays its body under — follows the bar's visible height. A
+//! flag change swaps only the top bar, in the same main-thread turn. Nothing
+//! on this side changes for it but [`APPLY_ORDER`].
 //!
 //! # No unwind across FFI
 //!
@@ -257,23 +268,31 @@ impl ChromeHost for AndroidChromeHost {
         }
         let applied = host_call("FrustNativeChrome.apply", |env, class| {
             debug_assert_main_thread(env, "FrustNativeChrome.apply");
-            upload_icons(env, class, &uploads)?;
-            if let Some(json) = &json {
-                let json = env.new_string(json)?;
-                env.call_static_method(
-                    class,
-                    jni_str!("apply"),
-                    jni_sig!("(Ljava/lang/String;)V"),
-                    &[JValue::Object(&json)],
-                )?;
-            }
-            if let Some((offset, max)) = scroll {
-                env.call_static_method(
-                    class,
-                    jni_str!("setScroll"),
-                    jni_sig!("(FF)V"),
-                    &[JValue::Float(offset), JValue::Float(max)],
-                )?;
+            for step in APPLY_ORDER {
+                match step {
+                    ApplyStep::Icons => upload_icons(env, class, &uploads)?,
+                    ApplyStep::Scroll => {
+                        if let Some((offset, max)) = scroll {
+                            env.call_static_method(
+                                class,
+                                jni_str!("setScroll"),
+                                jni_sig!("(FF)V"),
+                                &[JValue::Float(offset), JValue::Float(max)],
+                            )?;
+                        }
+                    }
+                    ApplyStep::Spec => {
+                        if let Some(json) = &json {
+                            let json = env.new_string(json)?;
+                            env.call_static_method(
+                                class,
+                                jni_str!("apply"),
+                                jni_sig!("(Ljava/lang/String;)V"),
+                                &[JValue::Object(&json)],
+                            )?;
+                        }
+                    }
+                }
             }
             Ok(())
         });
@@ -315,6 +334,27 @@ impl ChromeHost for AndroidChromeHost {
         }
     }
 }
+
+/// One Kotlin call an [`AndroidChromeHost::apply`] makes, each only when it
+/// has something to send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplyStep {
+    /// `setIcon` for every changed icon.
+    Icons,
+    /// `setScroll` for a [`ChromeField::Scroll`] change.
+    Scroll,
+    /// `apply` with the changed fields' JSON.
+    Spec,
+}
+
+/// The order of an apply's Kotlin calls. Icons precede the spec naming
+/// them. The scroll precedes the spec because the spec may build bars — a
+/// [`ChromeField::LargeTitle`] change swaps the top bar, a
+/// [`ChromeField::Brightness`] change rebuilds every bar — and a bar built
+/// after `setScroll` starts in the body's lifted and collapsed state, where
+/// one built before it would animate there from the resting state (a route
+/// change typically moves the scroll and the large-title flag together).
+const APPLY_ORDER: [ApplyStep; 3] = [ApplyStep::Icons, ApplyStep::Scroll, ApplyStep::Spec];
 
 /// [`ChromeError`] for a non-OK `install` code.
 fn install_error(code: i32) -> ChromeError {
@@ -587,5 +627,24 @@ mod tests {
         ));
         assert_eq!(install_error(INSTALL_NO_ACTIVITY), ChromeError::NoHost);
         assert!(matches!(install_error(7), ChromeError::Refused(_)));
+    }
+
+    #[test]
+    fn an_apply_sends_the_scroll_before_the_spec_that_may_rebuild_a_bar() {
+        let at = |step| {
+            APPLY_ORDER
+                .iter()
+                .position(|s| *s == step)
+                .expect("every step runs")
+        };
+        assert!(
+            at(ApplyStep::Icons) < at(ApplyStep::Spec),
+            "the icons precede the spec naming them"
+        );
+        assert!(
+            at(ApplyStep::Scroll) < at(ApplyStep::Spec),
+            "a swapped or rebuilt bar is built in the body's lifted and collapsed state"
+        );
+        assert_eq!(APPLY_ORDER.len(), 3, "each step runs once");
     }
 }
