@@ -138,8 +138,18 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   requests a repaint, so a chart updates with no rebuild and no frame loop. The views are
   `time_series` (area, line or block columns, several series, a mirrored pair, grid rules and corner
   labels), `sparkline`, `meter`, `meter_segments`, `meter_strip` and `heat_cells`. `YDomain` and
-  `nice_max` pick the y range and `Tone` maps a value to a threshold colour. Charts take no input,
-  so a tap reaches whatever is beneath them. `frust plugin add charts` adds it to an app.
+  `nice_max` pick the y range and `Tone` maps a value to a threshold colour. Charts are display-only
+  by default, so a tap reaches whatever is beneath them, except a `time_series` that sets
+  `on_scrub`. `frust plugin add charts` adds it to an app.
+- `frust-charts` gains five opt-in features. `TimeSeriesView::y_axis(YAxis)` draws round tick rules
+  and labels (`AxisSide`, `TickFormat`, `ticks`) in place of the `.grid` fractions; on an automatic
+  domain it asks for one layout pass when new data changes its ticks. `TimedSeries`
+  keeps timestamped points bounded by a capacity and/or a time window, with `gap_after`;
+  `SeriesSource` lets `series`, `mirrored` and `sparkline` take either handle, and block styles draw
+  a line for timed data. `TimeSeriesView::on_scrub` and `crosshair` report a `ScrubEvent` (with a
+  `ScrubSample`) while the pointer is down and `None` on release; with `on_scrub` set the plot
+  handles presses. `TimeSeriesView::smooth(true)` draws a monotone curve that never overshoots the
+  samples, and `SeriesStyle::tone_along_value(Tone)` colours a line and its area fill by value.
 - `frust::request_repaint()` asks for the next frame to repaint without a rebuild or a layout. It
   can be called from any thread and applies to the whole process: every live root repaints its tree
   once, content behind a `repaint_boundary` included, and semantics are published again. Use it for

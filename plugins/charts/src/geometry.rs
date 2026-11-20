@@ -5,7 +5,10 @@
 //! Coordinates are widget-local logical pixels, y down. Slots run oldest to newest and are
 //! right-aligned: the newest sits at the plot's right edge, so a series shorter than its
 //! capacity starts partway across. Only the newest `capacity` slots are drawn. A `None` or
-//! non-finite slot is a gap, and values are clamped to the `(min, max)` domain, which is
+//! non-finite slot is a gap. Timed points (`(t, value)`) are placed by time instead, over a
+//! [`time_span`] whose end is the newest point, at the right edge; points further apart than
+//! a threshold are a gap. Either way the line and area builders return the same shapes; block
+//! columns are offered for slots only. Values are clamped to the `(min, max)` domain, which is
 //! normalised the way [`YDomain::resolve`] normalises a fixed range (reversed is swapped,
 //! degenerate is widened). A plot with no positive, finite width and height yields empty
 //! geometry; nothing here panics or returns a non-finite coordinate.
@@ -15,9 +18,10 @@
 //! edges, widths and baselines are snapped, as are rule positions; line and area vertices are
 //! not, since they are antialiased curves.
 
+use frust::Color;
 use frust::authoring::{BezPath, Point, Rect};
 
-use crate::YDomain;
+use crate::{Tone, YDomain};
 
 /// Which way values grow inside a plot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -97,6 +101,14 @@ impl LineGeometry {
     pub fn paths(&self) -> Vec<BezPath> {
         self.polylines.iter().map(|run| polyline(run)).collect()
     }
+
+    /// Each polyline as a monotone smooth path (see [`smooth_polyline`]), ready to stroke.
+    pub fn smooth_paths(&self) -> Vec<BezPath> {
+        self.polylines
+            .iter()
+            .map(|run| smooth_polyline(run))
+            .collect()
+    }
 }
 
 /// An open path through `points` with straight segments; empty for no points.
@@ -112,6 +124,81 @@ pub fn polyline(points: &[Point]) -> BezPath {
     path
 }
 
+/// An open path through `points` that is a monotone cubic interpolation: it passes through
+/// every point and never overshoots, so between two neighbouring points its y stays within
+/// theirs. Tangents are the Fritsch-Carlson ones: the mean of the neighbouring secant slopes,
+/// zero at a local extremum or a flat step, and limited so no segment overshoots. Two points
+/// stay a straight segment, as does a pair that is not strictly left to right. Empty for no
+/// points.
+pub fn smooth_polyline(points: &[Point]) -> BezPath {
+    let mut path = BezPath::new();
+    let Some(&first) = points.first() else {
+        return path;
+    };
+    path.move_to(first);
+    if points.len() == 2 {
+        path.line_to(points[1]);
+        return path;
+    }
+    let tangents = monotone_tangents(points);
+    for (i, pair) in points.windows(2).enumerate() {
+        let (a, b) = (pair[0], pair[1]);
+        let dx = b.x - a.x;
+        if !(dx.is_finite() && dx > 0.0) {
+            path.line_to(b);
+            continue;
+        }
+        let third = dx / 3.0;
+        path.curve_to(
+            (a.x + third, a.y + tangents[i] * third),
+            (b.x - third, b.y - tangents[i + 1] * third),
+            (b.x, b.y),
+        );
+    }
+    path
+}
+
+/// The slope (dy/dx) at each point for a monotone cubic through `points`.
+fn monotone_tangents(points: &[Point]) -> Vec<f64> {
+    let n = points.len();
+    let secants: Vec<f64> = points
+        .windows(2)
+        .map(|w| {
+            let dx = w[1].x - w[0].x;
+            if dx > 0.0 {
+                (w[1].y - w[0].y) / dx
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let mut m = vec![0.0; n];
+    if n < 2 {
+        return m;
+    }
+    m[0] = secants[0];
+    m[n - 1] = secants[n - 2];
+    for k in 1..n - 1 {
+        let (a, b) = (secants[k - 1], secants[k]);
+        m[k] = if a * b <= 0.0 { 0.0 } else { (a + b) / 2.0 };
+    }
+    for (k, &d) in secants.iter().enumerate() {
+        if d == 0.0 {
+            m[k] = 0.0;
+            m[k + 1] = 0.0;
+            continue;
+        }
+        let (a, b) = (m[k] / d, m[k + 1] / d);
+        let s = a * a + b * b;
+        if s > 9.0 {
+            let tau = 3.0 / s.sqrt();
+            m[k] = tau * a * d;
+            m[k + 1] = tau * b * d;
+        }
+    }
+    m
+}
+
 /// The line geometry of `slots` (oldest to newest) in `plot`.
 pub fn line_segments<S>(
     slots: S,
@@ -124,15 +211,7 @@ where
     S: IntoIterator<Item = Option<f32>>,
     S::IntoIter: DoubleEndedIterator,
 {
-    let mut geometry = LineGeometry::default();
-    for run in runs(slots, capacity, domain, plot, orientation) {
-        if run.len() == 1 {
-            geometry.points.push(run[0]);
-        } else {
-            geometry.polylines.push(run);
-        }
-    }
-    geometry
+    line_from_runs(runs(slots, capacity, domain, plot, orientation))
 }
 
 /// The closed fill paths of `slots` in `plot`, oldest first.
@@ -152,31 +231,168 @@ where
     S: IntoIterator<Item = Option<f32>>,
     S::IntoIter: DoubleEndedIterator,
 {
-    let baseline = orientation.baseline(plot);
     let half = if capacity == 1 {
         plot.width() / 2.0
     } else {
         slot_spacing(capacity, plot) / 2.0
     };
-    let mut paths = Vec::new();
-    for run in runs(slots, capacity, domain, plot, orientation) {
-        let mut path = BezPath::new();
-        if let [p] = run[..] {
-            let (x0, x1) = ((p.x - half).max(plot.x0), (p.x + half).min(plot.x1));
-            path.move_to((x0, baseline));
-            path.line_to((x0, p.y));
-            path.line_to((x1, p.y));
-            path.line_to((x1, baseline));
-        } else {
-            path = polyline(&run);
-            let (first, last) = (run[0], run[run.len() - 1]);
-            path.line_to((last.x, baseline));
-            path.line_to((first.x, baseline));
-        }
-        path.close_path();
-        paths.push(path);
+    let runs = runs(slots, capacity, domain, plot, orientation);
+    area_from_runs(runs, half, plot, orientation, false)
+}
+
+/// [`area_paths`] with each run's top edge a monotone smooth curve (see [`smooth_polyline`]).
+pub fn smooth_area_paths<S>(
+    slots: S,
+    capacity: usize,
+    domain: (f32, f32),
+    plot: Rect,
+    orientation: Orientation,
+) -> Vec<BezPath>
+where
+    S: IntoIterator<Item = Option<f32>>,
+    S::IntoIter: DoubleEndedIterator,
+{
+    let half = if capacity == 1 {
+        plot.width() / 2.0
+    } else {
+        slot_spacing(capacity, plot) / 2.0
+    };
+    let runs = runs(slots, capacity, domain, plot, orientation);
+    area_from_runs(runs, half, plot, orientation, true)
+}
+
+/// The width in logical pixels of the area column an isolated timed sample fills.
+pub const TIMED_COLUMN_WIDTH: f64 = 3.0;
+
+/// The `(start, end)` time span a timed plot's x axis runs over, from the finite times in
+/// `points`: `[newest - window, newest]` with a `window` (finite and above 0), else
+/// `[oldest, newest]`. `None` when no point has a finite time.
+pub fn time_span(points: &[(f64, f32)], window: Option<f64>) -> Option<(f64, f64)> {
+    let mut times = points.iter().map(|p| p.0).filter(|t| t.is_finite());
+    let first = times.next()?;
+    let (oldest, newest) = times.fold((first, first), |(lo, hi), t| (lo.min(t), hi.max(t)));
+    match window.filter(|w| w.is_finite() && *w > 0.0) {
+        Some(window) => Some((newest - window, newest)),
+        None => Some((oldest, newest)),
     }
-    paths
+}
+
+/// The x of time `t` over `span`: `span.1` at `plot.x1` and `span.0` at `plot.x0`. An empty
+/// span (a single point) puts every time at `plot.x1`.
+pub fn x_for_time(t: f64, span: (f64, f64), plot: Rect) -> f64 {
+    let (start, end) = span;
+    let length = end - start;
+    if !(length.is_finite() && length > 0.0) {
+        return finite_or_zero(plot.x1);
+    }
+    finite_or_zero(plot.x1 - (end - t) / length * plot.width())
+}
+
+/// The line geometry of timed `points` (`(t, value)`, non-decreasing in `t`) in `plot`, each
+/// at its time over [`time_span`]`(points, window)`, so the newest sits at `plot.x1`.
+///
+/// A point outside the span, or with a non-finite time or value, is a gap. Two consecutive
+/// points more than `gap_after` seconds apart are not connected (a negative or non-finite
+/// threshold connects every pair), so a point alone between two such gaps is an isolated
+/// sample.
+pub fn timed_line_segments(
+    points: &[(f64, f32)],
+    window: Option<f64>,
+    gap_after: Option<f64>,
+    domain: (f32, f32),
+    plot: Rect,
+    orientation: Orientation,
+) -> LineGeometry {
+    line_from_runs(timed_runs(
+        points,
+        window,
+        gap_after,
+        domain,
+        plot,
+        orientation,
+    ))
+}
+
+/// The closed fill paths of timed `points` in `plot`, oldest first, with the runs of
+/// [`timed_line_segments`].
+///
+/// A run of two or more samples closes to the baseline as in [`area_paths`]; an isolated
+/// sample is a column [`TIMED_COLUMN_WIDTH`] wide, centred on it and kept inside the plot.
+pub fn timed_area_paths(
+    points: &[(f64, f32)],
+    window: Option<f64>,
+    gap_after: Option<f64>,
+    domain: (f32, f32),
+    plot: Rect,
+    orientation: Orientation,
+) -> Vec<BezPath> {
+    let runs = timed_runs(points, window, gap_after, domain, plot, orientation);
+    area_from_runs(runs, TIMED_COLUMN_WIDTH / 2.0, plot, orientation, false)
+}
+
+/// [`timed_area_paths`] with each run's top edge a monotone smooth curve (see
+/// [`smooth_polyline`]).
+pub fn smooth_timed_area_paths(
+    points: &[(f64, f32)],
+    window: Option<f64>,
+    gap_after: Option<f64>,
+    domain: (f32, f32),
+    plot: Rect,
+    orientation: Orientation,
+) -> Vec<BezPath> {
+    let runs = timed_runs(points, window, gap_after, domain, plot, orientation);
+    area_from_runs(runs, TIMED_COLUMN_WIDTH / 2.0, plot, orientation, true)
+}
+
+/// The stops of a vertical gradient that colours by value through `tone`, over a half-plot
+/// `plot` whose domain is `domain`.
+///
+/// The gradient starts at the baseline (offset 0, the domain minimum) and ends at the far
+/// edge (offset 1, the domain maximum), so offsets ascend with value in either `orientation`.
+/// Each threshold is a hard edge: two stops at the same offset, the colour below it then the
+/// colour from it. A threshold outside the domain is clamped to the nearest edge; a tone with
+/// no stops is its base colour alone. Every colour's alpha is scaled by `alpha`.
+pub fn tone_gradient(
+    tone: &Tone,
+    domain: (f32, f32),
+    plot: Rect,
+    orientation: Orientation,
+    alpha: f32,
+) -> ToneGradient {
+    let baseline = orientation.baseline(plot);
+    let far = match orientation {
+        Orientation::Upright => finite_or_zero(plot.y0),
+        Orientation::Inverted => finite_or_zero(plot.y1),
+    };
+    let span = far - baseline;
+    let scale = |c: Color| c.with_alpha(c.components[3] * alpha);
+    let mut stops = vec![(0.0, scale(tone.base()))];
+    let mut previous = tone.base();
+    if span != 0.0 {
+        for &(at, color) in tone.stops() {
+            let offset = ((orientation.y_for(at, domain, plot) - baseline) / span).clamp(0.0, 1.0);
+            stops.push((offset as f32, scale(previous)));
+            stops.push((offset as f32, scale(color)));
+            previous = color;
+        }
+    }
+    stops.push((1.0, scale(previous)));
+    ToneGradient {
+        start_y: baseline,
+        end_y: far,
+        stops,
+    }
+}
+
+/// A value-keyed vertical gradient: see [`tone_gradient`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToneGradient {
+    /// The widget-local y of offset 0 (the domain minimum).
+    pub start_y: f64,
+    /// The widget-local y of offset 1 (the domain maximum).
+    pub end_y: f64,
+    /// `(offset, colour)`, offsets ascending; coincident offsets are hard edges.
+    pub stops: Vec<(f32, Color)>,
 }
 
 /// One block column: its rectangle and the (unclamped) sample it shows.
@@ -365,5 +581,96 @@ where
         runs.push(current);
     }
     runs.reverse();
+    runs
+}
+
+/// Split runs into a line's polylines and its isolated samples.
+fn line_from_runs(runs: Vec<Vec<Point>>) -> LineGeometry {
+    let mut geometry = LineGeometry::default();
+    for run in runs {
+        if run.len() == 1 {
+            geometry.points.push(run[0]);
+        } else {
+            geometry.polylines.push(run);
+        }
+    }
+    geometry
+}
+
+/// Close each run to the baseline: a run of two or more along its polyline, an isolated
+/// sample as a column `half` either side of it, kept inside the plot.
+fn area_from_runs(
+    runs: Vec<Vec<Point>>,
+    half: f64,
+    plot: Rect,
+    orientation: Orientation,
+    smooth: bool,
+) -> Vec<BezPath> {
+    let baseline = orientation.baseline(plot);
+    let mut paths = Vec::new();
+    for run in runs {
+        let mut path = BezPath::new();
+        if let [p] = run[..] {
+            let (x0, x1) = ((p.x - half).max(plot.x0), (p.x + half).min(plot.x1));
+            path.move_to((x0, baseline));
+            path.line_to((x0, p.y));
+            path.line_to((x1, p.y));
+            path.line_to((x1, baseline));
+        } else {
+            path = if smooth {
+                smooth_polyline(&run)
+            } else {
+                polyline(&run)
+            };
+            let (first, last) = (run[0], run[run.len() - 1]);
+            path.line_to((last.x, baseline));
+            path.line_to((first.x, baseline));
+        }
+        path.close_path();
+        paths.push(path);
+    }
+    paths
+}
+
+/// The runs of timed points (see [`timed_line_segments`]), oldest run first, each oldest to
+/// newest.
+fn timed_runs(
+    points: &[(f64, f32)],
+    window: Option<f64>,
+    gap_after: Option<f64>,
+    domain: (f32, f32),
+    plot: Rect,
+    orientation: Orientation,
+) -> Vec<Vec<Point>> {
+    if !usable(plot) {
+        return Vec::new();
+    }
+    let Some(span) = time_span(points, window) else {
+        return Vec::new();
+    };
+    let gap_after = gap_after.filter(|g| g.is_finite() && *g >= 0.0);
+    let map = YMap::new(domain, plot, orientation);
+    let mut runs = Vec::new();
+    let mut current: Vec<Point> = Vec::new();
+    let mut previous: Option<f64> = None;
+    for &(t, value) in points {
+        let drawn = t.is_finite() && value.is_finite() && (span.0..=span.1).contains(&t);
+        let parted = match (previous, gap_after) {
+            (Some(previous), Some(gap_after)) => t - previous > gap_after,
+            _ => false,
+        };
+        if (!drawn || parted) && !current.is_empty() {
+            runs.push(std::mem::take(&mut current));
+        }
+        if !drawn {
+            previous = None;
+            continue;
+        }
+        current.push(Point::new(x_for_time(t, span, plot), map.y(value)));
+        previous = Some(t);
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
     runs
 }

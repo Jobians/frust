@@ -1,36 +1,62 @@
-//! The `time_series` widget: one or more [`Series`] drawn as an area, a line or block columns,
-//! sized to the box it is given.
+//! The `time_series` widget: one or more [`Series`] or [`TimedSeries`](crate::TimedSeries)
+//! drawn as an area, a line or block columns, sized to the box it is given.
 //!
 //! The widget reads its series while painting, so a push shows with no rebuild: the write
 //! requests a repaint and the next paint draws the new samples. Built paths are cached per
-//! series and rebuilt only when the series' revision, the plot size, the resolved domain or
-//! the style changed. All geometry comes from the crate's geometry functions.
+//! series and rebuilt only when the series' revision, the plot size, the resolved domain, the
+//! style or (for a timed series) the window, gap threshold or time span changed. All geometry
+//! comes from the crate's geometry functions. A [`Series`] is placed by slot and a
+//! [`TimedSeries`](crate::TimedSeries) by time, both against the same plot rect.
 //!
 //! Draw order: grid rules, then for each series (in the order given) its fill, its stroke and
-//! the dots marking isolated samples, then the corner labels. Everything is clipped to the
-//! widget's bounds. A mirrored pair splits the plot at a middle axis: the upper series grows
-//! up from it and the lower one hangs down from it.
+//! the dots marking isolated samples, then the scrub crosshair and its markers while a scrub is
+//! live, then the axis labels, then the corner labels. Everything is clipped to the widget's
+//! bounds. A mirrored pair splits the plot at a middle axis: the upper series grows up from it
+//! and the lower one hangs down from it.
+//!
+//! An optional [`YAxis`] draws its rules at [`ticks`] of each half's resolved domain, in place
+//! of the grid fractions, and a label per tick. Text is shaped only in layout, but an automatic
+//! domain is resolved at paint, on frames that skip layout. So a paint compares the ticks it
+//! resolves with the ones the labels were laid out for; when they differ it calls
+//! `PaintCtx::request_layout` once for that tick set and draws this frame with the labels it
+//! has, each at its own value (one whose value left the domain is skipped). The next layout
+//! shapes the new set. A gutter, when asked for, narrows the plot by the widest label.
 //!
 //! Colours: the caller's, then the installed theme's (series `primary`, grid
 //! `outline_variant`, labels `on_surface_variant`), then fallback constants. Labels are shaped
 //! in layout with the theme's `body_small` family, so a theme change needs a layout pass. The
-//! chart never animates, requests no frames and takes no input.
+//! chart never animates; the only frame it asks for is the layout above.
+//!
+//! Input: none by default, so the chart is tap-transparent. With
+//! [`on_scrub`](TimeSeriesView::on_scrub) set, a primary press inside the plot starts a scrub:
+//! the widget captures the pointer, reports a [`ScrubEvent`] on the press and on every move,
+//! and reports `None` when the press ends. Each paint during a scrub draws a vertical crosshair
+//! at the sample nearest the pointer in the series' current data, with a marker dot on each
+//! series' sample there (see [`crate::ScrubEvent`] for how the sample is found).
 
 use std::marker::PhantomData;
+use std::rc::Rc;
 
 use frust::authoring::text::{LocaleStamp, TextContext, TextLayout, TextStyle};
 use frust::authoring::{
-    BezPath, BoxConstraints, Brush, BuildCtx, ChangeFlags, LayoutCtx, PaintCtx, PaintScene, Point,
-    Rect, Role, SemanticsCtx, Shape, Size, View, Widget,
+    BezPath, BoxConstraints, Brush, BuildCtx, ChangeFlags, ErasedArgCallback, EventCtx,
+    EventResult, InputEvent, LayoutCtx, PaintCtx, PaintScene, Point, PointerButton, PointerEvent,
+    PointerPhase, Rect, Role, SemanticsCtx, Shape, Size, View, Widget, erase_callback_arg,
+    mark_pending_result_flush,
 };
 use frust::kurbo::Circle;
 use frust::peniko::{Gradient, GradientKind};
 use frust::{Color, Theme};
 
+use crate::axis::{AxisSide, YAxis, ticks};
 use crate::geometry::{
-    BlockColumn, Orientation, area_paths, block_columns, grid_rule_ys, line_segments, snap,
+    BlockColumn, Orientation, area_paths, block_columns, grid_rule_ys, line_segments,
+    smooth_area_paths, smooth_timed_area_paths, snap, snap_rule_y, timed_area_paths,
+    timed_line_segments, tone_gradient,
 };
-use crate::{Series, Tone, YDomain};
+use crate::scrub::{Placement, ScrubEvent, scrub_at};
+use crate::timed::SourceShape;
+use crate::{Series, SeriesSource, Tone, YDomain};
 
 const DEFAULT_STROKE_WIDTH: f32 = 1.5;
 const DEFAULT_HEIGHT: f64 = 56.0;
@@ -43,6 +69,9 @@ const FILL_ALPHA: (f32, f32) = (0.40, 0.03);
 const MIN_DOT_DIAMETER: f64 = 3.0;
 const FALLBACK_GRID: Color = Color::from_rgb8(0xd0, 0xd4, 0xda);
 const FALLBACK_LABEL: Color = Color::from_rgb8(0x5f, 0x65, 0x6e);
+const DEFAULT_CROSSHAIR_WIDTH: f32 = 1.0;
+/// The radius of the dot marking each series' sample on the crosshair.
+const MARKER_RADIUS: f64 = 3.5;
 
 /// How the samples of every series are drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -53,7 +82,8 @@ pub enum PlotStyle {
     /// A line alone; a series' fill is ignored.
     Line,
     /// One column per present sample, right-aligned, `column_width` wide with `gap` between
-    /// columns (both snapped to whole pixels).
+    /// columns (both snapped to whole pixels). A [`TimedSeries`](crate::TimedSeries) has no
+    /// columns: it draws as [`Line`](Self::Line).
     Blocks {
         /// Column width in logical pixels.
         column_width: f32,
@@ -116,6 +146,7 @@ pub struct SeriesStyle {
     stroke_width: f32,
     fill: SeriesFill,
     tone: Option<Tone>,
+    tone_along: Option<Tone>,
 }
 
 impl Default for SeriesStyle {
@@ -126,6 +157,7 @@ impl Default for SeriesStyle {
             stroke_width: DEFAULT_STROKE_WIDTH,
             fill: SeriesFill::Gradient,
             tone: None,
+            tone_along: None,
         }
     }
 }
@@ -181,6 +213,19 @@ impl SeriesStyle {
     }
 }
 
+impl SeriesStyle {
+    /// Colour a line or area by value through `tone`: the stroke is a vertical gradient over
+    /// the plot's y extent with a hard colour change at each threshold, and the derived area
+    /// fill takes the same gradient at reduced alpha. An explicit [`stroke`](Self::stroke)
+    /// brush wins for the stroke, and an explicit [`fill`](Self::fill) or
+    /// [`no_fill`](Self::no_fill) for the area. Block columns ignore it (use
+    /// [`tone`](Self::tone)).
+    pub fn tone_along_value(mut self, tone: Tone) -> Self {
+        self.tone_along = Some(tone);
+        self
+    }
+}
+
 /// The `(min, max)` a chart draws `series` against under `domain`: the largest sample across
 /// all of them feeds [`YDomain::resolve`]. Use it to format an axis label.
 pub fn auto_domain(series: &[&Series], domain: YDomain) -> (f32, f32) {
@@ -188,6 +233,15 @@ pub fn auto_domain(series: &[&Series], domain: YDomain) -> (f32, f32) {
         .iter()
         .filter_map(|series| series.max())
         .reduce(f32::max);
+    domain.resolve(max)
+}
+
+/// [`auto_domain`] over sources of either kind.
+fn source_domain<'a>(
+    sources: impl Iterator<Item = &'a SeriesSource>,
+    domain: YDomain,
+) -> (f32, f32) {
+    let max = sources.filter_map(SeriesSource::max).reduce(f32::max);
     domain.resolve(max)
 }
 
@@ -200,7 +254,7 @@ enum Half {
 
 #[derive(Clone, Debug)]
 struct Layer {
-    series: Series,
+    series: SeriesSource,
     style: SeriesStyle,
     half: Half,
 }
@@ -208,6 +262,26 @@ struct Layer {
 impl Layer {
     fn same(&self, other: &Self) -> bool {
         self.series.ptr_eq(&other.series) && self.style == other.style && self.half == other.half
+    }
+
+    /// How this layer draws under the plot's `style`: a timed series has no block columns,
+    /// so it falls back to a line.
+    fn style_under(&self, style: PlotStyle) -> PlotStyle {
+        match style {
+            PlotStyle::Blocks { .. } if self.series.is_timed() => PlotStyle::Line,
+            style => style,
+        }
+    }
+
+    /// Where this layer's slots sit under the plot's `style`, for the scrub search.
+    fn placement(&self, style: PlotStyle) -> Placement {
+        match self.style_under(style) {
+            PlotStyle::Blocks { column_width, gap } => Placement::Columns {
+                width: f64::from(column_width),
+                gap: f64::from(gap),
+            },
+            PlotStyle::Area | PlotStyle::Line => Placement::Slots,
+        }
     }
 }
 
@@ -218,12 +292,15 @@ struct Spec {
     shared_domain: bool,
     domain: YDomain,
     style: PlotStyle,
+    smooth: bool,
     corner: f32,
     grid: Vec<f32>,
     grid_color: Option<Color>,
     labels: [Option<String>; 4],
     label_size: f32,
     label_color: Option<Color>,
+    y_axis: Option<YAxis>,
+    crosshair: (Option<Color>, f32),
     height: Option<f32>,
     semantics: Option<String>,
     semantic_value: Option<String>,
@@ -236,6 +313,7 @@ impl Spec {
             || self.labels != old.labels
             || self.label_size != old.label_size
             || self.label_color != old.label_color
+            || self.y_axis != old.y_axis
         {
             return ChangeFlags::LAYOUT | ChangeFlags::PAINT;
         }
@@ -246,9 +324,11 @@ impl Spec {
             || self.shared_domain != old.shared_domain
             || self.domain != old.domain
             || self.style != old.style
+            || self.smooth != old.smooth
             || self.corner != old.corner
             || self.grid != old.grid
             || self.grid_color != old.grid_color
+            || self.crosshair != old.crosshair
             || self.semantics != old.semantics
             || self.semantic_value != old.semantic_value
         {
@@ -258,9 +338,14 @@ impl Spec {
     }
 }
 
-/// A display-only time-series plot. Build one with [`time_series`].
+/// A view-held scrub callback, erased on build.
+type OnScrub<S> = Rc<dyn Fn(&mut S, Option<ScrubEvent>)>;
+
+/// A time-series plot, display-only unless [`on_scrub`](Self::on_scrub) is set. Build one with
+/// [`time_series`].
 pub struct TimeSeriesView<S: 'static> {
     spec: Spec,
+    on_scrub: Option<OnScrub<S>>,
     _state: PhantomData<fn(&mut S)>,
 }
 
@@ -287,26 +372,30 @@ pub fn time_series<S: 'static>() -> TimeSeriesView<S> {
             shared_domain: false,
             domain: YDomain::percent(),
             style: PlotStyle::Area,
+            smooth: false,
             corner: 0.0,
             grid: Vec::new(),
             grid_color: None,
             labels: Default::default(),
             label_size: DEFAULT_LABEL_SIZE,
             label_color: None,
+            y_axis: None,
+            crosshair: (None, DEFAULT_CROSSHAIR_WIDTH),
             height: None,
             semantics: None,
             semantic_value: None,
         },
+        on_scrub: None,
         _state: PhantomData,
     }
 }
 
 impl<S: 'static> TimeSeriesView<S> {
-    /// Add a series; series draw in the order added, later ones on top. In a mirrored plot it
-    /// joins the upper half.
-    pub fn series(mut self, series: Series, style: SeriesStyle) -> Self {
+    /// Add a series, a [`Series`] or a [`TimedSeries`](crate::TimedSeries); series draw in the
+    /// order added, later ones on top. In a mirrored plot it joins the upper half.
+    pub fn series(mut self, series: impl Into<SeriesSource>, style: SeriesStyle) -> Self {
         self.spec.layers.push(Layer {
-            series,
+            series: series.into(),
             style,
             half: Half::Upper,
         });
@@ -315,8 +404,14 @@ impl<S: 'static> TimeSeriesView<S> {
 
     /// Split the plot at a middle axis: `upper` grows up from it and `lower` hangs down from
     /// it. Each half resolves its own domain unless [`shared_domain`](Self::shared_domain).
-    pub fn mirrored(mut self, upper: (Series, SeriesStyle), lower: (Series, SeriesStyle)) -> Self {
+    /// Either half takes a [`Series`] or a [`TimedSeries`](crate::TimedSeries).
+    pub fn mirrored(
+        mut self,
+        upper: (impl Into<SeriesSource>, SeriesStyle),
+        lower: (impl Into<SeriesSource>, SeriesStyle),
+    ) -> Self {
         self.spec.mirrored = true;
+        let (upper, lower) = ((upper.0.into(), upper.1), (lower.0.into(), lower.1));
         for ((series, style), half) in [(upper, Half::Upper), (lower, Half::Lower)] {
             self.spec.layers.push(Layer {
                 series,
@@ -343,6 +438,15 @@ impl<S: 'static> TimeSeriesView<S> {
     /// How samples are drawn (default [`PlotStyle::Area`]).
     pub fn style(mut self, style: PlotStyle) -> Self {
         self.spec.style = style;
+        self
+    }
+
+    /// Draw line and area edges as a monotone cubic curve through the samples instead of
+    /// straight segments (default `false`). The curve passes through every sample and never
+    /// overshoots between two; runs and gaps break as before, and a run of two is a straight
+    /// segment.
+    pub fn smooth(mut self, smooth: bool) -> Self {
+        self.spec.smooth = smooth;
         self
     }
 
@@ -379,6 +483,59 @@ impl<S: 'static> TimeSeriesView<S> {
         self
     }
 
+    /// An automatic y axis (default none): a rule and a label at each of the
+    /// [`ticks`] of the resolved domain, computed per half in a mirrored plot with the shared
+    /// middle axis labelled once. Its rules replace the [`grid`](Self::grid) fractions and use
+    /// the [`grid_color`](Self::grid_color).
+    ///
+    /// The labels follow an automatic domain as data arrives. They are shaped in layout, so
+    /// when a write moves the ticks, the paint that sees it asks for one layout pass and
+    /// draws the labels it already has until that pass shapes the new ones; nice-number
+    /// domains keep this rare. A fixed domain never asks.
+    pub fn y_axis(mut self, axis: YAxis) -> Self {
+        self.spec.y_axis = Some(axis);
+        self
+    }
+
+    /// Report a scrub to `on_scrub` (default: none, and the chart takes no input).
+    ///
+    /// With it set, a primary press inside the plot (not in an axis gutter) captures the
+    /// pointer and calls `on_scrub` with `Some(event)` on the press and on every move while
+    /// it is held, each [`ScrubEvent`] naming the sample nearest the pointer and every
+    /// series' value there; the release calls it with `None`. A move with no press is never a
+    /// scrub. Between the press and the release, each paint draws a crosshair (see
+    /// [`crosshair`](Self::crosshair)). The app renders its own readout from the events.
+    ///
+    /// When a scroll view or another gesture takes the drag away (a `Cancel`), the chart
+    /// stops drawing the crosshair at once and calls `on_scrub(None)` from the
+    /// `Housekeeping` broadcast of the rebuild that follows, still before the frame paints:
+    /// a `Cancel` handler never touches app state.
+    ///
+    /// The plot is no longer tap-transparent: a press inside it is handled here and does not
+    /// reach what lies beneath. A press does not take keyboard focus. Inside a vertical
+    /// scroll view, a sideways drag stays with the chart, while a drag that travels more
+    /// than the touch slop (18 px) vertically first is taken by the scroll view, which ends
+    /// the scrub. Inside a horizontal scroll view it is the other way round: the scroll view
+    /// takes a drag once it travels more than the slop sideways, so a scrub there ends after
+    /// 18 px of horizontal travel.
+    pub fn on_scrub(mut self, on_scrub: impl Fn(&mut S, Option<ScrubEvent>) + 'static) -> Self {
+        self.on_scrub = Some(Rc::new(on_scrub));
+        self
+    }
+
+    /// The scrub crosshair's colour and width in logical pixels (default: the theme's
+    /// `on_surface_variant` and 1); a width of 0 draws only the markers. A negative or
+    /// non-finite width is 0. Each series' marker dot takes the series' own colour.
+    pub fn crosshair(mut self, color: Color, width: f32) -> Self {
+        let width = if width.is_finite() {
+            width.max(0.0)
+        } else {
+            0.0
+        };
+        self.spec.crosshair = (Some(color), width);
+        self
+    }
+
     /// A fixed height in logical pixels (default: the available height when bounded, else
     /// 56). The width always expands to the available width.
     pub fn height(mut self, height: f32) -> Self {
@@ -406,7 +563,11 @@ impl<S: 'static> View<S> for TimeSeriesView<S> {
         TimeSeriesWidget {
             labels: Corner::ALL.map(|c| self.spec.labels[c.index()].clone().map(Label::new)),
             caches: vec![LayerCache::default(); self.spec.layers.len()],
+            axis: AxisLabels::default(),
             spec: self.spec.clone(),
+            on_scrub: self.on_scrub.as_ref().map(erase_callback_arg),
+            scrub: None,
+            end_owed: false,
         }
     }
 
@@ -416,9 +577,17 @@ impl<S: 'static> View<S> for TimeSeriesView<S> {
         element: &mut TimeSeriesWidget,
         _ctx: &mut BuildCtx<'_>,
     ) -> ChangeFlags {
-        let flags = self.spec.changes(&element.spec);
+        let mut flags = self.spec.changes(&element.spec);
         if !flags.is_empty() {
             element.adopt(self.spec.clone());
+        }
+        element.on_scrub = self.on_scrub.as_ref().map(erase_callback_arg);
+        if element.on_scrub.is_none() {
+            // Without a callback there is no scrub to draw or to end.
+            element.end_owed = false;
+            if element.scrub.take().is_some() {
+                flags |= ChangeFlags::PAINT;
+            }
         }
         flags
     }
@@ -428,17 +597,54 @@ impl<S: 'static> View<S> for TimeSeriesView<S> {
 #[derive(Clone, Debug, PartialEq)]
 struct CacheKey {
     revision: u64,
-    capacity: usize,
+    /// The capacity of a series, or the window, gap threshold and time span of a timed one.
+    source: SourceShape,
     plot: Rect,
     orientation: Orientation,
     domain: (f32, f32),
     style: PlotStyle,
+    smooth: bool,
     stroke_width: f32,
+}
+
+/// The inputs a tone gradient was built from.
+#[derive(Clone, Debug, PartialEq)]
+struct ToneKey {
+    tone: Tone,
+    plot: Rect,
+    orientation: Orientation,
+    domain: (f32, f32),
+}
+
+/// A tone's stroke and fill brushes in widget-local coordinates.
+#[derive(Clone, Debug)]
+struct ToneBrushes {
+    key: ToneKey,
+    stroke: Brush,
+    fill: Brush,
+}
+
+impl ToneBrushes {
+    fn build(key: ToneKey) -> Self {
+        let make = |alpha: f32| {
+            let g = tone_gradient(&key.tone, key.domain, key.plot, key.orientation, alpha);
+            Brush::Gradient(
+                Gradient::new_linear((0.0, g.start_y), (0.0, g.end_y))
+                    .with_stops(g.stops.as_slice()),
+            )
+        };
+        Self {
+            stroke: make(1.0),
+            fill: make(FILL_ALPHA.0),
+            key,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 struct LayerCache {
     key: Option<CacheKey>,
+    tone: Option<ToneBrushes>,
     fills: Vec<BezPath>,
     strokes: Vec<BezPath>,
     dots: Vec<BezPath>,
@@ -446,17 +652,18 @@ struct LayerCache {
 }
 
 impl LayerCache {
-    /// Rebuild the geometry of `series` unless `key` matches the last build.
-    fn refresh(&mut self, series: &Series, key: CacheKey) {
+    /// Rebuild the geometry of `source` unless `key` matches the last build. `key.style` is
+    /// the layer's own (a timed source never carries block columns).
+    fn refresh(&mut self, source: &SeriesSource, key: CacheKey) {
         if self.key.as_ref() == Some(&key) {
             return;
         }
         let CacheKey {
-            capacity,
             plot,
             orientation,
             domain,
             style,
+            smooth,
             stroke_width,
             ..
         } = key;
@@ -464,32 +671,77 @@ impl LayerCache {
         self.strokes.clear();
         self.dots.clear();
         self.blocks.clear();
-        series.with_slots(|slots| match style {
-            PlotStyle::Blocks { column_width, gap } => {
-                self.blocks = block_columns(
-                    slots.iter(),
-                    capacity,
-                    f64::from(column_width),
-                    f64::from(gap),
-                    domain,
-                    plot,
-                    orientation,
-                );
+        let area = style == PlotStyle::Area;
+        let line = match source {
+            SeriesSource::Series(series) => {
+                let capacity = series.capacity();
+                series.with_slots(|slots| match style {
+                    PlotStyle::Blocks { column_width, gap } => {
+                        self.blocks = block_columns(
+                            slots.iter(),
+                            capacity,
+                            f64::from(column_width),
+                            f64::from(gap),
+                            domain,
+                            plot,
+                            orientation,
+                        );
+                        None
+                    }
+                    PlotStyle::Area | PlotStyle::Line => {
+                        if area {
+                            let build = if smooth {
+                                smooth_area_paths
+                            } else {
+                                area_paths
+                            };
+                            self.fills = build(slots.iter(), capacity, domain, plot, orientation);
+                        }
+                        Some(line_segments(
+                            slots.iter(),
+                            capacity,
+                            domain,
+                            plot,
+                            orientation,
+                        ))
+                    }
+                })
             }
-            PlotStyle::Area | PlotStyle::Line => {
-                if style == PlotStyle::Area {
-                    self.fills = area_paths(slots.iter(), capacity, domain, plot, orientation);
-                }
-                let line = line_segments(slots.iter(), capacity, domain, plot, orientation);
-                self.strokes = line.paths();
-                let radius = MIN_DOT_DIAMETER.max(2.0 * f64::from(stroke_width)) / 2.0;
-                self.dots = line
-                    .points
-                    .iter()
-                    .map(|&p| Circle::new(p, radius).to_path(0.1))
-                    .collect();
+            SeriesSource::Timed(series) => {
+                let (window, gap_after) = (series.window_secs(), series.gap_after_secs());
+                series.with_points(|points| {
+                    if area {
+                        let build = if smooth {
+                            smooth_timed_area_paths
+                        } else {
+                            timed_area_paths
+                        };
+                        self.fills = build(points, window, gap_after, domain, plot, orientation);
+                    }
+                    Some(timed_line_segments(
+                        points,
+                        window,
+                        gap_after,
+                        domain,
+                        plot,
+                        orientation,
+                    ))
+                })
             }
-        });
+        };
+        if let Some(line) = line {
+            self.strokes = if smooth {
+                line.smooth_paths()
+            } else {
+                line.paths()
+            };
+            let radius = MIN_DOT_DIAMETER.max(2.0 * f64::from(stroke_width)) / 2.0;
+            self.dots = line
+                .points
+                .iter()
+                .map(|&p| Circle::new(p, radius).to_path(0.1))
+                .collect();
+        }
         self.key = Some(key);
     }
 }
@@ -546,9 +798,18 @@ impl Label {
         size
     }
 
+    /// The shaped size; zero before the first shape.
+    fn size(&self) -> Size {
+        self.layout.as_ref().map_or(Size::ZERO, TextLayout::size)
+    }
+
     fn paint(&self, origin: Point, scene: &mut dyn PaintScene) {
+        self.draw(origin + self.at.to_vec2(), scene);
+    }
+
+    /// Draw the shaped text with its top-left at `at` (scene coordinates).
+    fn draw(&self, at: Point, scene: &mut dyn PaintScene) {
         if let Some(layout) = &self.layout {
-            let at = origin + self.at.to_vec2();
             for run in layout.to_scene_runs(at) {
                 scene.draw_glyph_run(run);
             }
@@ -556,11 +817,54 @@ impl Label {
     }
 }
 
+/// One axis tick: its value and the half of the plot it belongs to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Tick {
+    half: Half,
+    value: f32,
+}
+
+/// The axis labels as last laid out, and the tick set a paint last asked a layout for.
+#[derive(Default)]
+struct AxisLabels {
+    /// The ticks the labels were shaped for, one per label.
+    ticks: Vec<Tick>,
+    /// The shaped labels; only `at.x` is laid out, a paint places each at its tick's y.
+    labels: Vec<Label>,
+    /// The tick set a paint asked a layout for, until a layout shapes one, so a paint asks at
+    /// most once per changed set.
+    requested: Option<Vec<Tick>>,
+    /// The width reserved beside the plot: 0 without a gutter.
+    gutter: f64,
+}
+
+/// The `(upper, lower)` resolved domains; both the same unless a mirrored plot resolves each
+/// half on its own.
+type Domains = ((f32, f32), (f32, f32));
+
+/// A half's rect, orientation and domain: what a tick or a layer in it is drawn against.
+type HalfPlot = (Rect, Orientation, (f32, f32));
+
+/// The top of the 1 px rule at `value`, kept on whole pixel rows inside its half.
+fn rule_y(value: f32, (rect, orientation, domain): HalfPlot) -> f64 {
+    let top = snap(rect.y0);
+    let bottom = (snap(rect.y1) - 1.0).max(top);
+    snap_rule_y(orientation.y_for(value, domain, rect)).clamp(top, bottom)
+}
+
 /// The retained widget behind a [`TimeSeriesView`].
 pub struct TimeSeriesWidget {
     spec: Spec,
     labels: [Option<Label>; 4],
     caches: Vec<LayerCache>,
+    axis: AxisLabels,
+    on_scrub: Option<ErasedArgCallback<Option<ScrubEvent>>>,
+    /// The pointer position (widget-local) of the live scrub: set by a primary press inside
+    /// the plot, moved by each captured move, cleared by the release or a cancel.
+    scrub: Option<Point>,
+    /// A cancel ended the scrub and `on_scrub(None)` is still owed, delivered from the next
+    /// `Housekeeping` broadcast (or ahead of the next press).
+    end_owed: bool,
 }
 
 /// `brush` with a gradient's points moved from widget-local to scene coordinates.
@@ -584,10 +888,11 @@ fn at_origin(brush: &Brush, origin: Point) -> Brush {
     Brush::Gradient(gradient)
 }
 
-/// The series and grid colours a paint falls back to.
+/// The series, grid and crosshair colours a paint falls back to.
 struct Defaults {
     series: Color,
     grid: Color,
+    crosshair: Color,
 }
 
 impl Defaults {
@@ -598,11 +903,13 @@ impl Defaults {
                 Self {
                     series: scheme.primary,
                     grid: scheme.outline_variant,
+                    crosshair: scheme.on_surface_variant,
                 }
             }
             None => Self {
                 series: Tone::FALLBACK_CALM,
                 grid: FALLBACK_GRID,
+                crosshair: FALLBACK_LABEL,
             },
         }
     }
@@ -622,31 +929,156 @@ impl TimeSeriesWidget {
         self.spec = spec;
     }
 
+    /// The plot: the widget's bounds less the axis gutter, if any.
+    fn plot(&self, size: Size) -> Rect {
+        let gutter = match &self.spec.y_axis {
+            Some(axis) if axis.gutter => self.axis.gutter.clamp(0.0, size.width.max(0.0)),
+            _ => 0.0,
+        };
+        match self.spec.y_axis.as_ref().map(|axis| axis.side) {
+            Some(AxisSide::Right) => Rect::new(0.0, 0.0, size.width - gutter, size.height),
+            _ => Rect::new(gutter, 0.0, size.width, size.height),
+        }
+    }
+
     /// The `(upper, lower)` plot rects: both the whole plot unless mirrored.
     fn halves(&self, size: Size) -> (Rect, Rect) {
-        let bounds = Rect::from_origin_size(Point::ZERO, size);
+        let plot = self.plot(size);
         if !self.spec.mirrored {
-            return (bounds, bounds);
+            return (plot, plot);
         }
         let mid = snap(size.height / 2.0);
         (
-            Rect::new(0.0, 0.0, size.width, mid),
-            Rect::new(0.0, mid, size.width, size.height),
+            Rect::new(plot.x0, 0.0, plot.x1, mid),
+            Rect::new(plot.x0, mid, plot.x1, size.height),
         )
     }
 
+    /// What `half` is drawn against, given the `(upper, lower)` rects and domains.
+    fn half_plot(
+        &self,
+        half: Half,
+        (upper, lower): (Rect, Rect),
+        (upper_domain, lower_domain): Domains,
+    ) -> HalfPlot {
+        match half {
+            Half::Lower if self.spec.mirrored => (lower, Orientation::Inverted, lower_domain),
+            _ => (upper, Orientation::Upright, upper_domain),
+        }
+    }
+
+    /// The axis ticks for the `(upper, lower)` domains: none without an axis, else each half's
+    /// own, with a mirrored plot's shared middle axis ticked once (by the upper half when it
+    /// has a tick there).
+    fn tick_set(&self, (upper, lower): Domains) -> Vec<Tick> {
+        let Some(axis) = &self.spec.y_axis else {
+            return Vec::new();
+        };
+        let mut set: Vec<Tick> = ticks(upper.0, upper.1, axis.tick_count)
+            .into_iter()
+            .map(|value| Tick {
+                half: Half::Upper,
+                value,
+            })
+            .collect();
+        if self.spec.mirrored {
+            let upper_on_axis = set.first().is_some_and(|tick| tick.value == upper.0);
+            set.extend(
+                ticks(lower.0, lower.1, axis.tick_count)
+                    .into_iter()
+                    .filter(|&value| !(upper_on_axis && value == lower.0))
+                    .map(|value| Tick {
+                        half: Half::Lower,
+                        value,
+                    }),
+            );
+        }
+        set
+    }
+
+    /// Shape a label per tick of the current domains (reusing a label whose text is
+    /// unchanged), measure the gutter and set each label's x. Without an axis, or without a
+    /// `style`, drop every axis label.
+    fn layout_axis(&mut self, ctx: &mut LayoutCtx, size: Size, style: Option<&TextStyle>) {
+        let Some((axis, style)) = self.spec.y_axis.as_ref().zip(style) else {
+            self.axis = AxisLabels::default();
+            return;
+        };
+        let ticks = self.tick_set(self.domains());
+        let mut old = std::mem::take(&mut self.axis.labels);
+        let mut labels = Vec::with_capacity(ticks.len());
+        let mut widest: f64 = 0.0;
+        for tick in &ticks {
+            let text = axis.format.format(tick.value);
+            let mut label = match old.iter().position(|label| label.text == text) {
+                Some(i) => old.swap_remove(i),
+                None => Label::new(text),
+            };
+            widest = widest.max(label.shape(ctx, style).width);
+            labels.push(label);
+        }
+        let (inset_x, _) = LABEL_INSET;
+        let gutter = if axis.gutter && !labels.is_empty() {
+            (widest + 2.0 * inset_x).ceil().min(size.width.max(0.0))
+        } else {
+            0.0
+        };
+        for label in &mut labels {
+            let width = label.size().width;
+            let x = match (axis.side, axis.gutter) {
+                (AxisSide::Left, false) => inset_x,
+                (AxisSide::Right, false) => size.width - inset_x - width,
+                (AxisSide::Left, true) => gutter - inset_x - width,
+                (AxisSide::Right, true) => size.width - gutter + inset_x,
+            };
+            label.at = Point::new(snap(x), 0.0);
+        }
+        self.axis = AxisLabels {
+            ticks,
+            labels,
+            requested: None,
+            gutter,
+        };
+    }
+
+    /// Draw each laid-out axis label centred on its tick's rule under the current domains,
+    /// kept inside the widget's height; a label whose value left its half's domain is skipped.
+    fn paint_axis_labels(
+        &self,
+        origin: Point,
+        size: Size,
+        domains: Domains,
+        scene: &mut dyn PaintScene,
+    ) {
+        let halves = self.halves(size);
+        let (_, inset_y) = LABEL_INSET;
+        for (tick, label) in self.axis.ticks.iter().zip(&self.axis.labels) {
+            let plot = self.half_plot(tick.half, halves, domains);
+            let (rect, orientation, domain) = plot;
+            if !(domain.0..=domain.1).contains(&tick.value) {
+                continue;
+            }
+            let height = label.size().height;
+            let centre = orientation.y_for(tick.value, domain, rect);
+            let top = (centre - height / 2.0)
+                .min(size.height - inset_y - height)
+                .max(inset_y);
+            let at = Point::new(origin.x + label.at.x, origin.y + snap(top));
+            label.draw(at, scene);
+        }
+    }
+
     /// The `(upper, lower)` domains resolved from the series' current data.
-    fn domains(&self) -> ((f32, f32), (f32, f32)) {
+    fn domains(&self) -> Domains {
         let domain = self.spec.domain;
         let of = |half: Option<Half>| {
-            let series: Vec<&Series> = self
+            let sources = self
                 .spec
                 .layers
                 .iter()
                 .filter(|l| half.is_none_or(|h| l.half == h))
-                .map(|l| &l.series)
-                .collect();
-            auto_domain(&series, domain)
+                .map(|l| &l.series);
+            source_domain(sources, domain)
         };
         if !self.spec.mirrored || self.spec.shared_domain {
             let all = of(None);
@@ -656,24 +1088,151 @@ impl TimeSeriesWidget {
         }
     }
 
-    fn paint_grid(&self, origin: Point, size: Size, color: Color, scene: &mut dyn PaintScene) {
-        if self.spec.grid.is_empty() {
+    /// The horizontal rules: one per axis tick when there is an axis, else one per grid
+    /// fraction (in each half of a mirrored plot), each across the plot's width.
+    fn paint_grid(
+        &self,
+        origin: Point,
+        size: Size,
+        (ticks, domains): (&[Tick], Domains),
+        color: Color,
+        scene: &mut dyn PaintScene,
+    ) {
+        let plot = self.plot(size);
+        if plot.width() <= 0.0 || plot.width().is_nan() {
             return;
         }
         let (upper, lower) = self.halves(size);
-        let mut ys = grid_rule_ys(&self.spec.grid, upper);
-        if self.spec.mirrored {
-            let flipped: Vec<f32> = self.spec.grid.iter().map(|f| 1.0 - f).collect();
-            ys.extend(grid_rule_ys(&flipped, lower));
-        }
+        let mut ys = if self.spec.y_axis.is_some() {
+            ticks
+                .iter()
+                .map(|tick| {
+                    rule_y(
+                        tick.value,
+                        self.half_plot(tick.half, (upper, lower), domains),
+                    )
+                })
+                .collect()
+        } else {
+            let mut ys = grid_rule_ys(&self.spec.grid, upper);
+            if self.spec.mirrored {
+                let flipped: Vec<f32> = self.spec.grid.iter().map(|f| 1.0 - f).collect();
+                ys.extend(grid_rule_ys(&flipped, lower));
+            }
+            ys
+        };
         ys.sort_by(f64::total_cmp);
         ys.dedup();
         for y in ys {
             scene.fill_rect(
-                Point::new(origin.x, origin.y + y),
-                Size::new(size.width, 1.0),
+                Point::new(origin.x + plot.x0, origin.y + y),
+                Size::new(plot.width(), 1.0),
                 color,
             );
+        }
+    }
+
+    /// The scrub at the widget-local `position` against the series' current data.
+    fn scrub_at(&self, size: Size, position: Point) -> ScrubEvent {
+        let style = self.spec.style;
+        let layers = self
+            .spec
+            .layers
+            .iter()
+            .map(move |layer| (&layer.series, layer.placement(style)));
+        scrub_at(layers, self.plot(size), position)
+    }
+
+    /// Whether a press at the widget-local `position` lands inside the plot.
+    fn in_plot(&self, size: Size, position: Point) -> bool {
+        let plot = self.plot(size);
+        plot.width() > 0.0
+            && (plot.x0..=plot.x1).contains(&position.x)
+            && (plot.y0..=plot.y1).contains(&position.y)
+    }
+
+    fn report(&mut self, ctx: &mut EventCtx, event: Option<ScrubEvent>) {
+        if let Some(on_scrub) = self.on_scrub.as_mut() {
+            on_scrub(ctx, event);
+        }
+    }
+
+    /// A pointer event while `on_scrub` is set.
+    fn scrub_pointer(&mut self, ctx: &mut EventCtx, p: &PointerEvent) -> EventResult {
+        match p.phase {
+            PointerPhase::Down => {
+                if p.button != PointerButton::Primary || !self.in_plot(ctx.size(), p.position) {
+                    return EventResult::Ignored;
+                }
+                if std::mem::take(&mut self.end_owed) {
+                    self.report(ctx, None);
+                }
+                ctx.capture_pointer();
+                self.scrub = Some(p.position);
+                let event = self.scrub_at(ctx.size(), p.position);
+                self.report(ctx, Some(event));
+            }
+            PointerPhase::Move => {
+                if self.scrub.is_none() {
+                    return EventResult::Ignored;
+                }
+                self.scrub = Some(p.position);
+                let event = self.scrub_at(ctx.size(), p.position);
+                self.report(ctx, Some(event));
+            }
+            PointerPhase::Up => {
+                if self.scrub.take().is_none() {
+                    return EventResult::Ignored;
+                }
+                self.report(ctx, None);
+            }
+            PointerPhase::Cancel => {
+                // A cancel may arrive over throwaway state, so it never calls back: the end is
+                // owed to the next state-bearing broadcast.
+                if self.scrub.take().is_none() {
+                    return EventResult::Ignored;
+                }
+                self.end_owed = true;
+                mark_pending_result_flush();
+            }
+        }
+        ctx.request_redraw();
+        EventResult::Handled
+    }
+
+    /// The crosshair at the live scrub's sample and a marker on each series' sample there.
+    fn paint_scrub(
+        &self,
+        origin: Point,
+        size: Size,
+        (position, domains): (Point, Domains),
+        defaults: &Defaults,
+        scene: &mut dyn PaintScene,
+    ) {
+        let plot = self.plot(size);
+        if plot.width() <= 0.0 || plot.width().is_nan() {
+            return;
+        }
+        let event = self.scrub_at(size, position);
+        let (color, width) = self.spec.crosshair;
+        let width = f64::from(width);
+        if width > 0.0 {
+            scene.fill_rect(
+                Point::new(origin.x + snap(event.x - width / 2.0), origin.y + plot.y0),
+                Size::new(width, plot.height()),
+                color.unwrap_or(defaults.crosshair),
+            );
+        }
+        let halves = self.halves(size);
+        for (layer, value) in self.spec.layers.iter().zip(&event.values) {
+            let Some(value) = *value else {
+                continue;
+            };
+            let (rect, orientation, domain) = self.half_plot(layer.half, halves, domains);
+            let centre = Point::new(event.x, orientation.y_for(value, domain, rect));
+            let dot = Circle::new(origin + centre.to_vec2(), MARKER_RADIUS).to_path(0.1);
+            let color = layer.style.color.unwrap_or(defaults.series);
+            scene.fill_path(Point::ZERO, &dot, &Brush::Solid(color));
         }
     }
 
@@ -681,24 +1240,40 @@ impl TimeSeriesWidget {
         &mut self,
         index: usize,
         origin: Point,
-        plot: (Rect, Orientation, (f32, f32)),
+        plot: HalfPlot,
         default_color: Color,
         scene: &mut dyn PaintScene,
     ) {
         let (rect, orientation, domain) = plot;
         let layer = &self.spec.layers[index];
-        let style = self.spec.style;
+        let style = layer.style_under(self.spec.style);
+        let (revision, source) = layer.series.shape();
         let key = CacheKey {
-            revision: layer.series.revision(),
-            capacity: layer.series.capacity(),
+            revision,
+            source,
             plot: rect,
             orientation,
             domain,
             style,
+            smooth: self.spec.smooth,
             stroke_width: layer.style.stroke_width,
         };
         let cache = &mut self.caches[index];
         cache.refresh(&layer.series, key);
+        match &layer.style.tone_along {
+            Some(tone) => {
+                let key = ToneKey {
+                    tone: tone.clone(),
+                    plot: rect,
+                    orientation,
+                    domain,
+                };
+                if cache.tone.as_ref().map(|b| &b.key) != Some(&key) {
+                    cache.tone = Some(ToneBrushes::build(key));
+                }
+            }
+            None => cache.tone = None,
+        }
         let series_style = &layer.style;
         let color = series_style.color.unwrap_or(default_color);
 
@@ -721,7 +1296,10 @@ impl TimeSeriesWidget {
 
         if style == PlotStyle::Area {
             let fill = match &series_style.fill {
-                SeriesFill::Gradient => Some(derived_fill(color, rect, orientation, origin)),
+                SeriesFill::Gradient => Some(match &cache.tone {
+                    Some(tone) => at_origin(&tone.fill, origin),
+                    None => derived_fill(color, rect, orientation, origin),
+                }),
                 SeriesFill::Brush(brush) => Some(at_origin(brush, origin)),
                 SeriesFill::None => None,
             };
@@ -731,10 +1309,11 @@ impl TimeSeriesWidget {
                 }
             }
         }
-        let stroke = series_style
-            .stroke
-            .as_ref()
-            .map_or(Brush::Solid(color), |brush| at_origin(brush, origin));
+        let stroke = match (&series_style.stroke, &cache.tone) {
+            (Some(brush), _) => at_origin(brush, origin),
+            (None, Some(tone)) => at_origin(&tone.stroke, origin),
+            (None, None) => Brush::Solid(color),
+        };
         let width = f64::from(series_style.stroke_width);
         if width > 0.0 {
             for path in &cache.strokes {
@@ -776,7 +1355,8 @@ impl Widget for TimeSeriesWidget {
             _ => DEFAULT_HEIGHT,
         };
         let size = bc.constrain(Size::new(width, height));
-        if self.labels.iter().all(Option::is_none) {
+        if self.labels.iter().all(Option::is_none) && self.spec.y_axis.is_none() {
+            self.axis = AxisLabels::default();
             return size;
         }
         let theme = Theme::from_layout_ctx(ctx);
@@ -784,13 +1364,22 @@ impl Widget for TimeSeriesWidget {
             .spec
             .label_color
             .unwrap_or_else(|| theme.map_or(FALLBACK_LABEL, |t| t.scheme().on_surface_variant));
-        let family = theme.map(|t| t.type_scale.body_small.family.clone());
-        let label_size = if self.spec.label_size.is_finite() && self.spec.label_size > 0.0 {
+        let family = theme
+            .map(|t| t.type_scale.body_small.family.clone())
+            .unwrap_or_default();
+        let usable = |size: f32| size.is_finite() && size > 0.0;
+        let label_size = if usable(self.spec.label_size) {
             self.spec.label_size
         } else {
             DEFAULT_LABEL_SIZE
         };
-        let style = TextStyle::new(label_size, color).with_family(family.unwrap_or_default());
+        let axis_style = self.spec.y_axis.as_ref().map(|axis| {
+            let size = axis.size.filter(|&s| usable(s)).unwrap_or(label_size);
+            TextStyle::new(size, axis.color.unwrap_or(color)).with_family(family.clone())
+        });
+        let style = TextStyle::new(label_size, color).with_family(family);
+        self.layout_axis(ctx, size, axis_style.as_ref());
+        let plot = self.plot(size);
         for corner in Corner::ALL {
             let Some(label) = &mut self.labels[corner.index()] else {
                 continue;
@@ -798,8 +1387,8 @@ impl Widget for TimeSeriesWidget {
             let text = label.shape(ctx, &style);
             let (inset_x, inset_y) = LABEL_INSET;
             let x = match corner {
-                Corner::TopLeft | Corner::BottomLeft => inset_x,
-                Corner::TopRight | Corner::BottomRight => size.width - inset_x - text.width,
+                Corner::TopLeft | Corner::BottomLeft => plot.x0 + inset_x,
+                Corner::TopRight | Corner::BottomRight => plot.x1 - inset_x - text.width,
             };
             let y = match corner {
                 Corner::TopLeft | Corner::TopRight => inset_y,
@@ -815,23 +1404,46 @@ impl Widget for TimeSeriesWidget {
         if !(size.width > 0.0 && size.height > 0.0) {
             return;
         }
+        let domains = self.domains();
+        let ticks = self.tick_set(domains);
+        if ticks != self.axis.ticks && self.axis.requested.as_ref() != Some(&ticks) {
+            // The labels are shaped for other ticks: ask once for a layout to shape these.
+            ctx.request_layout();
+            self.axis.requested = Some(ticks.clone());
+        }
         let defaults = Defaults::resolve(Theme::from_paint_ctx(ctx));
         scene.push_clip(origin, size);
         let grid = self.spec.grid_color.unwrap_or(defaults.grid);
-        self.paint_grid(origin, size, grid, scene);
-        let (upper, lower) = self.halves(size);
-        let (upper_domain, lower_domain) = self.domains();
+        self.paint_grid(origin, size, (&ticks, domains), grid, scene);
+        let halves = self.halves(size);
         for index in 0..self.spec.layers.len() {
-            let plot = match self.spec.layers[index].half {
-                Half::Lower if self.spec.mirrored => (lower, Orientation::Inverted, lower_domain),
-                _ => (upper, Orientation::Upright, upper_domain),
-            };
+            let plot = self.half_plot(self.spec.layers[index].half, halves, domains);
             self.paint_layer(index, origin, plot, defaults.series, scene);
         }
+        if let Some(position) = self.scrub {
+            self.paint_scrub(origin, size, (position, domains), &defaults, scene);
+        }
+        self.paint_axis_labels(origin, size, domains, scene);
         for label in self.labels.iter().flatten() {
             label.paint(origin, scene);
         }
         scene.pop_clip();
+    }
+
+    fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
+        if self.on_scrub.is_none() {
+            return EventResult::Ignored;
+        }
+        match event {
+            InputEvent::Pointer(p) => self.scrub_pointer(ctx, p),
+            InputEvent::Housekeeping => {
+                if std::mem::take(&mut self.end_owed) {
+                    self.report(ctx, None);
+                }
+                EventResult::Ignored
+            }
+            _ => EventResult::Ignored,
+        }
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
@@ -850,25 +1462,28 @@ impl Widget for TimeSeriesWidget {
 #[cfg(test)]
 mod tests {
     use super::{CacheKey, LayerCache, Orientation, PlotStyle};
-    use crate::Series;
+    use crate::{Series, SeriesSource, TimedSeries};
     use frust::authoring::Rect;
 
-    fn key(series: &Series, plot: Rect) -> CacheKey {
+    fn key(series: &SeriesSource, plot: Rect) -> CacheKey {
+        let (revision, source) = series.shape();
         CacheKey {
-            revision: series.revision(),
-            capacity: series.capacity(),
+            revision,
+            source,
             plot,
             orientation: Orientation::Upright,
             domain: (0.0, 100.0),
             style: PlotStyle::Area,
+            smooth: false,
             stroke_width: 1.5,
         }
     }
 
     #[test]
     fn cached_paths_are_rebuilt_only_when_an_input_changes() {
-        let series = Series::new(4);
-        series.extend([Some(10.0), Some(20.0)]);
+        let handle = Series::new(4);
+        handle.extend([Some(10.0), Some(20.0)]);
+        let series = SeriesSource::from(handle.clone());
         let plot = Rect::new(0.0, 0.0, 100.0, 50.0);
         let mut cache = LayerCache::default();
         cache.refresh(&series, key(&series, plot));
@@ -888,8 +1503,31 @@ mod tests {
         cache.strokes.clear();
         cache.refresh(&series, key(&series, wide));
         assert!(cache.strokes.is_empty());
-        series.push(30.0);
+        handle.push(30.0);
         cache.refresh(&series, key(&series, wide));
         assert_eq!(cache.strokes.len(), 1);
+    }
+
+    #[test]
+    fn a_timed_cache_is_rebuilt_when_its_timing_changes() {
+        let handle = TimedSeries::new(8);
+        handle.extend([(0.0, 10.0), (1.0, 20.0), (5.0, 30.0)]);
+        let series = SeriesSource::from(handle.clone());
+        let plot = Rect::new(0.0, 0.0, 100.0, 50.0);
+        let mut cache = LayerCache::default();
+        cache.refresh(&series, key(&series, plot));
+        assert_eq!(cache.strokes.len(), 1);
+
+        cache.strokes.clear();
+        cache.refresh(&series, key(&series, plot));
+        assert!(cache.strokes.is_empty(), "same inputs reuse the build");
+
+        // A gap threshold splits the line: the key's timing moves and the geometry follows.
+        let before = key(&series, plot);
+        let _handle = handle.gap_after(2.0);
+        let after = key(&series, plot);
+        assert_ne!(before.source, after.source);
+        cache.refresh(&series, after);
+        assert_eq!((cache.strokes.len(), cache.dots.len()), (1, 1));
     }
 }
