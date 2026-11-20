@@ -190,6 +190,11 @@ A gate for `frust-charts` (`plugins/charts`): open the **Charts** section of `ex
 - **Dim:** tick `dim`. The chart column fades to a stale look and back.
 - **Pushed page:** tap `open in page`. The pushed chart is live over the same handles; `Back` returns.
 - **Taps:** tap the block chart. `chart taps:` counts it, since charts take no input.
+- **Families:** the Families section below the monitoring set holds a bar chart, a donut, a gauge,
+  a scatter chart, a radar chart and a candlestick chart. Each updates live (the newest candle
+  keeps forming, then a new one starts), `builds:` does not advance, and `pause feed` stops them.
+
+The device record below predates the families and does not cover them.
 
 Device record, 2026-11-19 and 2026-11-20: Android at `053d69a3`, iPhone and macOS at `041d8b7b`
 (the only change between them is a heat-grid layout fix).

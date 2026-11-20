@@ -95,3 +95,93 @@ view takes the drag, the `None` arrives on the rebuild that follows.
 `TimeSeriesView::smooth(true)` draws a monotone curve through the samples that never overshoots
 them. `SeriesStyle::tone_along_value(tone)` changes the line (and its area fill) colour where it
 crosses a `Tone` threshold; `SeriesStyle::tone` still colours block columns only.
+
+## Chart families
+
+Six more families draw from handles the same way: a write repaints with no rebuild, and every
+family is display-only and tap-transparent, except the centre child of `pie_chart` and `gauge`,
+which receives input normally.
+
+```rust
+use frust_charts::{BarMode, Categories, Tone, YAxis, YDomain, bar_chart};
+
+let sales = Categories::from_rows([("Q1", [12.0, 8.0]), ("Q2", [15.0, 9.5])]);
+bar_chart(sales.clone())                  // grouped by default; one colour per value column
+    .mode(BarMode::Stacked)
+    .colors([blue, green])
+    .y_axis(YAxis::new());                // default domain: automatic, always contains 0
+```
+
+`bar_chart` can also run `.horizontal()` (the axis then runs along the bottom), colour by value
+with `.tone(Tone)`, and round the outer ends with `.radius`. Category labels are thinned to every
+k-th when crowded, never shortened. `YAxis::gutter` has no effect here (a measured gutter is
+always reserved), and neither does `YAxis::side` in horizontal mode.
+
+```rust
+use frust_charts::pie_chart;
+
+pie_chart::<App>(sales.clone())           // one section per row, from its first value
+    .donut(0.55)                          // inner radius as a fraction; 0 is a full pie
+    .gap(2.0)                             // constant-width gaps
+    .corner_radius(3.0)
+    .start_angle(0.0)                     // radians
+    .center(text("Sales"));               // in the donut hole; receives input
+```
+
+```rust
+use frust_charts::{GaugeCap, NeedleStyle, Samples, gauge};
+
+let cores = Samples::new(8);
+gauge::<App>(cores.slot(0))               // a fixed f32 or a live SampleSlot
+    .zones([(0.0, 60.0, calm), (60.0, 100.0, critical)])
+    .needle(NeedleStyle::new())
+    .ticks(11, 4.0, muted)                // count, length, colour
+    .cap(GaugeCap::Round)
+    .angles(std::f32::consts::PI, std::f32::consts::PI); // a half dial over the top
+```
+
+`gauge` is the radial sibling of `meter`; `.center(view)` puts a child in the middle.
+
+```rust
+use frust_charts::{Points, ScatterPoint, ScatterShape, scatter_chart};
+
+let points = Points::new(1_000);          // a bounded handle of ScatterPoints
+points.push(1.0, 20.0);
+points.push_point(ScatterPoint::new(2.0, 35.0).with_radius(6.0));
+scatter_chart::<App>(points.clone()).shape(ScatterShape::Cross).colors([blue, green]);
+```
+
+Both axes default to an automatic domain, and a point outside a domain is skipped.
+
+```rust
+use frust_charts::{RadarShape, RadarStyle, radar_chart};
+
+let skills = Categories::from_rows([
+    ("Speed", [70.0, 50.0]),
+    ("Power", [40.0, 80.0]),
+    ("Range", [60.0, 65.0]),              // three axes or more; fewer draws the web only
+]);
+radar_chart(skills.clone())               // each row is an axis, each value column a dataset
+    .shape(RadarShape::Circle)            // the web: Polygon (default) or Circle
+    .dataset_styles([RadarStyle::color(blue), RadarStyle::color(green)]);
+```
+
+Axis titles are kept inside the widget.
+
+```rust
+use frust_charts::{Candle, Candles, candlestick_chart};
+
+let candles = Candles::new(60);           // a fixed-capacity ring, newest right-aligned
+candles.push(Candle::new(10.0, 12.0, 9.0, 11.0));  // open, high, low, close
+candles.update_last(Candle::new(10.0, 13.0, 9.0, 12.5)); // the forming candle
+candlestick_chart(candles.clone()).up(green).down(red);
+```
+
+The automatic domain is not anchored at zero.
+
+`Categories` holds labelled rows of values (`set_value`, `set_label`, `set_rows`). A value write
+repaints; a label change (`bar_chart` and `radar_chart` draw the labels) asks for one layout pass
+to shape the new text. `YDomain::auto()` is an automatic range from the data's minimum to its
+maximum with both ends rounded to round numbers; `resolve_range(Some((min, max)))` resolves it.
+The polar helpers `arc_path`, `sector_path`, `point_on_circle`, `angle_of`, `normalize_angle` and
+`sweep_contains` work in radians with 0 at 3 o'clock, positive clockwise.

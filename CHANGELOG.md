@@ -150,6 +150,17 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   `ScrubSample`) while the pointer is down and `None` on release; with `on_scrub` set the plot
   handles presses. `TimeSeriesView::smooth(true)` draws a monotone curve that never overshoots the
   samples, and `SeriesStyle::tone_along_value(Tone)` colours a line and its area fill by value.
+- `frust-charts` gains six chart families: `bar_chart` (grouped or stacked, vertical or
+  horizontal, with an optional `YAxis`), `pie_chart` (pie or donut, with a centre child), `gauge`
+  (the radial sibling of `meter`, with zones, `NeedleStyle`, ticks and `GaugeCap`),
+  `scatter_chart` (`ScatterShape`), `radar_chart` (`RadarShape`, `RadarStyle`) and
+  `candlestick_chart`. They read three new shared handles: `Categories` (with `CategoryRow`),
+  `Points` (of `ScatterPoint`) and `Candles` (a ring of `Candle`, with `update_last`). Each repaints
+  on a write; they are display-only except the centre child of `pie_chart` and `gauge`. `bar_chart`
+  and `radar_chart` ask for one layout pass when a `Categories` label changes. `YDomain::auto()`
+  (the new `AutoRange` variant, resolved by `resolve_range`) spans the data's minimum to maximum
+  with round ends, and the polar helpers `arc_path`, `sector_path`, `point_on_circle`, `angle_of`,
+  `normalize_angle` and `sweep_contains` are public (radians, 0 at 3 o'clock, clockwise).
 - `frust::request_repaint()` asks for the next frame to repaint without a rebuild or a layout. It
   can be called from any thread and applies to the whole process: every live root repaints its tree
   once, content behind a `repaint_boundary` included, and semantics are published again. Use it for
