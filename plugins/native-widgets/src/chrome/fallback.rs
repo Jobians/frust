@@ -18,7 +18,9 @@
 //!   tab is drawn in `primary` and decides select versus reselect.
 //! - The toolbar row sits above the tab row (or takes the bottom inset when it
 //!   is the lowest bar): 56 px of trailing-aligned buttons, the primary last,
-//!   as a filled pill. A menu entry toggles an inline row of its items above
+//!   as a filled pill; [`ToolbarStyle::Floating`] instead centres the items
+//!   on one `surface_container_highest` pill with the primary beside it. A
+//!   menu entry toggles an inline row of its items above
 //!   it. Its taps are id-based ([`deliver_event`]): it holds the toolbar
 //!   alone, whose indices follow the top bar's in the live spec.
 //! - SF Symbol names exist only on Apple platforms, so a symbol icon draws the
@@ -44,8 +46,8 @@ use frust_core::{
 use kurbo::{Affine, BezPath, Point, Rect, Size};
 
 use super::{
-    ActionItem, ChromeEvent, ChromeGeneration, ChromeSpec, Leading, ToolbarSpec, TopBarSpec,
-    deliver, deliver_event, encode_event,
+    ActionItem, ChromeEvent, ChromeGeneration, ChromeSpec, Leading, ToolbarSpec, ToolbarStyle,
+    TopBarSpec, deliver, deliver_event, encode_event,
 };
 use crate::api::{TabIcon, TabItem};
 
@@ -63,6 +65,8 @@ const TAB_ROW_HEIGHT: f64 = 64.0;
 const TOOLBAR_ROW_HEIGHT: f64 = 56.0;
 /// The primary pill's height inside the toolbar row.
 const PRIMARY_HEIGHT: f64 = 40.0;
+/// The gap between the floating style's item pill and the primary.
+const FLOATING_GAP: f64 = 8.0;
 /// A tap target's side: the 48 px minimum touch target.
 const SLOT: f64 = 48.0;
 /// Gap between the bar's edge (inside the insets) and its outermost slot.
@@ -1030,6 +1034,8 @@ struct ToolbarRowWidget {
     decoded: Decoded,
     targets: Vec<Target>,
     rects: Vec<Rect>,
+    /// The pill behind the items in [`ToolbarStyle::Floating`].
+    pill: Option<Rect>,
     menu_rects: Vec<Rect>,
     size: Size,
 }
@@ -1047,6 +1053,7 @@ impl ToolbarRowWidget {
             decoded: Decoded::default(),
             targets: Vec::new(),
             rects: Vec::new(),
+            pill: None,
             menu_rects: Vec::new(),
             size: Size::ZERO,
         }
@@ -1211,28 +1218,61 @@ impl Widget for ToolbarRowWidget {
         let emphasised: Vec<bool> = (0..self.faces.len())
             .map(|i| self.is_emphasised(i))
             .collect();
-        let mut right = width - pad.right - EDGE_PAD;
+        let sizes: Vec<Size> = self
+            .faces
+            .iter_mut()
+            .enumerate()
+            .map(|(i, face)| {
+                let style = if emphasised[i] {
+                    &primary_style
+                } else {
+                    &styles.action
+                };
+                let w = match face {
+                    ActionFace::Icon(icon) => {
+                        icon.shape(ctx, &styles.letters);
+                        SLOT
+                    }
+                    ActionFace::Text(run) => {
+                        (run.shape(ctx, style.clone()).width + 2.0 * TEXT_PAD).max(SLOT)
+                    }
+                };
+                let h = if emphasised[i] { PRIMARY_HEIGHT } else { SLOT };
+                Size::new(w, h)
+            })
+            .collect();
+        let place = |x: f64, size: Size| {
+            let top = y + (TOOLBAR_ROW_HEIGHT - size.height) / 2.0;
+            Rect::new(x, top, x + size.width, top + size.height)
+        };
         self.rects = vec![Rect::ZERO; self.faces.len()];
-        for (i, face) in self.faces.iter_mut().enumerate().rev() {
-            let style = if emphasised[i] {
-                &primary_style
-            } else {
-                &styles.action
-            };
-            let w = match face {
-                ActionFace::Icon(icon) => {
-                    icon.shape(ctx, &styles.letters);
-                    SLOT
-                }
-                ActionFace::Text(run) => {
-                    (run.shape(ctx, style.clone()).width + 2.0 * TEXT_PAD).max(SLOT)
-                }
-            };
-            let h = if emphasised[i] { PRIMARY_HEIGHT } else { SLOT };
-            right -= w;
-            let top = y + (TOOLBAR_ROW_HEIGHT - h) / 2.0;
-            self.rects[i] = Rect::new(right, top, right + w, top + h);
-            right -= EDGE_PAD;
+        self.pill = None;
+        let items = self.toolbar.items.len();
+        if self.toolbar.style == ToolbarStyle::Floating && items > 0 {
+            // One pill of items, the primary beside it, centred as a group.
+            let items_w: f64 =
+                sizes[..items].iter().map(|s| s.width).sum::<f64>() + EDGE_PAD * (items - 1) as f64;
+            let pill_w = items_w + 2.0 * EDGE_PAD;
+            let primary_w = sizes.get(items).map_or(0.0, |s| FLOATING_GAP + s.width);
+            let span = width - pad.left - pad.right;
+            let mut x = pad.left + ((span - pill_w - primary_w) / 2.0).max(EDGE_PAD);
+            self.pill = Some(place(x, Size::new(pill_w, SLOT)));
+            x += EDGE_PAD;
+            for (i, size) in sizes[..items].iter().enumerate() {
+                self.rects[i] = place(x, *size);
+                x += size.width + EDGE_PAD;
+            }
+            if let Some(size) = sizes.get(items) {
+                x += FLOATING_GAP;
+                self.rects[items] = place(x, *size);
+            }
+        } else {
+            let mut right = width - pad.right - EDGE_PAD;
+            for (i, size) in sizes.iter().enumerate().rev() {
+                right -= size.width;
+                self.rects[i] = place(right, *size);
+                right -= EDGE_PAD;
+            }
         }
         for ((face, rect), badge) in self.faces.iter().zip(&self.rects).zip(&mut self.badges) {
             if let Some(badge) = badge {
@@ -1278,6 +1318,11 @@ impl Widget for ToolbarRowWidget {
             Size::new(self.size.width, HAIRLINE),
             scheme.outline_variant,
         );
+        if let Some(pill) = self.pill {
+            let r = at(pill);
+            let fill = scheme.surface_container_highest;
+            scene.fill_rounded_rect(r.origin(), r.size(), r.height() / 2.0, fill);
+        }
         for (i, rect) in self.rects.iter().enumerate() {
             if self.is_emphasised(i) {
                 let r = at(*rect);
@@ -2307,6 +2352,71 @@ mod tests {
         assert!(row.is_emphasised(0) && !row.is_emphasised(1));
         assert_eq!(row.rects[0].height(), PRIMARY_HEIGHT);
         assert_eq!(row.rects[1].height(), SLOT);
+    }
+
+    #[test]
+    fn the_floating_style_lays_the_items_out_on_one_pill_beside_the_primary() {
+        let toolbar = |style| {
+            ToolbarSpec::new()
+                .item(ActionItem::new("info", "Info").badge("2"))
+                .item(ActionItem::new("files", "Files").prominent(true))
+                .item(ActionItem::new("bell", "Bell").icon(TabIcon::AppleSymbol("bell".into())))
+                .primary(ActionItem::new("comment", "Comment"))
+                .style(style)
+        };
+        let row = |style| {
+            let view = ToolbarRowView {
+                toolbar: toolbar(style),
+                generation: ChromeGeneration(1),
+            };
+            let mut counter = 0;
+            <ToolbarRowView as View<()>>::build(&view, &mut BuildCtx::new(&mut counter))
+        };
+
+        let mut buttons = row(ToolbarStyle::Buttons);
+        let (plain, theme) = lay_out_and_paint(&mut buttons);
+        let highest = theme.scheme().surface_container_highest;
+        assert!(buttons.pill.is_none(), "the default style has no pill");
+        assert_eq!(count_color(&plain, highest), 0);
+        let trailing = buttons.rects[3];
+        assert!(
+            trailing.x1 > 390.0 - EDGE_PAD - 1.0,
+            "buttons stay trailing"
+        );
+
+        let mut floating = row(ToolbarStyle::Floating);
+        let (rec, _) = lay_out_and_paint(&mut floating);
+        let pill = floating.pill.expect("one pill");
+        assert_eq!(count_color(&rec, highest), 1, "one pill painted");
+        assert_eq!(pill.height(), SLOT);
+        for item in &floating.rects[..3] {
+            assert_eq!(pill.union(*item), pill, "{item:?} inside {pill:?}");
+        }
+        let primary = floating.rects[3];
+        assert!(
+            primary.x0 >= pill.x1 + FLOATING_GAP - 1e-9,
+            "the primary is beside it"
+        );
+        // Centred as a group in the 390 px row.
+        let (left, right) = (pill.x0, 390.0 - primary.x1);
+        assert!((left - right).abs() < 1e-6, "{left} vs {right}");
+        // Everything else is as in the default style: emphasis, badge, targets.
+        assert!(floating.is_emphasised(1) && floating.is_emphasised(3));
+        assert!(!floating.is_emphasised(0));
+        assert_eq!(count_color(&rec, theme.scheme().error), 1, "Info's badge");
+        assert_eq!(floating.targets.len(), 4);
+
+        // Without items there is nothing to gather: the primary stays trailing.
+        let view = ToolbarRowView {
+            toolbar: ToolbarSpec::new()
+                .primary(ActionItem::new("comment", "Comment"))
+                .style(ToolbarStyle::Floating),
+            generation: ChromeGeneration(1),
+        };
+        let mut counter = 0;
+        let mut lone = <ToolbarRowView as View<()>>::build(&view, &mut BuildCtx::new(&mut counter));
+        lay_out_and_paint(&mut lone);
+        assert!(lone.pill.is_none());
     }
 
     #[test]

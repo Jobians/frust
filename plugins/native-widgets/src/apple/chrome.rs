@@ -1338,6 +1338,10 @@ fn apply_top(
 /// flexible space between them and the primary trailing and prominent, each
 /// tagged with its `chrome_actions` index; hidden, without animation, when
 /// `spec` shows none.
+///
+/// `ToolbarSpec`'s `style` and `primary_label` are ignored here: the
+/// navigation controller's toolbar is the system one, its primary a
+/// prominent bar item whichever style the spec names.
 fn apply_toolbar(
     mtm: MainThreadMarker,
     page: &Page,

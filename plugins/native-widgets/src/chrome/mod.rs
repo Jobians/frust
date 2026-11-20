@@ -385,7 +385,9 @@ impl MenuItem {
 
 /// The bottom toolbar: secondary `items` and an optional `primary` action,
 /// shown trailing and emphasised — iOS navigation-controller toolbar items,
-/// Android floating action buttons, a frust-drawn row in the fallback. Its
+/// Android floating action buttons (or, for [`ToolbarStyle::Floating`], a
+/// Material floating toolbar beside the primary), a frust-drawn row in the
+/// fallback. Its
 /// actions report like the top bar's ([`ChromeEvent::ActionTapped`],
 /// [`ChromeEvent::MenuItemChosen`]), so their ids must not repeat a top-bar
 /// action's or each other's: the scaffold drops a repeat and says so.
@@ -393,12 +395,47 @@ impl MenuItem {
 pub struct ToolbarSpec {
     pub(crate) items: Vec<ActionItem>,
     pub(crate) primary: Option<ActionItem>,
+    pub(crate) style: ToolbarStyle,
+    pub(crate) primary_label: bool,
+}
+
+/// How the bottom toolbar's items are presented ([`ToolbarSpec::style`]).
+/// iOS ignores it: its toolbar is the navigation controller's own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ToolbarStyle {
+    /// Each entry its own button: on Android a column of floating action
+    /// buttons above the bottom navigation, trailing; a trailing row of
+    /// buttons in the frust-drawn chrome.
+    #[default]
+    Buttons,
+    /// The items together in one floating pill, the primary beside it: on
+    /// Android a Material 3 floating toolbar anchored bottom-centre with the
+    /// primary as a floating action button, hidden while the keyboard shows;
+    /// one pill of items in the frust-drawn chrome.
+    Floating,
 }
 
 impl ToolbarSpec {
     /// An empty toolbar, which shows nothing.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How the items are presented. Default [`ToolbarStyle::Buttons`].
+    pub fn style(mut self, style: ToolbarStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Whether a primary with an icon also shows its title beside the icon
+    /// (Android's extended floating action button). Default `false`: an
+    /// icon primary shows its icon alone, its title the accessibility label.
+    /// A primary without an icon always shows its title. iOS and the
+    /// frust-drawn chrome ignore it.
+    pub fn primary_label(mut self, label: bool) -> Self {
+        self.primary_label = label;
+        self
     }
 
     /// The secondary items, leading-first.
@@ -473,11 +510,16 @@ fn declaration_rank(field: ChromeField) -> u8 {
 }
 
 /// How the toolbar changed from `old` to `new`: a badge-only change keeps
-/// both present with the same entries in the same roles.
+/// both present with the same entries in the same roles, the same style and
+/// the same primary label.
 fn toolbar_change(old: Option<&ToolbarSpec>, new: Option<&ToolbarSpec>) -> ActionsChange {
     match (old, new) {
         _ if old == new => ActionsChange::None,
-        (Some(old), Some(new)) if old.primary.is_some() == new.primary.is_some() => {
+        (Some(old), Some(new))
+            if old.primary.is_some() == new.primary.is_some()
+                && old.style == new.style
+                && old.primary_label == new.primary_label =>
+        {
             ActionsChange::between(old.entries_exact(), new.entries_exact())
         }
         _ => ActionsChange::Items,
@@ -1067,7 +1109,10 @@ fn hand_over(routed: Option<(ChromeEvent, ChromeSink)>) -> bool {
 /// badge present, prominent `true` — so a spec using neither encodes exactly
 /// as before they existed; Kotlin reads an absent key as none/`false`. A
 /// [`ChromeField::ActionBadges`] apply carries every action's and toolbar
-/// entry's badge key, `null` for none, and nothing else.
+/// entry's badge key, `null` for none, and nothing else. Likewise
+/// `toolbarStyle` ([`toolbar_style_name`]) is written only for a style other
+/// than [`ToolbarStyle::Buttons`] and `toolbarPrimaryLabel` only when `true`;
+/// Kotlin reads them absent as `"buttons"`/`false`.
 ///
 /// # The toolbar
 ///
@@ -1082,7 +1127,7 @@ pub(crate) mod android_wire {
     use std::sync::Arc;
 
     use super::host::ChromeField;
-    use super::{ActionItem, ChromeSpec, Leading, ToolbarSpec, TopBarSpec};
+    use super::{ActionItem, ChromeSpec, Leading, ToolbarSpec, ToolbarStyle, TopBarSpec};
     use crate::api::TabIcon;
     use crate::runtime::escape;
 
@@ -1228,6 +1273,16 @@ pub(crate) mod android_wire {
                     for (t, entry) in entries.into_iter().enumerate() {
                         put_action(&mut put, ("toolbar", "toolbarMenu"), t, entry);
                     }
+                    // Appended keys, written only when set (module doc).
+                    if toolbar.style != ToolbarStyle::Buttons {
+                        put(
+                            "toolbarStyle".into(),
+                            Value::Str(toolbar_style_name(toolbar.style).into()),
+                        );
+                    }
+                    if toolbar.primary_label {
+                        put("toolbarPrimaryLabel".into(), Value::Bool(true));
+                    }
                 }
                 ChromeField::LargeTitle => {
                     put("largeTitle".into(), Value::Bool(top.large_title));
@@ -1299,6 +1354,14 @@ pub(crate) mod android_wire {
             Leading::Image(_) => "image",
             Leading::Icon(icon) if icon.bytes().is_some() => "icon",
             Leading::Icon(_) => "none",
+        }
+    }
+
+    /// `style`'s wire spelling, the `toolbarStyle` value.
+    pub(crate) fn toolbar_style_name(style: ToolbarStyle) -> &'static str {
+        match style {
+            ToolbarStyle::Buttons => "buttons",
+            ToolbarStyle::Floating => "floating",
         }
     }
 
@@ -1518,14 +1581,15 @@ pub(crate) mod android_wire {
 //             menu<i>_<j>Title, menu<i>_<j>Destructive, menu<i>_<j>Enabled,
 //             toolbarCount, toolbarPrimary (the last entry is the primary),
 //             toolbar<i>Title, toolbar<i>HasIcon, toolbar<i>MenuCount, toolbar<i>Badge, toolbar<i>Prominent,
-//             toolbarMenu<i>_<j>Title, toolbarMenu<i>_<j>Destructive, toolbarMenu<i>_<j>Enabled
+//             toolbarMenu<i>_<j>Title, toolbarMenu<i>_<j>Destructive, toolbarMenu<i>_<j>Enabled,
+//             toolbarStyle = "buttons" | "floating" (absent = "buttons"), toolbarPrimaryLabel (absent = false)
 //   Brightness: dark
 //   ActionBadges (apply only, never beside Actions): action<i>Badge and toolbar<i>Badge
 //             for every entry (null = none); the counts are unchanged
 "#;
 
         /// Every key template [`KOTLIN_KEY_HEADER`] names.
-        const KEY_TEMPLATES: [&str; 32] = [
+        const KEY_TEMPLATES: [&str; 34] = [
             "tabCount",
             "tab<i>Title",
             "tab<i>Enabled",
@@ -1556,6 +1620,8 @@ pub(crate) mod android_wire {
             "toolbarMenu<i>_<j>Title",
             "toolbarMenu<i>_<j>Destructive",
             "toolbarMenu<i>_<j>Enabled",
+            "toolbarStyle",
+            "toolbarPrimaryLabel",
             "dark",
             // Not a spec key: an apply's field list.
             "changed",
@@ -1607,15 +1673,17 @@ pub(crate) mod android_wire {
         }
 
         /// A spec exercising every key: [`old_shape_spec`] with a badged,
-        /// prominent top-bar action, a prominent toolbar item and a
-        /// dot-badged primary.
+        /// prominent top-bar action, a prominent toolbar item, a dot-badged
+        /// primary, the floating style and a labelled primary.
         fn full_spec() -> ChromeSpec {
             let mut spec = old_shape_spec();
             let top = spec.top.as_mut().unwrap();
             top.actions[0] = top.actions[0].clone().badge("4").prominent(true);
-            let toolbar = spec.toolbar.as_mut().unwrap();
+            let toolbar = spec.toolbar.take().unwrap();
+            let mut toolbar = toolbar.style(ToolbarStyle::Floating).primary_label(true);
             toolbar.items[0] = toolbar.items[0].clone().prominent(true);
             toolbar.primary = toolbar.primary.take().map(|primary| primary.badge(""));
+            spec.toolbar = Some(toolbar);
             spec
         }
 
@@ -1889,6 +1957,7 @@ pub(crate) mod android_wire {
                 r#""action0MenuCount":0,"action0Badge":"4","action0Prominent":true,"#,
                 r#""toolbar0MenuCount":1,"toolbar0Prominent":true,"#,
                 r#""toolbar1MenuCount":0,"toolbar1Badge":"","#,
+                r#""toolbarStyle":"floating","toolbarPrimaryLabel":true,"largeTitle""#,
             ] {
                 assert!(json.contains(needle), "{needle} missing from {json}");
             }
@@ -1904,10 +1973,55 @@ pub(crate) mod android_wire {
                     "action0Badge",
                     "action0Prominent",
                     "toolbar0Prominent",
-                    "toolbar1Badge"
+                    "toolbar1Badge",
+                    "toolbarPrimaryLabel",
+                    "toolbarStyle"
                 ]
             );
             assert!(old.is_subset(&new));
+        }
+
+        #[test]
+        fn the_toolbar_style_and_primary_label_keys_are_written_only_when_set() {
+            let icons = IconTable::new();
+            let with = |toolbar: ToolbarSpec| ChromeSpec {
+                toolbar: Some(toolbar),
+                ..old_shape_spec()
+            };
+            let base = old_shape_spec().toolbar.unwrap();
+            // The defaults spelled out encode exactly as the old shape.
+            let explicit = with(
+                base.clone()
+                    .style(ToolbarStyle::Buttons)
+                    .primary_label(false),
+            );
+            let mut synced = IconTable::new();
+            synced.sync(&explicit);
+            assert_eq!(install_json(&explicit, &synced), OLD_SHAPE_INSTALL);
+            // Each key alone, in the Actions group, after the entries.
+            let floating = with(base.clone().style(ToolbarStyle::Floating));
+            let json = apply_json(&floating, &[ChromeField::Actions], &icons).unwrap();
+            assert!(
+                json.ends_with(
+                    r#""toolbar1MenuCount":0,"toolbarStyle":"floating","changed":["Actions"]}"#
+                ),
+                "{json}"
+            );
+            assert!(!json.contains("toolbarPrimaryLabel"), "{json}");
+            let labelled = with(base.primary_label(true));
+            let json = apply_json(&labelled, &[ChromeField::Actions], &icons).unwrap();
+            assert!(
+                json.ends_with(
+                    r#""toolbar1MenuCount":0,"toolbarPrimaryLabel":true,"changed":["Actions"]}"#
+                ),
+                "{json}"
+            );
+            assert!(!json.contains("toolbarStyle"), "{json}");
+            assert_eq!(toolbar_style_name(ToolbarStyle::Buttons), "buttons");
+            assert_eq!(toolbar_style_name(ToolbarStyle::Floating), "floating");
+            // An absent toolbar writes neither.
+            let bare = install_json(&ChromeSpec::default(), &icons);
+            assert!(!bare.contains("toolbarStyle") && !bare.contains("toolbarPrimaryLabel"));
         }
 
         #[test]
@@ -2179,6 +2293,33 @@ mod tests {
                 ChromeField::Brightness
             ]
         );
+    }
+
+    #[test]
+    fn a_toolbar_style_or_primary_label_change_is_an_actions_change() {
+        let shown = with_toolbar();
+        let restyle = |change: fn(ToolbarSpec) -> ToolbarSpec| {
+            let mut new = shown.clone();
+            new.toolbar = new.toolbar.take().map(change);
+            diff_specs(&shown, &new).changed
+        };
+        assert_eq!(
+            restyle(|t| t.style(ToolbarStyle::Floating)),
+            [ChromeField::Actions],
+            "a style change rebuilds the toolbar"
+        );
+        assert_eq!(
+            restyle(|t| t.primary_label(true)),
+            [ChromeField::Actions],
+            "a primary-label change rebuilds the toolbar"
+        );
+        assert!(restyle(|t| t.style(ToolbarStyle::Buttons)).is_empty());
+        // Beside a badge change it is still a rebuild, which carries the badge.
+        let mut both = shown.clone();
+        let mut toolbar = both.toolbar.take().unwrap().style(ToolbarStyle::Floating);
+        toolbar.items[0] = toolbar.items[0].clone().badge("1");
+        both.toolbar = Some(toolbar);
+        assert_eq!(diff_specs(&shown, &both).changed, [ChromeField::Actions]);
     }
 
     #[test]

@@ -21,7 +21,10 @@
 //!
 //! `.toolbar(ToolbarSpec)` adds a bottom action strip: iOS navigation-controller
 //! toolbar items, Android floating action buttons, a frust-drawn row above the
-//! fallback tab row. Its actions report through `.on_action`/`.on_menu` like
+//! fallback tab row. `ToolbarSpec::style(ToolbarStyle::Floating)` gathers the
+//! items into one floating pill beside the primary (a Material floating
+//! toolbar on Android, centred and hidden while the keyboard shows; iOS keeps
+//! its system toolbar). Its actions report through `.on_action`/`.on_menu` like
 //! the top bar's, so every action id must be unique across both: a toolbar
 //! entry repeating an earlier id is dropped from the published spec, logged
 //! once per change and named by a one-line banner above the body.
@@ -431,7 +434,11 @@ fn without_repeats(
         .map(|top| top.actions.iter().map(ActionItem::id).collect())
         .unwrap_or_default();
     let mut repeats = Vec::new();
-    let mut kept = ToolbarSpec::default();
+    let mut kept = ToolbarSpec {
+        style: toolbar.style,
+        primary_label: toolbar.primary_label,
+        ..ToolbarSpec::default()
+    };
     let primary_at = toolbar.items.len();
     for (index, entry) in toolbar.entries().enumerate() {
         if seen.contains(&entry.id()) {
@@ -1476,6 +1483,32 @@ mod tests {
         assert!(element.banner.is_none());
         assert!(element.repeats.is_empty());
         teardown(&clean, &mut element);
+    }
+
+    #[test]
+    fn the_published_toolbar_keeps_its_style_and_primary_label() {
+        let _guard = chrome::slot_test_guard();
+        let toolbar = ToolbarSpec::new()
+            .item(ActionItem::new("add", "Add again"))
+            .item(ActionItem::new("info", "Info"))
+            .primary(ActionItem::new("comment", "Comment"))
+            .style(crate::api::ToolbarStyle::Floating)
+            .primary_label(true);
+        let (spec, repeats) = scaffold().toolbar(toolbar).spec_and_repeats();
+        assert_eq!(repeats, [ActionId::new("add")], "a repeat is still dropped");
+        let shown = spec.toolbar.expect("a toolbar");
+        assert_eq!(shown.style, crate::api::ToolbarStyle::Floating);
+        assert!(shown.primary_label);
+        let plain = scaffold()
+            .toolbar(ToolbarSpec::new().primary(ActionItem::new("comment", "Comment")))
+            .spec();
+        let plain = plain.toolbar.expect("a toolbar");
+        assert_eq!(
+            plain.style,
+            crate::api::ToolbarStyle::Buttons,
+            "the default"
+        );
+        assert!(!plain.primary_label);
     }
 
     #[test]

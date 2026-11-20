@@ -1,7 +1,7 @@
 // The `frust-native-widgets` plugin's Android app-chrome host: Material 3 bars
 // (AppBarLayout + MaterialToolbar on top, a medium collapsing bar for a large
 // title, BottomNavigationView at the bottom, the toolbar's floating action
-// buttons) around the frust embedding's content root, driven from Rust's
+// buttons or floating toolbar) around the frust embedding's content root, driven from Rust's
 // `ChromeHost` (`plugins/native-widgets/src/chrome/host.rs`) over JNI.
 //
 // FROZEN once shipped: the binary class name `dev.frust.nativewidgets.FrustNativeChrome`
@@ -24,13 +24,16 @@
 //             menu<i>_<j>Title, menu<i>_<j>Destructive, menu<i>_<j>Enabled,
 //             toolbarCount, toolbarPrimary (the last entry is the primary),
 //             toolbar<i>Title, toolbar<i>HasIcon, toolbar<i>MenuCount, toolbar<i>Badge, toolbar<i>Prominent,
-//             toolbarMenu<i>_<j>Title, toolbarMenu<i>_<j>Destructive, toolbarMenu<i>_<j>Enabled
+//             toolbarMenu<i>_<j>Title, toolbarMenu<i>_<j>Destructive, toolbarMenu<i>_<j>Enabled,
+//             toolbarStyle = "buttons" | "floating" (absent = "buttons"), toolbarPrimaryLabel (absent = false)
 //   Brightness: dark
 //   ActionBadges (apply only, never beside Actions): action<i>Badge and toolbar<i>Badge
 //             for every entry (null = none); the counts are unchanged
 // largeTitle = true builds the medium collapsing top bar (the class doc's Large title);
 // the table's "(ignored here)" is stale and stays only because a Rust test pins it verbatim.
 // Toolbar entry i reports as action index actionCount + i (its menu likewise).
+// "floating" gathers the items into one Material floating toolbar beside the primary;
+// toolbarPrimaryLabel shows an icon primary's title too (the class doc's Toolbar).
 // "image" is a round avatar, "icon" a plain navigation icon; both read ICON_SLOT_LEADING.
 // Icon bytes never travel as JSON: `setIcon(slot, index, png)` caches one
 // bitmap per (slot, index) until `dispose`, before or after the call naming it.
@@ -74,9 +77,11 @@ import com.google.android.material.badge.BadgeDrawable
 import com.google.android.material.badge.BadgeUtils
 import com.google.android.material.badge.ExperimentalBadgeUtils
 import com.google.android.material.bottomnavigation.BottomNavigationView
+import com.google.android.material.button.MaterialButton
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.floatingactionbutton.ExtendedFloatingActionButton
 import com.google.android.material.floatingactionbutton.FloatingActionButton
+import com.google.android.material.floatingtoolbar.FloatingToolbarLayout
 import com.google.android.material.navigation.NavigationBarView
 import dev.frust.FrustSurfaceView
 import org.json.JSONObject
@@ -138,6 +143,17 @@ import kotlin.math.roundToInt
  * that is shown, else above the larger of the IME and navigation-bar insets,
  * and the same distance in from the trailing edge's system insets.
  *
+ * With `toolbarStyle` "floating" the secondary entries instead sit in one
+ * Material 3 [FloatingToolbarLayout] (Widget.Material3.FloatingToolbar: text
+ * buttons for titles, icon buttons for icons), the primary beside it, the
+ * pair centred at the bottom the same distance above the same bars; the
+ * layout's own window-insets margins are switched off, since this listener
+ * places it. It hides while the keyboard shows and returns with it. A
+ * toolbar of only a primary, or a floating toolbar the theme cannot build,
+ * shows as the column. An icon primary is a plain [FloatingActionButton]
+ * unless `toolbarPrimaryLabel`, which makes it an extended one showing icon
+ * and title.
+ *
  * ## Badges and prominence
  *
  * An action's badge is a [BadgeDrawable] on its menu item ([BadgeUtils]), a
@@ -188,6 +204,10 @@ object FrustNativeChrome {
     private const val LEADING_BACK = "back"
     private const val LEADING_IMAGE = "image"
     private const val LEADING_ICON = "icon"
+
+    // `toolbarStyle` spellings (Rust's `android_wire::toolbar_style_name`); absent = buttons.
+    private const val TOOLBAR_STYLE_BUTTONS = "buttons"
+    private const val TOOLBAR_STYLE_FLOATING = "floating"
 
     /** Material's toolbar action icon box (Material 3 spec: 24dp). */
     private const val ACTION_ICON_DP = 24
@@ -270,6 +290,12 @@ object FrustNativeChrome {
         /** The toolbar's entries, the primary last when [toolbarPrimary]. */
         var toolbar: List<Action> = emptyList()
         var toolbarPrimary = false
+
+        /** [TOOLBAR_STYLE_BUTTONS] or [TOOLBAR_STYLE_FLOATING]; anything else shows as buttons. */
+        var toolbarStyle = TOOLBAR_STYLE_BUTTONS
+
+        /** Whether an icon primary also shows its title (an extended button). */
+        var toolbarPrimaryLabel = false
         var largeTitle = false
         var dark = false
     }
@@ -294,7 +320,10 @@ object FrustNativeChrome {
         val context: Context,
         var top: TopBar,
         val bottom: BottomNavigationView,
-        /** The toolbar's floating action buttons, top to bottom. */
+        /**
+         * The toolbar's container: its floating action buttons top to bottom,
+         * or for the floating style the floating toolbar and the primary.
+         */
         val fabs: LinearLayout,
     ) {
         val appBar: AppBarLayout get() = top.appBar
@@ -303,8 +332,14 @@ object FrustNativeChrome {
         /** The badges on the current [toolbar]'s menu items, by item id. */
         val actionBadges: HashMap<Int, BadgeDrawable> get() = top.actionBadges
 
-        /** The badges on [fabs]' buttons, by toolbar entry index. */
+        /** The badges on the toolbar's buttons, by toolbar entry index. */
         val fabBadges = HashMap<Int, BadgeDrawable>()
+
+        /** The toolbar's button per entry, by toolbar entry index. */
+        val toolbarButtons = ArrayList<View>()
+
+        /** Whether [fabs] is laid out for the floating style (else the column). */
+        var floating = false
     }
 
     private class Installed(
@@ -542,6 +577,8 @@ object FrustNativeChrome {
                 parseAction(json, "toolbar", "toolbarMenu", t)
             }
             model.toolbarPrimary = json.optBoolean("toolbarPrimary", false)
+            model.toolbarStyle = json.optString("toolbarStyle", TOOLBAR_STYLE_BUTTONS)
+            model.toolbarPrimaryLabel = json.optBoolean("toolbarPrimaryLabel", false)
         } else if (FIELD_ACTION_BADGES in fields) {
             model.actions = model.actions.mapIndexed { a, action ->
                 action.copy(badge = optStringOrNull(json, "action${a}Badge"))
@@ -903,6 +940,7 @@ object FrustNativeChrome {
         if (imeVisible != installed.imeVisible) {
             installed.imeVisible = imeVisible
             applyBottomVisibility(installed)
+            applyToolbarVisibility(installed)
         }
         val topCovered = bars.top.outer.visibility == View.VISIBLE
         val bottomCovered = bars.bottom.visibility == View.VISIBLE
@@ -937,7 +975,8 @@ object FrustNativeChrome {
     /**
      * Keep the toolbar column [FAB_MARGIN_DP] above the bottom navigation while
      * it shows, else above the larger of the IME and navigation-bar insets,
-     * and that far in from the trailing edge's system insets.
+     * and that far in from the trailing edge's system insets; the floating
+     * style the same distance up, centred between the side insets.
      */
     private fun positionToolbar(installed: Installed, insets: WindowInsetsCompat) {
         val bars = installed.bars
@@ -949,9 +988,18 @@ object FrustNativeChrome {
             max(ime, insets.getInsets(WindowInsetsCompat.Type.navigationBars()).bottom)
         }
         val sides = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+        val params = bars.fabs.layoutParams as? FrameLayout.LayoutParams ?: return
+        if (bars.floating) {
+            // Centred between the side insets.
+            if (params.bottomMargin == below + margin && params.leftMargin == sides.left && params.rightMargin == sides.right) return
+            params.bottomMargin = below + margin
+            params.leftMargin = sides.left
+            params.rightMargin = sides.right
+            bars.fabs.layoutParams = params
+            return
+        }
         val rtl = installed.content.layoutDirection == View.LAYOUT_DIRECTION_RTL
         val end = margin + if (rtl) sides.left else sides.right
-        val params = bars.fabs.layoutParams as? FrameLayout.LayoutParams ?: return
         if (params.bottomMargin == below + margin && params.marginEnd == end) return
         params.bottomMargin = below + margin
         params.marginEnd = end
@@ -1150,54 +1198,183 @@ object FrustNativeChrome {
         }
     }
 
-    /** Rebuild the toolbar column from the model: items stacked above the primary; GONE when empty. */
+    /**
+     * Rebuild the toolbar from the model: the column (items stacked above the
+     * primary) or, for the floating style, the floating toolbar beside the
+     * primary; GONE when empty or hidden by the keyboard.
+     */
     private fun applyToolbar(installed: Installed) {
         dismissPopup()
         val bars = installed.bars
-        val context = bars.context
-        val stack = bars.fabs
+        val model = installed.model
         detachToolbarBadges(bars)
-        stack.removeAllViews()
-        val entries = installed.model.toolbar
-        stack.visibility = if (entries.isEmpty()) View.GONE else View.VISIBLE
-        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
-        val fill = ColorStateList.valueOf(MaterialColors.getColor(stack, androidx.appcompat.R.attr.colorPrimary))
-        val onFill = ColorStateList.valueOf(MaterialColors.getColor(stack, com.google.android.material.R.attr.colorOnPrimary))
-        entries.forEachIndexed { t, entry ->
-            val primary = installed.model.toolbarPrimary && t == entries.lastIndex
-            val bitmap = icons[iconKey(ICON_SLOT_TOOLBAR, t)]
-            val icon = if (entry.hasIcon && bitmap != null) {
-                BitmapDrawable(context.resources, fitScaled(bitmap, dp(context, ACTION_ICON_DP)))
-            } else {
-                null
+        bars.fabs.removeAllViews()
+        bars.toolbarButtons.clear()
+        val entries = model.toolbar
+        val items = if (model.toolbarPrimary) max(0, entries.size - 1) else entries.size
+        var floating = model.toolbarStyle == TOOLBAR_STYLE_FLOATING && items > 0
+        if (floating) {
+            try {
+                addFloatingToolbar(installed, items)
+            } catch (t: Throwable) {
+                Log.w(TAG, "Frust: native app chrome could not build the floating toolbar; showing its buttons instead", t)
+                bars.fabs.removeAllViews()
+                bars.toolbarButtons.clear()
+                floating = false
             }
-            val button: View = if (primary && icon != null) {
-                FloatingActionButton(context).apply {
-                    setImageDrawable(icon)
-                    if (entry.prominent) {
-                        backgroundTintList = fill
-                        imageTintList = onFill
-                    }
+        }
+        layOutToolbar(bars, floating)
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+        val context = bars.context
+        val first = if (floating) items else 0
+        for (t in first until entries.size) {
+            val button = toolbarButton(installed, t)
+            val params = LinearLayout.LayoutParams(wrap, wrap)
+            if (floating) {
+                params.gravity = Gravity.CENTER_VERTICAL
+                params.marginStart = dp(context, FAB_GAP_DP)
+            } else {
+                params.gravity = Gravity.END
+                if (t > 0) params.topMargin = dp(context, FAB_GAP_DP)
+            }
+            bars.fabs.addView(button, params)
+            bars.toolbarButtons.add(button)
+        }
+        applyToolbarVisibility(installed)
+        applyToolbarBadges(installed)
+        repositionToolbar(installed)
+    }
+
+    /**
+     * Entry `t`'s floating action button: a plain one for a primary with an
+     * icon (extended, showing its title too, under `toolbarPrimaryLabel`),
+     * else an extended one with its title and any icon.
+     */
+    private fun toolbarButton(installed: Installed, t: Int): View {
+        val context = installed.bars.context
+        val model = installed.model
+        val entry = model.toolbar[t]
+        val primary = model.toolbarPrimary && t == model.toolbar.lastIndex
+        val icon = toolbarIcon(context, entry, t)
+        val fill = ColorStateList.valueOf(MaterialColors.getColor(installed.bars.fabs, androidx.appcompat.R.attr.colorPrimary))
+        val onFill = ColorStateList.valueOf(MaterialColors.getColor(installed.bars.fabs, com.google.android.material.R.attr.colorOnPrimary))
+        val button: View = if (primary && icon != null && !model.toolbarPrimaryLabel) {
+            FloatingActionButton(context).apply {
+                setImageDrawable(icon)
+                if (entry.prominent) {
+                    backgroundTintList = fill
+                    imageTintList = onFill
+                }
+            }
+        } else {
+            ExtendedFloatingActionButton(context).apply {
+                text = entry.title
+                this.icon = icon
+                if (entry.prominent) {
+                    backgroundTintList = fill
+                    setTextColor(onFill)
+                    iconTint = onFill
+                }
+            }
+        }
+        button.contentDescription = entry.title
+        button.setOnClickListener { onToolbarClicked(t, it) }
+        return button
+    }
+
+    /** Entry `t`'s icon at the action size, when it has one and its bitmap has arrived. */
+    private fun toolbarIcon(context: Context, entry: Action, t: Int): BitmapDrawable? {
+        val bitmap = icons[iconKey(ICON_SLOT_TOOLBAR, t)]
+        return if (entry.hasIcon && bitmap != null) {
+            BitmapDrawable(context.resources, fitScaled(bitmap, dp(context, ACTION_ICON_DP)))
+        } else {
+            null
+        }
+    }
+
+    /**
+     * Add the floating toolbar holding entries `0 until items` to the
+     * container: a text button per title, an icon button per icon (its title
+     * the accessibility label), a prominent one filled `colorPrimary`. The
+     * buttons are built in the toolbar's own context, which carries its
+     * theme overlay (the toolbar's button styles).
+     */
+    private fun addFloatingToolbar(installed: Installed, items: Int) {
+        val bars = installed.bars
+        val toolbar = FloatingToolbarLayout(bars.context)
+        // This chrome places the toolbar itself (positionToolbar); the layout's
+        // own listener would add the insets to its margins a second time.
+        ViewCompat.setOnApplyWindowInsetsListener(toolbar, null)
+        // A badge sits on its button's corner, partly outside it.
+        toolbar.clipChildren = false
+        toolbar.clipToPadding = false
+        val context = toolbar.context
+        val strip = LinearLayout(context)
+        strip.orientation = LinearLayout.HORIZONTAL
+        strip.gravity = Gravity.CENTER_VERTICAL
+        strip.clipChildren = false
+        strip.clipToPadding = false
+        val fill = ColorStateList.valueOf(MaterialColors.getColor(toolbar, androidx.appcompat.R.attr.colorPrimary))
+        val onFill = ColorStateList.valueOf(MaterialColors.getColor(toolbar, com.google.android.material.R.attr.colorOnPrimary))
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+        for (t in 0 until items) {
+            val entry = installed.model.toolbar[t]
+            val icon = toolbarIcon(context, entry, t)
+            val button = if (icon != null) {
+                MaterialButton(context, null, com.google.android.material.R.attr.materialIconButtonStyle).apply {
+                    this.icon = icon
                 }
             } else {
-                ExtendedFloatingActionButton(context).apply {
+                MaterialButton(context, null, androidx.appcompat.R.attr.borderlessButtonStyle).apply {
                     text = entry.title
-                    this.icon = icon
-                    if (entry.prominent) {
-                        backgroundTintList = fill
-                        setTextColor(onFill)
-                        iconTint = onFill
-                    }
                 }
+            }
+            if (entry.prominent) {
+                button.backgroundTintList = fill
+                button.setTextColor(onFill)
+                button.iconTint = onFill
             }
             button.contentDescription = entry.title
             button.setOnClickListener { onToolbarClicked(t, it) }
-            val params = LinearLayout.LayoutParams(wrap, wrap)
-            params.gravity = Gravity.END
-            if (t > 0) params.topMargin = dp(context, FAB_GAP_DP)
-            stack.addView(button, params)
+            strip.addView(button, LinearLayout.LayoutParams(wrap, wrap))
+            bars.toolbarButtons.add(button)
         }
-        applyToolbarBadges(installed)
+        toolbar.addView(strip, FrameLayout.LayoutParams(wrap, wrap, Gravity.CENTER))
+        val params = LinearLayout.LayoutParams(wrap, wrap)
+        params.gravity = Gravity.CENTER_VERTICAL
+        bars.fabs.addView(toolbar, params)
+    }
+
+    /**
+     * Shape the container for the floating style (a centred row) or the
+     * column (trailing, top to bottom); a change re-creates its layout
+     * params, which [positionToolbar] then fills.
+     */
+    private fun layOutToolbar(bars: Bars, floating: Boolean) {
+        if (bars.floating == floating) return
+        bars.floating = floating
+        val stack = bars.fabs
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+        val margin = dp(bars.context, FAB_MARGIN_DP)
+        val params = if (floating) {
+            stack.orientation = LinearLayout.HORIZONTAL
+            stack.gravity = Gravity.CENTER_VERTICAL
+            FrameLayout.LayoutParams(wrap, wrap, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+        } else {
+            stack.orientation = LinearLayout.VERTICAL
+            stack.gravity = Gravity.END
+            FrameLayout.LayoutParams(wrap, wrap, Gravity.BOTTOM or Gravity.END).apply { marginEnd = margin }
+        }
+        params.bottomMargin = margin
+        stack.layoutParams = params
+    }
+
+    /** GONE without entries, or for the floating style while the keyboard shows; else VISIBLE. */
+    private fun applyToolbarVisibility(installed: Installed) {
+        val bars = installed.bars
+        val hidden = installed.model.toolbar.isEmpty() || (bars.floating && installed.imeVisible)
+        val visibility = if (hidden) View.GONE else View.VISIBLE
+        if (bars.fabs.visibility != visibility) bars.fabs.visibility = visibility
     }
 
     /**
@@ -1212,7 +1389,7 @@ object FrustNativeChrome {
         for (t in bars.fabBadges.keys.toList()) {
             if (entries.getOrNull(t)?.badge == null) {
                 val drawable = bars.fabBadges.remove(t) ?: continue
-                bars.fabs.getChildAt(t)?.let { BadgeUtils.detachBadgeDrawable(drawable, it) }
+                bars.toolbarButtons.getOrNull(t)?.let { BadgeUtils.detachBadgeDrawable(drawable, it) }
             }
         }
         entries.forEachIndexed { t, entry ->
@@ -1222,7 +1399,7 @@ object FrustNativeChrome {
                 fillBadge(held, badge)
                 return@forEachIndexed
             }
-            val button = bars.fabs.getChildAt(t) ?: return@forEachIndexed
+            val button = bars.toolbarButtons.getOrNull(t) ?: return@forEachIndexed
             val drawable = BadgeDrawable.create(bars.context)
             fillBadge(drawable, badge)
             bars.fabBadges[t] = drawable
@@ -1235,7 +1412,7 @@ object FrustNativeChrome {
     @androidx.annotation.OptIn(markerClass = [ExperimentalBadgeUtils::class])
     private fun detachToolbarBadges(bars: Bars) {
         for ((t, drawable) in bars.fabBadges) {
-            bars.fabs.getChildAt(t)?.let { BadgeUtils.detachBadgeDrawable(drawable, it) }
+            bars.toolbarButtons.getOrNull(t)?.let { BadgeUtils.detachBadgeDrawable(drawable, it) }
         }
         bars.fabBadges.clear()
     }
@@ -1244,7 +1421,7 @@ object FrustNativeChrome {
     private val fabBadgeBounds =
         View.OnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
             val bars = live?.bars ?: return@OnLayoutChangeListener
-            val t = bars.fabs.indexOfChild(view)
+            val t = bars.toolbarButtons.indexOf(view)
             bars.fabBadges[t]?.let { BadgeUtils.setBadgeDrawableBounds(it, view, null) }
         }
 
