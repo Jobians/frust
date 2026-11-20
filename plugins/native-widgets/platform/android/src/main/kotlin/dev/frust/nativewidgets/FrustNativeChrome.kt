@@ -207,6 +207,9 @@ object FrustNativeChrome {
     /** The medium collapsing bar's expanded height without a theme value (Material 3 spec: 112dp). */
     private const val MEDIUM_BAR_DP = 112
 
+    /** The small bar's toolbar height without a theme value (Material 3 spec: 64dp). */
+    private const val SMALL_BAR_DP = 64
+
     /** [setIcon] decodes to at most 4x the slot's on-screen size, but never caps below this (px). */
     private const val MIN_ICON_DECODE_PX = 256
 
@@ -640,7 +643,12 @@ object FrustNativeChrome {
         // pre-API-30 sequential dispatch would then withhold from the bottom
         // bar and the root; pass them on untouched (the app bar pads itself).
         ViewCompat.setOnApplyWindowInsetsListener(collapsing) { _, insets -> insets }
-        val pinned = CollapsingToolbarLayout.LayoutParams(match, wrap)
+        // The toolbar's height must be fixed: the collapsing layout puts a
+        // MATCH_PARENT placeholder view inside it, which grows a wrap_content
+        // toolbar to the whole bar. The collapsing layout's minimum height
+        // (its collapsed height) is the toolbar's, so the bar would then have
+        // no range to collapse through and nowhere to draw the expanded title.
+        val pinned = CollapsingToolbarLayout.LayoutParams(match, actionBarHeight(context))
         pinned.collapseMode = CollapsingToolbarLayout.LayoutParams.COLLAPSE_MODE_PIN
         collapsing.addView(toolbar, pinned)
         val scrolls = AppBarLayout.LayoutParams(match, mediumBarHeight(context))
@@ -668,6 +676,16 @@ object FrustNativeChrome {
         val attrs = context.obtainStyledAttributes(intArrayOf(com.google.android.material.R.attr.collapsingToolbarLayoutMediumSize))
         return try {
             attrs.getDimensionPixelSize(0, dp(context, MEDIUM_BAR_DP))
+        } finally {
+            attrs.recycle()
+        }
+    }
+
+    /** The collapsed bar's toolbar height: the theme's `actionBarSize`, else [SMALL_BAR_DP]. */
+    private fun actionBarHeight(context: Context): Int {
+        val attrs = context.obtainStyledAttributes(intArrayOf(androidx.appcompat.R.attr.actionBarSize))
+        return try {
+            attrs.getDimensionPixelSize(0, dp(context, SMALL_BAR_DP))
         } finally {
             attrs.recycle()
         }
@@ -1018,7 +1036,7 @@ object FrustNativeChrome {
         val top = installed.bars.top
         val collapsing = top.collapsing ?: return
         val range = top.appBar.totalScrollRange.takeIf { it > 0 }
-            ?: max(0, collapsing.layoutParams.height - top.toolbar.minimumHeight)
+            ?: max(0, collapsing.layoutParams.height - top.toolbar.layoutParams.height)
         val rangeLogical = range / installed.bars.context.resources.displayMetrics.density
         val collapse = installed.lifted && (top.collapsed || installed.scrollMax > rangeLogical)
         if (collapse == top.collapsed) return
