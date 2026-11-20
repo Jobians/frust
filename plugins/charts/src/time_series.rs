@@ -9,9 +9,10 @@
 //! [`TimedSeries`](crate::TimedSeries) by time, both against the same plot rect.
 //!
 //! Draw order: grid rules, then for each series (in the order given) its fill, its stroke and
-//! the dots marking isolated samples, then the axis labels, then the corner labels. Everything
-//! is clipped to the widget's bounds. A mirrored pair splits the plot at a middle axis: the
-//! upper series grows up from it and the lower one hangs down from it.
+//! the dots marking isolated samples, then the scrub crosshair and its markers while a scrub is
+//! live, then the axis labels, then the corner labels. Everything is clipped to the widget's
+//! bounds. A mirrored pair splits the plot at a middle axis: the upper series grows up from it
+//! and the lower one hangs down from it.
 //!
 //! An optional [`YAxis`] draws its rules at [`ticks`] of each half's resolved domain, in place
 //! of the grid fractions, and a label per tick. Text is shaped only in layout, but an automatic
@@ -24,14 +25,24 @@
 //! Colours: the caller's, then the installed theme's (series `primary`, grid
 //! `outline_variant`, labels `on_surface_variant`), then fallback constants. Labels are shaped
 //! in layout with the theme's `body_small` family, so a theme change needs a layout pass. The
-//! chart never animates and takes no input; the only frame it asks for is the layout above.
+//! chart never animates; the only frame it asks for is the layout above.
+//!
+//! Input: none by default, so the chart is tap-transparent. With
+//! [`on_scrub`](TimeSeriesView::on_scrub) set, a primary press inside the plot starts a scrub:
+//! the widget captures the pointer, reports a [`ScrubEvent`] on the press and on every move,
+//! and reports `None` when the press ends. Each paint during a scrub draws a vertical crosshair
+//! at the sample nearest the pointer in the series' current data, with a marker dot on each
+//! series' sample there (see [`crate::ScrubEvent`] for how the sample is found).
 
 use std::marker::PhantomData;
+use std::rc::Rc;
 
 use frust::authoring::text::{LocaleStamp, TextContext, TextLayout, TextStyle};
 use frust::authoring::{
-    BezPath, BoxConstraints, Brush, BuildCtx, ChangeFlags, LayoutCtx, PaintCtx, PaintScene, Point,
-    Rect, Role, SemanticsCtx, Shape, Size, View, Widget,
+    BezPath, BoxConstraints, Brush, BuildCtx, ChangeFlags, ErasedArgCallback, EventCtx,
+    EventResult, InputEvent, LayoutCtx, PaintCtx, PaintScene, Point, PointerButton, PointerEvent,
+    PointerPhase, Rect, Role, SemanticsCtx, Shape, Size, View, Widget, erase_callback_arg,
+    mark_pending_result_flush,
 };
 use frust::kurbo::Circle;
 use frust::peniko::{Gradient, GradientKind};
@@ -42,6 +53,7 @@ use crate::geometry::{
     BlockColumn, Orientation, area_paths, block_columns, grid_rule_ys, line_segments, snap,
     snap_rule_y, timed_area_paths, timed_line_segments,
 };
+use crate::scrub::{Placement, ScrubEvent, scrub_at};
 use crate::timed::SourceShape;
 use crate::{Series, SeriesSource, Tone, YDomain};
 
@@ -56,6 +68,9 @@ const FILL_ALPHA: (f32, f32) = (0.40, 0.03);
 const MIN_DOT_DIAMETER: f64 = 3.0;
 const FALLBACK_GRID: Color = Color::from_rgb8(0xd0, 0xd4, 0xda);
 const FALLBACK_LABEL: Color = Color::from_rgb8(0x5f, 0x65, 0x6e);
+const DEFAULT_CROSSHAIR_WIDTH: f32 = 1.0;
+/// The radius of the dot marking each series' sample on the crosshair.
+const MARKER_RADIUS: f64 = 3.5;
 
 /// How the samples of every series are drawn.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -241,6 +256,17 @@ impl Layer {
             style => style,
         }
     }
+
+    /// Where this layer's slots sit under the plot's `style`, for the scrub search.
+    fn placement(&self, style: PlotStyle) -> Placement {
+        match self.style_under(style) {
+            PlotStyle::Blocks { column_width, gap } => Placement::Columns {
+                width: f64::from(column_width),
+                gap: f64::from(gap),
+            },
+            PlotStyle::Area | PlotStyle::Line => Placement::Slots,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +283,7 @@ struct Spec {
     label_size: f32,
     label_color: Option<Color>,
     y_axis: Option<YAxis>,
+    crosshair: (Option<Color>, f32),
     height: Option<f32>,
     semantics: Option<String>,
     semantic_value: Option<String>,
@@ -283,6 +310,7 @@ impl Spec {
             || self.corner != old.corner
             || self.grid != old.grid
             || self.grid_color != old.grid_color
+            || self.crosshair != old.crosshair
             || self.semantics != old.semantics
             || self.semantic_value != old.semantic_value
         {
@@ -292,9 +320,14 @@ impl Spec {
     }
 }
 
-/// A display-only time-series plot. Build one with [`time_series`].
+/// A view-held scrub callback, erased on build.
+type OnScrub<S> = Rc<dyn Fn(&mut S, Option<ScrubEvent>)>;
+
+/// A time-series plot, display-only unless [`on_scrub`](Self::on_scrub) is set. Build one with
+/// [`time_series`].
 pub struct TimeSeriesView<S: 'static> {
     spec: Spec,
+    on_scrub: Option<OnScrub<S>>,
     _state: PhantomData<fn(&mut S)>,
 }
 
@@ -328,10 +361,12 @@ pub fn time_series<S: 'static>() -> TimeSeriesView<S> {
             label_size: DEFAULT_LABEL_SIZE,
             label_color: None,
             y_axis: None,
+            crosshair: (None, DEFAULT_CROSSHAIR_WIDTH),
             height: None,
             semantics: None,
             semantic_value: None,
         },
+        on_scrub: None,
         _state: PhantomData,
     }
 }
@@ -434,6 +469,45 @@ impl<S: 'static> TimeSeriesView<S> {
         self
     }
 
+    /// Report a scrub to `on_scrub` (default: none, and the chart takes no input).
+    ///
+    /// With it set, a primary press inside the plot (not in an axis gutter) captures the
+    /// pointer and calls `on_scrub` with `Some(event)` on the press and on every move while
+    /// it is held, each [`ScrubEvent`] naming the sample nearest the pointer and every
+    /// series' value there; the release calls it with `None`. A move with no press is never a
+    /// scrub. Between the press and the release, each paint draws a crosshair (see
+    /// [`crosshair`](Self::crosshair)). The app renders its own readout from the events.
+    ///
+    /// When a scroll view or another gesture takes the drag away (a `Cancel`), the chart
+    /// stops drawing the crosshair at once and calls `on_scrub(None)` from the
+    /// `Housekeeping` broadcast of the rebuild that follows, still before the frame paints:
+    /// a `Cancel` handler never touches app state.
+    ///
+    /// The plot is no longer tap-transparent: a press inside it is handled here and does not
+    /// reach what lies beneath. A press does not take keyboard focus. Inside a vertical
+    /// scroll view, a sideways drag stays with the chart, while a drag that travels more
+    /// than the touch slop (18 px) vertically first is taken by the scroll view, which ends
+    /// the scrub. Inside a horizontal scroll view it is the other way round: the scroll view
+    /// takes a drag once it travels more than the slop sideways, so a scrub there ends after
+    /// 18 px of horizontal travel.
+    pub fn on_scrub(mut self, on_scrub: impl Fn(&mut S, Option<ScrubEvent>) + 'static) -> Self {
+        self.on_scrub = Some(Rc::new(on_scrub));
+        self
+    }
+
+    /// The scrub crosshair's colour and width in logical pixels (default: the theme's
+    /// `on_surface_variant` and 1); a width of 0 draws only the markers. A negative or
+    /// non-finite width is 0. Each series' marker dot takes the series' own colour.
+    pub fn crosshair(mut self, color: Color, width: f32) -> Self {
+        let width = if width.is_finite() {
+            width.max(0.0)
+        } else {
+            0.0
+        };
+        self.spec.crosshair = (Some(color), width);
+        self
+    }
+
     /// A fixed height in logical pixels (default: the available height when bounded, else
     /// 56). The width always expands to the available width.
     pub fn height(mut self, height: f32) -> Self {
@@ -463,6 +537,9 @@ impl<S: 'static> View<S> for TimeSeriesView<S> {
             caches: vec![LayerCache::default(); self.spec.layers.len()],
             axis: AxisLabels::default(),
             spec: self.spec.clone(),
+            on_scrub: self.on_scrub.as_ref().map(erase_callback_arg),
+            scrub: None,
+            end_owed: false,
         }
     }
 
@@ -472,9 +549,17 @@ impl<S: 'static> View<S> for TimeSeriesView<S> {
         element: &mut TimeSeriesWidget,
         _ctx: &mut BuildCtx<'_>,
     ) -> ChangeFlags {
-        let flags = self.spec.changes(&element.spec);
+        let mut flags = self.spec.changes(&element.spec);
         if !flags.is_empty() {
             element.adopt(self.spec.clone());
+        }
+        element.on_scrub = self.on_scrub.as_ref().map(erase_callback_arg);
+        if element.on_scrub.is_none() {
+            // Without a callback there is no scrub to draw or to end.
+            element.end_owed = false;
+            if element.scrub.take().is_some() {
+                flags |= ChangeFlags::PAINT;
+            }
         }
         flags
     }
@@ -696,6 +781,13 @@ pub struct TimeSeriesWidget {
     labels: [Option<Label>; 4],
     caches: Vec<LayerCache>,
     axis: AxisLabels,
+    on_scrub: Option<ErasedArgCallback<Option<ScrubEvent>>>,
+    /// The pointer position (widget-local) of the live scrub: set by a primary press inside
+    /// the plot, moved by each captured move, cleared by the release or a cancel.
+    scrub: Option<Point>,
+    /// A cancel ended the scrub and `on_scrub(None)` is still owed, delivered from the next
+    /// `Housekeeping` broadcast (or ahead of the next press).
+    end_owed: bool,
 }
 
 /// `brush` with a gradient's points moved from widget-local to scene coordinates.
@@ -719,10 +811,11 @@ fn at_origin(brush: &Brush, origin: Point) -> Brush {
     Brush::Gradient(gradient)
 }
 
-/// The series and grid colours a paint falls back to.
+/// The series, grid and crosshair colours a paint falls back to.
 struct Defaults {
     series: Color,
     grid: Color,
+    crosshair: Color,
 }
 
 impl Defaults {
@@ -733,11 +826,13 @@ impl Defaults {
                 Self {
                     series: scheme.primary,
                     grid: scheme.outline_variant,
+                    crosshair: scheme.on_surface_variant,
                 }
             }
             None => Self {
                 series: Tone::FALLBACK_CALM,
                 grid: FALLBACK_GRID,
+                crosshair: FALLBACK_LABEL,
             },
         }
     }
@@ -960,6 +1055,110 @@ impl TimeSeriesWidget {
         }
     }
 
+    /// The scrub at the widget-local `position` against the series' current data.
+    fn scrub_at(&self, size: Size, position: Point) -> ScrubEvent {
+        let style = self.spec.style;
+        let layers = self
+            .spec
+            .layers
+            .iter()
+            .map(move |layer| (&layer.series, layer.placement(style)));
+        scrub_at(layers, self.plot(size), position)
+    }
+
+    /// Whether a press at the widget-local `position` lands inside the plot.
+    fn in_plot(&self, size: Size, position: Point) -> bool {
+        let plot = self.plot(size);
+        plot.width() > 0.0
+            && (plot.x0..=plot.x1).contains(&position.x)
+            && (plot.y0..=plot.y1).contains(&position.y)
+    }
+
+    fn report(&mut self, ctx: &mut EventCtx, event: Option<ScrubEvent>) {
+        if let Some(on_scrub) = self.on_scrub.as_mut() {
+            on_scrub(ctx, event);
+        }
+    }
+
+    /// A pointer event while `on_scrub` is set.
+    fn scrub_pointer(&mut self, ctx: &mut EventCtx, p: &PointerEvent) -> EventResult {
+        match p.phase {
+            PointerPhase::Down => {
+                if p.button != PointerButton::Primary || !self.in_plot(ctx.size(), p.position) {
+                    return EventResult::Ignored;
+                }
+                if std::mem::take(&mut self.end_owed) {
+                    self.report(ctx, None);
+                }
+                ctx.capture_pointer();
+                self.scrub = Some(p.position);
+                let event = self.scrub_at(ctx.size(), p.position);
+                self.report(ctx, Some(event));
+            }
+            PointerPhase::Move => {
+                if self.scrub.is_none() {
+                    return EventResult::Ignored;
+                }
+                self.scrub = Some(p.position);
+                let event = self.scrub_at(ctx.size(), p.position);
+                self.report(ctx, Some(event));
+            }
+            PointerPhase::Up => {
+                if self.scrub.take().is_none() {
+                    return EventResult::Ignored;
+                }
+                self.report(ctx, None);
+            }
+            PointerPhase::Cancel => {
+                // A cancel may arrive over throwaway state, so it never calls back: the end is
+                // owed to the next state-bearing broadcast.
+                if self.scrub.take().is_none() {
+                    return EventResult::Ignored;
+                }
+                self.end_owed = true;
+                mark_pending_result_flush();
+            }
+        }
+        ctx.request_redraw();
+        EventResult::Handled
+    }
+
+    /// The crosshair at the live scrub's sample and a marker on each series' sample there.
+    fn paint_scrub(
+        &self,
+        origin: Point,
+        size: Size,
+        (position, domains): (Point, Domains),
+        defaults: &Defaults,
+        scene: &mut dyn PaintScene,
+    ) {
+        let plot = self.plot(size);
+        if plot.width() <= 0.0 || plot.width().is_nan() {
+            return;
+        }
+        let event = self.scrub_at(size, position);
+        let (color, width) = self.spec.crosshair;
+        let width = f64::from(width);
+        if width > 0.0 {
+            scene.fill_rect(
+                Point::new(origin.x + snap(event.x - width / 2.0), origin.y + plot.y0),
+                Size::new(width, plot.height()),
+                color.unwrap_or(defaults.crosshair),
+            );
+        }
+        let halves = self.halves(size);
+        for (layer, value) in self.spec.layers.iter().zip(&event.values) {
+            let Some(value) = *value else {
+                continue;
+            };
+            let (rect, orientation, domain) = self.half_plot(layer.half, halves, domains);
+            let centre = Point::new(event.x, orientation.y_for(value, domain, rect));
+            let dot = Circle::new(origin + centre.to_vec2(), MARKER_RADIUS).to_path(0.1);
+            let color = layer.style.color.unwrap_or(defaults.series);
+            scene.fill_path(Point::ZERO, &dot, &Brush::Solid(color));
+        }
+    }
+
     fn paint_layer(
         &mut self,
         index: usize,
@@ -1125,11 +1324,30 @@ impl Widget for TimeSeriesWidget {
             let plot = self.half_plot(self.spec.layers[index].half, halves, domains);
             self.paint_layer(index, origin, plot, defaults.series, scene);
         }
+        if let Some(position) = self.scrub {
+            self.paint_scrub(origin, size, (position, domains), &defaults, scene);
+        }
         self.paint_axis_labels(origin, size, domains, scene);
         for label in self.labels.iter().flatten() {
             label.paint(origin, scene);
         }
         scene.pop_clip();
+    }
+
+    fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
+        if self.on_scrub.is_none() {
+            return EventResult::Ignored;
+        }
+        match event {
+            InputEvent::Pointer(p) => self.scrub_pointer(ctx, p),
+            InputEvent::Housekeeping => {
+                if std::mem::take(&mut self.end_owed) {
+                    self.report(ctx, None);
+                }
+                EventResult::Ignored
+            }
+            _ => EventResult::Ignored,
+        }
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
