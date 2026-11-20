@@ -3,8 +3,9 @@
 //! Data lives in shared handles, not in view state: a [`Series`] is a fixed-capacity ring of
 //! evenly spaced samples (newest last, `None` a gap), a [`TimedSeries`] keeps timestamped
 //! points bounded by a count and/or a time window, and [`Samples`] is a fixed set of current
-//! values. All are cheap to clone and `Send + Sync`, so a background thread writes while a
-//! chart paints. Charts repaint when a handle is written, with no rebuild and no frame loop:
+//! values. [`Categories`] (labelled rows of values), [`Points`] (scatter points) and
+//! [`Candles`] (a ring of open-high-low-close candles) feed the chart families. All are cheap
+//! to clone and `Send + Sync`, so a background thread writes while a chart paints. Charts repaint when a handle is written, with no rebuild and no frame loop:
 //! each write bumps the handle's revision and calls [`frust::request_repaint`] once.
 //!
 //! Charts are display-only and tap-transparent by default, so a tap reaches whatever lies
@@ -13,6 +14,13 @@
 //! for one layout pass when new data changes its ticks, the only time a write leads to more
 //! than a repaint. A chart's colours come from the caller first, then the installed theme,
 //! then the fallback constants on [`Tone`]. [`YDomain`] and [`nice_max`] pick the y range.
+//!
+//! Beside the monitoring views (`time_series`, `sparkline`, `meter`, `heat_cells`) sit six
+//! chart families: `bar_chart`, `pie_chart`, `gauge`, `scatter_chart`, `radar_chart` and
+//! `candlestick_chart`. Each repaints on a write and is display-only, except the centre child
+//! of `pie_chart` and `gauge`; `bar_chart` and `radar_chart` ask for one layout pass when a
+//! label changes. [`YDomain::auto`] spans the data's minimum to maximum, and the polar helpers
+//! ([`arc_path`], [`sector_path`] and others) work in radians, 0 at 3 o'clock, clockwise.
 //!
 //! ```
 //! use frust_charts::{Samples, Series, YDomain};
