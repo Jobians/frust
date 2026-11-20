@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{ChromeGeneration, ChromeSpec, TopBarSpec};
+use super::{ActionsChange, ChromeGeneration, ChromeSpec, TopBarSpec};
 
 /// Why the chrome slot or a host refused a publish.
 #[derive(thiserror::Error, Clone, Debug, PartialEq, Eq)]
@@ -44,6 +44,11 @@ pub(crate) enum ChromeField {
     Scroll,
     /// The app theme's brightness (`ChromeSpec::dark`).
     Brightness,
+    /// Actions changed in their badges alone (top bar or toolbar, the same
+    /// count and order): an arm updates the shown items in place instead of
+    /// rebuilding them. Never reported beside [`Self::Actions`], whose
+    /// rebuild carries the badges too.
+    ActionBadges,
 }
 
 /// What changed between the retained spec and a newly published one. A
@@ -61,10 +66,13 @@ impl<'a> ChromeDiff<'a> {
     /// The field-level difference from `old` to `new`. An absent top bar
     /// compares as an empty one, so a bar appearing reports
     /// [`ChromeField::TopBar`] plus whichever of its fields are non-empty.
+    /// Top-bar actions differing only in their badges report
+    /// [`ChromeField::ActionBadges`] instead of [`ChromeField::Actions`].
     pub(crate) fn between(old: &ChromeSpec, new: &'a ChromeSpec) -> Self {
         let empty = TopBarSpec::default();
         let old_top = old.top.as_ref().unwrap_or(&empty);
         let new_top = new.top.as_ref().unwrap_or(&empty);
+        let actions = ActionsChange::between(old_top.actions.iter(), new_top.actions.iter());
         let checks = [
             (ChromeField::Tabs, old.tabs != new.tabs),
             (ChromeField::Selected, old.selected != new.selected),
@@ -72,13 +80,14 @@ impl<'a> ChromeDiff<'a> {
             (ChromeField::Title, old_top.title != new_top.title),
             (ChromeField::Subtitle, old_top.subtitle != new_top.subtitle),
             (ChromeField::Leading, old_top.leading != new_top.leading),
-            (ChromeField::Actions, old_top.actions != new_top.actions),
+            (ChromeField::Actions, actions == ActionsChange::Items),
             (
                 ChromeField::LargeTitle,
                 old_top.large_title != new_top.large_title,
             ),
             (ChromeField::Scroll, old.scroll != new.scroll),
             (ChromeField::Brightness, old.dark != new.dark),
+            (ChromeField::ActionBadges, actions == ActionsChange::Badges),
         ];
         let changed = checks
             .into_iter()

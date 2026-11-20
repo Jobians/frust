@@ -131,6 +131,18 @@
 //! the tab bar when shown), so the frust body's bottom view padding (and the
 //! scaffold's edge fade keyed off it) covers both, and follows the hide.
 //!
+//! # Badges, prominence and icons
+//!
+//! An action's badge is `UIBarButtonItem.badge` (iOS 26; UIKit draws it in
+//! navigation bars only), reached at run time behind a `respondsToSelector`
+//! check because the plugin's UIKit bindings do not enable it; older systems
+//! show none and log that once at debug level. `ChromeField::ActionBadges`
+//! (a badge-only change) re-badges the shown items by tag instead of
+//! rebuilding them. A prominent action takes `UIBarButtonItemStyle::Prominent`,
+//! like the toolbar's primary. A symbol-with-bytes icon shows its symbol, or
+//! its bytes for a name the system does not know; `Leading::Icon` is a plain,
+//! untappable bar item like `Leading::Symbol`.
+//!
 //! # Events
 //!
 //! One `FrustNativeControlTarget` per install, held in the chrome state, is
@@ -172,13 +184,14 @@ use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr::NonNull;
+use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::{Retained, Weak};
-use objc2::runtime::{NSObject, NSObjectProtocol};
+use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol};
 use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel,
 };
@@ -745,6 +758,8 @@ impl Chrome {
             apply_top(mtm, page, top, &self.target, |field| diff.contains(field));
             if diff.contains(ChromeField::Actions) {
                 apply_toolbar(mtm, page, &self.spec, &self.target);
+            } else if diff.contains(ChromeField::ActionBadges) {
+                rebadge_toolbar(page, &self.spec);
             }
         }
         // Animate only a push/pop inside the selected tab (module doc, Toolbar).
@@ -1313,6 +1328,9 @@ fn apply_top(
             .map(|(index, action)| action_item(mtm, index, action, target))
             .collect();
         item.setRightBarButtonItems(Some(&NSArray::from_retained_slice(&items)));
+    } else if wants(ChromeField::ActionBadges) {
+        let actions: Vec<&ActionItem> = bar.actions.iter().collect();
+        rebadge(item.rightBarButtonItems(), &actions, 0);
     }
 }
 
@@ -1333,14 +1351,20 @@ fn apply_toolbar(
     };
     let offset = toolbar_offset(spec);
     let mut items = Vec::with_capacity(2 * toolbar.items.len() + 2);
+    // A spacer's tag names no action, so [`rebadge`] passes it over.
+    let spacer = || {
+        let space = UIBarButtonItem::flexibleSpaceItem(mtm);
+        space.setTag(-1);
+        space
+    };
     for (i, entry) in toolbar.items.iter().enumerate() {
         if i > 0 {
-            items.push(UIBarButtonItem::flexibleSpaceItem(mtm));
+            items.push(spacer());
         }
         items.push(action_item(mtm, offset + i, entry, target));
     }
     if let Some(primary) = &toolbar.primary {
-        items.push(UIBarButtonItem::flexibleSpaceItem(mtm));
+        items.push(spacer());
         let item = action_item(mtm, offset + toolbar.items.len(), primary, target);
         item.setStyle(UIBarButtonItemStyle::Prominent);
         items.push(item);
@@ -1348,6 +1372,17 @@ fn apply_toolbar(
     page.page
         .setToolbarItems_animated(Some(&NSArray::from_retained_slice(&items)), false);
     page.nav.setToolbarHidden_animated(false, false);
+}
+
+/// Re-badge `page`'s shown toolbar items from `spec` in place
+/// ([`ChromeField::ActionBadges`]). UIKit currently draws a bar item's badge
+/// in navigation bars only, so a toolbar badge may not show.
+fn rebadge_toolbar(page: &Page, spec: &ChromeSpec) {
+    let Some(toolbar) = shown_toolbar(spec) else {
+        return;
+    };
+    let entries: Vec<&ActionItem> = toolbar.entries().collect();
+    rebadge(page.page.toolbarItems(), &entries, toolbar_offset(spec));
 }
 
 /// The leading item: a custom back chevron (the navigation controller has no
@@ -1387,6 +1422,11 @@ fn leading_item(
             item.setImage(UIImage::systemImageNamed(&NSString::from_str(name)).as_deref());
             Some(item)
         }
+        Leading::Icon(icon) => {
+            let item = UIBarButtonItem::new(mtm);
+            item.setImage(ui_image(icon).as_deref());
+            Some(item)
+        }
     }
 }
 
@@ -1423,6 +1463,12 @@ fn action_item(
         item.setAccessibilityLabel(Some(&title), mtm);
     } else {
         item.setTitle(Some(&title));
+    }
+    if action.prominent {
+        item.setStyle(UIBarButtonItemStyle::Prominent);
+    }
+    if action.badge.is_some() {
+        set_badge(&item, action.badge.as_deref());
     }
     // Action indices are small (the top bar's and toolbar's); the tag maps a tap back.
     item.setTag(index as isize);
@@ -1476,22 +1522,88 @@ fn menu_action(
 }
 
 /// The `UIImage` for `icon`: an SF Symbol by name, or bytes normalized into
-/// the tab-icon point box like the bare tab bar's. `None` when it fails.
+/// the tab-icon point box like the bare tab bar's; a symbol-with-bytes icon
+/// is its symbol, else (a name this system does not know) its bytes. `None`
+/// when it fails.
 fn ui_image(icon: &TabIcon) -> Option<Retained<UIImage>> {
     match icon {
         TabIcon::AppleSymbol(name) => UIImage::systemImageNamed(&NSString::from_str(name)),
-        TabIcon::Bytes(bytes) => {
-            let data = NSData::with_bytes(bytes);
-            let probe = UIImage::imageWithData(&data)?;
-            // SAFETY: `size` is marked unsafe only for thread safety; this
-            // runs on the main thread against an image only this call owns.
-            let size = unsafe { probe.size() };
-            let scale = icon_decode_scale(size.width, size.height);
-            if scale == 1.0 {
-                Some(probe)
-            } else {
-                UIImage::imageWithData_scale(&data, scale)
-            }
+        TabIcon::Bytes(bytes) => bytes_image(bytes),
+        TabIcon::AppleSymbolWithBytes { symbol, bytes } => {
+            UIImage::systemImageNamed(&NSString::from_str(symbol)).or_else(|| bytes_image(bytes))
+        }
+    }
+}
+
+/// Encoded `bytes` as a `UIImage` normalized into the tab-icon point box.
+fn bytes_image(bytes: &[u8]) -> Option<Retained<UIImage>> {
+    let data = NSData::with_bytes(bytes);
+    let probe = UIImage::imageWithData(&data)?;
+    // SAFETY: `size` is marked unsafe only for thread safety; this
+    // runs on the main thread against an image only this call owns.
+    let size = unsafe { probe.size() };
+    let scale = icon_decode_scale(size.width, size.height);
+    if scale == 1.0 {
+        Some(probe)
+    } else {
+        UIImage::imageWithData_scale(&data, scale)
+    }
+}
+
+/// Show `badge` (an action's, with the tab badge's grammar: a count, other
+/// text, or `""` for a dot) on `item`, or clear it for `None`. The badge is
+/// iOS 26 API (UIKit draws it in navigation bars only) that the plugin's
+/// UIKit bindings do not enable, so the class is looked up at run time and
+/// the setter is behind a `respondsToSelector` check; an older system shows
+/// no badge and says so once in the debug log.
+fn set_badge(item: &UIBarButtonItem, badge: Option<&str>) {
+    static UNSUPPORTED_LOGGED: Once = Once::new();
+    let class = AnyClass::get(c"UIBarButtonItemBadge");
+    let Some(class) = class.filter(|_| item.respondsToSelector(sel!(setBadge:))) else {
+        if badge.is_some() {
+            UNSUPPORTED_LOGGED.call_once(|| {
+                log::debug!(
+                    "frust-native-widgets: this system's UIBarButtonItem has no badge; chrome \
+                     action badges are not shown"
+                );
+            });
+        }
+        return;
+    };
+    // SAFETY: `UIBarButtonItemBadge`'s class factories take an `NSUInteger`
+    // or an `NSString` and return an autoreleased badge (or nil), and
+    // `setBadge:` takes a badge or nil; `item` is a live bar item on the main
+    // thread.
+    unsafe {
+        let value: Option<Retained<AnyObject>> = match badge {
+            None => None,
+            Some("") => msg_send![class, indicatorBadge],
+            Some(text) => match text.parse::<usize>() {
+                Ok(count) => msg_send![class, badgeWithCount: count],
+                Err(_) => msg_send![class, badgeWithString: &*NSString::from_str(text)],
+            },
+        };
+        let _: () = msg_send![item, setBadge: value.as_deref()];
+    }
+}
+
+/// Re-badge the shown bar `items` from `actions`, matched by their
+/// `chrome_actions` tag (`offset` is the first action's): a badge-only
+/// change ([`ChromeField::ActionBadges`]) touches nothing else.
+fn rebadge(
+    items: Option<Retained<NSArray<UIBarButtonItem>>>,
+    actions: &[&ActionItem],
+    offset: usize,
+) {
+    let Some(items) = items else {
+        return;
+    };
+    for item in items.iter() {
+        let index = usize::try_from(item.tag())
+            .ok()
+            .and_then(|tag| tag.checked_sub(offset));
+        if let Some(action) = index.and_then(|index| actions.get(index)) {
+            set_badge(&item, action.badge.as_deref());
         }
     }
 }

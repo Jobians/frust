@@ -133,15 +133,11 @@ fn avatar_png() -> Arc<[u8]> {
     Arc::clone(AVATAR.get_or_init(|| Arc::from(&include_bytes!("../assets/icons/avatar.png")[..])))
 }
 
-/// An icon: the SF Symbol `symbol` on iOS, `png` everywhere else. macOS and
-/// the other desktop targets draw the fallback chrome, which has no SF Symbol
-/// arm, so they take the bitmap asset.
+/// An icon that carries both forms: the SF Symbol `symbol`, which the iOS
+/// chrome shows, and `png`, which the Android chrome and the frust-drawn
+/// fallback chrome (macOS and the other desktop targets) show.
 fn chrome_icon(symbol: &str, png: Arc<[u8]>) -> TabIcon {
-    if cfg!(target_os = "ios") {
-        TabIcon::AppleSymbol(symbol.to_string())
-    } else {
-        TabIcon::Bytes(png)
-    }
+    TabIcon::apple_symbol_with_bytes(symbol, png)
 }
 
 /// Publishes the `assets/icons` PNG `bytes` once in `cell`, so every build
@@ -166,6 +162,44 @@ fn search_png() -> Arc<[u8]> {
 fn more_png() -> Arc<[u8]> {
     static MORE_PNG: OnceLock<Arc<[u8]>> = OnceLock::new();
     published_png(&MORE_PNG, include_bytes!("../assets/icons/more.png"))
+}
+
+/// The notifications bell, a 96x96 black-on-transparent PNG (2-bit palette)
+/// kept inline: the bitmap the bell action shows where SF Symbols do not exist.
+const BELL_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0x60, 0x02, 0x03, 0x00, 0x00, 0x00, 0x9f, 0xf6, 0x9f,
+    0xab, 0x00, 0x00, 0x00, 0x0c, 0x50, 0x4c, 0x54, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x35, 0xe9, 0x37, 0x96, 0x00, 0x00, 0x00, 0x04, 0x74, 0x52, 0x4e,
+    0x53, 0x00, 0x55, 0xaa, 0xff, 0xa0, 0x0e, 0x31, 0x2f, 0x00, 0x00, 0x01, 0x40, 0x49, 0x44, 0x41,
+    0x54, 0x78, 0xda, 0xed, 0x96, 0x3d, 0x52, 0x02, 0x41, 0x10, 0x85, 0xbb, 0xdd, 0x41, 0xa9, 0x22,
+    0xd9, 0x40, 0xab, 0xcc, 0x24, 0x30, 0xe7, 0x08, 0xcc, 0x11, 0xc8, 0x4c, 0x8d, 0xbd, 0x84, 0x17,
+    0xf2, 0x0e, 0xcb, 0x11, 0x38, 0x02, 0x81, 0x87, 0x20, 0x40, 0x9e, 0xc1, 0xee, 0xfc, 0x6e, 0x3f,
+    0x1d, 0x62, 0xed, 0x64, 0x61, 0xbe, 0xe9, 0xd7, 0x6f, 0x96, 0xae, 0x1e, 0x44, 0xfe, 0x43, 0x64,
+    0xf5, 0x49, 0xc0, 0xf6, 0x8b, 0x80, 0x01, 0x04, 0x00, 0x3e, 0x7d, 0xb9, 0x69, 0x29, 0x5e, 0x48,
+    0x65, 0x19, 0x0b, 0x91, 0x1d, 0x49, 0xc0, 0xc5, 0x5b, 0xa7, 0x00, 0x80, 0xa3, 0x01, 0xde, 0x01,
+    0x20, 0x9d, 0xa4, 0x0b, 0x1f, 0x74, 0x10, 0x11, 0x51, 0xdd, 0x9b, 0x4a, 0x99, 0x56, 0x74, 0xf5,
+    0x3c, 0x3e, 0x1e, 0x2d, 0x4f, 0x00, 0x70, 0xa9, 0xd7, 0x15, 0x53, 0xd4, 0x86, 0xbb, 0x00, 0x0e,
+    0x55, 0x8d, 0x65, 0xd8, 0xd1, 0x57, 0xc0, 0x05, 0x70, 0x5f, 0x81, 0xb0, 0x31, 0xee, 0x08, 0x60,
+    0xcd, 0x40, 0x34, 0xa3, 0xec, 0x87, 0xd2, 0xab, 0x33, 0xe6, 0x8d, 0x50, 0x1d, 0x9d, 0x66, 0xfc,
+    0x06, 0x34, 0xad, 0x78, 0x06, 0xa8, 0x14, 0xcd, 0xe8, 0x0b, 0xe0, 0x98, 0x94, 0x63, 0x19, 0xd2,
+    0x20, 0xe5, 0x0a, 0xd0, 0x37, 0xd8, 0xa5, 0x19, 0x14, 0x68, 0xdb, 0x4b, 0xf4, 0x2c, 0x63, 0x0e,
+    0xa6, 0x07, 0x66, 0xed, 0x60, 0xd4, 0xf0, 0x19, 0xd0, 0x26, 0x20, 0x57, 0x4b, 0xf5, 0x19, 0x70,
+    0x4c, 0xca, 0xb1, 0x0c, 0x69, 0x92, 0x72, 0x19, 0xe8, 0x9b, 0xec, 0xd2, 0x0c, 0x0a, 0x74, 0x36,
+    0x2e, 0x42, 0xc4, 0x71, 0xd6, 0xa1, 0x8a, 0xc3, 0x24, 0xb5, 0xac, 0xcb, 0xaf, 0x27, 0xe0, 0x2c,
+    0x5f, 0x3f, 0x36, 0xc3, 0xb9, 0x5e, 0x3c, 0x33, 0x70, 0x8c, 0x73, 0xb2, 0x72, 0xe5, 0xc3, 0x69,
+    0x1e, 0x46, 0xe3, 0x6f, 0xdb, 0x97, 0xb1, 0x65, 0x3e, 0x4a, 0x81, 0xdb, 0x34, 0xde, 0xca, 0x78,
+    0x02, 0x4e, 0xe6, 0xdb, 0x7d, 0x15, 0x59, 0x98, 0xc0, 0xb3, 0x53, 0x95, 0xc3, 0xb5, 0xe5, 0xc6,
+    0x19, 0x00, 0x98, 0x35, 0xf6, 0x65, 0xd3, 0xa7, 0xd8, 0x14, 0x76, 0xb3, 0xb8, 0xb3, 0x2f, 0x1c,
+    0x11, 0x1d, 0xcc, 0x2b, 0x4a, 0x44, 0x74, 0xf7, 0x97, 0xfe, 0x59, 0x7c, 0x03, 0xee, 0xfb, 0x97,
+    0x7e, 0x14, 0x91, 0x15, 0x58, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
+    0x82,
+];
+
+/// The Bell action's [`BELL_PNG`].
+fn bell_png() -> Arc<[u8]> {
+    static BELL: OnceLock<Arc<[u8]>> = OnceLock::new();
+    published_png(&BELL, BELL_PNG)
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +577,9 @@ pub struct NativeWidgetsDemoState {
     /// Presentation outcomes not yet seen: the Dialogs tab's badge while
     /// non-zero; selecting Dialogs clears it.
     pub unseen_outcomes: RwSignal<u32>,
+    /// Unread notifications: the Home bar's bell badge while non-zero; the
+    /// Home page's Notify and Clear buttons write it.
+    pub notifications: RwSignal<u32>,
     /// Navigator changes chrome handlers asked for, append-only.
     pub chrome_requests: RwSignal<Vec<ChromeRequest>>,
     /// Back at a tab's root returns to Home; at Home's root it exits.
@@ -586,6 +623,7 @@ impl NativeWidgetsDemoState {
             composer_open: RwSignal::new(false),
             chrome_event: RwSignal::new(None),
             unseen_outcomes: RwSignal::new(0),
+            notifications: RwSignal::new(0),
             chrome_requests: RwSignal::new(Vec::new()),
             home_fallback,
             applied_requests: Cell::new(0),
@@ -660,6 +698,8 @@ fn flipped(brightness: Brightness) -> Brightness {
 const ADD: &str = "add";
 /// Home's search action.
 const SEARCH: &str = "search";
+/// Home's notifications bell, badged with the unread count.
+const BELL: &str = "bell";
 /// Every tab root's overflow pull-down.
 const MORE: &str = "more";
 /// A pushed detail page's pull-down.
@@ -717,7 +757,11 @@ impl Component for NativeWidgetsDemoApp {
             .title(Self::title(tab, detail.as_ref()))
             .subtitle_if(Self::subtitle(detail.as_ref()))
             .leading(Self::leading(state, tab))
-            .actions(Self::actions(tab, state.route(tab).depth() > 1))
+            .actions(Self::actions(
+                tab,
+                state.route(tab).depth() > 1,
+                state.notifications.get(),
+            ))
             .toolbar(Self::toolbar(tab, detail.as_ref(), composer_open))
             .scroll(Self::scroll(state, tab))
             .events_into(state.chrome_event)
@@ -823,15 +867,27 @@ impl NativeWidgetsDemoApp {
         }
     }
 
-    /// One action: its SF Symbol on iOS, else its `png` icon, with its title
-    /// beside either (see [`chrome_icon`]).
+    /// One action: its SF Symbol on iOS, its `png` icon elsewhere, its title
+    /// the label of either (see [`chrome_icon`]).
     fn action(id: &str, title: &str, symbol: &str, png: Arc<[u8]>) -> ActionItem {
         ActionItem::new(id, title).icon(chrome_icon(symbol, png))
     }
 
-    /// Above a root: the page's Share/Copy link menu. At a root: Home's '+'
-    /// menu and search, then every tab's overflow menu.
-    fn actions(tab: Tab, pushed: bool) -> Vec<ActionItem> {
+    /// The bell, badged with the `unread` count while it is non-zero. A
+    /// count change is a badge-only chrome update.
+    fn bell(unread: u32) -> ActionItem {
+        let bell = Self::action(BELL, "Notifications", "bell", bell_png());
+        if unread > 0 {
+            bell.badge(unread.to_string())
+        } else {
+            bell
+        }
+    }
+
+    /// Above a root: the page's Share/Copy link menu. At a root: Home's
+    /// prominent '+' menu, the bell (badged with `unread`) and search, then
+    /// every tab's overflow menu.
+    fn actions(tab: Tab, pushed: bool, unread: u32) -> Vec<ActionItem> {
         if pushed {
             return vec![
                 Self::action(DETAIL_MORE, "More", "ellipsis.circle", more_png()).menu(vec![
@@ -842,10 +898,13 @@ impl NativeWidgetsDemoApp {
         }
         let home = (tab == Tab::Home).then(|| {
             [
-                Self::action(ADD, "New", "plus", plus_png()).menu(vec![
-                    MenuItem::new("new-issue", "New issue"),
-                    MenuItem::new("new-repository", "New repository"),
-                ]),
+                Self::action(ADD, "New", "plus", plus_png())
+                    .prominent(true)
+                    .menu(vec![
+                        MenuItem::new("new-issue", "New issue"),
+                        MenuItem::new("new-repository", "New repository"),
+                    ]),
+                Self::bell(unread),
                 Self::action(SEARCH, "Search", "magnifyingglass", search_png()),
             ]
         });
@@ -915,10 +974,12 @@ impl NativeWidgetsDemoApp {
         }
     }
 
-    /// Plain actions: search, and the detail toolbar's Comment and Info.
+    /// Plain actions: search, and the detail toolbar's Comment and Info. The
+    /// bell's tap shows only in the Home page's chrome-event readout.
     fn on_action(state: &NativeWidgetsDemoState) -> impl Fn(ActionId) + Send + Sync + 'static {
         let (toasts, composer_open) = (state.toasts, state.composer_open);
         move |id: ActionId| match id.as_str() {
+            BELL => {}
             SEARCH => push_toast(toasts, "Search".to_string()),
             COMMENT => composer_open.update(|open| *open = !*open),
             INFO => push_toast(toasts, "Pull request info".to_string()),
@@ -1503,5 +1564,42 @@ mod deep_link_tests {
         consumed.extend(model.take_next());
         assert_eq!(consumed, vec!["X", "X"], "shown twice, once per request");
         assert_eq!(model.take_next(), None, "nothing pending afterwards");
+    }
+}
+
+#[cfg(test)]
+mod chrome_action_tests {
+    use super::*;
+
+    #[test]
+    fn the_bell_is_badged_with_the_unread_count_only_while_non_zero() {
+        let plain = ActionItem::new(BELL, "Notifications").icon(chrome_icon("bell", bell_png()));
+        assert_eq!(NativeWidgetsDemoApp::bell(0), plain);
+        assert_eq!(NativeWidgetsDemoApp::bell(3), plain.clone().badge("3"));
+        assert_ne!(NativeWidgetsDemoApp::bell(3), NativeWidgetsDemoApp::bell(4));
+    }
+
+    #[test]
+    fn home_shows_a_prominent_new_the_bell_search_and_more() {
+        let actions = NativeWidgetsDemoApp::actions(Tab::Home, false, 2);
+        let ids: Vec<&str> = actions.iter().map(|a| a.id().as_str()).collect();
+        assert_eq!(ids, [ADD, BELL, SEARCH, MORE]);
+        assert_ne!(
+            actions[0],
+            actions[0].clone().prominent(false),
+            "New is the prominent action"
+        );
+        assert_eq!(actions[1], NativeWidgetsDemoApp::bell(2));
+        let others = NativeWidgetsDemoApp::actions(Tab::Lab, false, 2);
+        let ids: Vec<&str> = others.iter().map(|a| a.id().as_str()).collect();
+        assert_eq!(ids, [MORE], "the bell is Home's alone");
+    }
+
+    #[test]
+    fn every_chrome_icon_carries_a_symbol_and_decodable_bytes() {
+        let icon = chrome_icon("bell", bell_png());
+        assert_eq!(icon, TabIcon::apple_symbol_with_bytes("bell", bell_png()));
+        let decoded = frust::authoring::ImageSource::decode(BELL_PNG).expect("the bell decodes");
+        assert_eq!(decoded.natural_size(), Size::new(96.0, 96.0));
     }
 }

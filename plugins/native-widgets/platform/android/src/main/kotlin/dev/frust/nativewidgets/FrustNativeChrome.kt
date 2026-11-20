@@ -18,14 +18,18 @@
 //             none, "" = dot), tab<i>IconRev (0 = no icon)
 //   Selected: selectedIndex (-1 = none)
 //   TopBar:   hasTop          Title: title          Subtitle: subtitle (absent/null = none)
-//   Leading:  leading = "none" | "back" | "image"   LargeTitle: largeTitle (ignored here)
+//   Leading:  leading = "none" | "back" | "image" | "icon"   LargeTitle: largeTitle (ignored here)
 //   Actions:  actionCount, action<i>Title, action<i>HasIcon, action<i>MenuCount,
+//             action<i>Badge (absent/null = none, "" = dot), action<i>Prominent (absent = false),
 //             menu<i>_<j>Title, menu<i>_<j>Destructive, menu<i>_<j>Enabled,
 //             toolbarCount, toolbarPrimary (the last entry is the primary),
-//             toolbar<i>Title, toolbar<i>HasIcon, toolbar<i>MenuCount,
+//             toolbar<i>Title, toolbar<i>HasIcon, toolbar<i>MenuCount, toolbar<i>Badge, toolbar<i>Prominent,
 //             toolbarMenu<i>_<j>Title, toolbarMenu<i>_<j>Destructive, toolbarMenu<i>_<j>Enabled
 //   Brightness: dark
+//   ActionBadges (apply only, never beside Actions): action<i>Badge and toolbar<i>Badge
+//             for every entry (null = none); the counts are unchanged
 // Toolbar entry i reports as action index actionCount + i (its menu likewise).
+// "image" is a round avatar, "icon" a plain navigation icon; both read ICON_SLOT_LEADING.
 // Icon bytes never travel as JSON: `setIcon(slot, index, png)` caches one
 // bitmap per (slot, index) until `dispose`, before or after the call naming it.
 package dev.frust.nativewidgets
@@ -62,6 +66,9 @@ import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.appbar.AppBarLayout
 import com.google.android.material.appbar.MaterialToolbar
+import com.google.android.material.badge.BadgeDrawable
+import com.google.android.material.badge.BadgeUtils
+import com.google.android.material.badge.ExperimentalBadgeUtils
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.floatingactionbutton.ExtendedFloatingActionButton
@@ -108,6 +115,14 @@ import kotlin.math.roundToInt
  * that is shown, else above the larger of the IME and navigation-bar insets,
  * and the same distance in from the trailing edge's system insets.
  *
+ * ## Badges and prominence
+ *
+ * An action's badge is a [BadgeDrawable] on its menu item ([BadgeUtils]), a
+ * toolbar entry's one on its button; an ActionBadges apply updates them in
+ * place without rebuilding the menu or the buttons. A prominent action is
+ * tinted `colorPrimary` (a toolbar button is filled with it, its content
+ * `colorOnPrimary`).
+ *
  * ## Threading and ordering
  *
  * Every entry point and listener runs on the main thread (the frust UI
@@ -139,7 +154,7 @@ object FrustNativeChrome {
     /** [setIcon] slot: a top-bar action's icon, `index` = action index. */
     const val ICON_SLOT_ACTION = 1
 
-    /** [setIcon] slot: the leading image (avatar), `index` ignored. */
+    /** [setIcon] slot: the leading image (avatar) or icon, `index` ignored. */
     const val ICON_SLOT_LEADING = 2
 
     /** [setIcon] slot: a toolbar entry's icon, `index` = toolbar entry index. */
@@ -149,6 +164,7 @@ object FrustNativeChrome {
     private const val LEADING_NONE = "none"
     private const val LEADING_BACK = "back"
     private const val LEADING_IMAGE = "image"
+    private const val LEADING_ICON = "icon"
 
     /** Material's toolbar action icon box (Material 3 spec: 24dp). */
     private const val ACTION_ICON_DP = 24
@@ -184,6 +200,9 @@ object FrustNativeChrome {
     private const val FIELD_SCROLL = "Scroll"
     private const val FIELD_BRIGHTNESS = "Brightness"
 
+    /** Badges alone changed; an apply-only field, never beside [FIELD_ACTIONS]. */
+    private const val FIELD_ACTION_BADGES = "ActionBadges"
+
     /** Every field [install]'s spec carries (Rust's `INSTALL_FIELDS`; [FIELD_SCROLL] rides [setScroll]). */
     private val INSTALL_FIELDS = setOf(
         FIELD_TABS,
@@ -201,7 +220,13 @@ object FrustNativeChrome {
 
     private class MenuEntry(val title: String, val destructive: Boolean, val enabled: Boolean)
 
-    private class Action(val title: String, val hasIcon: Boolean, val menu: List<MenuEntry>)
+    private data class Action(
+        val title: String,
+        val hasIcon: Boolean,
+        val menu: List<MenuEntry>,
+        val badge: String? = null,
+        val prominent: Boolean = false,
+    )
 
     /** The retained spec, merged field by field by [apply]. */
     private class Model {
@@ -226,7 +251,13 @@ object FrustNativeChrome {
         val bottom: BottomNavigationView,
         /** The toolbar's floating action buttons, top to bottom. */
         val fabs: LinearLayout,
-    )
+    ) {
+        /** The badges on [toolbar]'s menu items, by item id. */
+        val actionBadges = HashMap<Int, BadgeDrawable>()
+
+        /** The badges on [fabs]' buttons, by toolbar entry index. */
+        val fabBadges = HashMap<Int, BadgeDrawable>()
+    }
 
     private class Installed(
         val generation: Long,
@@ -456,6 +487,13 @@ object FrustNativeChrome {
                 parseAction(json, "toolbar", "toolbarMenu", t)
             }
             model.toolbarPrimary = json.optBoolean("toolbarPrimary", false)
+        } else if (FIELD_ACTION_BADGES in fields) {
+            model.actions = model.actions.mapIndexed { a, action ->
+                action.copy(badge = optStringOrNull(json, "action${a}Badge"))
+            }
+            model.toolbar = model.toolbar.mapIndexed { t, entry ->
+                entry.copy(badge = optStringOrNull(json, "toolbar${t}Badge"))
+            }
         }
         if (FIELD_BRIGHTNESS in fields) model.dark = json.optBoolean("dark", false)
     }
@@ -473,6 +511,8 @@ object FrustNativeChrome {
                     json.optBoolean("$menuPrefix${a}_${m}Enabled", true),
                 )
             },
+            optStringOrNull(json, "$prefix${a}Badge"),
+            json.optBoolean("$prefix${a}Prominent", false),
         )
     }
 
@@ -749,6 +789,10 @@ object FrustNativeChrome {
         if (FIELD_ACTIONS in changed) {
             applyActions(installed)
             applyToolbar(installed)
+        } else if (FIELD_ACTION_BADGES in changed) {
+            // In place: the menu items and buttons stay, only their badges move.
+            applyActionBadges(installed)
+            applyToolbarBadges(installed)
         }
         if (FIELD_TABS in changed) applyTabs(installed) else if (FIELD_SELECTED in changed) applySelected(installed)
     }
@@ -794,6 +838,14 @@ object FrustNativeChrome {
                     RoundedBitmapDrawableFactory.create(context.resources, squareScaled(it, size)).apply { isCircular = true }
                 }
             }
+            LEADING_ICON -> {
+                // A plain icon, tinted like an action and not tappable (the iOS leading symbol).
+                val bitmap = icons[iconKey(ICON_SLOT_LEADING, 0)]
+                toolbar.setNavigationOnClickListener(null)
+                toolbar.setNavigationContentDescription(null)
+                toolbar.navigationIcon = bitmap?.let { BitmapDrawable(context.resources, fitScaled(it, dp(context, ACTION_ICON_DP))) }
+                toolbar.setNavigationIconTint(MaterialColors.getColor(toolbar, com.google.android.material.R.attr.colorOnSurface))
+            }
             else -> {
                 toolbar.setNavigationOnClickListener(null)
                 toolbar.navigationIcon = null
@@ -805,16 +857,70 @@ object FrustNativeChrome {
         dismissPopup()
         val bars = installed.bars
         val menu = bars.toolbar.menu
+        detachActionBadges(bars)
         menu.clear()
         val tint = ColorStateList.valueOf(MaterialColors.getColor(bars.toolbar, com.google.android.material.R.attr.colorOnSurfaceVariant))
+        val primary = MaterialColors.getColor(bars.toolbar, androidx.appcompat.R.attr.colorPrimary)
         installed.model.actions.forEachIndexed { index, action ->
-            val item = menu.add(Menu.NONE, index + 1, index, action.title)
+            // A prominent title-only item is drawn in the primary colour.
+            val title: CharSequence = if (action.prominent) tinted(action.title, primary) else action.title
+            val item = menu.add(Menu.NONE, index + 1, index, title)
             item.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS)
             item.contentDescription = action.title
             val bitmap = icons[iconKey(ICON_SLOT_ACTION, index)]
             if (action.hasIcon && bitmap != null) {
                 item.icon = BitmapDrawable(bars.context.resources, fitScaled(bitmap, dp(bars.context, ACTION_ICON_DP)))
-                item.iconTintList = tint
+                item.iconTintList = if (action.prominent) ColorStateList.valueOf(primary) else tint
+            }
+        }
+        applyActionBadges(installed)
+    }
+
+    /**
+     * Bring the menu items' badges to the model in place: update a badge that
+     * stays, attach a new one, detach a gone one. Attaching through the
+     * toolbar waits for the item's view (Material posts it), so a detach is
+     * posted too: it then runs after any attach still pending.
+     */
+    @androidx.annotation.OptIn(markerClass = [ExperimentalBadgeUtils::class])
+    private fun applyActionBadges(installed: Installed) {
+        val bars = installed.bars
+        val actions = installed.model.actions
+        for (id in bars.actionBadges.keys.toList()) {
+            if (actions.getOrNull(id - 1)?.badge == null) {
+                val drawable = bars.actionBadges.remove(id) ?: continue
+                postDetach(bars, drawable, id)
+            }
+        }
+        actions.forEachIndexed { index, action ->
+            val badge = action.badge ?: return@forEachIndexed
+            val id = index + 1
+            val held = bars.actionBadges[id]
+            if (held != null) {
+                fillBadge(held, badge)
+            } else {
+                val drawable = BadgeDrawable.create(bars.context)
+                fillBadge(drawable, badge)
+                bars.actionBadges[id] = drawable
+                BadgeUtils.attachBadgeDrawable(drawable, bars.toolbar, id)
+            }
+        }
+    }
+
+    /** Detach every menu-item badge, before the menu is rebuilt. */
+    private fun detachActionBadges(bars: Bars) {
+        for ((id, drawable) in bars.actionBadges) postDetach(bars, drawable, id)
+        bars.actionBadges.clear()
+    }
+
+    @androidx.annotation.OptIn(markerClass = [ExperimentalBadgeUtils::class])
+    private fun postDetach(bars: Bars, drawable: BadgeDrawable, id: Int) {
+        val toolbar = bars.toolbar
+        toolbar.post {
+            try {
+                BadgeUtils.detachBadgeDrawable(drawable, toolbar, id)
+            } catch (t: Throwable) {
+                Log.w(TAG, "Frust: native app chrome badge detach failed", t)
             }
         }
     }
@@ -825,10 +931,13 @@ object FrustNativeChrome {
         val bars = installed.bars
         val context = bars.context
         val stack = bars.fabs
+        detachToolbarBadges(bars)
         stack.removeAllViews()
         val entries = installed.model.toolbar
         stack.visibility = if (entries.isEmpty()) View.GONE else View.VISIBLE
         val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+        val fill = ColorStateList.valueOf(MaterialColors.getColor(stack, androidx.appcompat.R.attr.colorPrimary))
+        val onFill = ColorStateList.valueOf(MaterialColors.getColor(stack, com.google.android.material.R.attr.colorOnPrimary))
         entries.forEachIndexed { t, entry ->
             val primary = installed.model.toolbarPrimary && t == entries.lastIndex
             val bitmap = icons[iconKey(ICON_SLOT_TOOLBAR, t)]
@@ -838,11 +947,22 @@ object FrustNativeChrome {
                 null
             }
             val button: View = if (primary && icon != null) {
-                FloatingActionButton(context).apply { setImageDrawable(icon) }
+                FloatingActionButton(context).apply {
+                    setImageDrawable(icon)
+                    if (entry.prominent) {
+                        backgroundTintList = fill
+                        imageTintList = onFill
+                    }
+                }
             } else {
                 ExtendedFloatingActionButton(context).apply {
                     text = entry.title
                     this.icon = icon
+                    if (entry.prominent) {
+                        backgroundTintList = fill
+                        setTextColor(onFill)
+                        iconTint = onFill
+                    }
                 }
             }
             button.contentDescription = entry.title
@@ -852,7 +972,62 @@ object FrustNativeChrome {
             if (t > 0) params.topMargin = dp(context, FAB_GAP_DP)
             stack.addView(button, params)
         }
+        applyToolbarBadges(installed)
     }
+
+    /**
+     * Bring the toolbar buttons' badges to the model in place, like
+     * [applyActionBadges]. A button's badge rides its overlay and follows its
+     * layout ([fabBadgeBounds]).
+     */
+    @androidx.annotation.OptIn(markerClass = [ExperimentalBadgeUtils::class])
+    private fun applyToolbarBadges(installed: Installed) {
+        val bars = installed.bars
+        val entries = installed.model.toolbar
+        for (t in bars.fabBadges.keys.toList()) {
+            if (entries.getOrNull(t)?.badge == null) {
+                val drawable = bars.fabBadges.remove(t) ?: continue
+                bars.fabs.getChildAt(t)?.let { BadgeUtils.detachBadgeDrawable(drawable, it) }
+            }
+        }
+        entries.forEachIndexed { t, entry ->
+            val badge = entry.badge ?: return@forEachIndexed
+            val held = bars.fabBadges[t]
+            if (held != null) {
+                fillBadge(held, badge)
+                return@forEachIndexed
+            }
+            val button = bars.fabs.getChildAt(t) ?: return@forEachIndexed
+            val drawable = BadgeDrawable.create(bars.context)
+            fillBadge(drawable, badge)
+            bars.fabBadges[t] = drawable
+            BadgeUtils.attachBadgeDrawable(drawable, button)
+            button.addOnLayoutChangeListener(fabBadgeBounds)
+        }
+    }
+
+    /** Detach every toolbar-button badge, before the buttons are rebuilt. */
+    @androidx.annotation.OptIn(markerClass = [ExperimentalBadgeUtils::class])
+    private fun detachToolbarBadges(bars: Bars) {
+        for ((t, drawable) in bars.fabBadges) {
+            bars.fabs.getChildAt(t)?.let { BadgeUtils.detachBadgeDrawable(drawable, it) }
+        }
+        bars.fabBadges.clear()
+    }
+
+    /** Re-anchors a toolbar button's badge once the button is laid out. */
+    private val fabBadgeBounds =
+        View.OnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
+            val bars = live?.bars ?: return@OnLayoutChangeListener
+            val t = bars.fabs.indexOfChild(view)
+            bars.fabBadges[t]?.let { BadgeUtils.setBadgeDrawableBounds(it, view, null) }
+        }
+
+    /** `text` drawn in `color`. */
+    private fun tinted(text: String, color: Int): CharSequence =
+        SpannableString(text).apply {
+            setSpan(ForegroundColorSpan(color), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
 
     private fun onActionClicked(index: Int) {
         val installed = live ?: return
@@ -879,13 +1054,7 @@ object FrustNativeChrome {
         val shown = PopupMenu(bars.context, anchor, Gravity.END)
         val danger = MaterialColors.getColor(bars.toolbar, androidx.appcompat.R.attr.colorError)
         action.menu.forEachIndexed { m, entry ->
-            val title: CharSequence = if (entry.destructive) {
-                SpannableString(entry.title).apply {
-                    setSpan(ForegroundColorSpan(danger), 0, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
-                }
-            } else {
-                entry.title
-            }
+            val title: CharSequence = if (entry.destructive) tinted(entry.title, danger) else entry.title
             shown.menu.add(Menu.NONE, m + 1, m, title).isEnabled = entry.enabled
         }
         shown.setOnMenuItemClickListener { item ->
@@ -942,7 +1111,11 @@ object FrustNativeChrome {
             bottom.removeBadge(itemId)
             return
         }
-        val drawable = bottom.getOrCreateBadge(itemId)
+        fillBadge(bottom.getOrCreateBadge(itemId), badge)
+    }
+
+    /** Show `badge` on `drawable`: `""` is a dot, a non-negative number a count, anything else its text. */
+    private fun fillBadge(drawable: BadgeDrawable, badge: String) {
         val number = badge.toIntOrNull()
         drawable.clearNumber()
         drawable.clearText()

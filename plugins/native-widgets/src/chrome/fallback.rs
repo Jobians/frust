@@ -22,7 +22,12 @@
 //!   it. Its taps are id-based ([`deliver_event`]): it holds the toolbar
 //!   alone, whose indices follow the top bar's in the live spec.
 //! - SF Symbol names exist only on Apple platforms, so a symbol icon draws the
-//!   first letters of its name in a circle; byte icons draw untinted.
+//!   first letters of its name in a circle; byte icons, and the bytes of a
+//!   symbol-with-bytes icon, draw untinted.
+//! - An action's badge is the tab badge's `error` pill (a dot for `""`) on
+//!   its icon's or label's top-trailing corner, and its node's description;
+//!   a prominent action sits on a `primary` pill, as the toolbar's primary
+//!   does.
 //! - No keyboard focus: each target publishes a clickable semantics node,
 //!   which assistive technology activates as a tap.
 
@@ -204,10 +209,24 @@ enum IconFace {
 }
 
 impl IconFace {
+    /// `icon`'s face: its bytes where it has them (a symbol-with-bytes icon
+    /// included — no SF Symbols here), else its symbol's letters.
     fn of(icon: &TabIcon, decoded: &mut Decoded, previous: &Decoded) -> Self {
         match icon {
-            TabIcon::Bytes(bytes) => Self::Image(decoded.image(previous, bytes)),
+            TabIcon::Bytes(bytes) | TabIcon::AppleSymbolWithBytes { bytes, .. } => {
+                Self::Image(decoded.image(previous, bytes))
+            }
             TabIcon::AppleSymbol(name) => Self::Letters(Run::new(symbol_letters(name))),
+        }
+    }
+
+    /// The side this face paints at inside an icon box of `side`: letters
+    /// get a little more room for their circle.
+    fn painted_side(&self, side: f64) -> f64 {
+        if matches!(self, Self::Letters(_)) {
+            side + 4.0
+        } else {
+            side
         }
     }
 
@@ -233,6 +252,84 @@ impl IconFace {
                 run.paint_centered(circle, scene);
             }
         }
+    }
+}
+
+/// Shape `run` (a badge's text, `""` for a dot) and place it on `anchor`'s
+/// top-trailing corner — an icon's box, or a label's when there is no icon.
+fn place_badge(ctx: &mut LayoutCtx, run: &mut Run, style: &TextStyle, anchor: Rect) -> Rect {
+    let text = run.shape(ctx, style.clone());
+    if run.content.is_empty() {
+        Rect::from_center_size((anchor.x1, anchor.y0 + 2.0), (BADGE_DOT, BADGE_DOT))
+    } else {
+        let w = (text.width + 8.0).max(BADGE_HEIGHT);
+        let x = anchor.x1 - 6.0;
+        let y = anchor.y0 - 4.0;
+        Rect::new(x, y, x + w, y + BADGE_HEIGHT)
+    }
+}
+
+/// A badge [`place_badge`] placed at `rect` (already in scene space): an
+/// `error` pill, with its text unless it is a dot.
+fn paint_badge(run: &Run, rect: Rect, scheme: &ColorScheme, scene: &mut dyn PaintScene) {
+    scene.fill_rounded_rect(
+        rect.origin(),
+        rect.size(),
+        rect.height() / 2.0,
+        scheme.error,
+    );
+    if !run.content.is_empty() {
+        run.paint_centered(rect, scene);
+    }
+}
+
+/// The badge text style: small labels on the `error` pill.
+fn badge_style(theme: &Theme) -> TextStyle {
+    styled(&theme.type_scale.label_small, theme.scheme().on_error)
+}
+
+/// The filled `primary` pill behind an emphasised action in `slot`.
+fn emphasis_pill(slot: Rect) -> Rect {
+    let height = PRIMARY_HEIGHT.min(slot.height());
+    let width = (slot.width() - 2.0 * EDGE_PAD).max(height);
+    Rect::from_center_size(slot.center(), (width, height))
+}
+
+/// One action's badge run, with its placed rect once laid out.
+struct BadgeCell {
+    run: Run,
+    rect: Rect,
+}
+
+impl BadgeCell {
+    fn of(action: &ActionItem) -> Option<Self> {
+        action.badge.as_deref().map(|badge| Self {
+            run: Run::new(badge),
+            rect: Rect::ZERO,
+        })
+    }
+}
+
+/// The anchor a badge on `face`, drawn in `slot`, sits on.
+fn action_anchor(face: &ActionFace, slot: Rect) -> Rect {
+    match face {
+        ActionFace::Icon(_) => Rect::from_center_size(slot.center(), (ICON, ICON)),
+        ActionFace::Text(run) => Rect::from_center_size(slot.center(), run.size()),
+    }
+}
+
+/// Paint one action `face` in `rect` (scene space).
+fn paint_action(face: &ActionFace, rect: Rect, scheme: &ColorScheme, scene: &mut dyn PaintScene) {
+    match face {
+        ActionFace::Icon(icon) => {
+            let side = icon.painted_side(ICON);
+            icon.paint(
+                Rect::from_center_size(rect.center(), (side, side)),
+                scheme,
+                scene,
+            );
+        }
+        ActionFace::Text(run) => run.paint_centered(rect, scene),
     }
 }
 
@@ -390,6 +487,8 @@ enum LeadingFace {
     Back(BezPath, f64),
     Avatar(Option<ImageSource>),
     Symbol(Run),
+    /// A plain icon (`Leading::Icon`), not tappable.
+    Icon(IconFace),
 }
 
 enum ActionFace {
@@ -405,6 +504,8 @@ struct TopBarWidget {
     title: Run,
     subtitle: Option<Run>,
     actions: Vec<ActionFace>,
+    /// One per action: its badge, if it has one.
+    badges: Vec<Option<BadgeCell>>,
     /// The expanded action's menu-item runs.
     menu: Vec<Run>,
     expanded: Option<usize>,
@@ -430,6 +531,7 @@ impl TopBarWidget {
             title: Run::new(""),
             subtitle: None,
             actions: Vec::new(),
+            badges: Vec::new(),
             menu: Vec::new(),
             expanded: None,
             armed: None,
@@ -461,6 +563,9 @@ impl TopBarWidget {
             }
             Leading::Image(bytes) => LeadingFace::Avatar(self.decoded.image(&previous, bytes)),
             Leading::Symbol(name) => LeadingFace::Symbol(Run::new(name.clone())),
+            Leading::Icon(icon) => {
+                LeadingFace::Icon(IconFace::of(icon, &mut self.decoded, &previous))
+            }
         };
         self.title.set(&top.title);
         self.subtitle = top.subtitle.as_deref().map(Run::new);
@@ -472,6 +577,7 @@ impl TopBarWidget {
             });
         }
         self.actions = actions;
+        self.badges = top.actions.iter().map(BadgeCell::of).collect();
         self.spec = ChromeSpec {
             top: Some(top.clone()),
             ..ChromeSpec::default()
@@ -575,7 +681,10 @@ struct TopStyles {
     subtitle: TextStyle,
     leading: TextStyle,
     action: TextStyle,
+    /// A text action on its emphasis pill.
+    prominent: TextStyle,
     letters: TextStyle,
+    badge: TextStyle,
     menu: TextStyle,
     menu_destructive: TextStyle,
     menu_disabled: TextStyle,
@@ -594,7 +703,9 @@ impl TopStyles {
             subtitle: styled(&t.body_medium, s.on_surface_variant),
             leading: styled(&t.label_large, s.on_surface),
             action: styled(&t.label_large, s.primary),
+            prominent: styled(&t.label_large, s.on_primary),
             letters: letters_style(theme),
+            badge: badge_style(theme),
             menu: styled(&t.label_large, s.on_surface),
             menu_destructive: styled(&t.label_large, s.error),
             menu_disabled: styled(&t.label_large, with_alpha(s.on_surface, DISABLED_ALPHA)),
@@ -642,6 +753,13 @@ impl Widget for TopBarWidget {
                 x += SLOT;
                 x + EDGE_PAD
             }
+            LeadingFace::Icon(icon) => {
+                icon.shape(ctx, &styles.letters);
+                let side = icon.painted_side(ICON);
+                self.leading_rect = Rect::from_center_size(slot(x, SLOT).center(), (side, side));
+                x += SLOT;
+                x + EDGE_PAD
+            }
             LeadingFace::Symbol(run) => {
                 let size = run.shape(ctx, styles.leading.clone());
                 let origin = (x + TEXT_PAD, top + (TOP_BAR_HEIGHT - size.height) / 2.0);
@@ -655,17 +773,34 @@ impl Widget for TopBarWidget {
         let mut right = width - pad.right - EDGE_PAD;
         self.action_rects = vec![Rect::ZERO; self.actions.len()];
         for (i, face) in self.actions.iter_mut().enumerate().rev() {
+            let prominent = actions.get(i).is_some_and(|a| a.prominent);
+            let style = if prominent {
+                &styles.prominent
+            } else {
+                &styles.action
+            };
             let w = match face {
                 ActionFace::Icon(icon) => {
                     icon.shape(ctx, &styles.letters);
                     SLOT
                 }
                 ActionFace::Text(run) => {
-                    (run.shape(ctx, styles.action.clone()).width + 2.0 * TEXT_PAD).max(SLOT)
+                    (run.shape(ctx, style.clone()).width + 2.0 * TEXT_PAD).max(SLOT)
                 }
             };
             right -= w;
             self.action_rects[i] = slot(right, w);
+        }
+        for ((face, rect), badge) in self
+            .actions
+            .iter()
+            .zip(&self.action_rects)
+            .zip(&mut self.badges)
+        {
+            if let Some(badge) = badge {
+                let anchor = action_anchor(face, *rect);
+                badge.rect = place_badge(ctx, &mut badge.run, &styles.badge, anchor);
+            }
         }
         for (i, action) in actions.iter().enumerate() {
             let hit = if action.menu.is_some() {
@@ -752,6 +887,17 @@ impl Widget for TopBarWidget {
             Size::new(width, HAIRLINE),
             scheme.outline_variant,
         );
+        for (action, rect) in self.actions().iter().zip(&self.action_rects) {
+            if action.prominent {
+                let pill = emphasis_pill(at(*rect));
+                scene.fill_rounded_rect(
+                    pill.origin(),
+                    pill.size(),
+                    pill.height() / 2.0,
+                    scheme.primary,
+                );
+            }
+        }
         if let Some(target) = self.armed.and_then(|i| self.targets.get(i)) {
             pressed_layer(at(target.rect), scheme, scene);
         }
@@ -776,6 +922,7 @@ impl Widget for TopBarWidget {
                 scene.pop_clip();
             }
             LeadingFace::Symbol(run) => run.paint(leading.origin(), scene),
+            LeadingFace::Icon(icon) => icon.paint(leading, scheme, scene),
         }
 
         let title = at(self.title_rect);
@@ -788,22 +935,10 @@ impl Widget for TopBarWidget {
         scene.pop_clip();
 
         for (face, rect) in self.actions.iter().zip(&self.action_rects) {
-            let rect = at(*rect);
-            match face {
-                ActionFace::Icon(icon) => {
-                    let side = if matches!(icon, IconFace::Letters(_)) {
-                        ICON + 4.0
-                    } else {
-                        ICON
-                    };
-                    icon.paint(
-                        Rect::from_center_size(rect.center(), (side, side)),
-                        scheme,
-                        scene,
-                    );
-                }
-                ActionFace::Text(run) => run.paint_centered(rect, scene),
-            }
+            paint_action(face, at(*rect), scheme, scene);
+        }
+        for badge in self.badges.iter().flatten() {
+            paint_badge(&badge.run, at(badge.rect), scheme, scene);
         }
         for (run, rect) in self.menu.iter().zip(&self.menu_rects) {
             run.paint_centered(at(*rect), scene);
@@ -840,10 +975,20 @@ impl Widget for TopBarWidget {
                         if let Hit::Menu(i) = target.hit {
                             node.set_expanded(self.expanded == Some(i));
                         }
+                        if let Hit::Action(i) | Hit::Menu(i) = target.hit {
+                            describe_badge(node, self.actions().get(i));
+                        }
                     });
                 }
             },
         );
+    }
+}
+
+/// Publish `action`'s badge as its node's description, as a tab's is.
+fn describe_badge(node: &mut Node, action: Option<&ActionItem>) {
+    if let Some(badge) = action.and_then(|action| action.badge.as_deref()) {
+        node.set_description(badge);
     }
 }
 
@@ -876,6 +1021,8 @@ struct ToolbarRowWidget {
     generation: ChromeGeneration,
     /// One face per entry, items then the primary.
     faces: Vec<ActionFace>,
+    /// One per entry: its badge, if it has one.
+    badges: Vec<Option<BadgeCell>>,
     /// The expanded entry's menu-item runs.
     menu: Vec<Run>,
     expanded: Option<usize>,
@@ -893,6 +1040,7 @@ impl ToolbarRowWidget {
             toolbar: ToolbarSpec::default(),
             generation,
             faces: Vec::new(),
+            badges: Vec::new(),
             menu: Vec::new(),
             expanded: None,
             armed: None,
@@ -912,6 +1060,12 @@ impl ToolbarRowWidget {
         self.toolbar.primary.is_some() && index == self.toolbar.items.len()
     }
 
+    /// Whether entry `index` sits on a filled pill: the primary, or an
+    /// entry marked prominent.
+    fn is_emphasised(&self, index: usize) -> bool {
+        self.is_primary(index) || self.entry(index).is_some_and(|entry| entry.prominent)
+    }
+
     /// Take `toolbar` as the shown one, reusing decoded icons.
     fn adopt(&mut self, toolbar: &ToolbarSpec) {
         let previous = std::mem::take(&mut self.decoded);
@@ -922,6 +1076,7 @@ impl ToolbarRowWidget {
                 None => ActionFace::Text(Run::new(entry.title.clone())),
             })
             .collect();
+        self.badges = toolbar.entries().map(BadgeCell::of).collect();
         self.toolbar = toolbar.clone();
         self.expanded = self
             .expanded
@@ -1053,15 +1208,13 @@ impl Widget for ToolbarRowWidget {
             y = MENU_ROW_HEIGHT;
         }
 
-        let primary = self
-            .toolbar
-            .primary
-            .is_some()
-            .then_some(self.toolbar.items.len());
+        let emphasised: Vec<bool> = (0..self.faces.len())
+            .map(|i| self.is_emphasised(i))
+            .collect();
         let mut right = width - pad.right - EDGE_PAD;
         self.rects = vec![Rect::ZERO; self.faces.len()];
         for (i, face) in self.faces.iter_mut().enumerate().rev() {
-            let style = if primary == Some(i) {
+            let style = if emphasised[i] {
                 &primary_style
             } else {
                 &styles.action
@@ -1075,15 +1228,17 @@ impl Widget for ToolbarRowWidget {
                     (run.shape(ctx, style.clone()).width + 2.0 * TEXT_PAD).max(SLOT)
                 }
             };
-            let h = if primary == Some(i) {
-                PRIMARY_HEIGHT
-            } else {
-                SLOT
-            };
+            let h = if emphasised[i] { PRIMARY_HEIGHT } else { SLOT };
             right -= w;
             let top = y + (TOOLBAR_ROW_HEIGHT - h) / 2.0;
             self.rects[i] = Rect::new(right, top, right + w, top + h);
             right -= EDGE_PAD;
+        }
+        for ((face, rect), badge) in self.faces.iter().zip(&self.rects).zip(&mut self.badges) {
+            if let Some(badge) = badge {
+                let anchor = action_anchor(face, *rect);
+                badge.rect = place_badge(ctx, &mut badge.run, &styles.badge, anchor);
+            }
         }
         for (i, rect) in self.rects.iter().enumerate() {
             let menu = self
@@ -1124,7 +1279,7 @@ impl Widget for ToolbarRowWidget {
             scheme.outline_variant,
         );
         for (i, rect) in self.rects.iter().enumerate() {
-            if self.is_primary(i) {
+            if self.is_emphasised(i) {
                 let r = at(*rect);
                 scene.fill_rounded_rect(r.origin(), r.size(), r.height() / 2.0, scheme.primary);
             }
@@ -1133,22 +1288,10 @@ impl Widget for ToolbarRowWidget {
             pressed_layer(at(target.rect), scheme, scene);
         }
         for (face, rect) in self.faces.iter().zip(&self.rects) {
-            let rect = at(*rect);
-            match face {
-                ActionFace::Icon(icon) => {
-                    let side = if matches!(icon, IconFace::Letters(_)) {
-                        ICON + 4.0
-                    } else {
-                        ICON
-                    };
-                    icon.paint(
-                        Rect::from_center_size(rect.center(), (side, side)),
-                        scheme,
-                        scene,
-                    );
-                }
-                ActionFace::Text(run) => run.paint_centered(rect, scene),
-            }
+            paint_action(face, at(*rect), scheme, scene);
+        }
+        for badge in self.badges.iter().flatten() {
+            paint_badge(&badge.run, at(badge.rect), scheme, scene);
         }
         for (run, rect) in self.menu.iter().zip(&self.menu_rects) {
             run.paint_centered(at(*rect), scene);
@@ -1175,6 +1318,9 @@ impl Widget for ToolbarRowWidget {
                         target_node(node, origin, target, label);
                         if let Hit::Menu(i) = target.hit {
                             node.set_expanded(self.expanded == Some(i));
+                        }
+                        if let Hit::Action(i) | Hit::Menu(i) = target.hit {
+                            describe_badge(node, self.entry(i));
                         }
                     });
                 }
@@ -1346,7 +1492,7 @@ impl Widget for TabRowWidget {
             (
                 styled(&t.label_medium, s.on_surface_variant),
                 styled(&t.label_medium, s.primary),
-                styled(&t.label_small, s.on_error),
+                badge_style(theme),
                 letters_style(theme),
             )
         };
@@ -1383,17 +1529,10 @@ impl Widget for TabRowWidget {
             let anchor = cell
                 .icon_rect
                 .unwrap_or_else(|| Rect::from_origin_size(cell.title_origin, title));
-            cell.badge_rect = cell.badge.as_mut().map(|run| {
-                let text = run.shape(ctx, badge.clone());
-                if run.content.is_empty() {
-                    Rect::from_center_size((anchor.x1, anchor.y0 + 2.0), (BADGE_DOT, BADGE_DOT))
-                } else {
-                    let w = (text.width + 8.0).max(BADGE_HEIGHT);
-                    let x = anchor.x1 - 6.0;
-                    let y = anchor.y0 - 4.0;
-                    Rect::new(x, y, x + w, y + BADGE_HEIGHT)
-                }
-            });
+            cell.badge_rect = cell
+                .badge
+                .as_mut()
+                .map(|run| place_badge(ctx, run, &badge, anchor));
             self.targets.push(Target {
                 rect,
                 hit: Hit::Tab(i),
@@ -1445,16 +1584,7 @@ impl Widget for TabRowWidget {
             cell.title
                 .paint(origin + cell.title_origin.to_vec2(), scene);
             if let (Some(run), Some(rect)) = (&cell.badge, cell.badge_rect) {
-                let rect = at(rect);
-                scene.fill_rounded_rect(
-                    rect.origin(),
-                    rect.size(),
-                    rect.height() / 2.0,
-                    scheme.error,
-                );
-                if !run.content.is_empty() {
-                    run.paint_centered(rect, scene);
-                }
+                paint_badge(run, at(rect), scheme, scene);
             }
             if !cell.enabled {
                 scene.pop_layer();
@@ -2030,6 +2160,184 @@ mod tests {
         let mut state = ();
         let mut ctx = EventCtx::new(&mut state, Point::ZERO, size);
         assert_eq!(row.event(&mut ctx, &down), EventResult::Ignored);
+    }
+
+    fn top_bar(top: TopBarSpec) -> TopBarWidget {
+        let view = TopBarView {
+            top,
+            generation: ChromeGeneration(1),
+        };
+        let mut counter = 0;
+        <TopBarView as View<()>>::build(&view, &mut BuildCtx::new(&mut counter))
+    }
+
+    /// Lay `widget` out 390 px wide and paint it under the neutral theme.
+    fn lay_out_and_paint(widget: &mut dyn Widget) -> (Rec, Theme) {
+        let theme = Theme::neutral();
+        let mut text = TextContext::new();
+        let mut lctx = LayoutCtx::with_text_context(&mut text).with_theme(&theme);
+        let bc = BoxConstraints::new(Size::new(390.0, 0.0), Size::new(390.0, 400.0));
+        let size = widget.layout(&mut lctx, &bc);
+        let mut rec = Rec::default();
+        widget.paint(
+            &mut PaintCtx::new(Point::ZERO, size).with_theme(&theme),
+            &mut rec,
+        );
+        (rec, theme)
+    }
+
+    fn count_color(rec: &Rec, color: Color) -> usize {
+        rec.colors
+            .iter()
+            .filter(|seen| **seen == color.components)
+            .count()
+    }
+
+    /// A bar with a symbol action and a text action, badged as given.
+    fn badged_bar(bell: Option<&str>, mail: Option<&str>) -> TopBarSpec {
+        let badge = |action: ActionItem, badge: Option<&str>| match badge {
+            Some(badge) => action.badge(badge),
+            None => action,
+        };
+        TopBarSpec {
+            title: "Inbox".into(),
+            actions: vec![
+                badge(
+                    ActionItem::new("bell", "Bell").icon(TabIcon::AppleSymbol("bell".into())),
+                    bell,
+                ),
+                badge(ActionItem::new("mail", "Mail"), mail),
+            ],
+            ..TopBarSpec::default()
+        }
+    }
+
+    #[test]
+    fn the_top_bar_paints_an_actions_count_badge_and_dot() {
+        let mut plain = top_bar(badged_bar(None, None));
+        let (plain_rec, theme) = lay_out_and_paint(&mut plain);
+        let error = theme.scheme().error;
+        assert_eq!(count_color(&plain_rec, error), 0);
+        // Title, the bell's letter and the Mail label.
+        assert_eq!(plain_rec.glyph_runs, 3);
+
+        let mut badged = top_bar(badged_bar(Some("12"), Some("")));
+        let (rec, _) = lay_out_and_paint(&mut badged);
+        assert_eq!(count_color(&rec, error), 2, "one pill per badge");
+        assert_eq!(rec.glyph_runs, 4, "plus the count; a dot has no text");
+        let count = badged.badges[0].as_ref().expect("the bell's badge").rect;
+        let dot = badged.badges[1].as_ref().expect("the mail dot").rect;
+        assert!(count.width() >= BADGE_HEIGHT);
+        assert_eq!(dot.size(), Size::new(BADGE_DOT, BADGE_DOT));
+        let bell = badged.action_rects[0];
+        assert!(
+            count.x0 > bell.center().x && count.y0 < bell.center().y,
+            "on the icon's top-trailing corner"
+        );
+    }
+
+    #[test]
+    fn a_badge_is_its_actions_accessibility_description() {
+        let _guard = slot_test_guard();
+        let mut app = App::new(SIZES[0], Brightness::Light, WindowInsets::default()).with_toolbar(
+            ToolbarSpec::new().primary(ActionItem::new("comment", "Comment").badge("2")),
+            false,
+        );
+        app.frame();
+        let comment = app
+            .nodes(Role::Button)
+            .into_iter()
+            .find(|(_, node)| node.label() == Some("Comment"))
+            .expect("the comment button");
+        assert_eq!(comment.1.description(), Some("2"));
+        let add = app
+            .nodes(Role::Button)
+            .into_iter()
+            .find(|(_, node)| node.label() == Some("Add"))
+            .expect("the add action");
+        assert_eq!(add.1.description(), None, "no badge, no description");
+    }
+
+    #[test]
+    fn a_toolbar_entry_paints_its_badge() {
+        let toolbar = ToolbarSpec::new()
+            .item(ActionItem::new("info", "Info").badge("new"))
+            .primary(ActionItem::new("comment", "Comment"));
+        let view = ToolbarRowView {
+            toolbar,
+            generation: ChromeGeneration(1),
+        };
+        let mut counter = 0;
+        let mut row = <ToolbarRowView as View<()>>::build(&view, &mut BuildCtx::new(&mut counter));
+        let (rec, theme) = lay_out_and_paint(&mut row);
+        assert_eq!(count_color(&rec, theme.scheme().error), 1);
+        assert_eq!(rec.glyph_runs, 3, "two labels and the badge's text");
+        assert!(row.badges[0].is_some() && row.badges[1].is_none());
+    }
+
+    #[test]
+    fn a_prominent_action_sits_on_a_primary_pill() {
+        let icons = |prominent: bool| TopBarSpec {
+            title: "Inbox".into(),
+            actions: vec![
+                ActionItem::new("bell", "Bell")
+                    .icon(TabIcon::AppleSymbol("bell".into()))
+                    .prominent(prominent),
+                ActionItem::new("gear", "Gear").icon(TabIcon::AppleSymbol("gear".into())),
+            ],
+            ..TopBarSpec::default()
+        };
+        let (plain, theme) = lay_out_and_paint(&mut top_bar(icons(false)));
+        let primary = theme.scheme().primary;
+        assert_eq!(count_color(&plain, primary), 0);
+        let (shown, _) = lay_out_and_paint(&mut top_bar(icons(true)));
+        assert_eq!(count_color(&shown, primary), 1, "one pill, the bell's");
+
+        // A prominent toolbar item is emphasised like the primary.
+        let toolbar = ToolbarSpec::new()
+            .item(ActionItem::new("info", "Info").prominent(true))
+            .item(ActionItem::new("sort", "Sort"));
+        let view = ToolbarRowView {
+            toolbar,
+            generation: ChromeGeneration(1),
+        };
+        let mut counter = 0;
+        let mut row = <ToolbarRowView as View<()>>::build(&view, &mut BuildCtx::new(&mut counter));
+        lay_out_and_paint(&mut row);
+        assert!(row.is_emphasised(0) && !row.is_emphasised(1));
+        assert_eq!(row.rects[0].height(), PRIMARY_HEIGHT);
+        assert_eq!(row.rects[1].height(), SLOT);
+    }
+
+    #[test]
+    fn symbol_with_bytes_icons_draw_their_bytes() {
+        let bytes: Arc<[u8]> = Arc::from(&b"not an image"[..]);
+        let icon = TabIcon::apple_symbol_with_bytes("bell", Arc::clone(&bytes));
+        let (mut decoded, previous) = (Decoded::default(), Decoded::default());
+        assert!(matches!(
+            IconFace::of(&icon, &mut decoded, &previous),
+            IconFace::Image(None)
+        ));
+        let mut bar = top_bar(TopBarSpec {
+            title: "Inbox".into(),
+            leading: Leading::Icon(icon.clone()),
+            ..TopBarSpec::default()
+        });
+        assert!(matches!(bar.leading, LeadingFace::Icon(IconFace::Image(_))));
+        let (rec, _) = lay_out_and_paint(&mut bar);
+        assert_eq!(
+            rec.glyph_runs, 1,
+            "the title alone: no letters for these bytes"
+        );
+        assert!(bar.targets.is_empty(), "a leading icon is not tappable");
+        assert_eq!(bar.leading_rect.width(), ICON);
+        let mut symbol = top_bar(TopBarSpec {
+            title: "Inbox".into(),
+            leading: Leading::Icon(TabIcon::AppleSymbol("bell".into())),
+            ..TopBarSpec::default()
+        });
+        let (rec, _) = lay_out_and_paint(&mut symbol);
+        assert_eq!(rec.glyph_runs, 2, "the title and the symbol's letter");
     }
 
     #[test]
