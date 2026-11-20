@@ -37,7 +37,7 @@
 use std::marker::PhantomData;
 use std::rc::Rc;
 
-use frust::authoring::text::{LocaleStamp, TextContext, TextLayout, TextStyle};
+use frust::authoring::text::TextStyle;
 use frust::authoring::{
     BezPath, BoxConstraints, Brush, BuildCtx, ChangeFlags, ErasedArgCallback, EventCtx,
     EventResult, InputEvent, LayoutCtx, PaintCtx, PaintScene, Point, PointerButton, PointerEvent,
@@ -54,6 +54,7 @@ use crate::geometry::{
     smooth_area_paths, smooth_timed_area_paths, snap, snap_rule_y, timed_area_paths,
     timed_line_segments, tone_gradient,
 };
+use crate::label::Label;
 use crate::scrub::{Placement, ScrubEvent, scrub_at};
 use crate::timed::SourceShape;
 use crate::{Series, SeriesSource, Tone, YDomain};
@@ -743,77 +744,6 @@ impl LayerCache {
                 .collect();
         }
         self.key = Some(key);
-    }
-}
-
-/// The cache key behind a label's retained [`TextLayout`]: the style it was shaped at and the
-/// [`LocaleStamp`] read before shaping, so a style or default-locale change reshapes it.
-#[derive(Default)]
-struct LayoutGuard {
-    style: Option<TextStyle>,
-    stamp: LocaleStamp,
-}
-
-impl LayoutGuard {
-    fn matches(&self, style: &TextStyle) -> bool {
-        self.style.as_ref() == Some(style) && self.stamp.is_current(style.locale.as_deref())
-    }
-}
-
-/// One corner label: its text, its shaped layout and where it sits.
-struct Label {
-    text: String,
-    layout: Option<TextLayout>,
-    guard: LayoutGuard,
-    at: Point,
-}
-
-impl Label {
-    fn new(text: String) -> Self {
-        Self {
-            text,
-            layout: None,
-            guard: LayoutGuard::default(),
-            at: Point::ZERO,
-        }
-    }
-
-    /// Shape at `style`, or reuse the last shape when the style and locale are unchanged.
-    fn shape(&mut self, ctx: &mut LayoutCtx, style: &TextStyle) -> Size {
-        if let Some(layout) = &self.layout
-            && self.guard.matches(style)
-        {
-            return layout.size();
-        }
-        let stamp = LocaleStamp::for_style(style.locale.as_deref());
-        let layout = ctx
-            .text_context::<TextContext>()
-            .layout(&self.text, style, None);
-        let size = layout.size();
-        self.layout = Some(layout);
-        self.guard = LayoutGuard {
-            style: Some(style.clone()),
-            stamp,
-        };
-        size
-    }
-
-    /// The shaped size; zero before the first shape.
-    fn size(&self) -> Size {
-        self.layout.as_ref().map_or(Size::ZERO, TextLayout::size)
-    }
-
-    fn paint(&self, origin: Point, scene: &mut dyn PaintScene) {
-        self.draw(origin + self.at.to_vec2(), scene);
-    }
-
-    /// Draw the shaped text with its top-left at `at` (scene coordinates).
-    fn draw(&self, at: Point, scene: &mut dyn PaintScene) {
-        if let Some(layout) = &self.layout {
-            for run in layout.to_scene_runs(at) {
-                scene.draw_glyph_run(run);
-            }
-        }
     }
 }
 

@@ -28,11 +28,20 @@
 //! ```
 
 mod axis;
+mod bar;
+mod candlestick;
+mod categories;
+mod gauge;
 mod geometry;
 mod heat;
+mod label;
 mod meter;
+mod pie;
+mod polar;
+mod radar;
 mod samples;
 mod scale;
+mod scatter;
 mod scrub;
 mod series;
 mod sparkline;
@@ -41,6 +50,10 @@ mod timed;
 mod tone;
 
 pub use axis::{AxisSide, TickFormat, YAxis, ticks};
+pub use categories::{Categories, CategoryRow};
+pub use polar::{
+    angle_of, arc_path, normalize_angle, point_on_circle, sector_path, sweep_contains,
+};
 pub use samples::{SampleSlot, Samples};
 pub use scale::{YDomain, nice_max};
 pub use scrub::{ScrubEvent, ScrubSample};
@@ -48,8 +61,20 @@ pub use series::{Series, SlotsView};
 pub use timed::{SeriesSource, TimedSeries};
 pub use tone::Tone;
 
+#[allow(unused_imports)]
+pub use bar::*;
+#[allow(unused_imports)]
+pub use candlestick::*;
+#[allow(unused_imports)]
+pub use gauge::*;
 pub use geometry::*;
 pub use heat::*;
 pub use meter::*;
+#[allow(unused_imports)]
+pub use pie::*;
+#[allow(unused_imports)]
+pub use radar::*;
+#[allow(unused_imports)]
+pub use scatter::*;
 pub use sparkline::*;
 pub use time_series::*;
