@@ -78,10 +78,22 @@
 //! re-sent only when their bytes change ([`android_wire::IconTable`]); a
 //! toolbar entry's ride `ICON_SLOT_TOOLBAR` and, like the toolbar itself,
 //! [`ChromeField::Actions`], which already re-syncs the table. A
-//! bottom item has one icon (a tab's selected-state icon is unused), and an
-//! Apple SF Symbol has no Android rendering: a symbol tab or action shows
-//! its title alone and `Leading::Symbol` shows no leading item (limitation
-//! `native-chrome-android-bitmap-icons`). A menu item's icon is not shown.
+//! bottom item has one icon (a tab's selected-state icon is unused). An
+//! icon's bytes are a `TabIcon::Bytes` or the bytes half of a
+//! `TabIcon::AppleSymbolWithBytes`, which is how a tab, an action or a
+//! `Leading::Icon` (a plain toolbar navigation icon) shows on both phones;
+//! an Apple SF Symbol alone has no Android rendering: a symbol-only tab or
+//! action shows its title alone and `Leading::Symbol` shows no leading item
+//! (limitation `native-chrome-android-bitmap-icons`). A menu item's icon is
+//! not shown.
+//!
+//! # Badges and prominence
+//!
+//! An action's badge is a Material `BadgeDrawable` on its toolbar menu item
+//! (`BadgeUtils`), a toolbar entry's one on its floating button; a
+//! [`ChromeField::ActionBadges`] apply re-badges them in place. A prominent
+//! action is tinted with the theme's `colorPrimary` (a floating button is
+//! filled with it).
 //!
 //! # No unwind across FFI
 //!

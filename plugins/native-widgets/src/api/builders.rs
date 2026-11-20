@@ -2076,9 +2076,9 @@ impl std::fmt::Display for TabId {
     }
 }
 
-/// A tab's icon: encoded image bytes, or an Apple SF Symbol name — never an
-/// arbitrary string passed off as a cross-platform icon (the bar is
-/// iOS-only, and a symbol name means nothing anywhere else).
+/// A tab's icon: encoded image bytes, an Apple SF Symbol name, or both —
+/// never an arbitrary string passed off as a cross-platform icon (a symbol
+/// name means nothing outside Apple platforms).
 #[derive(Clone, Debug, PartialEq)]
 pub enum TabIcon {
     /// Encoded image bytes (PNG/JPEG — whatever `UIImage` decodes), shown as
@@ -2087,8 +2087,48 @@ pub enum TabIcon {
     Bytes(Arc<[u8]>),
     /// An SF Symbol name (`"house"`, `"gearshape.fill"`) —
     /// `UIImage.systemImageNamed:`, sized by the bar itself. An unknown name
-    /// shows the title alone (logged once).
+    /// shows the title alone (logged once). Apple-only: Android and the
+    /// frust-drawn chrome have no symbol by name.
     AppleSymbol(String),
+    /// An SF Symbol for Apple platforms and encoded image `bytes` (as
+    /// [`Self::Bytes`]) for the rest: the app chrome's iOS arm shows the
+    /// symbol (falling back to the bytes for a name it does not know), its
+    /// Android arm and the frust-drawn chrome the bytes. The bare
+    /// [`native_tab_bar`] is iOS-only and shows the symbol.
+    AppleSymbolWithBytes {
+        /// The SF Symbol name, as in [`Self::AppleSymbol`].
+        symbol: String,
+        /// The image every platform without SF Symbols shows.
+        bytes: Arc<[u8]>,
+    },
+}
+
+impl TabIcon {
+    /// An icon that is the SF Symbol `symbol` on Apple platforms and the
+    /// encoded image `bytes` everywhere else
+    /// ([`Self::AppleSymbolWithBytes`]).
+    pub fn apple_symbol_with_bytes(symbol: impl Into<String>, bytes: Arc<[u8]>) -> Self {
+        Self::AppleSymbolWithBytes {
+            symbol: symbol.into(),
+            bytes,
+        }
+    }
+
+    /// The SF Symbol name this icon carries, if any.
+    pub(crate) fn symbol(&self) -> Option<&str> {
+        match self {
+            Self::AppleSymbol(symbol) | Self::AppleSymbolWithBytes { symbol, .. } => Some(symbol),
+            Self::Bytes(_) => None,
+        }
+    }
+
+    /// The encoded image bytes a platform without SF Symbols shows, if any.
+    pub(crate) fn bytes(&self) -> Option<&Arc<[u8]>> {
+        match self {
+            Self::Bytes(bytes) | Self::AppleSymbolWithBytes { bytes, .. } => Some(bytes),
+            Self::AppleSymbol(_) => None,
+        }
+    }
 }
 
 /// One tab of a [`native_tab_bar`]: a stable [`TabId`], a title, an icon,
@@ -2171,13 +2211,12 @@ impl TabItem {
 /// The SF Symbol name one icon slot carries on the wire (byte icons ride
 /// the side table instead — `crate::controls::tab_bar`'s module doc).
 fn symbol_name(icon: Option<&TabIcon>) -> Option<&str> {
-    match icon {
-        Some(TabIcon::AppleSymbol(name)) => Some(name),
-        _ => None,
-    }
+    icon.and_then(TabIcon::symbol)
 }
 
-/// The encoded bytes one icon slot publishes, if it is a byte icon.
+/// The encoded bytes one icon slot publishes, if it is a byte icon. A
+/// symbol-with-bytes icon publishes none: the bar is iOS-only and shows its
+/// symbol.
 fn icon_bytes(icon: Option<&TabIcon>) -> Option<Arc<[u8]>> {
     match icon {
         Some(TabIcon::Bytes(bytes)) => Some(Arc::clone(bytes)),
@@ -3281,6 +3320,26 @@ mod tests {
         assert_eq!(props.unselected_tint, Some(dark_tokens().muted as i32));
         assert_eq!(props.background, Some(dark_tokens().surface_bg as i32));
         tab_bar::retire_icon_bytes(slot);
+    }
+
+    #[test]
+    fn a_symbol_with_bytes_icon_is_its_symbol_on_the_bare_tab_bar() {
+        let bytes: Arc<[u8]> = Arc::from(vec![4u8, 2].into_boxed_slice());
+        let icon = TabIcon::apple_symbol_with_bytes("bell", Arc::clone(&bytes));
+        assert_eq!(icon.symbol(), Some("bell"));
+        assert_eq!(icon.bytes(), Some(&bytes));
+        assert_eq!(symbol("gear").bytes(), None);
+        assert_eq!(TabIcon::Bytes(Arc::clone(&bytes)).symbol(), None);
+        let view = native_tab_bar(vec![TabItem::new("a", "A", icon)], "a");
+        assert!(
+            view.params_for(8, None, 0)
+                .contains("\"tab0Symbol\":\"bell\"")
+        );
+        assert_eq!(
+            view.icon_bytes()[0].icon,
+            None,
+            "the iOS bar shows the symbol"
+        );
     }
 
     #[test]

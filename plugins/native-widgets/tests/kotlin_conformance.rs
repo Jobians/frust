@@ -99,9 +99,12 @@
 //! copy of the header's JSON key table `src/chrome/mod.rs`'s encoder tests
 //! round-trip against is still verbatim; and
 //! [`chrome_changed_field_spellings_match_between_kotlin_and_rust`] that
-//! Kotlin's `FIELD_*` constants spell the ten `ChromeField`s exactly as
+//! Kotlin's `FIELD_*` constants spell the eleven `ChromeField`s exactly as
 //! `android_wire::field_name` does, are the only place Kotlin spells them, and
-//! that Kotlin's `INSTALL_FIELDS` names `android_wire::INSTALL_FIELDS`.
+//! that Kotlin's `INSTALL_FIELDS` names `android_wire::INSTALL_FIELDS`; and
+//! [`chrome_leading_spellings_match_between_kotlin_and_rust`] that Kotlin's
+//! `LEADING_*` constants are exactly the `leading` values
+//! `android_wire::leading_name` writes.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -970,8 +973,8 @@ fn chrome_changed_field_spellings_match_between_kotlin_and_rust() {
     let arms = rust_field_name_arms(&rust);
     assert_eq!(
         arms.len(),
-        10,
-        "{RUST_CHROME_MOD_PATH}'s field_name should spell all ten ChromeFields: {arms:?}"
+        11,
+        "{RUST_CHROME_MOD_PATH}'s field_name should spell all eleven ChromeFields: {arms:?}"
     );
     for (variant, spelling) in &arms {
         assert_eq!(
@@ -1033,5 +1036,52 @@ fn chrome_changed_field_spellings_match_between_kotlin_and_rust() {
     assert_eq!(
         kotlin_install, rust_install,
         "{KOTLIN_CHROME_PATH}'s INSTALL_FIELDS drifted from {RUST_CHROME_MOD_PATH}'s"
+    );
+}
+
+/// Every string literal in `text`, in order (no escapes in these bodies).
+fn quoted_strings(text: &str) -> Vec<String> {
+    text.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn chrome_leading_spellings_match_between_kotlin_and_rust() {
+    let kotlin = read(KOTLIN_CHROME_PATH);
+    let rust = read(RUST_CHROME_MOD_PATH);
+
+    let mut kotlin_values: Vec<String> = kotlin
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("private const val LEADING_"))
+        .filter_map(|rest| rest.split_once('=').map(|(_, value)| value))
+        .flat_map(quoted_strings)
+        .collect();
+    // `leading_name` sits inside the indented `android_wire` module.
+    let body = rust
+        .split_once("fn leading_name(")
+        .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("no `fn leading_name(` body found in {RUST_CHROME_MOD_PATH}"));
+    let mut rust_values: Vec<String> = body
+        .lines()
+        .filter(|line| line.contains("=>"))
+        .flat_map(|line| quoted_strings(line.split_once("=>").map_or("", |(_, value)| value)))
+        .collect();
+    kotlin_values.sort();
+    rust_values.sort();
+    rust_values.dedup();
+    assert_eq!(
+        kotlin_values,
+        ["back", "icon", "image", "none"],
+        "{KOTLIN_CHROME_PATH}'s LEADING_* constants"
+    );
+    assert_eq!(
+        kotlin_values, rust_values,
+        "{KOTLIN_CHROME_PATH}'s LEADING_* constants drifted from {RUST_CHROME_MOD_PATH}'s \
+         leading_name — a leading item Kotlin does not know shows nothing"
     );
 }

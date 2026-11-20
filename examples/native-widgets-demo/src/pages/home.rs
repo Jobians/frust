@@ -1,15 +1,16 @@
 //! The Home tab's root page, after the GitHub app's home: a "My Work" card of
 //! icon-tile rows that each push a [`detail`](super::detail) page, a
-//! "Favorites" card whose one control is a real native button, and a
-//! "Shortcuts" note. The body is frust, the bars are the shell's native
-//! chrome, and the button that stays put is native.
+//! "Favorites" card whose one control is a real native button, a
+//! "Notifications" card driving the bar's bell badge, and a "Shortcuts" note.
+//! The body is frust, the bars are the shell's native chrome, and the button
+//! that stays put is native.
 
 use frust::authoring::text::FontWeight;
 use frust::{
-    AnyView, Axis, Color, EdgeInsets, FlexChild, FlexView, GestureDetector, IconSource, Padding,
-    Set, Theme, View, container, divider, flexible, icon, icons, inflexible, text,
+    AnyView, Axis, Color, EdgeInsets, FlexChild, FlexView, GestureDetector, Get, IconSource,
+    Padding, Set, Theme, Update, View, container, divider, flexible, icon, icons, inflexible, text,
 };
-use frust_native_widgets::native_button;
+use frust_native_widgets::{ChromeEvent, native_button};
 
 use super::common::{S, caption, chip, gap, gap_h, page_column, readout, row, tab_body, theme};
 use super::detail;
@@ -92,6 +93,10 @@ pub fn page(state: &S) -> AnyView<S> {
         section_title("Favorites", None),
         gap(8.0),
         inflexible(card(favorites_body(state))),
+        gap(20.0),
+        section_title("Notifications", None),
+        gap(8.0),
+        inflexible(card(notifications_body(state))),
         gap(20.0),
         section_title("Shortcuts", None),
         gap(8.0),
@@ -204,4 +209,54 @@ fn favorites_body(state: &S) -> Vec<FlexChild<S>> {
                 .on_press(move || push_toast(toasts, "Favorites added".to_string())),
         ),
     ]
+}
+
+/// The Notifications card: a readout of the bell's unread count and the last
+/// chrome event (the bell's tap lands here), and frust buttons that bump and
+/// clear the count the bell is badged with. No native slot, so Home's
+/// documented at-rest count is unchanged.
+fn notifications_body(state: &S) -> Vec<FlexChild<S>> {
+    let unread = state.notifications.get();
+    let event = state.chrome_event.get();
+    vec![
+        inflexible(readout(describe_bell(unread, event.as_ref()))),
+        gap(4.0),
+        inflexible(caption(
+            "The bell in the bar is native chrome badged with this count; '+' is the \
+             prominent action.",
+        )),
+        gap(12.0),
+        inflexible(row(vec![
+            inflexible(chip("Notify", |state: &mut S| {
+                state.notifications.update(|n| *n = n.saturating_add(1));
+            })),
+            gap_h(8.0),
+            inflexible(chip("Clear", |state: &mut S| state.notifications.set(0))),
+        ])),
+    ]
+}
+
+/// The Notifications readout: `unread` and the last chrome event.
+fn describe_bell(unread: u32, event: Option<&ChromeEvent>) -> String {
+    let last = event.map_or_else(|| "(none yet)".to_string(), |event| format!("{event:?}"));
+    format!("Unread: {unread} \u{b7} last chrome event: {last}")
+}
+
+#[cfg(test)]
+mod tests {
+    use frust_native_widgets::ActionId;
+
+    use super::*;
+
+    #[test]
+    fn the_readout_names_the_count_and_the_last_event() {
+        assert_eq!(
+            describe_bell(0, None),
+            "Unread: 0 \u{b7} last chrome event: (none yet)"
+        );
+        let tapped = ChromeEvent::ActionTapped(ActionId::new("bell"));
+        let line = describe_bell(3, Some(&tapped));
+        assert!(line.starts_with("Unread: 3"), "{line}");
+        assert!(line.contains("bell"), "{line}");
+    }
 }
