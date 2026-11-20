@@ -55,6 +55,7 @@
   "android.tmpl/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml",
   "android.tmpl/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml",
   "android.tmpl/app/src/main/res/values/ic_launcher_background.xml",
+  "android.tmpl/app/src/main/res/values/themes.xml",
   "ios.tmpl/Runner.xcodeproj/project.pbxproj.tmpl",
   "ios.tmpl/Runner.xcodeproj/xcshareddata/xcschemes/Runner.xcscheme",
   "ios.tmpl/Runner/Info.plist.tmpl",

@@ -5,8 +5,8 @@
 //! Instead, a plugin's contributions are applied to an existing generated
 //! project on demand: [`add_plugin`] performs the exact edits a plugin's
 //! README documents (a Cargo.toml dependency, an Info.plist key, a Gradle
-//! library-module include, an Android manifest permission, an iOS
-//! entitlement), each **idempotent**
+//! library-module include, an Android manifest permission, the parent of the
+//! app's Android activity theme, an iOS entitlement), each **idempotent**
 //! — running it twice yields a byte-identical tree, every line item reported
 //! [`AddOutcome::AlreadyPresent`] the second time.
 //!
@@ -378,6 +378,29 @@ pub enum Contribution {
         /// A short comment written above the block.
         comment: Cow<'static, str>,
     },
+    /// The parent of the app-owned `FrustAppTheme` style in
+    /// `android/app/src/main/res/values/themes.xml` — the activity theme the
+    /// app template's `AndroidManifest.xml` names on both its `<application>`
+    /// and its `<activity>` element. For a plugin whose native controls need
+    /// a theme family the platform theme is not (Material 3).
+    ///
+    /// Satisfied — [`AddOutcome::AlreadyPresent`], nothing written — when the
+    /// style's parent already equals `parent`, or when the app has no
+    /// `FrustAppTheme` but its manifest's activity theme already names a
+    /// `Theme.Material3` or `Theme.Material3Expressive` style. A style with
+    /// another parent has only that attribute rewritten in place
+    /// ([`AddOutcome::Applied`]). An app with neither (one generated before
+    /// the template defined the style) is refused with
+    /// [`PluginAddError::AndroidAppThemeMissing`] before `add_plugin` writes
+    /// anything; an app without `android/` skips it.
+    ///
+    /// Built-in plugins only: a `'static` parent no package manifest can
+    /// spell.
+    AndroidThemeParent {
+        /// The parent style, as the `parent` attribute writes it, e.g.
+        /// `"Theme.Material3.DayNight.NoActionBar"`.
+        parent: &'static str,
+    },
     /// A macro invocation appended to the app crate's `src/lib.rs`.
     ///
     /// The escape hatch for a plugin whose platform side needs something the
@@ -538,6 +561,9 @@ impl Contribution {
             }
             Contribution::MavenRepository { url, .. } => {
                 format!("Gradle Maven repository `{url}`")
+            }
+            Contribution::AndroidThemeParent { parent } => {
+                format!("Android theme `FrustAppTheme` parent `{parent}`")
             }
             Contribution::AppCrateMacro { invocation, .. } => {
                 format!("app crate `src/lib.rs` invocation `{invocation}`")
@@ -773,6 +799,25 @@ pub enum PluginAddError {
         /// What to change, as a sentence.
         hint: &'static str,
     },
+    /// A [`Contribution::AndroidThemeParent`] found no `FrustAppTheme` style
+    /// to set the parent of, and the manifest's activity theme is not a
+    /// Material 3 one: an app generated before the template defined the
+    /// style. Raised before anything is written; the two edits that make the
+    /// app addable are named.
+    #[error(
+        "plugin `{plugin}` sets the parent of the app's `FrustAppTheme` Android style to \
+         `{parent}`, but this app has no such style. Add \
+         `<style name=\"FrustAppTheme\" parent=\"{parent}\" />` inside `<resources>` in \
+         android/app/src/main/res/values/themes.xml (create the file if it is missing), set \
+         android:theme=\"@style/FrustAppTheme\" on both the <application> and the <activity> \
+         element of android/app/src/main/AndroidManifest.xml, then re-run"
+    )]
+    AndroidAppThemeMissing {
+        /// The plugin's id.
+        plugin: Box<str>,
+        /// The parent the plugin sets.
+        parent: &'static str,
+    },
 }
 
 /// The platform a [`PluginAddError::PlatformFloorTooLow`] names.
@@ -838,6 +883,17 @@ mod tests {
             }
             .describe(),
             "iOS entitlement `aps-environment` (`CODE_SIGN_ENTITLEMENTS`)"
+        );
+    }
+
+    #[test]
+    fn android_theme_parent_describe_names_the_style_and_parent() {
+        assert_eq!(
+            Contribution::AndroidThemeParent {
+                parent: "Theme.Material3.DayNight.NoActionBar",
+            }
+            .describe(),
+            "Android theme `FrustAppTheme` parent `Theme.Material3.DayNight.NoActionBar`"
         );
     }
 

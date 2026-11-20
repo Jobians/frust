@@ -9,9 +9,9 @@
 //! registry entry to use [`Contribution::SwiftPackageRef`] — and an app-crate
 //! export shim a device gate proved necessary, see this module's `CAMERA_BASE`
 //! constant's doc comment for the full rationale), `native-widgets`
-//! (dependency plus the plugin's own Android library
-//! module — and **nothing** on iOS, which is not an omission: that arm ships
-//! zero Swift by design), `clipboard` (dependency only — plain text
+//! (dependency, the plugin's own Android library module and a Material 3
+//! parent for the app's activity theme — and **nothing** on iOS, which is
+//! not an omission: that arm ships zero Swift by design), `clipboard` (dependency only — plain text
 //! clipboard access needs no manifest permission, plist key, Gradle module,
 //! or Swift package on either mobile platform), `haptics` (dependency
 //! plus the `android.permission.VIBRATE` manifest permission — the first
@@ -58,7 +58,7 @@
 //! ported from shadcn/ui rather than authored in this repo), `beui`
 //! (dependency only, the same shape again), and
 //! `video-player` (dependency plus the plugin's own Android library
-//! module — the exact `native-widgets` two-contribution shape; no plist
+//! module — `native-widgets`' shape without its theme parent; no plist
 //! key, no manifest permission, no Swift package, no app-crate macro, and
 //! no contribution at all on macOS, whose factory self-registers into
 //! `frust_plugin::desktop` at first use — see `VIDEO_PLAYER_BASE`'s doc
@@ -231,8 +231,8 @@ const CAMERA: PluginSpec = PluginSpec {
     ..PluginSpec::DEFAULT
 };
 
-/// `native-widgets`' base contributions — deliberately just **two**, and the
-/// short list is the interesting part.
+/// `native-widgets`' base contributions — deliberately just **three**, and
+/// the short list is the interesting part.
 ///
 /// The Android half is one [`Contribution::GradleModule`]: the plugin's own
 /// `com.android.library` module carries both of its Kotlin classes
@@ -241,7 +241,12 @@ const CAMERA: PluginSpec = PluginSpec {
 /// `consumer-rules.pro`, so nothing is copied into the app and nothing can
 /// drift from the plugin it came from — the same shape secure-storage and
 /// camera already use. It needs **no** [`Contribution::ManifestPermission`]:
-/// hosting an `android.widget` view requires no permission at all.
+/// hosting an `android.widget` view requires no permission at all. The third
+/// item, a [`Contribution::AndroidThemeParent`], gives the app's
+/// `FrustAppTheme` the `Theme.Material3.DayNight.NoActionBar` parent the
+/// Material chrome, sheet, segmented and toolbar controls need (the module's
+/// `api` dependency on Material Components provides the style); under the
+/// platform theme they would fall back to frust-drawn bars.
 ///
 /// The iOS half is **empty on purpose, not by omission**. There is no
 /// [`Contribution::SwiftPackageRef`] and no `.swift` file anywhere in this
@@ -258,6 +263,9 @@ const NATIVE_WIDGETS_BASE: &[Contribution] = &[
     Contribution::GradleModule {
         gradle_name: Cow::Borrowed(":frust-native-widgets"),
         rel_path: Cow::Borrowed("plugins/native-widgets/platform/android"),
+    },
+    Contribution::AndroidThemeParent {
+        parent: "Theme.Material3.DayNight.NoActionBar",
     },
 ];
 
@@ -483,8 +491,8 @@ const IAP: PluginSpec = PluginSpec {
     ..PluginSpec::DEFAULT
 };
 
-/// `video-player`'s base contributions — the exact two-contribution shape
-/// [`NATIVE_WIDGETS_BASE`] uses: a Cargo dependency plus the plugin's own
+/// `video-player`'s base contributions — [`NATIVE_WIDGETS_BASE`]'s shape
+/// without its theme parent: a Cargo dependency plus the plugin's own
 /// Android library module, and nothing else.
 ///
 /// No [`Contribution::PlistEntry`]: video playback needs no usage-description
@@ -1760,20 +1768,21 @@ mod tests {
         );
     }
 
-    /// The `native-widgets` entry is exactly a Cargo dependency plus the
-    /// plugin's own Android library module — and the **absences** are the
-    /// assertion that matters (see `NATIVE_WIDGETS_BASE`'s doc): no
+    /// The `native-widgets` entry is exactly a Cargo dependency, the
+    /// plugin's own Android library module and a Material 3 theme parent —
+    /// and the **absences** are the assertion that matters (see
+    /// `NATIVE_WIDGETS_BASE`'s doc): no
     /// `SwiftPackageRef`, because that arm ships zero Swift by design, and no
     /// `PlistEntry`/`ManifestPermission`, because hosting an OS control needs
     /// neither. A later widening would have to come here and say why.
     #[test]
-    fn native_widgets_is_a_cargo_dep_plus_one_gradle_module_and_nothing_else() {
+    fn native_widgets_is_a_cargo_dep_one_gradle_module_and_a_theme_parent() {
         let spec = find_plugin("native-widgets").unwrap();
         assert_eq!(spec.crate_dir, "native-widgets");
         assert!(spec.optional_features.is_empty());
         assert_eq!(spec.requires_sibling, None);
 
-        assert_eq!(spec.base.len(), 2, "{:?}", spec.base);
+        assert_eq!(spec.base.len(), 3, "{:?}", spec.base);
         assert!(matches!(&spec.base[0], Contribution::CargoDep {
                 name
             } if name == "frust-native-widgets"));
@@ -1781,6 +1790,12 @@ mod tests {
                 gradle_name,
                 rel_path,
             } if gradle_name == ":frust-native-widgets" && rel_path == "plugins/native-widgets/platform/android"));
+        assert_eq!(
+            spec.base[2],
+            Contribution::AndroidThemeParent {
+                parent: "Theme.Material3.DayNight.NoActionBar",
+            }
+        );
         assert!(
             !spec
                 .base
@@ -1791,8 +1806,8 @@ mod tests {
         );
     }
 
-    /// The `video-player` entry mirrors `native-widgets`' exact
-    /// two-contribution shape (see `VIDEO_PLAYER_BASE`'s doc): a Cargo
+    /// The `video-player` entry mirrors `native-widgets`' shape without its
+    /// theme parent (see `VIDEO_PLAYER_BASE`'s doc): a Cargo
     /// dependency plus the plugin's own Android library module, and the
     /// same absences matter here too — no `SwiftPackageRef` (the Apple
     /// factories are pure-Rust `define_class!` types), no
@@ -2965,17 +2980,17 @@ mod tests {
 
     /// The `native-widgets` counterpart of the camera end-to-end case above:
     /// a fresh scaffold, `add_plugin(.., "native-widgets", ..)` applied
-    /// twice. The second apply must report `AlreadyPresent` for both
+    /// twice. The second apply must report `AlreadyPresent` for all three
     /// contributions and leave a byte-identical tree — the idempotence
     /// contract `docs/CODE_STANDARDS.md`'s Plugin Conventions requires of
     /// every generated-project mutation.
     #[test]
-    fn native_widgets_add_plugin_applies_both_contributions_and_reapply_is_idempotent() {
+    fn native_widgets_add_plugin_applies_every_contribution_and_reapply_is_idempotent() {
         let root = scaffold_project("native-widgets-idempotence");
 
         let first = add_plugin(&root, "native-widgets", &[]).unwrap();
         assert_eq!(first.plugin_id, "native-widgets");
-        assert_eq!(first.items.len(), 2, "{first:?}");
+        assert_eq!(first.items.len(), 3, "{first:?}");
         assert!(
             first.items.iter().all(|i| i.outcome == AddOutcome::Applied),
             "{first:?}"
@@ -2997,6 +3012,14 @@ mod tests {
             app_build.contains("implementation(project(\":frust-native-widgets\"))"),
             "{app_build}"
         );
+        let themes =
+            fs::read_to_string(root.join("android/app/src/main/res/values/themes.xml")).unwrap();
+        assert!(
+            themes.contains(
+                "<style name=\"FrustAppTheme\" parent=\"Theme.Material3.DayNight.NoActionBar\" />"
+            ),
+            "{themes}"
+        );
 
         // The iOS side must be untouched: no Swift package reference, no
         // plist key. A regression here would mean the entry grew a
@@ -3011,7 +3034,7 @@ mod tests {
 
         let after_first = snapshot_tree(&root);
         let second = add_plugin(&root, "native-widgets", &[]).unwrap();
-        assert_eq!(second.items.len(), 2);
+        assert_eq!(second.items.len(), 3);
         assert!(
             second
                 .items
