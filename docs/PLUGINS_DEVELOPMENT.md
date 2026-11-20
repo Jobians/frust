@@ -193,8 +193,6 @@ A gate for `frust-charts` (`plugins/charts`): open the **Charts** section of `ex
 - **Families:** the Families section below the monitoring set holds a bar chart, a donut, a gauge,
   a scatter chart, a radar chart and a candlestick chart. Each updates live (the newest candle
   keeps forming, then a new one starts), `builds:` does not advance, and `pause feed` stops them.
-  Tapping a family chart is counted by `chart taps:` too, since only the centre child of a donut or
-  gauge takes input.
 
 The device record below predates the families and does not cover them.
 

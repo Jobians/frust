@@ -5,8 +5,9 @@
 //! points bounded by a count and/or a time window, and [`Samples`] is a fixed set of current
 //! values. [`Categories`] (labelled rows of values), [`Points`] (scatter points) and
 //! [`Candles`] (a ring of open-high-low-close candles) feed the chart families. All are cheap
-//! to clone and `Send + Sync`, so a background thread writes while a chart paints. Charts repaint when a handle is written, with no rebuild and no frame loop:
-//! each write bumps the handle's revision and calls [`frust::request_repaint`] once.
+//! to clone and `Send + Sync`, so a background thread writes while a chart paints. Charts
+//! repaint when a handle is written, with no rebuild and no frame loop: each write bumps the
+//! handle's revision and calls [`frust::request_repaint`] once.
 //!
 //! Charts are display-only and tap-transparent by default, so a tap reaches whatever lies
 //! beneath. Setting `on_scrub` on a `time_series` opts in to scrubbing: its plot then handles

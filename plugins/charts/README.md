@@ -156,7 +156,11 @@ Both axes default to an automatic domain, and a point outside a domain is skippe
 ```rust
 use frust_charts::{RadarShape, RadarStyle, radar_chart};
 
-let skills = Categories::from_rows([("Speed", [70.0, 50.0]), ("Power", [40.0, 80.0])]);
+let skills = Categories::from_rows([
+    ("Speed", [70.0, 50.0]),
+    ("Power", [40.0, 80.0]),
+    ("Range", [60.0, 65.0]),              // three axes or more; fewer draws the web only
+]);
 radar_chart(skills.clone())               // each row is an axis, each value column a dataset
     .shape(RadarShape::Circle)            // the web: Polygon (default) or Circle
     .dataset_styles([RadarStyle::color(blue), RadarStyle::color(green)]);
