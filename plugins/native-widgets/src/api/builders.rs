@@ -2990,6 +2990,84 @@ mod tests {
     }
 
     #[test]
+    fn a_themed_button_restyled_away_from_plain_and_back_matches_a_fresh_one() {
+        use crate::controls::Setter;
+        use crate::controls::button::{ButtonProps, ButtonStyle, Restyle};
+        use crate::controls::typeface::Typeface;
+        // A Glyph face, so the face is a planned look field too.
+        let tokens = ResolvedTheme {
+            button_typeface: Typeface::GlyphMono,
+            ..dark_tokens()
+        };
+        let decode = |view: NativeButtonView| {
+            ButtonProps::decode(&crate::runtime::Params::new(
+                &view.params_for(7, Some(tokens)),
+            ))
+            .unwrap()
+        };
+        let plain = decode(native_button("Go"));
+        let prominent = decode(native_button("Go").style(NativeButtonStyle::Prominent));
+        let fill = plain.background_color.expect("the theme fill");
+        let radius_dp = plain.corner_radius_dp.expect("the theme radius");
+        let caption = plain.text_color.expect("the theme caption colour");
+        let size = plain.text_size_sp.expect("the theme text size");
+        let face = plain.typeface;
+        assert_eq!(face, Typeface::GlyphMono);
+        fn update<'a>(
+            old: &ButtonProps,
+            new: &'a ButtonProps,
+        ) -> (Option<Restyle>, Vec<Setter<'a>>) {
+            (
+                ButtonProps::style_change(old, new),
+                ButtonProps::plan(old, new),
+            )
+        }
+        fn fresh(props: &ButtonProps) -> (Option<Restyle>, Vec<Setter<'_>>) {
+            update(&ButtonProps::platform_default(props.slot), props)
+        }
+
+        // Plain -> Prominent: the restyle clears the theme fill, radius and
+        // caption colour; nothing re-applies them, only the size and face.
+        let (restyle, plan) = update(&plain, &prominent);
+        assert_eq!(
+            restyle,
+            Some(Restyle {
+                style: ButtonStyle::Prominent,
+                clear_background: true,
+                clear_text_color: true,
+            })
+        );
+        assert_eq!(plan, vec![Setter::TextSizeSp(size), Setter::Typeface(face)]);
+        let (fresh_restyle, fresh_plan) = fresh(&prominent);
+        assert_eq!(restyle.map(|r| r.style), fresh_restyle.map(|r| r.style));
+        assert_eq!(plan, fresh_plan[1..], "all but the caption, as on create");
+
+        // Prominent -> Plain: back to the platform's plain style, then the
+        // theme fill, radius, caption colour, size and face again.
+        let (restyle, plan) = update(&prominent, &plain);
+        assert_eq!(
+            restyle,
+            Some(Restyle {
+                style: ButtonStyle::Plain,
+                clear_background: false,
+                clear_text_color: false,
+            })
+        );
+        assert_eq!(
+            plan,
+            vec![
+                Setter::TextColor(caption),
+                Setter::ThemedBackground { fill, radius_dp },
+                Setter::TextSizeSp(size),
+                Setter::Typeface(face),
+            ]
+        );
+        let (fresh_restyle, fresh_plan) = fresh(&plain);
+        assert_eq!(fresh_restyle, None, "plain is the fresh button's style");
+        assert_eq!(plan, fresh_plan[1..], "all but the caption, as on create");
+    }
+
+    #[test]
     fn label_params_snapshot() {
         let view = native_label("42 fps");
         assert_eq!(

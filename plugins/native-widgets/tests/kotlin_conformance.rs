@@ -1208,10 +1208,20 @@ fn button_style_wire_values_match_between_kotlin_and_rust() {
         "{KOTLIN_FACTORY_PATH}'s BUTTON_STYLE_* constants drifted from {RUST_BUTTON_PATH}'s \
          ButtonStyle::wire"
     );
-    assert!(
-        kotlin.contains("buttonCreate(") && kotlin.contains("buttonSetStyle("),
-        "{KOTLIN_FACTORY_PATH} lost a button style helper the Android arm calls"
-    );
+    for helper in [
+        "buttonCreate",
+        "buttonSetStyle",
+        "buttonSetThemedBackground",
+    ] {
+        assert!(
+            kotlin.contains(&format!("fun {helper}(")),
+            "{KOTLIN_FACTORY_PATH} lost the button helper {helper} the Android arm calls"
+        );
+        assert!(
+            rust.contains(&format!("jni_str!(\"{helper}\")")),
+            "{RUST_BUTTON_PATH} no longer calls the Kotlin button helper {helper}"
+        );
+    }
     assert!(
         rust.contains("\"buttonStyle\""),
         "{RUST_BUTTON_PATH} lost the `buttonStyle` wire key"

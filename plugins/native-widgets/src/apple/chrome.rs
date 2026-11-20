@@ -1558,34 +1558,50 @@ fn bytes_image(bytes: &[u8]) -> Option<Retained<UIImage>> {
 /// text, or `""` for a dot) on `item`, or clear it for `None`. The badge is
 /// iOS 26 API (UIKit draws it in navigation bars only) that the plugin's
 /// UIKit bindings do not enable, so the class is looked up at run time and
-/// the setter is behind a `respondsToSelector` check; an older system shows
-/// no badge and says so once in the debug log.
+/// the setter and the badge class's factory are each behind a
+/// `respondsToSelector` check (the factory's on the metaclass, since it is a
+/// class method); a system missing either shows no badge and says so once in
+/// the debug log.
 fn set_badge(item: &UIBarButtonItem, badge: Option<&str>) {
     static UNSUPPORTED_LOGGED: Once = Once::new();
+    let log_unsupported = || {
+        UNSUPPORTED_LOGGED.call_once(|| {
+            log::debug!(
+                "frust-native-widgets: this system's UIBarButtonItem has no badge; chrome \
+                 action badges are not shown"
+            );
+        });
+    };
     let class = AnyClass::get(c"UIBarButtonItemBadge");
     let Some(class) = class.filter(|_| item.respondsToSelector(sel!(setBadge:))) else {
         if badge.is_some() {
-            UNSUPPORTED_LOGGED.call_once(|| {
-                log::debug!(
-                    "frust-native-widgets: this system's UIBarButtonItem has no badge; chrome \
-                     action badges are not shown"
-                );
-            });
+            log_unsupported();
         }
         return;
     };
+    let count = badge.and_then(|text| text.parse::<usize>().ok());
+    let factory = match badge {
+        None => None,
+        Some("") => Some(sel!(indicatorBadge)),
+        Some(_) if count.is_some() => Some(sel!(badgeWithCount:)),
+        Some(_) => Some(sel!(badgeWithString:)),
+    };
+    if let Some(factory) = factory
+        && !class.metaclass().responds_to(factory)
+    {
+        log_unsupported();
+        return;
+    }
     // SAFETY: `UIBarButtonItemBadge`'s class factories take an `NSUInteger`
-    // or an `NSString` and return an autoreleased badge (or nil), and
-    // `setBadge:` takes a badge or nil; `item` is a live bar item on the main
-    // thread.
+    // or an `NSString` and return an autoreleased badge (or nil), and the one
+    // sent below was just checked on the metaclass; `setBadge:` takes a badge
+    // or nil and was checked on `item`, a live bar item on the main thread.
     unsafe {
-        let value: Option<Retained<AnyObject>> = match badge {
-            None => None,
-            Some("") => msg_send![class, indicatorBadge],
-            Some(text) => match text.parse::<usize>() {
-                Ok(count) => msg_send![class, badgeWithCount: count],
-                Err(_) => msg_send![class, badgeWithString: &*NSString::from_str(text)],
-            },
+        let value: Option<Retained<AnyObject>> = match (badge, count) {
+            (None, _) => None,
+            (Some(""), _) => msg_send![class, indicatorBadge],
+            (Some(_), Some(count)) => msg_send![class, badgeWithCount: count],
+            (Some(text), None) => msg_send![class, badgeWithString: &*NSString::from_str(text)],
         };
         let _: () = msg_send![item, setBadge: value.as_deref()];
     }

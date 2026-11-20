@@ -54,9 +54,22 @@ if [ -z "$nm" ]; then
   exit 2
 fi
 
-# One path per line: the type argument naming each static's init function.
-paths=$("$nm" -C --defined-only "$lib" \
-  | grep 'sys::thread_local::os::Storage' \
+# llvm-nm runs on its own first: in the pipeline below its failure would look like "no match".
+# A library with no symbols at all (a stripped one) is an input error too, not a count of 0.
+symbols=$(mktemp)
+trap 'rm -f "$symbols"' EXIT
+if ! "$nm" -C --defined-only "$lib" >"$symbols"; then
+  echo "error: llvm-nm failed on $lib (not an object file?)" >&2
+  exit 2
+fi
+if [ ! -s "$symbols" ]; then
+  echo "error: llvm-nm found no symbols in $lib (stripped?)" >&2
+  exit 2
+fi
+
+# One path per line: the type argument naming each static's init function. Only grep's "no
+# match" can fail here, and that is a count of 0.
+paths=$(grep 'sys::thread_local::os::Storage' "$symbols" \
   | grep '__rust_std_internal_init_fn' \
   | grep -oE '::(try_initialize|get)::<.+::__rust_std_internal_init_fn>' \
   | sed -E 's/^::(try_initialize|get)::<//; s/::__rust_std_internal_init_fn>$//' \
