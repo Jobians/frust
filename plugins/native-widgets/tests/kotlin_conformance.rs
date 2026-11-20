@@ -1141,3 +1141,79 @@ fn chrome_toolbar_style_spellings_match_between_kotlin_and_rust() {
         );
     }
 }
+
+// --- the button style twins --------------------------------------------------
+
+/// `plugins/native-widgets/src/controls/button.rs`: `ButtonStyle::wire` and the
+/// `BUTTON_STYLE` key.
+const RUST_BUTTON_PATH: &str = "plugins/native-widgets/src/controls/button.rs";
+
+#[test]
+fn button_style_wire_values_match_between_kotlin_and_rust() {
+    let kotlin = read(KOTLIN_FACTORY_PATH);
+    let rust = read(RUST_BUTTON_PATH);
+
+    // `private const val BUTTON_STYLE_<NAME> = <n>`, NAME in SCREAMING_SNAKE.
+    let mut kotlin_values: Vec<(String, i64)> = kotlin
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("private const val BUTTON_STYLE_"))
+        .filter_map(|rest| rest.split_once('='))
+        .map(|(name, value)| {
+            let value = value.trim().parse().unwrap_or_else(|e| {
+                panic!("parsing BUTTON_STYLE_{name}= {value} in {KOTLIN_FACTORY_PATH}: {e}")
+            });
+            (name.trim().replace('_', "").to_lowercase(), value)
+        })
+        .collect();
+
+    // `Self::<Variant> => <n>,` inside `fn wire(`.
+    let body = rust
+        .split_once("pub(crate) fn wire(self) -> i64 {")
+        .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("no `fn wire(self) -> i64` body found in {RUST_BUTTON_PATH}"));
+    let mut rust_values: Vec<(String, i64)> = body
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("Self::"))
+        .filter_map(|rest| rest.split_once("=>"))
+        .map(|(name, value)| {
+            let value = value
+                .trim()
+                .trim_end_matches(',')
+                .parse()
+                .unwrap_or_else(|e| {
+                    panic!("parsing `{name} => {value}` in {RUST_BUTTON_PATH}: {e}")
+                });
+            (name.trim().to_lowercase(), value)
+        })
+        .collect();
+
+    kotlin_values.sort();
+    rust_values.sort();
+    assert_eq!(
+        rust_values,
+        [
+            ("destructive".to_string(), 2),
+            ("glass".to_string(), 3),
+            ("plain".to_string(), 0),
+            ("prominent".to_string(), 1),
+            ("prominentglass".to_string(), 4),
+        ],
+        "{RUST_BUTTON_PATH}'s ButtonStyle wire values are append-only"
+    );
+    assert_eq!(
+        kotlin_values, rust_values,
+        "{KOTLIN_FACTORY_PATH}'s BUTTON_STYLE_* constants drifted from {RUST_BUTTON_PATH}'s \
+         ButtonStyle::wire"
+    );
+    assert!(
+        kotlin.contains("buttonCreate(") && kotlin.contains("buttonSetStyle("),
+        "{KOTLIN_FACTORY_PATH} lost a button style helper the Android arm calls"
+    );
+    assert!(
+        rust.contains("\"buttonStyle\""),
+        "{RUST_BUTTON_PATH} lost the `buttonStyle` wire key"
+    );
+}

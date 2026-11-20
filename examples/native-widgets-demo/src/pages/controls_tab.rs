@@ -25,10 +25,15 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::Duration;
 
-use frust::{AnyView, FlexChild, Get, ScrollController, inflexible, text};
+use frust::{
+    AnyView, Axis, Component, CrossAxisAlignment, EdgeInsets, FlexChild, FlexView, Get,
+    GetUntracked, Padding, RwSignal, ScrollController, Set, SizedBox, checkbox, component,
+    inflexible, text,
+};
+use frust_native_widgets::{NativeButtonStyle, native_button};
 
 use super::common::{
-    S, accent, anchor_probe, caption, fresh_anchor_rect, fresh_body_inset, page_column,
+    S, accent, anchor_probe, caption, fresh_anchor_rect, fresh_body_inset, muted, page_column,
     page_header, tab_body, viewport_key,
 };
 use super::{SECTION_SUMMARIES, composite, controls, new_controls};
@@ -208,6 +213,143 @@ pub(super) fn scroll_on_request(
     });
 }
 
+/// The anchor-less section naming the button styles; collapsed at rest so the
+/// tab keeps its documented slot count.
+const BUTTON_STYLES_TITLE: &str = "Button styles";
+
+/// Every style, with the caption each button wears.
+const BUTTON_STYLES: [(NativeButtonStyle, &str); 5] = [
+    (NativeButtonStyle::Plain, "Plain"),
+    (NativeButtonStyle::Prominent, "Primary"),
+    (NativeButtonStyle::Destructive, "Delete"),
+    (NativeButtonStyle::Glass, "Glass"),
+    (NativeButtonStyle::ProminentGlass, "Glass+"),
+];
+
+/// The style the cycling button takes after `style`.
+fn next_style(style: NativeButtonStyle) -> NativeButtonStyle {
+    match style {
+        NativeButtonStyle::Prominent => NativeButtonStyle::Destructive,
+        NativeButtonStyle::Destructive => NativeButtonStyle::Glass,
+        NativeButtonStyle::Glass => NativeButtonStyle::ProminentGlass,
+        NativeButtonStyle::ProminentGlass => NativeButtonStyle::Plain,
+        _ => NativeButtonStyle::Prominent,
+    }
+}
+
+/// The button-style showcase: one `native_button` per [`NativeButtonStyle`],
+/// each logging its press to a readout, and one that takes the next style on
+/// every press (a style change restyles the live button, no remount).
+///
+/// A [`Component`] so its signals live in its own state; it adds six native
+/// slots while expanded, which is why it starts collapsed.
+struct ButtonStyles;
+
+struct ButtonStylesState {
+    /// Whether the six buttons are mounted.
+    expanded: RwSignal<bool>,
+    /// The readout: which button was pressed last.
+    last: RwSignal<String>,
+    /// The cycling button's current style.
+    cycled: RwSignal<NativeButtonStyle>,
+}
+
+impl Component for ButtonStyles {
+    type State = ButtonStylesState;
+
+    fn init(&self) -> ButtonStylesState {
+        ButtonStylesState {
+            expanded: RwSignal::new(false),
+            last: RwSignal::new("none yet".to_string()),
+            cycled: RwSignal::new(NativeButtonStyle::Prominent),
+        }
+    }
+
+    fn build(
+        &self,
+        state: &mut ButtonStylesState,
+    ) -> impl frust::authoring::View<ButtonStylesState> {
+        let expanded = state.expanded.get();
+        let last = state.last.get();
+        let cycled = state.cycled.get();
+        let (expanded_sig, last_sig, cycled_sig) = (state.expanded, state.last, state.cycled);
+
+        let mut children: Vec<FlexChild<ButtonStylesState>> = vec![
+            inflexible(
+                text(BUTTON_STYLES_TITLE.to_string())
+                    .size(18.0)
+                    .color(accent()),
+            ),
+            inflexible(
+                text(
+                    "One native_button per NativeButtonStyle. Expanding mounts six native \
+                 slots (five styles plus the cycling button), so it starts collapsed."
+                        .to_string(),
+                )
+                .size(11.0)
+                .color(muted()),
+            ),
+            inflexible(checkbox(
+                expanded,
+                "Show the button styles",
+                move |_: &mut ButtonStylesState, on: bool| expanded_sig.set(on),
+            )),
+        ];
+        if expanded {
+            let styled = |style: NativeButtonStyle, caption: &str| {
+                let label = caption.to_string();
+                native_button(caption)
+                    .style(style)
+                    .size(112.0, 44.0)
+                    .on_press(move || last_sig.set(format!("{label} ({style:?})")))
+            };
+            let cell = |button| inflexible(Padding(EdgeInsets::all(4.0), button));
+            let [plain, prominent, destructive, glass, prominent_glass] = BUTTON_STYLES;
+            children.push(inflexible(
+                FlexView::new(
+                    Axis::Horizontal,
+                    vec![
+                        cell(styled(plain.0, plain.1)),
+                        cell(styled(prominent.0, prominent.1)),
+                        cell(styled(destructive.0, destructive.1)),
+                    ],
+                )
+                .cross_axis(CrossAxisAlignment::Center),
+            ));
+            children.push(inflexible(
+                FlexView::new(
+                    Axis::Horizontal,
+                    vec![
+                        cell(styled(glass.0, glass.1)),
+                        cell(styled(prominent_glass.0, prominent_glass.1)),
+                        cell(
+                            native_button("Cycle")
+                                .style(cycled)
+                                .size(112.0, 44.0)
+                                .on_press(move || {
+                                    let current = cycled_sig.get_untracked();
+                                    last_sig.set(format!("Cycle ({current:?})"));
+                                    cycled_sig.set(next_style(current));
+                                }),
+                        ),
+                    ],
+                )
+                .cross_axis(CrossAxisAlignment::Center),
+            ));
+            children.push(inflexible(SizedBox(None, Some(6.0))));
+            children.push(inflexible(
+                text(format!("Last press: {last}"))
+                    .size(12.0)
+                    .color(muted()),
+            ));
+        }
+        Padding(
+            EdgeInsets::all(16.0),
+            FlexView::new(Axis::Vertical, children),
+        )
+    }
+}
+
 /// See the page-fn contract in [`crate::pages`].
 pub fn page(state: &S) -> AnyView<S> {
     scroll_on_request(state, Tab::Controls, TOP, ANCHORS);
@@ -231,6 +373,7 @@ pub fn page(state: &S) -> AnyView<S> {
                 SECTION_SUMMARIES[2],
                 new_controls::section(state),
             ),
+            inflexible(component(ButtonStyles)),
             titled(
                 composite::ANCHOR,
                 SECTION_LABELS[6],
