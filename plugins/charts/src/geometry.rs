@@ -5,7 +5,10 @@
 //! Coordinates are widget-local logical pixels, y down. Slots run oldest to newest and are
 //! right-aligned: the newest sits at the plot's right edge, so a series shorter than its
 //! capacity starts partway across. Only the newest `capacity` slots are drawn. A `None` or
-//! non-finite slot is a gap, and values are clamped to the `(min, max)` domain, which is
+//! non-finite slot is a gap. Timed points (`(t, value)`) are placed by time instead, over a
+//! [`time_span`] whose end is the newest point, at the right edge; points further apart than
+//! a threshold are a gap. Either way the line and area builders return the same shapes; block
+//! columns are offered for slots only. Values are clamped to the `(min, max)` domain, which is
 //! normalised the way [`YDomain::resolve`] normalises a fixed range (reversed is swapped,
 //! degenerate is widened). A plot with no positive, finite width and height yields empty
 //! geometry; nothing here panics or returns a non-finite coordinate.
@@ -124,15 +127,7 @@ where
     S: IntoIterator<Item = Option<f32>>,
     S::IntoIter: DoubleEndedIterator,
 {
-    let mut geometry = LineGeometry::default();
-    for run in runs(slots, capacity, domain, plot, orientation) {
-        if run.len() == 1 {
-            geometry.points.push(run[0]);
-        } else {
-            geometry.polylines.push(run);
-        }
-    }
-    geometry
+    line_from_runs(runs(slots, capacity, domain, plot, orientation))
 }
 
 /// The closed fill paths of `slots` in `plot`, oldest first.
@@ -152,31 +147,82 @@ where
     S: IntoIterator<Item = Option<f32>>,
     S::IntoIter: DoubleEndedIterator,
 {
-    let baseline = orientation.baseline(plot);
     let half = if capacity == 1 {
         plot.width() / 2.0
     } else {
         slot_spacing(capacity, plot) / 2.0
     };
-    let mut paths = Vec::new();
-    for run in runs(slots, capacity, domain, plot, orientation) {
-        let mut path = BezPath::new();
-        if let [p] = run[..] {
-            let (x0, x1) = ((p.x - half).max(plot.x0), (p.x + half).min(plot.x1));
-            path.move_to((x0, baseline));
-            path.line_to((x0, p.y));
-            path.line_to((x1, p.y));
-            path.line_to((x1, baseline));
-        } else {
-            path = polyline(&run);
-            let (first, last) = (run[0], run[run.len() - 1]);
-            path.line_to((last.x, baseline));
-            path.line_to((first.x, baseline));
-        }
-        path.close_path();
-        paths.push(path);
+    let runs = runs(slots, capacity, domain, plot, orientation);
+    area_from_runs(runs, half, plot, orientation)
+}
+
+/// The width in logical pixels of the area column an isolated timed sample fills.
+pub const TIMED_COLUMN_WIDTH: f64 = 3.0;
+
+/// The `(start, end)` time span a timed plot's x axis runs over, from the finite times in
+/// `points`: `[newest - window, newest]` with a `window` (finite and above 0), else
+/// `[oldest, newest]`. `None` when no point has a finite time.
+pub fn time_span(points: &[(f64, f32)], window: Option<f64>) -> Option<(f64, f64)> {
+    let mut times = points.iter().map(|p| p.0).filter(|t| t.is_finite());
+    let first = times.next()?;
+    let (oldest, newest) = times.fold((first, first), |(lo, hi), t| (lo.min(t), hi.max(t)));
+    match window.filter(|w| w.is_finite() && *w > 0.0) {
+        Some(window) => Some((newest - window, newest)),
+        None => Some((oldest, newest)),
     }
-    paths
+}
+
+/// The x of time `t` over `span`: `span.1` at `plot.x1` and `span.0` at `plot.x0`. An empty
+/// span (a single point) puts every time at `plot.x1`.
+pub fn x_for_time(t: f64, span: (f64, f64), plot: Rect) -> f64 {
+    let (start, end) = span;
+    let length = end - start;
+    if !(length.is_finite() && length > 0.0) {
+        return finite_or_zero(plot.x1);
+    }
+    finite_or_zero(plot.x1 - (end - t) / length * plot.width())
+}
+
+/// The line geometry of timed `points` (`(t, value)`, non-decreasing in `t`) in `plot`, each
+/// at its time over [`time_span`]`(points, window)`, so the newest sits at `plot.x1`.
+///
+/// A point outside the span, or with a non-finite time or value, is a gap. Two consecutive
+/// points more than `gap_after` seconds apart are not connected (a negative or non-finite
+/// threshold connects every pair), so a point alone between two such gaps is an isolated
+/// sample.
+pub fn timed_line_segments(
+    points: &[(f64, f32)],
+    window: Option<f64>,
+    gap_after: Option<f64>,
+    domain: (f32, f32),
+    plot: Rect,
+    orientation: Orientation,
+) -> LineGeometry {
+    line_from_runs(timed_runs(
+        points,
+        window,
+        gap_after,
+        domain,
+        plot,
+        orientation,
+    ))
+}
+
+/// The closed fill paths of timed `points` in `plot`, oldest first, with the runs of
+/// [`timed_line_segments`].
+///
+/// A run of two or more samples closes to the baseline as in [`area_paths`]; an isolated
+/// sample is a column [`TIMED_COLUMN_WIDTH`] wide, centred on it and kept inside the plot.
+pub fn timed_area_paths(
+    points: &[(f64, f32)],
+    window: Option<f64>,
+    gap_after: Option<f64>,
+    domain: (f32, f32),
+    plot: Rect,
+    orientation: Orientation,
+) -> Vec<BezPath> {
+    let runs = timed_runs(points, window, gap_after, domain, plot, orientation);
+    area_from_runs(runs, TIMED_COLUMN_WIDTH / 2.0, plot, orientation)
 }
 
 /// One block column: its rectangle and the (unclamped) sample it shows.
@@ -365,5 +411,91 @@ where
         runs.push(current);
     }
     runs.reverse();
+    runs
+}
+
+/// Split runs into a line's polylines and its isolated samples.
+fn line_from_runs(runs: Vec<Vec<Point>>) -> LineGeometry {
+    let mut geometry = LineGeometry::default();
+    for run in runs {
+        if run.len() == 1 {
+            geometry.points.push(run[0]);
+        } else {
+            geometry.polylines.push(run);
+        }
+    }
+    geometry
+}
+
+/// Close each run to the baseline: a run of two or more along its polyline, an isolated
+/// sample as a column `half` either side of it, kept inside the plot.
+fn area_from_runs(
+    runs: Vec<Vec<Point>>,
+    half: f64,
+    plot: Rect,
+    orientation: Orientation,
+) -> Vec<BezPath> {
+    let baseline = orientation.baseline(plot);
+    let mut paths = Vec::new();
+    for run in runs {
+        let mut path = BezPath::new();
+        if let [p] = run[..] {
+            let (x0, x1) = ((p.x - half).max(plot.x0), (p.x + half).min(plot.x1));
+            path.move_to((x0, baseline));
+            path.line_to((x0, p.y));
+            path.line_to((x1, p.y));
+            path.line_to((x1, baseline));
+        } else {
+            path = polyline(&run);
+            let (first, last) = (run[0], run[run.len() - 1]);
+            path.line_to((last.x, baseline));
+            path.line_to((first.x, baseline));
+        }
+        path.close_path();
+        paths.push(path);
+    }
+    paths
+}
+
+/// The runs of timed points (see [`timed_line_segments`]), oldest run first, each oldest to
+/// newest.
+fn timed_runs(
+    points: &[(f64, f32)],
+    window: Option<f64>,
+    gap_after: Option<f64>,
+    domain: (f32, f32),
+    plot: Rect,
+    orientation: Orientation,
+) -> Vec<Vec<Point>> {
+    if !usable(plot) {
+        return Vec::new();
+    }
+    let Some(span) = time_span(points, window) else {
+        return Vec::new();
+    };
+    let gap_after = gap_after.filter(|g| g.is_finite() && *g >= 0.0);
+    let map = YMap::new(domain, plot, orientation);
+    let mut runs = Vec::new();
+    let mut current: Vec<Point> = Vec::new();
+    let mut previous: Option<f64> = None;
+    for &(t, value) in points {
+        let drawn = t.is_finite() && value.is_finite() && (span.0..=span.1).contains(&t);
+        let parted = match (previous, gap_after) {
+            (Some(previous), Some(gap_after)) => t - previous > gap_after,
+            _ => false,
+        };
+        if (!drawn || parted) && !current.is_empty() {
+            runs.push(std::mem::take(&mut current));
+        }
+        if !drawn {
+            previous = None;
+            continue;
+        }
+        current.push(Point::new(x_for_time(t, span, plot), map.y(value)));
+        previous = Some(t);
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
     runs
 }

@@ -1,10 +1,12 @@
-//! The `time_series` widget: one or more [`Series`] drawn as an area, a line or block columns,
-//! sized to the box it is given.
+//! The `time_series` widget: one or more [`Series`] or [`TimedSeries`](crate::TimedSeries)
+//! drawn as an area, a line or block columns, sized to the box it is given.
 //!
 //! The widget reads its series while painting, so a push shows with no rebuild: the write
 //! requests a repaint and the next paint draws the new samples. Built paths are cached per
-//! series and rebuilt only when the series' revision, the plot size, the resolved domain or
-//! the style changed. All geometry comes from the crate's geometry functions.
+//! series and rebuilt only when the series' revision, the plot size, the resolved domain, the
+//! style or (for a timed series) the window, gap threshold or time span changed. All geometry
+//! comes from the crate's geometry functions. A [`Series`] is placed by slot and a
+//! [`TimedSeries`](crate::TimedSeries) by time, both against the same plot rect.
 //!
 //! Draw order: grid rules, then for each series (in the order given) its fill, its stroke and
 //! the dots marking isolated samples, then the axis labels, then the corner labels. Everything
@@ -38,9 +40,10 @@ use frust::{Color, Theme};
 use crate::axis::{AxisSide, YAxis, ticks};
 use crate::geometry::{
     BlockColumn, Orientation, area_paths, block_columns, grid_rule_ys, line_segments, snap,
-    snap_rule_y,
+    snap_rule_y, timed_area_paths, timed_line_segments,
 };
-use crate::{Series, Tone, YDomain};
+use crate::timed::SourceShape;
+use crate::{Series, SeriesSource, Tone, YDomain};
 
 const DEFAULT_STROKE_WIDTH: f32 = 1.5;
 const DEFAULT_HEIGHT: f64 = 56.0;
@@ -63,7 +66,8 @@ pub enum PlotStyle {
     /// A line alone; a series' fill is ignored.
     Line,
     /// One column per present sample, right-aligned, `column_width` wide with `gap` between
-    /// columns (both snapped to whole pixels).
+    /// columns (both snapped to whole pixels). A [`TimedSeries`](crate::TimedSeries) has no
+    /// columns: it draws as [`Line`](Self::Line).
     Blocks {
         /// Column width in logical pixels.
         column_width: f32,
@@ -201,6 +205,15 @@ pub fn auto_domain(series: &[&Series], domain: YDomain) -> (f32, f32) {
     domain.resolve(max)
 }
 
+/// [`auto_domain`] over sources of either kind.
+fn source_domain<'a>(
+    sources: impl Iterator<Item = &'a SeriesSource>,
+    domain: YDomain,
+) -> (f32, f32) {
+    let max = sources.filter_map(SeriesSource::max).reduce(f32::max);
+    domain.resolve(max)
+}
+
 /// Which half of a mirrored plot a series is drawn in; the whole plot when not mirrored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Half {
@@ -210,7 +223,7 @@ enum Half {
 
 #[derive(Clone, Debug)]
 struct Layer {
-    series: Series,
+    series: SeriesSource,
     style: SeriesStyle,
     half: Half,
 }
@@ -218,6 +231,15 @@ struct Layer {
 impl Layer {
     fn same(&self, other: &Self) -> bool {
         self.series.ptr_eq(&other.series) && self.style == other.style && self.half == other.half
+    }
+
+    /// How this layer draws under the plot's `style`: a timed series has no block columns,
+    /// so it falls back to a line.
+    fn style_under(&self, style: PlotStyle) -> PlotStyle {
+        match style {
+            PlotStyle::Blocks { .. } if self.series.is_timed() => PlotStyle::Line,
+            style => style,
+        }
     }
 }
 
@@ -315,11 +337,11 @@ pub fn time_series<S: 'static>() -> TimeSeriesView<S> {
 }
 
 impl<S: 'static> TimeSeriesView<S> {
-    /// Add a series; series draw in the order added, later ones on top. In a mirrored plot it
-    /// joins the upper half.
-    pub fn series(mut self, series: Series, style: SeriesStyle) -> Self {
+    /// Add a series, a [`Series`] or a [`TimedSeries`](crate::TimedSeries); series draw in the
+    /// order added, later ones on top. In a mirrored plot it joins the upper half.
+    pub fn series(mut self, series: impl Into<SeriesSource>, style: SeriesStyle) -> Self {
         self.spec.layers.push(Layer {
-            series,
+            series: series.into(),
             style,
             half: Half::Upper,
         });
@@ -328,8 +350,14 @@ impl<S: 'static> TimeSeriesView<S> {
 
     /// Split the plot at a middle axis: `upper` grows up from it and `lower` hangs down from
     /// it. Each half resolves its own domain unless [`shared_domain`](Self::shared_domain).
-    pub fn mirrored(mut self, upper: (Series, SeriesStyle), lower: (Series, SeriesStyle)) -> Self {
+    /// Either half takes a [`Series`] or a [`TimedSeries`](crate::TimedSeries).
+    pub fn mirrored(
+        mut self,
+        upper: (impl Into<SeriesSource>, SeriesStyle),
+        lower: (impl Into<SeriesSource>, SeriesStyle),
+    ) -> Self {
         self.spec.mirrored = true;
+        let (upper, lower) = ((upper.0.into(), upper.1), (lower.0.into(), lower.1));
         for ((series, style), half) in [(upper, Half::Upper), (lower, Half::Lower)] {
             self.spec.layers.push(Layer {
                 series,
@@ -456,7 +484,8 @@ impl<S: 'static> View<S> for TimeSeriesView<S> {
 #[derive(Clone, Debug, PartialEq)]
 struct CacheKey {
     revision: u64,
-    capacity: usize,
+    /// The capacity of a series, or the window, gap threshold and time span of a timed one.
+    source: SourceShape,
     plot: Rect,
     orientation: Orientation,
     domain: (f32, f32),
@@ -474,13 +503,13 @@ struct LayerCache {
 }
 
 impl LayerCache {
-    /// Rebuild the geometry of `series` unless `key` matches the last build.
-    fn refresh(&mut self, series: &Series, key: CacheKey) {
+    /// Rebuild the geometry of `source` unless `key` matches the last build. `key.style` is
+    /// the layer's own (a timed source never carries block columns).
+    fn refresh(&mut self, source: &SeriesSource, key: CacheKey) {
         if self.key.as_ref() == Some(&key) {
             return;
         }
         let CacheKey {
-            capacity,
             plot,
             orientation,
             domain,
@@ -492,32 +521,65 @@ impl LayerCache {
         self.strokes.clear();
         self.dots.clear();
         self.blocks.clear();
-        series.with_slots(|slots| match style {
-            PlotStyle::Blocks { column_width, gap } => {
-                self.blocks = block_columns(
-                    slots.iter(),
-                    capacity,
-                    f64::from(column_width),
-                    f64::from(gap),
-                    domain,
-                    plot,
-                    orientation,
-                );
+        let area = style == PlotStyle::Area;
+        let line = match source {
+            SeriesSource::Series(series) => {
+                let capacity = series.capacity();
+                series.with_slots(|slots| match style {
+                    PlotStyle::Blocks { column_width, gap } => {
+                        self.blocks = block_columns(
+                            slots.iter(),
+                            capacity,
+                            f64::from(column_width),
+                            f64::from(gap),
+                            domain,
+                            plot,
+                            orientation,
+                        );
+                        None
+                    }
+                    PlotStyle::Area | PlotStyle::Line => {
+                        if area {
+                            self.fills =
+                                area_paths(slots.iter(), capacity, domain, plot, orientation);
+                        }
+                        Some(line_segments(
+                            slots.iter(),
+                            capacity,
+                            domain,
+                            plot,
+                            orientation,
+                        ))
+                    }
+                })
             }
-            PlotStyle::Area | PlotStyle::Line => {
-                if style == PlotStyle::Area {
-                    self.fills = area_paths(slots.iter(), capacity, domain, plot, orientation);
-                }
-                let line = line_segments(slots.iter(), capacity, domain, plot, orientation);
-                self.strokes = line.paths();
-                let radius = MIN_DOT_DIAMETER.max(2.0 * f64::from(stroke_width)) / 2.0;
-                self.dots = line
-                    .points
-                    .iter()
-                    .map(|&p| Circle::new(p, radius).to_path(0.1))
-                    .collect();
+            SeriesSource::Timed(series) => {
+                let (window, gap_after) = (series.window_secs(), series.gap_after_secs());
+                series.with_points(|points| {
+                    if area {
+                        self.fills =
+                            timed_area_paths(points, window, gap_after, domain, plot, orientation);
+                    }
+                    Some(timed_line_segments(
+                        points,
+                        window,
+                        gap_after,
+                        domain,
+                        plot,
+                        orientation,
+                    ))
+                })
             }
-        });
+        };
+        if let Some(line) = line {
+            self.strokes = line.paths();
+            let radius = MIN_DOT_DIAMETER.max(2.0 * f64::from(stroke_width)) / 2.0;
+            self.dots = line
+                .points
+                .iter()
+                .map(|&p| Circle::new(p, radius).to_path(0.1))
+                .collect();
+        }
         self.key = Some(key);
     }
 }
@@ -838,14 +900,13 @@ impl TimeSeriesWidget {
     fn domains(&self) -> Domains {
         let domain = self.spec.domain;
         let of = |half: Option<Half>| {
-            let series: Vec<&Series> = self
+            let sources = self
                 .spec
                 .layers
                 .iter()
                 .filter(|l| half.is_none_or(|h| l.half == h))
-                .map(|l| &l.series)
-                .collect();
-            auto_domain(&series, domain)
+                .map(|l| &l.series);
+            source_domain(sources, domain)
         };
         if !self.spec.mirrored || self.spec.shared_domain {
             let all = of(None);
@@ -909,10 +970,11 @@ impl TimeSeriesWidget {
     ) {
         let (rect, orientation, domain) = plot;
         let layer = &self.spec.layers[index];
-        let style = self.spec.style;
+        let style = layer.style_under(self.spec.style);
+        let (revision, source) = layer.series.shape();
         let key = CacheKey {
-            revision: layer.series.revision(),
-            capacity: layer.series.capacity(),
+            revision,
+            source,
             plot: rect,
             orientation,
             domain,
@@ -1086,13 +1148,14 @@ impl Widget for TimeSeriesWidget {
 #[cfg(test)]
 mod tests {
     use super::{CacheKey, LayerCache, Orientation, PlotStyle};
-    use crate::Series;
+    use crate::{Series, SeriesSource, TimedSeries};
     use frust::authoring::Rect;
 
-    fn key(series: &Series, plot: Rect) -> CacheKey {
+    fn key(series: &SeriesSource, plot: Rect) -> CacheKey {
+        let (revision, source) = series.shape();
         CacheKey {
-            revision: series.revision(),
-            capacity: series.capacity(),
+            revision,
+            source,
             plot,
             orientation: Orientation::Upright,
             domain: (0.0, 100.0),
@@ -1103,8 +1166,9 @@ mod tests {
 
     #[test]
     fn cached_paths_are_rebuilt_only_when_an_input_changes() {
-        let series = Series::new(4);
-        series.extend([Some(10.0), Some(20.0)]);
+        let handle = Series::new(4);
+        handle.extend([Some(10.0), Some(20.0)]);
+        let series = SeriesSource::from(handle.clone());
         let plot = Rect::new(0.0, 0.0, 100.0, 50.0);
         let mut cache = LayerCache::default();
         cache.refresh(&series, key(&series, plot));
@@ -1124,8 +1188,31 @@ mod tests {
         cache.strokes.clear();
         cache.refresh(&series, key(&series, wide));
         assert!(cache.strokes.is_empty());
-        series.push(30.0);
+        handle.push(30.0);
         cache.refresh(&series, key(&series, wide));
         assert_eq!(cache.strokes.len(), 1);
+    }
+
+    #[test]
+    fn a_timed_cache_is_rebuilt_when_its_timing_changes() {
+        let handle = TimedSeries::new(8);
+        handle.extend([(0.0, 10.0), (1.0, 20.0), (5.0, 30.0)]);
+        let series = SeriesSource::from(handle.clone());
+        let plot = Rect::new(0.0, 0.0, 100.0, 50.0);
+        let mut cache = LayerCache::default();
+        cache.refresh(&series, key(&series, plot));
+        assert_eq!(cache.strokes.len(), 1);
+
+        cache.strokes.clear();
+        cache.refresh(&series, key(&series, plot));
+        assert!(cache.strokes.is_empty(), "same inputs reuse the build");
+
+        // A gap threshold splits the line: the key's timing moves and the geometry follows.
+        let before = key(&series, plot);
+        let _handle = handle.gap_after(2.0);
+        let after = key(&series, plot);
+        assert_ne!(before.source, after.source);
+        cache.refresh(&series, after);
+        assert_eq!((cache.strokes.len(), cache.dots.len()), (1, 1));
     }
 }

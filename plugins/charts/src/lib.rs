@@ -40,6 +40,7 @@ pub use axis::{AxisSide, TickFormat, YAxis, ticks};
 pub use samples::{SampleSlot, Samples};
 pub use scale::{YDomain, nice_max};
 pub use series::{Series, SlotsView};
+pub use timed::{SeriesSource, TimedSeries};
 pub use tone::Tone;
 
 pub use geometry::*;
