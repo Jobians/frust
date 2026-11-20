@@ -260,3 +260,76 @@ fn auto_range_covers_the_data_across_magnitudes() {
     }
     assert!(checked > 2000, "only {checked} pairs checked");
 }
+
+/// Asserts that `domain` resolves `(min, max)` to a usable range containing both.
+fn assert_covers(domain: YDomain, (min, max): (f32, f32)) {
+    let (lo, hi) = domain.resolve_range(Some((min, max)));
+    assert!(lo <= min && hi >= max, "({lo}, {hi}) misses ({min}, {max})");
+    assert_usable((lo, hi));
+}
+
+/// `v` moved `steps` representable `f32` values up.
+fn ulps_up(v: f32, steps: usize) -> f32 {
+    (0..steps).fold(v, |v, _| v.next_up())
+}
+
+const NICE_FROM_ANY_SPAN: YDomain = YDomain::AutoRange {
+    nice: true,
+    min_span: 0.0,
+};
+
+#[test]
+fn auto_range_covers_a_narrow_span_far_from_zero() {
+    for range in [
+        (1_500_000.0_f32 + 0.875, 1_500_004.0_f32 + 0.875),
+        (-1_500_004.0 - 0.875, -1_500_000.0 - 0.875),
+        (1.7e9 + 128.0, 1.7e9 + 1152.0),
+        (2.0e7, 2.0e7 + 8.0),
+        (14_246.115, 14_246.151),
+        (61.875_504, 61.875_587),
+        (-5.524_945, -5.524_935_7),
+    ] {
+        assert_covers(YDomain::auto(), range);
+        assert_covers(NICE_FROM_ANY_SPAN, range);
+    }
+}
+
+#[test]
+fn auto_range_covers_small_spans_at_large_offsets() {
+    let mut checked = 0;
+    for exponent in 5..=9 {
+        for mantissa in [1.0_f32, 1.5, 2.37, 4.0, 6.81, 9.99] {
+            for span in [1.0_f32, 3.0, 4.0, 8.0, 25.0, 1000.0] {
+                for offset in [0.0_f32, 0.125, 0.375, 0.875] {
+                    for sign in [1.0_f32, -1.0] {
+                        let a = sign * (mantissa * 10f32.powi(exponent) + offset);
+                        let b = a + span;
+                        if a == b {
+                            continue;
+                        }
+                        let range = (a.min(b), a.max(b));
+                        assert_covers(YDomain::auto(), range);
+                        assert_covers(NICE_FROM_ANY_SPAN, range);
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    // Pairs that collapse to one `f32` at the largest offsets are skipped above.
+    assert!(checked > 900, "only {checked} pairs checked");
+}
+
+#[test]
+fn auto_range_covers_spans_a_few_float_steps_wide() {
+    for magnitude in [1.0_f32, 61.875_5, 100.0, 14_246.115, 1.0e4, 1.0e7, 3.3e8] {
+        for sign in [1.0_f32, -1.0] {
+            for steps in [1, 2, 3, 10, 37, 100, 1000] {
+                let a = sign * magnitude;
+                let b = ulps_up(a, steps);
+                assert_covers(NICE_FROM_ANY_SPAN, (a, b));
+                assert_covers(YDomain::auto(), (a, b));
+            }
+        }
+    }
+}

@@ -143,6 +143,10 @@ fn finite_range((a, b): (f32, f32)) -> Option<(f32, f32)> {
 /// How many parts at most a nice [`YDomain::AutoRange`] step divides the data's span into.
 const RANGE_PARTS: f64 = 4.0;
 
+/// How many steps outward a nice end may walk to cover the data before the data's own ends
+/// are used instead.
+const COVER_STEPS: usize = 3;
+
 /// The [`YDomain::AutoRange`] resolution of finite, ordered `data`.
 fn auto_range(data: Option<(f32, f32)>, nice: bool, min_span: f32) -> (f32, f32) {
     let min_span = if min_span.is_finite() {
@@ -163,8 +167,9 @@ fn auto_range(data: Option<(f32, f32)>, nice: bool, min_span: f32) -> (f32, f32)
 }
 
 /// `lo..hi` widened to whole multiples of the smallest nice step at least `(hi - lo) / 4`,
-/// or `None` when the span is empty or a rounded end does not fit in `f32`. The result
-/// always covers `lo..hi` as `f32` values.
+/// or `None` when the span is empty, a rounded end does not fit in `f32`, or the step is too
+/// fine for `f32` at that magnitude to cover the data. A returned range always covers
+/// `lo..hi` as `f32` values.
 fn nice_ends(lo: f64, hi: f64) -> Option<(f32, f32)> {
     let span = hi - lo;
     if !(span.is_finite() && span > 0.0) {
@@ -173,9 +178,10 @@ fn nice_ends(lo: f64, hi: f64) -> Option<(f32, f32)> {
     let (mantissa, exponent) = nice_step(span / RANGE_PARTS)?;
     let size = mantissa * 10f64.powi(exponent);
     // The tolerance keeps an end that is a whole multiple of the step (up to the rounding of
-    // the f32 it came from) on that multiple instead of a step further out. It can also pull
-    // an end just outside a multiple onto it, so each end is checked against the data below.
-    let tolerance = |x: f64| 1e-6 * x.abs().max(1.0);
+    // the f32 it came from) on that multiple instead of a step further out. It is capped at
+    // half a step: far from zero the uncapped value would span several steps and carry an
+    // end deep into the data.
+    let tolerance = |x: f64| (1e-6 * x.abs().max(1.0)).min(0.5);
     let (first, last) = (lo / size, hi / size);
     let first = (first + tolerance(first)).floor();
     let last = (last - tolerance(last)).ceil();
@@ -190,18 +196,22 @@ fn nice_ends(lo: f64, hi: f64) -> Option<(f32, f32)> {
         };
         value as f32
     };
-    // An end the tolerance left inside the data moves one step out, so the range covers it.
+    // An end the tolerance left inside the data moves out a step at a time until the range
+    // covers it. One step is enough while a step is wider than the f32 spacing at that
+    // magnitude; when it is not, the walk gives up and the caller keeps the data's own ends.
     let (data_lo, data_hi) = (lo as f32, hi as f32);
-    let first = if value(first) > data_lo {
-        first - 1.0
-    } else {
-        first
-    };
-    let last = if value(last) < data_hi {
-        last + 1.0
-    } else {
-        last
-    };
+    let (mut first, mut last) = (first, last);
+    for _ in 0..COVER_STEPS {
+        if value(first) > data_lo {
+            first -= 1.0;
+        }
+        if value(last) < data_hi {
+            last += 1.0;
+        }
+    }
+    if value(first) > data_lo || value(last) < data_hi {
+        return None;
+    }
     let (lo, hi) = (value(first), value(last));
     (lo.is_finite() && hi.is_finite() && hi > lo).then_some((lo, hi))
 }
