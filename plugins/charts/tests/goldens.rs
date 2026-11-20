@@ -329,6 +329,34 @@ fn heat() -> CorpusCase {
     )
 }
 
+fn smooth_tone_frame() -> (&'static str, FrameSpec) {
+    case("charts-line-smooth-tone", 342.0, 56.0, 1.0)
+}
+
+fn line_smooth_tone() -> CorpusCase {
+    fn record(scene: &mut Scene) {
+        let series = Series::new(60);
+        series.extend((0..60).map(|i| match i {
+            28..=31 => None,
+            _ => Some(waveform(i, 10.0, 125.0)),
+        }));
+        record_chart(scene, &smooth_tone_frame().1, move || {
+            time_series::<()>()
+                .series(
+                    series.clone(),
+                    SeriesStyle::color(BLUE).tone_along_value(load_tone()),
+                )
+                .smooth(true)
+                .height(56.0)
+        });
+    }
+    corpus_case(
+        smooth_tone_frame(),
+        record,
+        "a smoothed area chart coloured along its value by the load tone, with one gap",
+    )
+}
+
 fn chart_cases() -> Vec<CorpusCase> {
     vec![
         area(),
@@ -339,6 +367,7 @@ fn chart_cases() -> Vec<CorpusCase> {
         meters(),
         meter_strip_case(),
         heat(),
+        line_smooth_tone(),
     ]
 }
 

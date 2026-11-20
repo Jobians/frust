@@ -18,9 +18,10 @@
 //! edges, widths and baselines are snapped, as are rule positions; line and area vertices are
 //! not, since they are antialiased curves.
 
+use frust::Color;
 use frust::authoring::{BezPath, Point, Rect};
 
-use crate::YDomain;
+use crate::{Tone, YDomain};
 
 /// Which way values grow inside a plot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -100,6 +101,14 @@ impl LineGeometry {
     pub fn paths(&self) -> Vec<BezPath> {
         self.polylines.iter().map(|run| polyline(run)).collect()
     }
+
+    /// Each polyline as a monotone smooth path (see [`smooth_polyline`]), ready to stroke.
+    pub fn smooth_paths(&self) -> Vec<BezPath> {
+        self.polylines
+            .iter()
+            .map(|run| smooth_polyline(run))
+            .collect()
+    }
 }
 
 /// An open path through `points` with straight segments; empty for no points.
@@ -113,6 +122,81 @@ pub fn polyline(points: &[Point]) -> BezPath {
         }
     }
     path
+}
+
+/// An open path through `points` that is a monotone cubic interpolation: it passes through
+/// every point and never overshoots, so between two neighbouring points its y stays within
+/// theirs. Tangents are the Fritsch-Carlson ones: the mean of the neighbouring secant slopes,
+/// zero at a local extremum or a flat step, and limited so no segment overshoots. Two points
+/// stay a straight segment, as does a pair that is not strictly left to right. Empty for no
+/// points.
+pub fn smooth_polyline(points: &[Point]) -> BezPath {
+    let mut path = BezPath::new();
+    let Some(&first) = points.first() else {
+        return path;
+    };
+    path.move_to(first);
+    if points.len() == 2 {
+        path.line_to(points[1]);
+        return path;
+    }
+    let tangents = monotone_tangents(points);
+    for (i, pair) in points.windows(2).enumerate() {
+        let (a, b) = (pair[0], pair[1]);
+        let dx = b.x - a.x;
+        if !(dx.is_finite() && dx > 0.0) {
+            path.line_to(b);
+            continue;
+        }
+        let third = dx / 3.0;
+        path.curve_to(
+            (a.x + third, a.y + tangents[i] * third),
+            (b.x - third, b.y - tangents[i + 1] * third),
+            (b.x, b.y),
+        );
+    }
+    path
+}
+
+/// The slope (dy/dx) at each point for a monotone cubic through `points`.
+fn monotone_tangents(points: &[Point]) -> Vec<f64> {
+    let n = points.len();
+    let secants: Vec<f64> = points
+        .windows(2)
+        .map(|w| {
+            let dx = w[1].x - w[0].x;
+            if dx > 0.0 {
+                (w[1].y - w[0].y) / dx
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let mut m = vec![0.0; n];
+    if n < 2 {
+        return m;
+    }
+    m[0] = secants[0];
+    m[n - 1] = secants[n - 2];
+    for k in 1..n - 1 {
+        let (a, b) = (secants[k - 1], secants[k]);
+        m[k] = if a * b <= 0.0 { 0.0 } else { (a + b) / 2.0 };
+    }
+    for (k, &d) in secants.iter().enumerate() {
+        if d == 0.0 {
+            m[k] = 0.0;
+            m[k + 1] = 0.0;
+            continue;
+        }
+        let (a, b) = (m[k] / d, m[k + 1] / d);
+        let s = a * a + b * b;
+        if s > 9.0 {
+            let tau = 3.0 / s.sqrt();
+            m[k] = tau * a * d;
+            m[k + 1] = tau * b * d;
+        }
+    }
+    m
 }
 
 /// The line geometry of `slots` (oldest to newest) in `plot`.
@@ -153,7 +237,28 @@ where
         slot_spacing(capacity, plot) / 2.0
     };
     let runs = runs(slots, capacity, domain, plot, orientation);
-    area_from_runs(runs, half, plot, orientation)
+    area_from_runs(runs, half, plot, orientation, false)
+}
+
+/// [`area_paths`] with each run's top edge a monotone smooth curve (see [`smooth_polyline`]).
+pub fn smooth_area_paths<S>(
+    slots: S,
+    capacity: usize,
+    domain: (f32, f32),
+    plot: Rect,
+    orientation: Orientation,
+) -> Vec<BezPath>
+where
+    S: IntoIterator<Item = Option<f32>>,
+    S::IntoIter: DoubleEndedIterator,
+{
+    let half = if capacity == 1 {
+        plot.width() / 2.0
+    } else {
+        slot_spacing(capacity, plot) / 2.0
+    };
+    let runs = runs(slots, capacity, domain, plot, orientation);
+    area_from_runs(runs, half, plot, orientation, true)
 }
 
 /// The width in logical pixels of the area column an isolated timed sample fills.
@@ -222,7 +327,72 @@ pub fn timed_area_paths(
     orientation: Orientation,
 ) -> Vec<BezPath> {
     let runs = timed_runs(points, window, gap_after, domain, plot, orientation);
-    area_from_runs(runs, TIMED_COLUMN_WIDTH / 2.0, plot, orientation)
+    area_from_runs(runs, TIMED_COLUMN_WIDTH / 2.0, plot, orientation, false)
+}
+
+/// [`timed_area_paths`] with each run's top edge a monotone smooth curve (see
+/// [`smooth_polyline`]).
+pub fn smooth_timed_area_paths(
+    points: &[(f64, f32)],
+    window: Option<f64>,
+    gap_after: Option<f64>,
+    domain: (f32, f32),
+    plot: Rect,
+    orientation: Orientation,
+) -> Vec<BezPath> {
+    let runs = timed_runs(points, window, gap_after, domain, plot, orientation);
+    area_from_runs(runs, TIMED_COLUMN_WIDTH / 2.0, plot, orientation, true)
+}
+
+/// The stops of a vertical gradient that colours by value through `tone`, over a half-plot
+/// `plot` whose domain is `domain`.
+///
+/// The gradient starts at the baseline (offset 0, the domain minimum) and ends at the far
+/// edge (offset 1, the domain maximum), so offsets ascend with value in either `orientation`.
+/// Each threshold is a hard edge: two stops at the same offset, the colour below it then the
+/// colour from it. A threshold outside the domain is clamped to the nearest edge; a tone with
+/// no stops is its base colour alone. Every colour's alpha is scaled by `alpha`.
+pub fn tone_gradient(
+    tone: &Tone,
+    domain: (f32, f32),
+    plot: Rect,
+    orientation: Orientation,
+    alpha: f32,
+) -> ToneGradient {
+    let baseline = orientation.baseline(plot);
+    let far = match orientation {
+        Orientation::Upright => finite_or_zero(plot.y0),
+        Orientation::Inverted => finite_or_zero(plot.y1),
+    };
+    let span = far - baseline;
+    let scale = |c: Color| c.with_alpha(c.components[3] * alpha);
+    let mut stops = vec![(0.0, scale(tone.base()))];
+    let mut previous = tone.base();
+    if span != 0.0 {
+        for &(at, color) in tone.stops() {
+            let offset = ((orientation.y_for(at, domain, plot) - baseline) / span).clamp(0.0, 1.0);
+            stops.push((offset as f32, scale(previous)));
+            stops.push((offset as f32, scale(color)));
+            previous = color;
+        }
+    }
+    stops.push((1.0, scale(previous)));
+    ToneGradient {
+        start_y: baseline,
+        end_y: far,
+        stops,
+    }
+}
+
+/// A value-keyed vertical gradient: see [`tone_gradient`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToneGradient {
+    /// The widget-local y of offset 0 (the domain minimum).
+    pub start_y: f64,
+    /// The widget-local y of offset 1 (the domain maximum).
+    pub end_y: f64,
+    /// `(offset, colour)`, offsets ascending; coincident offsets are hard edges.
+    pub stops: Vec<(f32, Color)>,
 }
 
 /// One block column: its rectangle and the (unclamped) sample it shows.
@@ -434,6 +604,7 @@ fn area_from_runs(
     half: f64,
     plot: Rect,
     orientation: Orientation,
+    smooth: bool,
 ) -> Vec<BezPath> {
     let baseline = orientation.baseline(plot);
     let mut paths = Vec::new();
@@ -446,7 +617,11 @@ fn area_from_runs(
             path.line_to((x1, p.y));
             path.line_to((x1, baseline));
         } else {
-            path = polyline(&run);
+            path = if smooth {
+                smooth_polyline(&run)
+            } else {
+                polyline(&run)
+            };
             let (first, last) = (run[0], run[run.len() - 1]);
             path.line_to((last.x, baseline));
             path.line_to((first.x, baseline));
