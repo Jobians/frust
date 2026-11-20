@@ -12,7 +12,10 @@
 //! 5. a plain labelled group (not merged) around two buttons: the group "Two actions" and
 //!    each button ("First action", "Second action") are separately reachable;
 //! 6. a `hidden(true)` wrapper around a text: nothing is announced and the text is skipped;
-//! 7. a status line showing the tap counter.
+//! 7. three sibling nodes that show how a label and a value are exposed together: a button
+//!    with a label only ("Filters, button"), a button with the label "All, 8" and the value
+//!    "Selected", and a node with the label "Volume" and the value "40 percent" and no role;
+//! 8. a status line showing the tap counter.
 
 use frust::{
     ButtonStyle, Color, EdgeInsets, GestureDetector, Get, Image, ImageFit, ImageSource, Padding,
@@ -129,6 +132,17 @@ pub fn page(state: &PlaygroundState) -> impl View<PlaygroundState> {
     let hidden = semantics(text("Decorative text, hidden from assistive technology").size(12.0))
         .hidden(true);
 
+    let label_only = semantics(tile(scheme.secondary_container, 160.0, 40.0))
+        .label("Filters")
+        .button();
+    let label_and_value = semantics(tile(scheme.secondary_container, 160.0, 40.0))
+        .label("All, 8")
+        .value("Selected")
+        .button();
+    let no_role = semantics(tile(scheme.tertiary_container, 160.0, 40.0))
+        .label("Volume")
+        .value("40 percent");
+
     Padding(
         EdgeInsets::all(16.0),
         column()
@@ -157,6 +171,17 @@ pub fn page(state: &PlaygroundState) -> impl View<PlaygroundState> {
             .child(hidden)
             .child(SizedBox(None, Some(4.0)))
             .child(caption("nothing: the text above is skipped"))
+            .child(label_only)
+            .child(SizedBox(None, Some(4.0)))
+            .child(caption("\"Filters, button\""))
+            .child(label_and_value)
+            .child(SizedBox(None, Some(4.0)))
+            .child(caption(
+                "the label \"All, 8\", the value \"Selected\" and the button role, all three",
+            ))
+            .child(no_role)
+            .child(SizedBox(None, Some(4.0)))
+            .child(caption("the label \"Volume\" and the value \"40 percent\""))
             .child(text(format!("Taps: {count}")).size(14.0)),
     )
 }

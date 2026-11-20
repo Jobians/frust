@@ -134,97 +134,78 @@ is a person-driven check:
   home bar's brand slot sits clear of the window control; full screen reads zeros.
 
 **Android: run 2026-11-12** on a Pixel 4a (Android 16), `adb`-driven with screenshots read by
-eye, against `examples/playground` built from `0f55c1af`.
-
-| Check | Result | Observed |
-|---|---|---|
-| Safe-area | pass | portrait and both landscape rotations: content clears the status bar and the display cutout on whichever side it sits; the tab bar sits above the gesture bar |
-| Keyboard | partial | the keyboard shows on focus, soft-key typing inserts at the caret, the layout returns on dismiss; **not checked:** content shifting clear of the keyboard, since no playground page has a text field near the bottom |
-| Back | pass | Tabs page pushed to depth 3: back pops 3 → 2 → 1, then leaves to the launcher at the root (back key event, not the edge gesture) |
-| Density refresh | pass | `wm density 330` then reset on the running app: the layout rescales in the same process (not a second display) |
-| Bar region | pass | no black band behind the status bar or the gesture bar in either orientation |
-
-Defects seen on this run (open): after the keyboard is dismissed with back, a tap on the same
-still-focused field does not reopen it until focus has moved away; `adb shell input text` inserts
-nothing into a focused field; the density change put the playground back on its first page.
+eye, against `examples/playground` built from `0f55c1af`. Safe-area (portrait and both landscape
+rotations clear the status bar and cutout; the tab bar sits above the gesture bar), back (Tabs page
+at depth 3 pops 3 → 2 → 1, then leaves to the launcher), density refresh (`wm density 330` rescales
+in the same process) and bar region pass. Keyboard is partial: it shows on focus, soft-key typing
+inserts at the caret and the layout returns on dismiss; **not checked:** content shifting clear of
+the keyboard, since no playground page had a text field near the bottom. Defects seen on this run
+(open): after the keyboard is dismissed with back, a tap on the same still-focused field does not
+reopen it until focus has moved away; `adb shell input text` inserts nothing into a focused field;
+the density change put the playground back on its first page.
 
 **Android: re-run 2026-11-12 on the Forms page** on the same Pixel 4a (Android 16), `adb`-driven
-with screenshots read by eye, against `examples/playground` built from `bc46fc9b`. The keyboard
-state is read from `dumpsys input_method` (`mInputShown`).
-
-| Check | Result | Observed |
-|---|---|---|
-| Keyboard reopen | pass | field A: tap shows the keyboard, back hides it, a second tap on the still-focused field shows it again (twice in a row); the same on the obscured field C; a tap on a caption does not raise it, and (re-checked on the build from `b9f2e896`) a scroll after back leaves it hidden. The reopen leg alone also passes on a OnePlus 9 (Android 15) |
-| Keyboard over the bottom field | **fail** | field D, the last row, scrolled to the end and tapped: the keyboard shows and the tab bar hides, but the page does not scroll and D stays under the keyboard; a scroll drag with the keyboard up hides the keyboard instead of revealing D. The layout returns on dismiss |
-| Back | pass | full-width navigator pushed to depth 3: the back key pops 3 → 2, the back gesture from the left edge pops 2 → 1, and back at the root leaves to the launcher |
-
-Not run on this pass: moving focus with the keyboard's Return or Next key (the Forms page has no
-way to move focus from app code, so Return only counts a press) and typing with a composing
-keyboard.
+with screenshots read by eye, against `examples/playground` built from `bc46fc9b`; the keyboard
+state is read from `dumpsys input_method` (`mInputShown`). Keyboard reopen passes (fields A and C:
+tap, back, tap again shows it; a caption tap does not raise it; on the build from `b9f2e896` a
+scroll after back leaves it hidden; the reopen leg also passes on a OnePlus 9, Android 15), and back
+passes (depth 3: the back key pops 3 → 2, the left-edge gesture 2 → 1, back at the root leaves to
+the launcher). **Fail:** keyboard over the bottom field: field D scrolled to the end and tapped, the
+keyboard shows and the tab bar hides, but the page does not scroll and D stays under the keyboard; a
+scroll drag with the keyboard up hides the keyboard instead of revealing D; the layout returns on
+dismiss. Not run: moving focus with Return or Next (the page cannot move focus from app code, so
+Return only counts a press) and typing with a composing keyboard.
 
 **Android: re-run 2026-11-12 after the keyboard edge and the caret reveal** on the same Pixel 4a
-(Android 16), against `examples/playground` built from `ae10e573`, Forms page.
-
-| Check | Result | Observed |
-|---|---|---|
-| Keyboard over the bottom field | pass | field D scrolled to the end and tapped: the keyboard shows, the page body ends at the top of the tab bar, which sits directly above the keyboard, and D with its caption and caret is visible above it; the content moves up, not down. Text typed on the on-screen keyboard appears in D. Dismissing returns the layout, still scrolled to the end |
-| Scroll while typing | pass | with D focused and the keyboard up, a drag scrolls the page, the keyboard stays up, and D is not pulled back into view afterwards. On that build keys typed after the drag did not reach the field; re-checked on the build from `82c88a60`: after an upward drag that starts on a caption the field keeps focus and the next keys land in it |
-| Drag to dismiss | pass | build from `82c88a60`, where the page scroll view opts in: a downward drag that starts on a caption hides the keyboard and ends the field's focus; an upward drag does not |
-| Keyboard reopen | pass | field A: tap, back, tap again shows the keyboard; a tap on a caption does not |
-| Back | pass | depth 3: the back key pops 3 → 2 and the back gesture 2 → 1 |
-| Password field in the accessibility tree | pass | three characters typed in field C: the node's text is three bullets, `password="true"`, named "Field C"; the typed text is not in the dump |
+(Android 16), against `examples/playground` built from `ae10e573`, Forms page; all checks pass:
+field D sits above the keyboard with its caption and caret, the content moving up, typed text
+appears and dismissing keeps the scroll; with D focused a drag scrolls and keeps the keyboard (on
+that build later keys did not reach the field; on `82c88a60` they do, and a downward drag from a
+caption dismisses, an upward one does not); keyboard reopen and back (key 3 → 2, gesture 2 → 1)
+pass; field C with three characters typed reports three bullets, `password="true"` and the name
+"Field C", without the typed text.
 
 **iOS: run 2026-11-12, does not pass** on an iPhone 13 mini (iOS 27.2), XCUITest-driven with the
-hand-run legs noted, against `examples/playground` built from `355d6f1a` with Xcode 27.0. The
-active keyboard was a third-party one, not the system keyboard.
-
-| Check | Result | Observed |
-|---|---|---|
-| Safe-area | pass | portrait and landscape-left: content clears the notch and the home indicator, and the layout switches to the side rail in landscape; landscape-right not tried |
-| Keyboard | partial | focus raises the keyboard and dismissing it restores the layout; **not checked:** content shifting clear of the keyboard (no field near the bottom of a page) |
-| Back | **fail** | Tabs page pushed to depth 3: four synthetic edge drags and a hand-run edge swipe left the depth at 3; the root-level leg was not reached |
-| Density refresh | not run | no external display |
-| Text input | partial | the Swift half builds, links and runs; typing reaches the field; autocorrect and dictation work (hand-run); a re-tap on a field brings back a dismissed keyboard; **not run:** IME composition, a password-classified field, a direct field-to-field focus move |
-
-The back failure is not yet attributed: the Tabs navigators sit 16 pt in from the screen edge and
-the edge-swipe arms only near the navigator's own left edge, so the fixture's geometry and a real
-defect are not told apart. The playground needs four fixtures before this gate can pass in full: a
-field near the bottom of a page, a password field, two fields on one page, and a pushed route in a
-full-width navigator.
+hand-run legs noted, against `examples/playground` built from `355d6f1a` with Xcode 27.0 and a
+third-party keyboard. Safe-area passes (portrait and landscape-left clear the notch and home
+indicator, the layout switches to the side rail; landscape-right not tried). Keyboard is partial
+(focus raises it, dismissing restores the layout; **not checked:** content clearing the keyboard, no
+field near the bottom of a page). **Back fails:** Tabs page at depth 3, four synthetic edge drags
+and a hand-run edge swipe left the depth at 3; the root leg was not reached. Density refresh not run
+(no external display). Text input is partial: the Swift half builds, links and runs; typing reaches
+the field; autocorrect and dictation work (hand-run); a re-tap brings back a dismissed keyboard;
+**not run:** IME composition, a password-classified field, a direct field-to-field focus move. The
+back failure is not yet attributed: the Tabs navigators sit 16 pt in from the screen edge and the
+edge swipe arms only near the navigator's own left edge, so the fixture's geometry and a real defect
+are not told apart.
 
 **iOS: re-run 2026-11-12 on the Forms page, does not pass** on the same iPhone 13 mini (iOS 27.2),
-against `examples/playground` built from `f36a8cbd`, with the Apple keyboard. Every leg is
-XCUITest-driven (synthetic touches and the accessibility snapshot); none was run by hand.
-
-| Check | Result | Observed |
-|---|---|---|
-| Keyboard over the bottom field | **fail** | field D, the last row, scrolled to the end and tapped: the keyboard shows and D ends up 171 pt below the keyboard's top edge; the content moves 34 pt down on focus, not up. Seen twice from a clean launch |
-| Keyboard reopen | pass | a drag dismisses the keyboard, it stays down, and a tap on the same field brings it back |
-| Back | pass | full-width navigator at depth 3: two edge drags from x = 3 and x = 1 pop to depth 1. Tabs page (navigators inset 16 pt): drags starting at x = 18 and x = 24 pop one level each when they start within the navigator's height; a start at x = 14, x = 40 or x = 3 does not |
-| Text input | partial | typed in A, tapped B, typed one character: B holds only that character and A keeps its text. Field C draws dots, Dictate is disabled and the keyboard is left out of screenshots; whether the suggestion bar is empty was not seen. **Not run:** IME composition, Return or Next between fields |
-
-The earlier back failure is explained for the synthetic drags: they started below the Tabs
-navigator, whose hit area ends at the bottom of its short content, so no press reached it. The
-hand-run failure of that pass has not been repeated or explained; a hand swipe low on that page
-would fail the same way.
+against `examples/playground` built from `f36a8cbd`, with the Apple keyboard; every leg
+XCUITest-driven, none by hand. **Fail:** keyboard over the bottom field: field D scrolled to the end
+and tapped, the keyboard shows and D ends 171 pt below the keyboard's top edge; the content moves
+34 pt down on focus, not up (seen twice from a clean launch). Keyboard reopen passes (a drag
+dismisses, a tap brings it back). Back passes: full-width navigator at depth 3, edge drags from
+x = 3 and x = 1 pop to depth 1; on the Tabs page (navigators inset 16 pt) drags starting at x = 18
+and x = 24 pop one level when they start within the navigator's height, starts at x = 14, 40 or 3
+do not. Text input is partial: typed in A, tapped B, typed one character, B holds only that and A
+keeps its text; field C draws dots, Dictate is disabled, the keyboard is left out of screenshots;
+the suggestion bar was not seen; **not run:** IME composition, Return or Next between fields. The
+earlier back failure is explained for the synthetic drags: they started below the Tabs navigator,
+whose hit area ends at the bottom of its short content. The hand-run failure of that pass has not
+been repeated or explained; a hand swipe low on that page would fail the same way.
 
 **iOS: re-run 2026-11-12 after the keyboard edge, the caret reveal and the accessibility fix** on
-the same iPhone 13 mini (iOS 27.2), against `examples/playground` built from `26a3dfb7`, Forms
-page, XCUITest-driven; nothing by hand.
-
-| Check | Result | Observed |
-|---|---|---|
-| Keyboard over the bottom field | pass | field D scrolled to the end and tapped: D ends 89 pt above the top of the keyboard, the tab bar sits directly above the keyboard, and the content moves up by 245 pt. Text typed in D appears |
-| Scroll while typing | **fail on this build**, pass on the re-run | a drag with the keyboard up scrolls the page and keeps the keyboard, and D is not pulled back; but keys typed after the drag did not reach the field and it drew the unfocused border. Fixed after this build. Re-run on the build from `1799e148`: with `abc` typed in D, an upward drag that starts on a filler row keeps the keyboard, and the next typed character appends (`abcx`) and brings D back into view |
-| Password field in the accessibility tree | pass | with `pw1` typed in field C the full-screen text-input view has no value, `pw1` is nowhere in the snapshot, and the field's own element shows three bullets; the same view has no value with a normal field focused. The fields carry their placeholders as names. Dictate is disabled and the keyboard is left out of screenshots with C focused |
-| Dismiss | pass | a tap on a caption hides the keyboard and the layout returns. No swipe dismissed the keyboard on this build (a drag no longer blurs). Re-run on the build from `1799e148`, where the page scroll view opts into drag-to-dismiss: a downward drag that starts on a filler row hides the keyboard and the layout returns; a downward drag that starts on the focused field dismisses too; an upward drag from either place keeps the keyboard |
-| Back | pass | full-width navigator at depth 3: an edge drag pops 3 → 2, another 2 → 1 |
-| Text input | pass | typed in A, tapped B, typed one character: B holds only that character. **Not verified:** autocorrect (synthetic typing bypasses it), composition |
-
-The `1799e148` re-run repeated the other rows with the same results (field above the keyboard,
-the password field's accessibility value, back, two-field input). One thing it showed outside the
-checks: a scroll drag that begins on an unfocused text field focuses that field, the keyboard
-opens, and the field can end below the shrunken page body until a key is typed.
+the same iPhone 13 mini (iOS 27.2), against `examples/playground` built from `26a3dfb7`, Forms page,
+XCUITest-driven; nothing by hand. Pass: field D ends 89 pt above the keyboard (tab bar directly
+above it, content up 245 pt) and typed text appears; field C with `pw1` typed exposes no value
+anywhere, shows three bullets, disables Dictate and is left out of screenshots; a caption tap
+dismisses; back pops 3 → 2 → 1 by edge drags; two-field input lands in B only (**not verified:**
+autocorrect, composition). **Scroll while typing failed on this build, passes on `1799e148`:** keys
+typed after a drag did not reach the field and it drew the unfocused border; on `1799e148` an upward
+drag from a filler row keeps the keyboard and the next character appends (`abcx`), and a downward
+drag from a filler row or the focused field dismisses. Outside the checks: a scroll drag that begins
+on an unfocused text field focuses it, the keyboard opens, and the field can end below the shrunken
+page body until a key is typed.
 
 ## Clipboard manual test (Android + iOS)
 
@@ -308,6 +289,27 @@ Xiaomi 12 not run) — same checklist. **Desktop: not run yet.**
   the primary button. macOS additionally: a two-finger trackpad pinch zooms the graph (winit's
   `PinchGesture`); Linux/Windows have no trackpad-pinch source yet (`desktop-pinch-linux-windows-unavailable`
   in [LIMITATIONS.md](LIMITATIONS.md)) — ctrl/⌘+wheel is the only route there.
+
+## Text field focus, composition and long-press drag manual test (Android + iOS + macOS)
+
+Run 2026-11-19/20 on `examples/playground`'s Forms page (steps in its README) built from `02cbcd005`:
+Android on a Pixel 5 (Android 14), `adb`-driven; iOS on an iPhone 13 mini (iOS 27.2, Xcode 27.0),
+XCUITest-driven, Gboard and the Apple Japanese keyboard; macOS 27.0.1 in a desktop window, synthetic
+mouse and keys. Results read from the page's status block, dumps and screenshots.
+
+| Step | Result |
+|---|---|
+| 1 Autofocus | Android PASS; iOS PASS; macOS PASS: one tap focuses the field, the phone keyboard is up at once |
+| 2 Programmatic focus | Android PASS; iOS PASS; macOS PASS: Focus field expands the collapsed bar and focuses it (an open, unfocused bar cannot exist: blur collapses it) |
+| 3 Keep focus | Android PASS; iOS PASS; macOS PASS: X empties the field, focus, caret and keyboard stay; the status block's last change keeps the cleared text |
+| 4 Focus callback | Android PASS; iOS PASS; macOS PASS: a tap outside collapses the bar, focused: no |
+| 5 Composition | Android PASS (Gboard Japanese, `adb` key events and taps on its action key): preedit reads composing yes, Enter or the action key commits with no submit, the next one submits once. iOS **FAIL**: the ✓ key commits the preedit with no submit, but the next Return, and Return or Done after plain text with Japanese or English Gboard, inserts a line break into the single-line field and nothing is submitted. Neither phone draws an underline under the preedit. macOS NOT RUN: no Japanese input source on the Mac |
+| 6 Single-line overflow | Android PASS; iOS PASS; macOS PASS: the long text is clipped and scrolled to the caret, nothing draws over the X, a tap or click puts the caret at that character boundary. The long placeholder is never on screen: a placeholder draws only while empty and unfocused, and the bar is open only while focused. macOS: the first keystroke scrolled the page about 230 pt to the field although it was in view |
+| 7 Long-press drag | Android PASS; iOS PASS; macOS PASS: a quick drag scrolls the grid and selects nothing; press, hold, drag across and down extends the selection without scrolling the grid; release keeps it; a new press starts fresh. Android: the status line wrapped mid-drag and moved the grid a few points. macOS: a quick drag also moved the page about 17 pt |
+| 8 Photo size | Android and iOS: the Picker line shows the copied file's size on both (2,872,807 and 8,452,291 bytes). NOT RUN for the library asset's size (expected on Android, none on iOS): no playground page shows it |
+| 9 iPhone console | iOS PASS: `frust run -d <iPhone>` printed the app's log lines while it ran |
+| 10 Apple compile checks | PASS: `cargo clippy -p <pkg> --target aarch64-apple-ios-sim -- -D warnings` for frust-core, frust-widgets, frust-ui and frust-photo-library, and `cargo check -p <pkg> --target aarch64-apple-ios` for frust-beui, frust-shadcn and frust-material all exit 0 (Cargo prints unused-dependency warnings only) |
+| 11 Android accessibility | Pixel 5, Android 14, playground A11y page, TalkBack touched by hand. Before: `uiautomator` shows each label in `content-desc` and each value in `text` (button "All, 8" / "Selected", role-less "Volume" / "40 percent"), and TalkBack drops the value: "Filters, Button. Double tap to activate", "All 8, button. Double tap to activate", "Volume". Fixed by the vendored delegate moving a non-editable node's value into its state description (API 30+). After: "80% battery", "filters, button. double tap to activate", "Selected, All, 8, double tap to activate", "40%, Volume"; the value now comes first, "button" was not heard on the "All, 8" node and the merged cell's hint was not heard |
 
 ## Per-OS desktop shell gate (macOS + Windows + Linux)
 

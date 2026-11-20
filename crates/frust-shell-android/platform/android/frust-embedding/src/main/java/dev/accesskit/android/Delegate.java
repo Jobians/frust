@@ -3,8 +3,9 @@
 // the LICENSE-APACHE file) or the MIT license (found in
 // the LICENSE-MIT file), at your option.
 //
-// Vendored from accesskit_android 0.9.1's `java/` directory with one frust
-// patch, `labelAsText` below (marked "frust patch"); the rest is verbatim. The
+// Vendored from accesskit_android 0.9.1's `java/` directory with two frust
+// patches, `labelAsText` and `valueAsState` below (marked "frust patch"); the
+// rest is verbatim. The
 // `frust-shell-android` crate's `InjectingAdapter` locates this
 // class at runtime via `env.find_class("dev/accesskit/android/Delegate")` and
 // registers its native methods dynamically, so the package and class name
@@ -18,6 +19,7 @@
 
 package dev.accesskit.android;
 
+import android.os.Build;
 import android.os.Bundle;
 import android.view.MotionEvent;
 import android.view.View;
@@ -76,18 +78,44 @@ public final class Delegate extends View.AccessibilityDelegate implements View.O
         return info;
     }
 
+    // frust patch (not upstream). A node with both a label and a value gets the
+    // label as its content description and the value as its text, and TalkBack
+    // reads only the content description once one is set: on a Pixel 5 (Android
+    // 14) a button labelled "All, 8" with the value "Selected" was announced
+    // "All 8, button" and a role-less "Volume" / "40 percent" node as "Volume".
+    // Move the value into the state description (API 30+), which TalkBack reads
+    // after the name. Editable fields keep their text.
+    private static AccessibilityNodeInfo valueAsState(AccessibilityNodeInfo info) {
+        if (info == null
+                || Build.VERSION.SDK_INT < Build.VERSION_CODES.R
+                || info.isEditable()) {
+            return info;
+        }
+        CharSequence label = info.getContentDescription();
+        CharSequence value = info.getText();
+        if (label != null && label.length() > 0 && value != null && value.length() > 0) {
+            info.setStateDescription(value);
+            info.setText(null);
+        }
+        return info;
+    }
+
+    private static AccessibilityNodeInfo patch(AccessibilityNodeInfo info) {
+        return valueAsState(labelAsText(info));
+    }
+
     @Override
     public AccessibilityNodeProvider getAccessibilityNodeProvider(final View host) {
         return new AccessibilityNodeProvider() {
             @Override
             public AccessibilityNodeInfo createAccessibilityNodeInfo(int virtualViewId) {
-                return labelAsText(
+                return patch(
                         Delegate.createAccessibilityNodeInfo(adapterHandle, host, virtualViewId));
             }
 
             @Override
             public AccessibilityNodeInfo findFocus(int focusType) {
-                return labelAsText(Delegate.findFocus(adapterHandle, host, focusType));
+                return patch(Delegate.findFocus(adapterHandle, host, focusType));
             }
 
             @Override
