@@ -36,6 +36,7 @@ mod time_series;
 mod timed;
 mod tone;
 
+pub use axis::{AxisSide, TickFormat, YAxis, ticks};
 pub use samples::{SampleSlot, Samples};
 pub use scale::{YDomain, nice_max};
 pub use series::{Series, SlotsView};

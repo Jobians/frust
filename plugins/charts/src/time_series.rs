@@ -7,14 +7,22 @@
 //! the style changed. All geometry comes from the crate's geometry functions.
 //!
 //! Draw order: grid rules, then for each series (in the order given) its fill, its stroke and
-//! the dots marking isolated samples, then the corner labels. Everything is clipped to the
-//! widget's bounds. A mirrored pair splits the plot at a middle axis: the upper series grows
-//! up from it and the lower one hangs down from it.
+//! the dots marking isolated samples, then the axis labels, then the corner labels. Everything
+//! is clipped to the widget's bounds. A mirrored pair splits the plot at a middle axis: the
+//! upper series grows up from it and the lower one hangs down from it.
+//!
+//! An optional [`YAxis`] draws its rules at [`ticks`] of each half's resolved domain, in place
+//! of the grid fractions, and a label per tick. Text is shaped only in layout, but an automatic
+//! domain is resolved at paint, on frames that skip layout. So a paint compares the ticks it
+//! resolves with the ones the labels were laid out for; when they differ it calls
+//! `PaintCtx::request_layout` once for that tick set and draws this frame with the labels it
+//! has, each at its own value (one whose value left the domain is skipped). The next layout
+//! shapes the new set. A gutter, when asked for, narrows the plot by the widest label.
 //!
 //! Colours: the caller's, then the installed theme's (series `primary`, grid
 //! `outline_variant`, labels `on_surface_variant`), then fallback constants. Labels are shaped
 //! in layout with the theme's `body_small` family, so a theme change needs a layout pass. The
-//! chart never animates, requests no frames and takes no input.
+//! chart never animates and takes no input; the only frame it asks for is the layout above.
 
 use std::marker::PhantomData;
 
@@ -27,8 +35,10 @@ use frust::kurbo::Circle;
 use frust::peniko::{Gradient, GradientKind};
 use frust::{Color, Theme};
 
+use crate::axis::{AxisSide, YAxis, ticks};
 use crate::geometry::{
     BlockColumn, Orientation, area_paths, block_columns, grid_rule_ys, line_segments, snap,
+    snap_rule_y,
 };
 use crate::{Series, Tone, YDomain};
 
@@ -224,6 +234,7 @@ struct Spec {
     labels: [Option<String>; 4],
     label_size: f32,
     label_color: Option<Color>,
+    y_axis: Option<YAxis>,
     height: Option<f32>,
     semantics: Option<String>,
     semantic_value: Option<String>,
@@ -236,6 +247,7 @@ impl Spec {
             || self.labels != old.labels
             || self.label_size != old.label_size
             || self.label_color != old.label_color
+            || self.y_axis != old.y_axis
         {
             return ChangeFlags::LAYOUT | ChangeFlags::PAINT;
         }
@@ -293,6 +305,7 @@ pub fn time_series<S: 'static>() -> TimeSeriesView<S> {
             labels: Default::default(),
             label_size: DEFAULT_LABEL_SIZE,
             label_color: None,
+            y_axis: None,
             height: None,
             semantics: None,
             semantic_value: None,
@@ -379,6 +392,20 @@ impl<S: 'static> TimeSeriesView<S> {
         self
     }
 
+    /// An automatic y axis (default none): a rule and a label at each of the
+    /// [`ticks`] of the resolved domain, computed per half in a mirrored plot with the shared
+    /// middle axis labelled once. Its rules replace the [`grid`](Self::grid) fractions and use
+    /// the [`grid_color`](Self::grid_color).
+    ///
+    /// The labels follow an automatic domain as data arrives. They are shaped in layout, so
+    /// when a write moves the ticks, the paint that sees it asks for one layout pass and
+    /// draws the labels it already has until that pass shapes the new ones; nice-number
+    /// domains keep this rare. A fixed domain never asks.
+    pub fn y_axis(mut self, axis: YAxis) -> Self {
+        self.spec.y_axis = Some(axis);
+        self
+    }
+
     /// A fixed height in logical pixels (default: the available height when bounded, else
     /// 56). The width always expands to the available width.
     pub fn height(mut self, height: f32) -> Self {
@@ -406,6 +433,7 @@ impl<S: 'static> View<S> for TimeSeriesView<S> {
         TimeSeriesWidget {
             labels: Corner::ALL.map(|c| self.spec.labels[c.index()].clone().map(Label::new)),
             caches: vec![LayerCache::default(); self.spec.layers.len()],
+            axis: AxisLabels::default(),
             spec: self.spec.clone(),
         }
     }
@@ -546,9 +574,18 @@ impl Label {
         size
     }
 
+    /// The shaped size; zero before the first shape.
+    fn size(&self) -> Size {
+        self.layout.as_ref().map_or(Size::ZERO, TextLayout::size)
+    }
+
     fn paint(&self, origin: Point, scene: &mut dyn PaintScene) {
+        self.draw(origin + self.at.to_vec2(), scene);
+    }
+
+    /// Draw the shaped text with its top-left at `at` (scene coordinates).
+    fn draw(&self, at: Point, scene: &mut dyn PaintScene) {
         if let Some(layout) = &self.layout {
-            let at = origin + self.at.to_vec2();
             for run in layout.to_scene_runs(at) {
                 scene.draw_glyph_run(run);
             }
@@ -556,11 +593,47 @@ impl Label {
     }
 }
 
+/// One axis tick: its value and the half of the plot it belongs to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Tick {
+    half: Half,
+    value: f32,
+}
+
+/// The axis labels as last laid out, and the tick set a paint last asked a layout for.
+#[derive(Default)]
+struct AxisLabels {
+    /// The ticks the labels were shaped for, one per label.
+    ticks: Vec<Tick>,
+    /// The shaped labels; only `at.x` is laid out, a paint places each at its tick's y.
+    labels: Vec<Label>,
+    /// The tick set a paint asked a layout for, until a layout shapes one, so a paint asks at
+    /// most once per changed set.
+    requested: Option<Vec<Tick>>,
+    /// The width reserved beside the plot: 0 without a gutter.
+    gutter: f64,
+}
+
+/// The `(upper, lower)` resolved domains; both the same unless a mirrored plot resolves each
+/// half on its own.
+type Domains = ((f32, f32), (f32, f32));
+
+/// A half's rect, orientation and domain: what a tick or a layer in it is drawn against.
+type HalfPlot = (Rect, Orientation, (f32, f32));
+
+/// The top of the 1 px rule at `value`, kept on whole pixel rows inside its half.
+fn rule_y(value: f32, (rect, orientation, domain): HalfPlot) -> f64 {
+    let top = snap(rect.y0);
+    let bottom = (snap(rect.y1) - 1.0).max(top);
+    snap_rule_y(orientation.y_for(value, domain, rect)).clamp(top, bottom)
+}
+
 /// The retained widget behind a [`TimeSeriesView`].
 pub struct TimeSeriesWidget {
     spec: Spec,
     labels: [Option<Label>; 4],
     caches: Vec<LayerCache>,
+    axis: AxisLabels,
 }
 
 /// `brush` with a gradient's points moved from widget-local to scene coordinates.
@@ -622,21 +695,147 @@ impl TimeSeriesWidget {
         self.spec = spec;
     }
 
+    /// The plot: the widget's bounds less the axis gutter, if any.
+    fn plot(&self, size: Size) -> Rect {
+        let gutter = match &self.spec.y_axis {
+            Some(axis) if axis.gutter => self.axis.gutter.clamp(0.0, size.width.max(0.0)),
+            _ => 0.0,
+        };
+        match self.spec.y_axis.as_ref().map(|axis| axis.side) {
+            Some(AxisSide::Right) => Rect::new(0.0, 0.0, size.width - gutter, size.height),
+            _ => Rect::new(gutter, 0.0, size.width, size.height),
+        }
+    }
+
     /// The `(upper, lower)` plot rects: both the whole plot unless mirrored.
     fn halves(&self, size: Size) -> (Rect, Rect) {
-        let bounds = Rect::from_origin_size(Point::ZERO, size);
+        let plot = self.plot(size);
         if !self.spec.mirrored {
-            return (bounds, bounds);
+            return (plot, plot);
         }
         let mid = snap(size.height / 2.0);
         (
-            Rect::new(0.0, 0.0, size.width, mid),
-            Rect::new(0.0, mid, size.width, size.height),
+            Rect::new(plot.x0, 0.0, plot.x1, mid),
+            Rect::new(plot.x0, mid, plot.x1, size.height),
         )
     }
 
+    /// What `half` is drawn against, given the `(upper, lower)` rects and domains.
+    fn half_plot(
+        &self,
+        half: Half,
+        (upper, lower): (Rect, Rect),
+        (upper_domain, lower_domain): Domains,
+    ) -> HalfPlot {
+        match half {
+            Half::Lower if self.spec.mirrored => (lower, Orientation::Inverted, lower_domain),
+            _ => (upper, Orientation::Upright, upper_domain),
+        }
+    }
+
+    /// The axis ticks for the `(upper, lower)` domains: none without an axis, else each half's
+    /// own, with a mirrored plot's shared middle axis ticked once (by the upper half when it
+    /// has a tick there).
+    fn tick_set(&self, (upper, lower): Domains) -> Vec<Tick> {
+        let Some(axis) = &self.spec.y_axis else {
+            return Vec::new();
+        };
+        let mut set: Vec<Tick> = ticks(upper.0, upper.1, axis.tick_count)
+            .into_iter()
+            .map(|value| Tick {
+                half: Half::Upper,
+                value,
+            })
+            .collect();
+        if self.spec.mirrored {
+            let upper_on_axis = set.first().is_some_and(|tick| tick.value == upper.0);
+            set.extend(
+                ticks(lower.0, lower.1, axis.tick_count)
+                    .into_iter()
+                    .filter(|&value| !(upper_on_axis && value == lower.0))
+                    .map(|value| Tick {
+                        half: Half::Lower,
+                        value,
+                    }),
+            );
+        }
+        set
+    }
+
+    /// Shape a label per tick of the current domains (reusing a label whose text is
+    /// unchanged), measure the gutter and set each label's x. Without an axis, or without a
+    /// `style`, drop every axis label.
+    fn layout_axis(&mut self, ctx: &mut LayoutCtx, size: Size, style: Option<&TextStyle>) {
+        let Some((axis, style)) = self.spec.y_axis.as_ref().zip(style) else {
+            self.axis = AxisLabels::default();
+            return;
+        };
+        let ticks = self.tick_set(self.domains());
+        let mut old = std::mem::take(&mut self.axis.labels);
+        let mut labels = Vec::with_capacity(ticks.len());
+        let mut widest: f64 = 0.0;
+        for tick in &ticks {
+            let text = axis.format.format(tick.value);
+            let mut label = match old.iter().position(|label| label.text == text) {
+                Some(i) => old.swap_remove(i),
+                None => Label::new(text),
+            };
+            widest = widest.max(label.shape(ctx, style).width);
+            labels.push(label);
+        }
+        let (inset_x, _) = LABEL_INSET;
+        let gutter = if axis.gutter && !labels.is_empty() {
+            (widest + 2.0 * inset_x).ceil().min(size.width.max(0.0))
+        } else {
+            0.0
+        };
+        for label in &mut labels {
+            let width = label.size().width;
+            let x = match (axis.side, axis.gutter) {
+                (AxisSide::Left, false) => inset_x,
+                (AxisSide::Right, false) => size.width - inset_x - width,
+                (AxisSide::Left, true) => gutter - inset_x - width,
+                (AxisSide::Right, true) => size.width - gutter + inset_x,
+            };
+            label.at = Point::new(snap(x), 0.0);
+        }
+        self.axis = AxisLabels {
+            ticks,
+            labels,
+            requested: None,
+            gutter,
+        };
+    }
+
+    /// Draw each laid-out axis label centred on its tick's rule under the current domains,
+    /// kept inside the widget's height; a label whose value left its half's domain is skipped.
+    fn paint_axis_labels(
+        &self,
+        origin: Point,
+        size: Size,
+        domains: Domains,
+        scene: &mut dyn PaintScene,
+    ) {
+        let halves = self.halves(size);
+        let (_, inset_y) = LABEL_INSET;
+        for (tick, label) in self.axis.ticks.iter().zip(&self.axis.labels) {
+            let plot = self.half_plot(tick.half, halves, domains);
+            let (rect, orientation, domain) = plot;
+            if !(domain.0..=domain.1).contains(&tick.value) {
+                continue;
+            }
+            let height = label.size().height;
+            let centre = orientation.y_for(tick.value, domain, rect);
+            let top = (centre - height / 2.0)
+                .min(size.height - inset_y - height)
+                .max(inset_y);
+            let at = Point::new(origin.x + label.at.x, origin.y + snap(top));
+            label.draw(at, scene);
+        }
+    }
+
     /// The `(upper, lower)` domains resolved from the series' current data.
-    fn domains(&self) -> ((f32, f32), (f32, f32)) {
+    fn domains(&self) -> Domains {
         let domain = self.spec.domain;
         let of = |half: Option<Half>| {
             let series: Vec<&Series> = self
@@ -656,22 +855,45 @@ impl TimeSeriesWidget {
         }
     }
 
-    fn paint_grid(&self, origin: Point, size: Size, color: Color, scene: &mut dyn PaintScene) {
-        if self.spec.grid.is_empty() {
+    /// The horizontal rules: one per axis tick when there is an axis, else one per grid
+    /// fraction (in each half of a mirrored plot), each across the plot's width.
+    fn paint_grid(
+        &self,
+        origin: Point,
+        size: Size,
+        (ticks, domains): (&[Tick], Domains),
+        color: Color,
+        scene: &mut dyn PaintScene,
+    ) {
+        let plot = self.plot(size);
+        if plot.width() <= 0.0 || plot.width().is_nan() {
             return;
         }
         let (upper, lower) = self.halves(size);
-        let mut ys = grid_rule_ys(&self.spec.grid, upper);
-        if self.spec.mirrored {
-            let flipped: Vec<f32> = self.spec.grid.iter().map(|f| 1.0 - f).collect();
-            ys.extend(grid_rule_ys(&flipped, lower));
-        }
+        let mut ys = if self.spec.y_axis.is_some() {
+            ticks
+                .iter()
+                .map(|tick| {
+                    rule_y(
+                        tick.value,
+                        self.half_plot(tick.half, (upper, lower), domains),
+                    )
+                })
+                .collect()
+        } else {
+            let mut ys = grid_rule_ys(&self.spec.grid, upper);
+            if self.spec.mirrored {
+                let flipped: Vec<f32> = self.spec.grid.iter().map(|f| 1.0 - f).collect();
+                ys.extend(grid_rule_ys(&flipped, lower));
+            }
+            ys
+        };
         ys.sort_by(f64::total_cmp);
         ys.dedup();
         for y in ys {
             scene.fill_rect(
-                Point::new(origin.x, origin.y + y),
-                Size::new(size.width, 1.0),
+                Point::new(origin.x + plot.x0, origin.y + y),
+                Size::new(plot.width(), 1.0),
                 color,
             );
         }
@@ -681,7 +903,7 @@ impl TimeSeriesWidget {
         &mut self,
         index: usize,
         origin: Point,
-        plot: (Rect, Orientation, (f32, f32)),
+        plot: HalfPlot,
         default_color: Color,
         scene: &mut dyn PaintScene,
     ) {
@@ -776,7 +998,8 @@ impl Widget for TimeSeriesWidget {
             _ => DEFAULT_HEIGHT,
         };
         let size = bc.constrain(Size::new(width, height));
-        if self.labels.iter().all(Option::is_none) {
+        if self.labels.iter().all(Option::is_none) && self.spec.y_axis.is_none() {
+            self.axis = AxisLabels::default();
             return size;
         }
         let theme = Theme::from_layout_ctx(ctx);
@@ -784,13 +1007,22 @@ impl Widget for TimeSeriesWidget {
             .spec
             .label_color
             .unwrap_or_else(|| theme.map_or(FALLBACK_LABEL, |t| t.scheme().on_surface_variant));
-        let family = theme.map(|t| t.type_scale.body_small.family.clone());
-        let label_size = if self.spec.label_size.is_finite() && self.spec.label_size > 0.0 {
+        let family = theme
+            .map(|t| t.type_scale.body_small.family.clone())
+            .unwrap_or_default();
+        let usable = |size: f32| size.is_finite() && size > 0.0;
+        let label_size = if usable(self.spec.label_size) {
             self.spec.label_size
         } else {
             DEFAULT_LABEL_SIZE
         };
-        let style = TextStyle::new(label_size, color).with_family(family.unwrap_or_default());
+        let axis_style = self.spec.y_axis.as_ref().map(|axis| {
+            let size = axis.size.filter(|&s| usable(s)).unwrap_or(label_size);
+            TextStyle::new(size, axis.color.unwrap_or(color)).with_family(family.clone())
+        });
+        let style = TextStyle::new(label_size, color).with_family(family);
+        self.layout_axis(ctx, size, axis_style.as_ref());
+        let plot = self.plot(size);
         for corner in Corner::ALL {
             let Some(label) = &mut self.labels[corner.index()] else {
                 continue;
@@ -798,8 +1030,8 @@ impl Widget for TimeSeriesWidget {
             let text = label.shape(ctx, &style);
             let (inset_x, inset_y) = LABEL_INSET;
             let x = match corner {
-                Corner::TopLeft | Corner::BottomLeft => inset_x,
-                Corner::TopRight | Corner::BottomRight => size.width - inset_x - text.width,
+                Corner::TopLeft | Corner::BottomLeft => plot.x0 + inset_x,
+                Corner::TopRight | Corner::BottomRight => plot.x1 - inset_x - text.width,
             };
             let y = match corner {
                 Corner::TopLeft | Corner::TopRight => inset_y,
@@ -815,19 +1047,23 @@ impl Widget for TimeSeriesWidget {
         if !(size.width > 0.0 && size.height > 0.0) {
             return;
         }
+        let domains = self.domains();
+        let ticks = self.tick_set(domains);
+        if ticks != self.axis.ticks && self.axis.requested.as_ref() != Some(&ticks) {
+            // The labels are shaped for other ticks: ask once for a layout to shape these.
+            ctx.request_layout();
+            self.axis.requested = Some(ticks.clone());
+        }
         let defaults = Defaults::resolve(Theme::from_paint_ctx(ctx));
         scene.push_clip(origin, size);
         let grid = self.spec.grid_color.unwrap_or(defaults.grid);
-        self.paint_grid(origin, size, grid, scene);
-        let (upper, lower) = self.halves(size);
-        let (upper_domain, lower_domain) = self.domains();
+        self.paint_grid(origin, size, (&ticks, domains), grid, scene);
+        let halves = self.halves(size);
         for index in 0..self.spec.layers.len() {
-            let plot = match self.spec.layers[index].half {
-                Half::Lower if self.spec.mirrored => (lower, Orientation::Inverted, lower_domain),
-                _ => (upper, Orientation::Upright, upper_domain),
-            };
+            let plot = self.half_plot(self.spec.layers[index].half, halves, domains);
             self.paint_layer(index, origin, plot, defaults.series, scene);
         }
+        self.paint_axis_labels(origin, size, domains, scene);
         for label in self.labels.iter().flatten() {
             label.paint(origin, scene);
         }
