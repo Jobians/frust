@@ -3,7 +3,14 @@
 //!
 //! The page's [`Component::init`] creates the data handles ([`Series`] and [`Samples`]) and starts
 //! one thread that writes new values to all of them every [`TICK`]. A write bumps the handle's
-//! revision and asks for a repaint; no signal changes, so nothing rebuilds. [`Component::build`]
+//! revision and asks for a repaint; no signal changes, so nothing rebuilds.
+//!
+//! Below the monitoring set, a "Families" section shows each chart family once over handles
+//! created in the same place and written by the same thread: a grouped bar chart and a radar
+//! chart over [`Categories`], a donut over [`Categories`], a gauge over one [`Samples`] slot, a
+//! scatter chart over [`Points`] and a candlestick chart over [`Candles`]. Their values drift
+//! slowly; the newest candle keeps forming for [`CANDLE_TICKS`] ticks before the next one
+//! starts. [`Component::build`]
 //! counts itself (`builds: N`) and reads the cpu series' revision (`samples: N`). Both labels are
 //! only fresh at the moment of a build: while the charts keep moving the labels stay still, and
 //! pressing any control rebuilds the page and catches them up.
@@ -16,7 +23,8 @@
 //!
 //! # Controls
 //!
-//! - **pause feed**: the thread keeps ticking but writes nothing, so the page goes idle.
+//! - **pause feed**: the thread keeps ticking but writes nothing, so the page goes idle (the
+//!   families stop with the rest).
 //! - **inject gap**: pushes gaps to the time-series handles for [`GAP_TICKS`] ticks (two seconds).
 //! - **dim**: wraps the chart column in `animated_opacity` at 0.4 to show stale-state dimming.
 //! - **open in page**: pushes a navigator page with one live chart over the same handle.
@@ -33,8 +41,10 @@ use frust::{
     SizedBox, Theme, View, button, checkbox, column, flexible, on_cleanup, row, text, use_context,
 };
 use frust_charts::{
-    Corner, PlotStyle, Samples, Segment, Series, SeriesStyle, SparkStyle, Tone, YDomain,
-    auto_domain, heat_cells, meter, meter_segments, meter_strip, sparkline, time_series,
+    Candle, Candles, Categories, Corner, NeedleStyle, PlotStyle, Points, RadarStyle, Samples,
+    ScatterPoint, Segment, Series, SeriesStyle, SparkStyle, Tone, YDomain, auto_domain, bar_chart,
+    candlestick_chart, gauge, heat_cells, meter, meter_segments, meter_strip, pie_chart,
+    radar_chart, scatter_chart, sparkline, time_series,
 };
 
 use crate::PlaygroundState;
@@ -53,6 +63,19 @@ const CORES: usize = 32;
 const CELLS: usize = 64;
 /// Meter slots: three single meters, then two segments of the segmented one.
 const METER_SLOTS: usize = 5;
+/// The bar chart's categories, each with [`BAR_SERIES`] values.
+const BAR_LABELS: [&str; 4] = ["Q1", "Q2", "Q3", "Q4"];
+const BAR_SERIES: usize = 3;
+/// The donut's sections.
+const SLICES: usize = 4;
+/// The radar chart's axes, each with [`RADAR_SETS`] values.
+const RADAR_LABELS: [&str; 6] = ["cpu", "mem", "disk", "net", "gpu", "io"];
+const RADAR_SETS: usize = 2;
+/// Points on the scatter chart.
+const SCATTER_POINTS: usize = 30;
+/// Candles kept, and how many ticks each one forms for (two seconds).
+const CANDLES: usize = 30;
+const CANDLE_TICKS: u32 = 4;
 
 const BLUE: Color = Color::from_rgb8(0x3b, 0x82, 0xf6);
 const AMBER: Color = Color::from_rgb8(0xf5, 0x9e, 0x0b);
@@ -69,6 +92,12 @@ struct Feed {
     cores: Samples,
     cells: Samples,
     meters: Samples,
+    bars: Categories,
+    slices: Categories,
+    gauge: Samples,
+    scatter: Points,
+    radar: Categories,
+    candles: Candles,
     paused: AtomicBool,
     stopped: AtomicBool,
     gap_ticks: AtomicU32,
@@ -84,6 +113,14 @@ struct Walk {
     cores: [f32; CORES],
     cells: [f32; CELLS],
     meters: [f32; METER_SLOTS],
+    bars: [[f32; BAR_SERIES]; BAR_LABELS.len()],
+    slices: [f32; SLICES],
+    gauge: f32,
+    scatter: [(f32, f32); SCATTER_POINTS],
+    radar: [[f32; RADAR_SETS]; RADAR_LABELS.len()],
+    price: f32,
+    /// Ticks written so far, which pace the candles.
+    candle_ticks: u32,
 }
 
 impl Walk {
@@ -97,6 +134,16 @@ impl Walk {
             cores: [30.0; CORES],
             cells: [30.0; CELLS],
             meters: [30.0; METER_SLOTS],
+            bars: [[30.0; BAR_SERIES]; BAR_LABELS.len()],
+            slices: [25.0; SLICES],
+            gauge: 50.0,
+            scatter: std::array::from_fn(|i| {
+                let t = i as f32 / SCATTER_POINTS as f32;
+                (5.0 + 90.0 * t, 20.0 + 60.0 * t)
+            }),
+            radar: [[60.0; RADAR_SETS]; RADAR_LABELS.len()],
+            price: 50.0,
+            candle_ticks: 0,
         }
     }
 
@@ -128,6 +175,12 @@ impl Feed {
             cores: Samples::new(CORES),
             cells: Samples::new(CELLS),
             meters: Samples::new(METER_SLOTS),
+            bars: Categories::from_rows(BAR_LABELS.map(|label| (label, [0.0; BAR_SERIES]))),
+            slices: Categories::from_rows((0..SLICES).map(|i| (format!("part {}", i + 1), [0.0]))),
+            gauge: Samples::new(1),
+            scatter: Points::new(SCATTER_POINTS),
+            radar: Categories::from_rows(RADAR_LABELS.map(|label| (label, [0.0; RADAR_SETS]))),
+            candles: Candles::new(CANDLES),
             paused: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             gap_ticks: AtomicU32::new(0),
@@ -194,6 +247,59 @@ impl Feed {
             rng.meters[index] = rng.walk(rng.meters[index], 10.0, lo, hi);
         }
         self.meters.set_all(rng.meters.iter().map(|v| Some(*v)));
+        self.write_families(rng);
+    }
+
+    /// The families: small steps, so their values drift rather than jump.
+    fn write_families(&self, rng: &mut Walk) {
+        for row in 0..BAR_LABELS.len() {
+            for col in 0..BAR_SERIES {
+                rng.bars[row][col] = rng.walk(rng.bars[row][col], 3.0, 5.0, 60.0);
+            }
+        }
+        self.bars.set_rows(BAR_LABELS.into_iter().zip(rng.bars));
+        for index in 0..SLICES {
+            rng.slices[index] = rng.walk(rng.slices[index], 2.0, 5.0, 40.0);
+        }
+        self.slices
+            .set_rows((0..SLICES).map(|i| (format!("part {}", i + 1), [rng.slices[i]])));
+        rng.gauge = rng.walk(rng.gauge, 4.0, 0.0, 100.0);
+        self.gauge.set(0, rng.gauge);
+        for index in 0..SCATTER_POINTS {
+            let (x, y) = rng.scatter[index];
+            rng.scatter[index] = (rng.walk(x, 1.5, 0.0, 100.0), rng.walk(y, 3.0, 0.0, 100.0));
+        }
+        self.scatter
+            .replace(rng.scatter.iter().enumerate().map(|(index, &(x, y))| {
+                ScatterPoint::new(x, y)
+                    .with_radius(2.0 + (index % 3) as f32)
+                    .with_color(index % 3)
+            }));
+        for row in 0..RADAR_LABELS.len() {
+            for col in 0..RADAR_SETS {
+                rng.radar[row][col] = rng.walk(rng.radar[row][col], 4.0, 20.0, 100.0);
+            }
+        }
+        self.radar.set_rows(RADAR_LABELS.into_iter().zip(rng.radar));
+
+        // The newest candle forms for `CANDLE_TICKS` ticks, then the next opens at its close.
+        rng.price = rng.walk(rng.price, 1.5, 20.0, 80.0);
+        let price = rng.price;
+        let forming = !rng.candle_ticks.is_multiple_of(CANDLE_TICKS);
+        rng.candle_ticks = rng.candle_ticks.wrapping_add(1);
+        match self.candles.latest() {
+            Some(last) if forming => self.candles.update_last(Candle::new(
+                last.open,
+                last.high.max(price),
+                last.low.min(price),
+                price,
+            )),
+            last => {
+                let open = last.map_or(price, |last| last.close);
+                self.candles
+                    .push(Candle::new(open, open.max(price), open.min(price), price));
+            }
+        }
     }
 }
 
@@ -368,9 +474,11 @@ impl Component for ChartsPage {
         let heat = heat_cells::<ChartsState>(feed.cells.clone())
             .columns(16)
             .cell(12.0, 18.0)
-            .tone(load)
+            .tone(load.clone())
             .range(0.0, 100.0)
             .semantics("Heat grid");
+
+        let families = families(feed, load);
 
         let charts = column::<ChartsState>()
             .gap(12.0)
@@ -389,7 +497,9 @@ impl Component for ChartsPage {
             .child(caption("Per-core strip"))
             .child(strip)
             .child(caption("Heat grid"))
-            .child(heat);
+            .child(heat)
+            .child(text("Families").size(13.0).color(accent()))
+            .child(families);
 
         let target = if state.dim { 0.4 } else { 1.0 };
         let pause_label = if state.paused {
@@ -451,6 +561,72 @@ impl Component for ChartsPage {
                 .child(animated_opacity(target, charts)),
         )
     }
+}
+
+/// One chart of each family, over the feed's family handles. Building reads no data: every chart
+/// reads its handle while painting.
+fn families(feed: &Feed, load: Tone) -> impl View<ChartsState> {
+    let bars = bar_chart(feed.bars.clone())
+        .colors([BLUE, AMBER, GREEN])
+        .domain(YDomain::fixed(0.0, 60.0))
+        .grid([0.5])
+        .radius(2.0)
+        .height(120.0)
+        .semantics("Bar chart, three series per quarter");
+
+    let donut = pie_chart::<ChartsState>(feed.slices.clone())
+        .colors([BLUE, AMBER, GREEN, VIOLET])
+        .donut(0.55)
+        .gap(2.0)
+        .corner_radius(2.0)
+        .size(120.0)
+        .semantics("Donut, four parts");
+
+    let dial = gauge::<ChartsState>(feed.gauge.slot(0))
+        .zones([
+            (0.0, 60.0, Tone::FALLBACK_CALM),
+            (60.0, 85.0, Tone::FALLBACK_BUSY),
+            (85.0, 100.0, Tone::FALLBACK_CRITICAL),
+        ])
+        .tone(load)
+        .needle(NeedleStyle::new())
+        .ticks(11, 4.0, muted())
+        .size(120.0)
+        .semantics("Gauge");
+
+    let scatter = scatter_chart::<ChartsState>(feed.scatter.clone())
+        .x_domain(YDomain::fixed(0.0, 100.0))
+        .y_domain(YDomain::fixed(0.0, 100.0))
+        .colors([BLUE, AMBER, VIOLET])
+        .grid(&[0.5], &[0.5])
+        .height(120.0)
+        .semantics("Scatter chart, three colours");
+
+    let radar = radar_chart(feed.radar.clone())
+        .domain(YDomain::fixed(0.0, 100.0))
+        .dataset_styles([RadarStyle::color(GREEN), RadarStyle::color(BLUE)])
+        .size(200.0)
+        .semantics("Radar chart, two datasets");
+
+    let candles = candlestick_chart(feed.candles.clone())
+        .up(GREEN)
+        .down(Tone::FALLBACK_CRITICAL)
+        .grid([0.25, 0.5, 0.75])
+        .height(96.0)
+        .semantics("Candlestick chart");
+
+    column::<ChartsState>()
+        .gap(12.0)
+        .child(caption("Bars, grouped, fixed 0..60"))
+        .child(bars)
+        .child(caption("Donut and gauge (zones, load tone, needle)"))
+        .child(row::<ChartsState>().gap(16.0).child(donut).child(dial))
+        .child(caption("Scatter, size and colour per point"))
+        .child(scatter)
+        .child(caption("Radar, two datasets"))
+        .child(radar)
+        .child(caption("Candlesticks, a new candle every two seconds"))
+        .child(candles)
 }
 
 /// The pushed page: one live time series over the same handles, which is a retained boundary
@@ -515,12 +691,59 @@ mod tests {
         let feed = Feed::new();
         let mut rng = Walk::new(7);
         let before = feed.cpu.revision();
+        let families_before = family_revisions(&feed);
         feed.tick(&mut rng);
         assert!(feed.cpu.revision() > before);
         assert_eq!(feed.cpu.len(), HISTORY);
         assert!(feed.cores.get(CORES - 1).is_some());
         assert!(feed.cells.get(CELLS - 1).is_some());
         assert!(feed.meters.get(METER_SLOTS - 1).is_some());
+        let families_after = family_revisions(&feed);
+        for (index, (before, after)) in families_before.iter().zip(&families_after).enumerate() {
+            assert!(after > before, "family handle {index} was not written");
+        }
+        assert_eq!(feed.bars.len(), BAR_LABELS.len());
+        assert_eq!(feed.scatter.len(), SCATTER_POINTS);
+        assert_eq!(
+            feed.candles.len(),
+            CANDLES,
+            "the prefill fills the candle ring"
+        );
+        assert!(feed.gauge.get(0).is_some());
+    }
+
+    /// Every family handle's revision, in one comparable value.
+    fn family_revisions(feed: &Feed) -> [u64; 6] {
+        [
+            feed.bars.revision(),
+            feed.slices.revision(),
+            feed.gauge.revision(),
+            feed.scatter.revision(),
+            feed.radar.revision(),
+            feed.candles.revision(),
+        ]
+    }
+
+    #[test]
+    fn a_candle_opens_at_the_last_close_then_forms_for_its_ticks() {
+        let _guard = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        let feed = Feed::new();
+        // A fresh walk starts a candle on its first tick.
+        let mut rng = Walk::new(7);
+        let prior = feed.candles.latest().expect("a candle after the prefill");
+        feed.tick(&mut rng);
+        let opened = feed.candles.latest().expect("a candle");
+        assert_eq!(
+            opened.open, prior.close,
+            "a new candle opens at the last close"
+        );
+        for _ in 1..CANDLE_TICKS {
+            feed.tick(&mut rng);
+            let forming = feed.candles.latest().expect("a candle");
+            assert_eq!(forming.open, opened.open, "a forming candle keeps its open");
+            assert!(forming.low <= forming.open.min(forming.close));
+            assert!(forming.high >= forming.open.max(forming.close));
+        }
     }
 
     #[test]
@@ -529,9 +752,20 @@ mod tests {
         let feed = Feed::new();
         let mut rng = Walk::new(7);
         feed.paused.store(true, Ordering::Release);
-        let before = (feed.cpu.revision(), feed.cores.revision());
+        let before = (
+            feed.cpu.revision(),
+            feed.cores.revision(),
+            family_revisions(&feed),
+        );
         feed.tick(&mut rng);
-        assert_eq!(before, (feed.cpu.revision(), feed.cores.revision()));
+        assert_eq!(
+            before,
+            (
+                feed.cpu.revision(),
+                feed.cores.revision(),
+                family_revisions(&feed)
+            )
+        );
     }
 
     #[test]

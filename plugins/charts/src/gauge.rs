@@ -9,12 +9,13 @@
 //! Geometry: the gauge lays out square at [`size`](GaugeView::size) (default the smaller of
 //! the available width and height) and draws inside the largest circle centred in whatever
 //! box it is given, so a non-square constraint never pushes a stroke out of bounds. Angles are
-//! degrees, 0 at 3 o'clock and growing clockwise; the default is a 270 degree arc open at the
-//! bottom. The track and the value arc are stroked arcs with the chosen [`GaugeCap`]. Zones
-//! are butt-ended arcs between their values; with round caps, a zone that reaches an end of
-//! the range gets an exact half-disc there, so it covers the track's cap without overlapping
-//! itself. Ticks are marks inside the track's inner edge and draw no text. An optional centre
-//! child is laid out loose in the square inscribed in the track's inner edge and centred.
+//! radians, 0 at 3 o'clock and growing clockwise, as in [`pie_chart`](crate::pie_chart) and
+//! the polar helpers; the default is a three-quarter turn open at the bottom. The track and
+//! the value arc are stroked arcs with the chosen [`GaugeCap`]. Zones are butt-ended arcs
+//! between their values; with round caps, a zone that reaches an end of the range gets an
+//! exact half-disc there, so it covers the track's cap without overlapping itself. Ticks are
+//! marks inside the track's inner edge and draw no text. An optional centre child is laid out
+//! loose in the square inscribed in the track's inner edge and centred.
 //!
 //! Colours: the caller's, then the installed theme's (value `primary`, track
 //! `surface_container_highest`, needle `on_surface`), then [`Tone::FALLBACK_CALM`],
@@ -23,7 +24,7 @@
 //! value. A gauge never animates and requests no frames; without a centre child it takes no
 //! input, and with one it routes events to that child.
 
-use std::f64::consts::{FRAC_PI_2, PI, SQRT_2, TAU};
+use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI, SQRT_2, TAU};
 
 use frust::authoring::scene::{StrokeCap, StrokeJoin, StrokeStyle};
 use frust::authoring::{
@@ -36,8 +37,10 @@ use frust::{Color, Theme};
 use crate::{MeterValue, MeterView, Tone, YDomain, arc_path, point_on_circle, sector_path};
 
 const DEFAULT_RANGE: (f32, f32) = (0.0, 100.0);
-const DEFAULT_START: f32 = 135.0;
-const DEFAULT_SWEEP: f32 = 270.0;
+/// 7:30 on a clock face, the lower left.
+const DEFAULT_START: f64 = 3.0 * FRAC_PI_4;
+/// Three quarters of a turn, clockwise.
+const DEFAULT_SWEEP: f64 = 3.0 * FRAC_PI_2;
 const DEFAULT_THICKNESS: f32 = 10.0;
 const DEFAULT_SIZE: f64 = 120.0;
 const DEFAULT_NEEDLE_WIDTH: f32 = 3.0;
@@ -121,8 +124,10 @@ struct Ticks {
 struct GaugeSpec {
     value: MeterValue,
     range: (f32, f32),
-    start: f32,
-    sweep: f32,
+    /// Radians.
+    start: f64,
+    /// Radians, within one turn either way.
+    sweep: f64,
     thickness: f32,
     cap: GaugeCap,
     track: Option<Color>,
@@ -208,10 +213,7 @@ impl GaugeSpec {
 
     /// `(start, sweep)` in radians.
     fn radians(&self) -> (f64, f64) {
-        (
-            f64::from(self.start).to_radians(),
-            f64::from(self.sweep).to_radians(),
-        )
+        (self.start, self.sweep)
     }
 
     /// The cap actually drawn: a closed ring has no ends to cap.
@@ -405,8 +407,8 @@ pub struct GaugeView<State: 'static = ()> {
 }
 
 /// A gauge showing `value` (fixed `f32`, `Option<f32>`, or a live
-/// [`SampleSlot`](crate::SampleSlot)) on a 0..100 range, as a 10 px thick 270 degree arc open
-/// at the bottom.
+/// [`SampleSlot`](crate::SampleSlot)) on a 0..100 range, as a 10 px thick arc of three quarters
+/// of a turn open at the bottom.
 pub fn gauge<State: 'static>(value: impl Into<MeterValue>) -> GaugeView<State> {
     GaugeView {
         spec: GaugeSpec::new(value.into()),
@@ -425,17 +427,27 @@ impl<State: 'static> GaugeView<State> {
         self
     }
 
-    /// Where the arc starts and how far it sweeps, in degrees: 0 at 3 o'clock, positive
-    /// clockwise, a negative sweep running counter-clockwise (default `135, 270`). A sweep
-    /// beyond a full turn is clamped to one; a non-finite angle keeps the default.
+    /// Where the arc starts and how far it sweeps, in radians: 0 at 3 o'clock, positive
+    /// clockwise, a negative sweep running counter-clockwise (default `3 * PI / 4, 3 * PI / 2`,
+    /// a three-quarter turn open at the bottom). A sweep beyond a full turn is clamped to one;
+    /// a non-finite angle keeps the default.
+    ///
+    /// ```
+    /// use std::f32::consts::PI;
+    /// use frust_charts::gauge;
+    ///
+    /// // A half-circle speedometer over the top: from 9 o'clock clockwise to 3 o'clock.
+    /// let speed = gauge::<()>(42.0).angles(PI, PI);
+    /// # let _ = speed;
+    /// ```
     pub fn angles(mut self, start: f32, sweep: f32) -> Self {
         self.spec.start = if start.is_finite() {
-            start
+            f64::from(start)
         } else {
             DEFAULT_START
         };
         self.spec.sweep = if sweep.is_finite() {
-            sweep.clamp(-360.0, 360.0)
+            f64::from(sweep).clamp(-TAU, TAU)
         } else {
             DEFAULT_SWEEP
         };

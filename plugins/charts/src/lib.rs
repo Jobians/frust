@@ -61,20 +61,19 @@ pub use series::{Series, SlotsView};
 pub use timed::{SeriesSource, TimedSeries};
 pub use tone::Tone;
 
-#[allow(unused_imports)]
-pub use bar::*;
-#[allow(unused_imports)]
-pub use candlestick::*;
-#[allow(unused_imports)]
-pub use gauge::*;
+pub use bar::{BarChartView, BarChartWidget, BarMode, bar_chart};
+pub use candlestick::{
+    Candle, CandleSlots, Candles, CandlestickView, CandlestickWidget, candlestick_chart,
+};
+pub use gauge::{GaugeCap, GaugeView, GaugeWidget, NeedleStyle, gauge};
 pub use geometry::*;
 pub use heat::*;
 pub use meter::*;
-#[allow(unused_imports)]
-pub use pie::*;
-#[allow(unused_imports)]
-pub use radar::*;
-#[allow(unused_imports)]
-pub use scatter::*;
+pub use pie::{PieChartView, PieChartWidget, pie_chart};
+pub use radar::{RadarChartView, RadarChartWidget, RadarShape, RadarStyle, radar_chart};
+pub use scatter::{
+    Points, PointsView, ScatterChartView, ScatterChartWidget, ScatterPoint, ScatterShape,
+    scatter_chart,
+};
 pub use sparkline::*;
 pub use time_series::*;
