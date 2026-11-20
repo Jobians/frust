@@ -6,6 +6,7 @@ mod android_sdk;
 mod cargo_ndk;
 mod cargo_packager;
 mod mobile_targets;
+mod plugins;
 pub mod report;
 mod rust_toolchain;
 // `pub(crate)`: the browser pipeline's own preflight
@@ -22,6 +23,7 @@ pub use android_sdk::AndroidSdkValidator;
 pub use cargo_ndk::CargoNdkValidator;
 pub use cargo_packager::CargoPackagerValidator;
 pub use mobile_targets::MobileTargetsValidator;
+pub use plugins::{PluginFinding, plugin_findings};
 pub use report::{Area, Component, ComponentStatus, DoctorReport, FixCommand, build_report};
 pub use rust_toolchain::RustToolchainValidator;
 pub use wasm_bindgen_cli::WasmBindgenCliValidator;
