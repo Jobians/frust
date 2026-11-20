@@ -2,6 +2,15 @@
 
 Live charts for Frust apps, fed from shared data handles (platform-free).
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/frust-rs/frust/main/docs/assets/readme/charts-time-series.png" alt="time_series as an area, block columns and a mirrored pair, above sparkline rows" width="24%">
+  <img src="https://raw.githubusercontent.com/frust-rs/frust/main/docs/assets/readme/charts-meters-heat-bars.png" alt="sparklines, meters, a per-core meter strip, heat cells and a grouped bar chart" width="24%">
+  <img src="https://raw.githubusercontent.com/frust-rs/frust/main/docs/assets/readme/charts-donut-gauge-scatter.png" alt="a grouped bar chart, a donut, a gauge and a scatter chart" width="24%">
+  <img src="https://raw.githubusercontent.com/frust-rs/frust/main/docs/assets/readme/charts-radar-candlesticks.png" alt="a donut, a gauge, a scatter chart, a radar chart and a candlestick chart" width="24%">
+</p>
+
+<p align="center"><em>The playground's Charts page on a Pixel 5, every chart fed live from one background thread.</em></p>
+
 ## Add the dependency
 
 ```toml
