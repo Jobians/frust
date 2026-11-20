@@ -195,3 +195,68 @@ fn resolve_on_auto_range_runs_from_zero() {
     assert_eq!(auto.resolve(None), auto.resolve_range(None));
     assert_eq!(auto.resolve(Some(f32::NAN)), auto.resolve_range(None));
 }
+
+#[test]
+fn auto_range_covers_ends_just_outside_a_round_number() {
+    let auto = YDomain::auto();
+    for (min, max) in [
+        (0.499_999_97_f32, 1.5_f32),
+        (3.2, 100.000_01),
+        (-0.000_01, 87.0),
+    ] {
+        let (lo, hi) = auto.resolve_range(Some((min, max)));
+        assert!(lo <= min && hi >= max, "({lo}, {hi}) misses ({min}, {max})");
+        assert_usable((lo, hi));
+    }
+}
+
+#[test]
+fn auto_range_keeps_ends_that_are_already_round() {
+    let auto = YDomain::auto();
+    for range in [
+        (0.0_f32, 100.0_f32),
+        (10.0, 13.0),
+        (-40.0, 20.0),
+        (2.5, 12.5),
+    ] {
+        assert_eq!(auto.resolve_range(Some(range)), range);
+    }
+}
+
+#[test]
+fn auto_range_covers_the_data_across_magnitudes() {
+    let auto = YDomain::auto();
+    let nudges = |v: f32| [v.next_down(), v, v.next_up()];
+    let mut checked = 0;
+    for exponent in -6..=9 {
+        let scale = 10f32.powi(exponent);
+        for mantissa in [1.0_f32, 1.3, 2.0, 2.5, 3.7, 5.0, 7.5, 9.99] {
+            for span in [1.0_f32, 1.5, 4.0, 10.0, 37.0] {
+                for sign in [1.0_f32, -1.0] {
+                    let base = sign * mantissa * scale;
+                    let far = base + span * scale;
+                    for a in nudges(base) {
+                        for b in nudges(far) {
+                            let (min, max) = (a.min(b), a.max(b));
+                            if max - min < 1.0 {
+                                // Narrower than `min_span`: widened about the middle instead.
+                                continue;
+                            }
+                            let (lo, hi) = auto.resolve_range(Some((min, max)));
+                            assert!(lo <= min && hi >= max, "({lo}, {hi}) misses ({min}, {max})");
+                            assert_usable((lo, hi));
+                            // Rounding outward adds less than the data's own span at each end.
+                            let span = max - min;
+                            assert!(
+                                min - lo <= span && hi - max <= span,
+                                "({lo}, {hi}) is too wide for ({min}, {max})"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 2000, "only {checked} pairs checked");
+}
