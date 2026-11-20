@@ -2,8 +2,9 @@
 //! body (headings, bullets, a three-column table, inline code chips) long
 //! enough to scroll under both bars, and, while the toolbar's Comment is on,
 //! a composer pinned under the scroller. Its bar title and subtitle travel as
-//! its [`DetailRoute`]; the page draws the body only, on the shell's detail
-//! scroll controller, and never sets chrome.
+//! its [`DetailRoute`], which the shell shows as a large title (collapsing as
+//! the body scrolls); the page draws the body only, on the shell's detail
+//! scroll controller, never sets chrome and does not repeat the title.
 //!
 //! The composer is the LAST child of a column whose first child is the flexed
 //! scroller, so the scaffold's keyboard avoidance lifts it onto the keyboard
@@ -42,16 +43,9 @@ pub fn page(state: &S, route: &DetailRoute) -> AnyView<S> {
     any(FlexView::new(Axis::Vertical, children))
 }
 
-/// The pull request's body, top to bottom.
+/// The pull request's body, top to bottom, under the bar's large title.
 fn body(route: &DetailRoute) -> Vec<FlexChild<S>> {
     vec![
-        inflexible(
-            text(route.title.clone())
-                .size(22.0)
-                .weight(FontWeight::BOLD)
-                .color(theme().scheme().on_surface),
-        ),
-        gap(4.0),
         inflexible(caption(format!(
             "{} \u{b7} opened by frust-bot",
             route.subtitle

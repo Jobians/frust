@@ -1,8 +1,8 @@
 // The `frust-native-widgets` plugin's Android app-chrome host: Material 3 bars
-// (AppBarLayout + MaterialToolbar on top, BottomNavigationView at the bottom,
-// the toolbar's floating action buttons) around the frust embedding's content
-// root, driven from Rust's `ChromeHost` (`plugins/native-widgets/src/chrome/host.rs`)
-// over JNI.
+// (AppBarLayout + MaterialToolbar on top, a medium collapsing bar for a large
+// title, BottomNavigationView at the bottom, the toolbar's floating action
+// buttons) around the frust embedding's content root, driven from Rust's
+// `ChromeHost` (`plugins/native-widgets/src/chrome/host.rs`) over JNI.
 //
 // FROZEN once shipped: the binary class name `dev.frust.nativewidgets.FrustNativeChrome`
 // (Rust loads it through the application classloader), the `@JvmStatic` entry
@@ -28,6 +28,8 @@
 //   Brightness: dark
 //   ActionBadges (apply only, never beside Actions): action<i>Badge and toolbar<i>Badge
 //             for every entry (null = none); the counts are unchanged
+// largeTitle = true builds the medium collapsing top bar (the class doc's Large title);
+// the table's "(ignored here)" is stale and stays only because a Rust test pins it verbatim.
 // Toolbar entry i reports as action index actionCount + i (its menu likewise).
 // "image" is a round avatar, "icon" a plain navigation icon; both read ICON_SLOT_LEADING.
 // Icon bytes never travel as JSON: `setIcon(slot, index, png)` caches one
@@ -59,12 +61,14 @@ import android.view.ViewTreeObserver
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import androidx.coordinatorlayout.widget.CoordinatorLayout
 import androidx.core.graphics.Insets
 import androidx.core.graphics.drawable.RoundedBitmapDrawableFactory
 import androidx.core.view.DisplayCutoutCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.google.android.material.appbar.AppBarLayout
+import com.google.android.material.appbar.CollapsingToolbarLayout
 import com.google.android.material.appbar.MaterialToolbar
 import com.google.android.material.badge.BadgeDrawable
 import com.google.android.material.badge.BadgeUtils
@@ -93,6 +97,25 @@ import kotlin.math.roundToInt
  * reaches them with the real insets), and the root's padding shrinks the
  * surface to the space between them — synced from the bars' laid-out heights in
  * a pre-draw pass, which cancels that one draw instead of showing a stale one.
+ *
+ * ## Large title
+ *
+ * With the spec's large-title flag the top bar is Material 3's medium
+ * collapsing bar: a [CoordinatorLayout] (only so the [AppBarLayout.Behavior]
+ * can offset the bar) around the [AppBarLayout], whose
+ * [CollapsingToolbarLayout] (`collapsingToolbarLayoutMediumStyle`, scroll |
+ * exit-until-collapsed) draws the title and subtitle, expanded and collapsed,
+ * over a pinned [MaterialToolbar] carrying the leading item and the actions.
+ * The frust surface is no nested-scrolling child, so the bar never scrolls by
+ * itself (dragging it is off): [setScroll]'s lifted signal collapses it, back
+ * at the top it expands, animated once the bar is on screen. It does not
+ * collapse when the body's [setScroll] `max` would not stay positive once the
+ * body grows by the collapse range (offsets are logical px, taken as dp), so a
+ * short page never bounces. The root's top padding follows the bar's visible
+ * height — expanded, collapsed or in between — in the same pre-draw pass. A
+ * flag change swaps the top bar alone in one main-thread turn ([swapTopBar]):
+ * the old bar's views and listeners go with it, and the new one is laid out
+ * before the next draw, so nothing flashes.
  *
  * ## Insets
  *
@@ -181,6 +204,9 @@ object FrustNativeChrome {
     /** The gap between stacked toolbar buttons. */
     private const val FAB_GAP_DP = 12
 
+    /** The medium collapsing bar's expanded height without a theme value (Material 3 spec: 112dp). */
+    private const val MEDIUM_BAR_DP = 112
+
     /** [setIcon] decodes to at most 4x the slot's on-screen size, but never caps below this (px). */
     private const val MIN_ICON_DECODE_PX = 256
 
@@ -241,19 +267,38 @@ object FrustNativeChrome {
         /** The toolbar's entries, the primary last when [toolbarPrimary]. */
         var toolbar: List<Action> = emptyList()
         var toolbarPrimary = false
+        var largeTitle = false
         var dark = false
+    }
+
+    /** The top app bar: the small one, or the medium collapsing one for a large title. */
+    private class TopBar(
+        /** The view [android.R.id.content] holds: [appBar] itself, or the CoordinatorLayout around it. */
+        val outer: ViewGroup,
+        val appBar: AppBarLayout,
+        val toolbar: MaterialToolbar,
+        /** The layout drawing the large title; `null` for the small bar. */
+        val collapsing: CollapsingToolbarLayout?,
+    ) {
+        /** The badges on [toolbar]'s menu items, by item id. */
+        val actionBadges = HashMap<Int, BadgeDrawable>()
+
+        /** Whether [appBar] was last told to collapse (collapsing bar only). */
+        var collapsed = false
     }
 
     private class Bars(
         val context: Context,
-        val appBar: AppBarLayout,
-        val toolbar: MaterialToolbar,
+        var top: TopBar,
         val bottom: BottomNavigationView,
         /** The toolbar's floating action buttons, top to bottom. */
         val fabs: LinearLayout,
     ) {
-        /** The badges on [toolbar]'s menu items, by item id. */
-        val actionBadges = HashMap<Int, BadgeDrawable>()
+        val appBar: AppBarLayout get() = top.appBar
+        val toolbar: MaterialToolbar get() = top.toolbar
+
+        /** The badges on the current [toolbar]'s menu items, by item id. */
+        val actionBadges: HashMap<Int, BadgeDrawable> get() = top.actionBadges
 
         /** The badges on [fabs]' buttons, by toolbar entry index. */
         val fabBadges = HashMap<Int, BadgeDrawable>()
@@ -273,6 +318,9 @@ object FrustNativeChrome {
 
         /** The lifted state last handed to [AppBarLayout.setLifted]; a rebuilt bar re-adopts it. */
         var lifted = false
+
+        /** The last [setScroll] `max`, which gates collapsing a large title. */
+        var scrollMax = 0f
 
         /** The IME visibility last seen by the insets listener; the bottom bar is hidden while it is true. */
         var imeVisible = false
@@ -328,7 +376,7 @@ object FrustNativeChrome {
             return INSTALL_REFUSED
         }
         val bars = try {
-            buildBars(activity, model.dark)
+            buildBars(activity, model.dark, model.largeTitle)
         } catch (t: Throwable) {
             warnTheme(t)
             return INSTALL_REFUSED
@@ -429,17 +477,21 @@ object FrustNativeChrome {
      * so Material's own lift-on-scroll never fires and the lifted state is
      * driven by hand. Android is the only consumer of `ChromeSpec.scroll`
      * (iOS draws a frust-side edge fade instead). `(0, 0)` means at the top.
-     * Main thread only; `setLifted` runs only when the state flips, so a
-     * scrolling frame costs one compare.
+     * The same lifted state collapses a large title ([applyCollapse]).
+     * Main thread only; `setLifted` and `setExpanded` run only when their
+     * state flips, so a scrolling frame costs a few compares.
      */
     @JvmStatic
     fun setScroll(offset: Float, max: Float) {
         assertMainThread()
         val installed = live ?: return
+        installed.scrollMax = max
         val lifted = offset > LIFT_THRESHOLD_PX && max > 0f
-        if (lifted == installed.lifted) return
-        installed.lifted = lifted
-        installed.bars.appBar.setLifted(lifted)
+        if (lifted != installed.lifted) {
+            installed.lifted = lifted
+            installed.bars.appBar.setLifted(lifted)
+        }
+        applyCollapse(installed)
     }
 
     /** [FrustNativePresenter]'s lifecycle hook: the host Activity is going away. */
@@ -495,6 +547,7 @@ object FrustNativeChrome {
                 entry.copy(badge = optStringOrNull(json, "toolbar${t}Badge"))
             }
         }
+        if (FIELD_LARGE_TITLE in fields) model.largeTitle = json.optBoolean("largeTitle", false)
         if (FIELD_BRIGHTNESS in fields) model.dark = json.optBoolean("dark", false)
     }
 
@@ -539,33 +592,85 @@ object FrustNativeChrome {
 
     /**
      * Inflate the bars in the Activity's own theme with the night bit forced to
-     * `dark` (the frust app's brightness, not the system's). Material's theme
-     * enforcement throws here for a non-Material theme.
+     * `dark` (the frust app's brightness, not the system's), the top bar the
+     * collapsing one when `large`. Material's theme enforcement throws here
+     * for a non-Material theme.
      */
-    private fun buildBars(activity: Activity, dark: Boolean): Bars {
+    private fun buildBars(activity: Activity, dark: Boolean, large: Boolean): Bars {
         val config = Configuration(activity.resources.configuration)
         val night = if (dark) Configuration.UI_MODE_NIGHT_YES else Configuration.UI_MODE_NIGHT_NO
         config.uiMode = (config.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or night
         val theme = activity.packageManager.getActivityInfo(activity.componentName, 0).themeResource
         val context = ContextThemeWrapper(activity, theme)
         context.applyOverrideConfiguration(config)
-        val appBar = AppBarLayout(context)
-        appBar.fitsSystemWindows = false
-        // Lift on scroll with no liftOnScrollTargetViewId: AppBarLayout has no
-        // nested-scrolling sibling to watch, so [setScroll] drives setLifted.
-        // setLiftable(true) pins the liftable state so layout passes cannot
-        // recompute it away (Material 1.14.0 setLiftable sets liftableOverride).
-        appBar.isLiftOnScroll = true
-        appBar.setLiftable(true)
-        val toolbar = MaterialToolbar(context)
-        appBar.addView(toolbar, AppBarLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        val top = buildTopBar(context, large)
         val bottom = BottomNavigationView(context)
         bottom.labelVisibilityMode = NavigationBarView.LABEL_VISIBILITY_LABELED
         val fabs = LinearLayout(context)
         fabs.orientation = LinearLayout.VERTICAL
         fabs.gravity = Gravity.END
         fabs.visibility = View.GONE
-        return Bars(context, appBar, toolbar, bottom, fabs)
+        return Bars(context, top, bottom, fabs)
+    }
+
+    /**
+     * The small top bar (an [AppBarLayout] holding the [MaterialToolbar]),
+     * or for `large` the medium collapsing one (class doc's *Large title*).
+     */
+    private fun buildTopBar(context: Context, large: Boolean): TopBar {
+        val match = ViewGroup.LayoutParams.MATCH_PARENT
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+        val appBar = AppBarLayout(context)
+        appBar.fitsSystemWindows = false
+        // Lift on scroll with no liftOnScrollTargetViewId: AppBarLayout has no
+        // nested-scrolling sibling to watch, so [setScroll] drives setLifted.
+        // setLiftable(true) pins the liftable state so layout passes cannot
+        // recompute it away (Material 1.14.0 setLiftable sets liftableOverride,
+        // which also turns the Behavior's own lift updates into no-ops).
+        appBar.isLiftOnScroll = true
+        appBar.setLiftable(true)
+        val toolbar = MaterialToolbar(context)
+        if (!large) {
+            appBar.addView(toolbar, AppBarLayout.LayoutParams(match, wrap))
+            return TopBar(appBar, appBar, toolbar, null)
+        }
+        val collapsing = CollapsingToolbarLayout(context, null, com.google.android.material.R.attr.collapsingToolbarLayoutMediumStyle)
+        collapsing.fitsSystemWindows = false
+        // CollapsingToolbarLayout consumes the insets it is handed, which a
+        // pre-API-30 sequential dispatch would then withhold from the bottom
+        // bar and the root; pass them on untouched (the app bar pads itself).
+        ViewCompat.setOnApplyWindowInsetsListener(collapsing) { _, insets -> insets }
+        val pinned = CollapsingToolbarLayout.LayoutParams(match, wrap)
+        pinned.collapseMode = CollapsingToolbarLayout.LayoutParams.COLLAPSE_MODE_PIN
+        collapsing.addView(toolbar, pinned)
+        val scrolls = AppBarLayout.LayoutParams(match, mediumBarHeight(context))
+        scrolls.scrollFlags = AppBarLayout.LayoutParams.SCROLL_FLAG_SCROLL or
+            AppBarLayout.LayoutParams.SCROLL_FLAG_EXIT_UNTIL_COLLAPSED
+        appBar.addView(collapsing, scrolls)
+        val behavior = AppBarLayout.Behavior()
+        // Only [applyCollapse] moves the bar: a drag on it would leave the
+        // scroll signal and the bar disagreeing.
+        behavior.setDragCallback(
+            object : AppBarLayout.Behavior.DragCallback() {
+                override fun canDrag(appBarLayout: AppBarLayout): Boolean = false
+            },
+        )
+        val coordinator = CoordinatorLayout(context)
+        coordinator.fitsSystemWindows = false
+        val params = CoordinatorLayout.LayoutParams(match, wrap)
+        params.behavior = behavior
+        coordinator.addView(appBar, params)
+        return TopBar(coordinator, appBar, toolbar, collapsing)
+    }
+
+    /** The medium collapsing bar's expanded height: the theme's `collapsingToolbarLayoutMediumSize`, else [MEDIUM_BAR_DP]. */
+    private fun mediumBarHeight(context: Context): Int {
+        val attrs = context.obtainStyledAttributes(intArrayOf(com.google.android.material.R.attr.collapsingToolbarLayoutMediumSize))
+        return try {
+            attrs.getDimensionPixelSize(0, dp(context, MEDIUM_BAR_DP))
+        } finally {
+            attrs.recycle()
+        }
     }
 
     private fun attach(installed: Installed) {
@@ -584,7 +689,7 @@ object FrustNativeChrome {
         val bars = installed.bars
         val match = ViewGroup.LayoutParams.MATCH_PARENT
         val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
-        installed.content.addView(bars.appBar, 0, FrameLayout.LayoutParams(match, wrap, Gravity.TOP))
+        attachTopBar(installed, bars.top, 0)
         installed.content.addView(bars.bottom, 1, FrameLayout.LayoutParams(match, wrap, Gravity.BOTTOM))
         // Last, so it draws over the root; the insets listener moves it off the bars.
         val margin = dp(bars.context, FAB_MARGIN_DP)
@@ -592,11 +697,6 @@ object FrustNativeChrome {
         fabParams.marginEnd = margin
         fabParams.bottomMargin = margin
         installed.content.addView(bars.fabs, fabParams)
-        ViewCompat.setOnApplyWindowInsetsListener(bars.appBar) { view, insets ->
-            val sides = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
-            view.setPadding(sides.left, sides.top, sides.right, 0)
-            insets
-        }
         bars.bottom.addOnLayoutChangeListener(bottomHeightWatch)
         bars.bottom.setOnItemSelectedListener { item ->
             if (!applyingSelection) emitTab(item.itemId - 1, reselect = false)
@@ -605,16 +705,28 @@ object FrustNativeChrome {
         bars.bottom.setOnItemReselectedListener { item ->
             if (!applyingSelection) emitTab(item.itemId - 1, reselect = true)
         }
-        bars.toolbar.setOnMenuItemClickListener { item ->
+        bars.bottom.accessibilityTraversalAfter = installed.root.id
+    }
+
+    /** Add `top` to the content at `index` (before the root) and wire its insets and menu taps. */
+    private fun attachTopBar(installed: Installed, top: TopBar, index: Int) {
+        val match = ViewGroup.LayoutParams.MATCH_PARENT
+        val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
+        installed.content.addView(top.outer, index, FrameLayout.LayoutParams(match, wrap, Gravity.TOP))
+        ViewCompat.setOnApplyWindowInsetsListener(top.appBar) { view, insets ->
+            val sides = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+            view.setPadding(sides.left, sides.top, sides.right, 0)
+            insets
+        }
+        top.toolbar.setOnMenuItemClickListener { item ->
             onActionClicked(item.itemId - 1)
             true
         }
-        bars.bottom.accessibilityTraversalAfter = installed.root.id
     }
 
     private fun rebuildBars(installed: Installed) {
         val fresh = try {
-            buildBars(installed.activity, installed.model.dark)
+            buildBars(installed.activity, installed.model.dark, installed.model.largeTitle)
         } catch (t: Throwable) {
             Log.w(TAG, "Frust: native app chrome kept its old brightness — rebuilding the bars failed", t)
             return
@@ -628,10 +740,52 @@ object FrustNativeChrome {
         ViewCompat.requestApplyInsets(installed.content)
     }
 
+    /**
+     * Swap the top bar for the small or the collapsing one the model's
+     * large-title flag names, leaving the bottom bar and the toolbar column
+     * as they are; `false` when the shown bar already matches. The new bar is
+     * built before anything is touched (a throw leaves the old one), takes
+     * the old one's place, padding and lifted state in this same turn, and is
+     * measured and laid out before the next draw, whose pre-draw pass pads
+     * the root to it — so no frame shows either bar half-built. The old bar
+     * leaves with its views; it held no listener on anything that stays.
+     */
+    private fun swapTopBar(installed: Installed): Boolean {
+        val bars = installed.bars
+        val old = bars.top
+        val large = installed.model.largeTitle
+        if ((old.collapsing != null) == large) return false
+        val fresh = buildTopBar(bars.context, large)
+        dismissPopup()
+        val index = max(0, installed.content.indexOfChild(old.outer))
+        releaseTopBar(old)
+        installed.content.removeView(old.outer)
+        bars.top = fresh
+        // The insets pass below re-pads it; until then it keeps the old bar's status-bar padding.
+        fresh.appBar.setPadding(old.appBar.paddingLeft, old.appBar.paddingTop, old.appBar.paddingRight, 0)
+        if (installed.lifted) fresh.appBar.setLifted(true)
+        attachTopBar(installed, fresh, index)
+        applyTop(installed)
+        applyCollapse(installed)
+        ViewCompat.requestApplyInsets(installed.content)
+        return true
+    }
+
+    /**
+     * Unhook a top bar that is leaving: its insets listener, menu taps and
+     * badge bookkeeping. Its badges ride its own menu items' overlays and go
+     * with them; its navigation listener only reaches [emit] through [live].
+     */
+    private fun releaseTopBar(top: TopBar) {
+        ViewCompat.setOnApplyWindowInsetsListener(top.appBar, null)
+        top.toolbar.setOnMenuItemClickListener(null)
+        top.actionBadges.clear()
+    }
+
     private fun removeBars(installed: Installed) {
         val bars = installed.bars
         bars.bottom.removeOnLayoutChangeListener(bottomHeightWatch)
-        installed.content.removeView(bars.appBar)
+        installed.content.removeView(bars.top.outer)
         installed.content.removeView(bars.bottom)
         installed.content.removeView(bars.fabs)
     }
@@ -700,18 +854,29 @@ object FrustNativeChrome {
         positionToolbar(installed, insets)
     }
 
-    /** Pad the root to the bars' laid-out heights; `false` cancels a draw that would show a stale size. */
+    /**
+     * Pad the root to the bars' laid-out heights (a collapsing bar's visible
+     * one, [shownHeight]); `false` cancels a draw that would show a stale size.
+     */
     private fun syncRootPadding(): Boolean {
         val installed = live ?: return true
         val bars = installed.bars
         val base = installed.basePadding
-        val top = base[1] + if (bars.appBar.visibility == View.VISIBLE) bars.appBar.height else 0
+        val top = base[1] + if (bars.top.outer.visibility == View.VISIBLE) shownHeight(bars.top) else 0
         val bottom = base[3] + if (bars.bottom.visibility == View.VISIBLE) bars.bottom.height else 0
         val root = installed.root
         if (root.paddingTop == top && root.paddingBottom == bottom) return true
         root.setPadding(base[0], top, base[2], bottom)
         return false
     }
+
+    /**
+     * How much of the content's top `top` covers: the small bar's height, or
+     * the collapsing bar's bottom edge — its expanded height less how far the
+     * Behavior has offset it up (laid out at the coordinator's top).
+     */
+    private fun shownHeight(top: TopBar): Int =
+        if (top.collapsing == null) top.appBar.height else max(0, top.appBar.bottom)
 
     private fun rootInsets(installed: Installed, insets: WindowInsetsCompat): WindowInsetsCompat {
         val bars = installed.bars
@@ -721,7 +886,7 @@ object FrustNativeChrome {
             installed.imeVisible = imeVisible
             applyBottomVisibility(installed)
         }
-        val topCovered = bars.appBar.visibility == View.VISIBLE
+        val topCovered = bars.top.outer.visibility == View.VISIBLE
         val bottomCovered = bars.bottom.visibility == View.VISIBLE
         val builder = WindowInsetsCompat.Builder(insets)
         val sideTypes = intArrayOf(
@@ -783,40 +948,82 @@ object FrustNativeChrome {
             rebuildBars(installed)
             return
         }
-        if (FIELD_TOP_BAR in changed) applyTopVisibility(installed)
-        if (FIELD_TITLE in changed || FIELD_SUBTITLE in changed) applyTitles(installed)
-        if (FIELD_LEADING in changed) applyLeading(installed)
+        // A swapped top bar was filled from the whole merged model already.
+        val swapped = FIELD_LARGE_TITLE in changed && swapTopBar(installed)
+        if (!swapped) {
+            if (FIELD_TOP_BAR in changed) applyTopVisibility(installed)
+            if (FIELD_TITLE in changed || FIELD_SUBTITLE in changed) applyTitles(installed)
+            if (FIELD_LEADING in changed) applyLeading(installed)
+        }
         if (FIELD_ACTIONS in changed) {
-            applyActions(installed)
+            if (!swapped) applyActions(installed)
             applyToolbar(installed)
         } else if (FIELD_ACTION_BADGES in changed) {
             // In place: the menu items and buttons stay, only their badges move.
-            applyActionBadges(installed)
+            if (!swapped) applyActionBadges(installed)
             applyToolbarBadges(installed)
         }
         if (FIELD_TABS in changed) applyTabs(installed) else if (FIELD_SELECTED in changed) applySelected(installed)
     }
 
     private fun applyAll(installed: Installed) {
+        applyTop(installed)
+        applyToolbar(installed)
+        applyTabs(installed)
+        applyCollapse(installed)
+    }
+
+    /** Everything the top bar shows, from the merged model. */
+    private fun applyTop(installed: Installed) {
         applyTopVisibility(installed)
         applyTitles(installed)
         applyLeading(installed)
         applyActions(installed)
-        applyToolbar(installed)
-        applyTabs(installed)
     }
 
     private fun applyTopVisibility(installed: Installed) {
         val visibility = if (installed.model.hasTop) View.VISIBLE else View.GONE
-        if (installed.bars.appBar.visibility != visibility) {
-            installed.bars.appBar.visibility = visibility
+        val outer = installed.bars.top.outer
+        if (outer.visibility != visibility) {
+            outer.visibility = visibility
             ViewCompat.requestApplyInsets(installed.content)
         }
     }
 
     private fun applyTitles(installed: Installed) {
-        installed.bars.toolbar.title = installed.model.title
-        installed.bars.toolbar.subtitle = installed.model.subtitle
+        val top = installed.bars.top
+        val collapsing = top.collapsing
+        if (collapsing == null) {
+            top.toolbar.title = installed.model.title
+            top.toolbar.subtitle = installed.model.subtitle
+        } else {
+            // The collapsing layout draws both, expanded and collapsed; a
+            // toolbar title would draw a second copy over the collapsed one.
+            top.toolbar.title = null
+            top.toolbar.subtitle = null
+            collapsing.title = installed.model.title
+            collapsing.subtitle = installed.model.subtitle
+        }
+    }
+
+    /**
+     * Collapse a large title while the body is lifted, expand it at the top;
+     * animated once the bar is laid out, else jumped to (a fresh install or
+     * swap over a scrolled body). An expanded bar collapses only when the
+     * body's `max` exceeds the collapse range: the body grows by that range
+     * as the bar collapses, and a body that would then have nothing to scroll
+     * would snap back to the top and expand the bar again.
+     */
+    private fun applyCollapse(installed: Installed) {
+        val top = installed.bars.top
+        val collapsing = top.collapsing ?: return
+        val range = top.appBar.totalScrollRange.takeIf { it > 0 }
+            ?: max(0, collapsing.layoutParams.height - top.toolbar.minimumHeight)
+        val rangeLogical = range / installed.bars.context.resources.displayMetrics.density
+        val collapse = installed.lifted && (top.collapsed || installed.scrollMax > rangeLogical)
+        if (collapse == top.collapsed) return
+        top.collapsed = collapse
+        top.appBar.setExpanded(!collapse, top.appBar.isLaidOut)
     }
 
     private fun applyLeading(installed: Installed) {

@@ -11,9 +11,10 @@
 //!
 //! **Chrome.** At a navigator's root the bar shows the selected tab's title
 //! (the avatar leads on Home); above it, the pushed page's [`DetailRoute`]
-//! title and subtitle and a back item. Chrome handlers get no `&mut State` and
-//! must be `Send + Sync`, so they write signals only: a pop they ask for is a
-//! queued [`ChromeRequest`] the shell's next build applies.
+//! title and subtitle as a large title, and a back item. Chrome handlers get
+//! no `&mut State` and must be `Send + Sync`, so they write signals only: a
+//! pop they ask for is a queued [`ChromeRequest`] the shell's next build
+//! applies.
 //!
 //! **Deep links.** `native-widgets-demo://section/<label>` opens the tab an old
 //! section label now lives on and asks it to scroll to that section
@@ -756,6 +757,9 @@ impl Component for NativeWidgetsDemoApp {
             .tabs(Self::tabs(state), tab.slug())
             .title(Self::title(tab, detail.as_ref()))
             .subtitle_if(Self::subtitle(detail.as_ref()))
+            // A pushed detail page shows its title large (the Android medium
+            // collapsing bar, the iOS large title); a tab root keeps the small bar.
+            .large_title(detail.is_some())
             .leading(Self::leading(state, tab))
             .actions(Self::actions(
                 tab,
