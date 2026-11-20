@@ -50,8 +50,9 @@ use frust::{Color, Theme};
 
 use crate::axis::{AxisSide, YAxis, ticks};
 use crate::geometry::{
-    BlockColumn, Orientation, area_paths, block_columns, grid_rule_ys, line_segments, snap,
-    snap_rule_y, timed_area_paths, timed_line_segments,
+    BlockColumn, Orientation, area_paths, block_columns, grid_rule_ys, line_segments,
+    smooth_area_paths, smooth_timed_area_paths, snap, snap_rule_y, timed_area_paths,
+    timed_line_segments, tone_gradient,
 };
 use crate::scrub::{Placement, ScrubEvent, scrub_at};
 use crate::timed::SourceShape;
@@ -145,6 +146,7 @@ pub struct SeriesStyle {
     stroke_width: f32,
     fill: SeriesFill,
     tone: Option<Tone>,
+    tone_along: Option<Tone>,
 }
 
 impl Default for SeriesStyle {
@@ -155,6 +157,7 @@ impl Default for SeriesStyle {
             stroke_width: DEFAULT_STROKE_WIDTH,
             fill: SeriesFill::Gradient,
             tone: None,
+            tone_along: None,
         }
     }
 }
@@ -206,6 +209,19 @@ impl SeriesStyle {
     /// Colour each column by its own value through `tone` ([`PlotStyle::Blocks`] only).
     pub fn tone(mut self, tone: Tone) -> Self {
         self.tone = Some(tone);
+        self
+    }
+}
+
+impl SeriesStyle {
+    /// Colour a line or area by value through `tone`: the stroke is a vertical gradient over
+    /// the plot's y extent with a hard colour change at each threshold, and the derived area
+    /// fill takes the same gradient at reduced alpha. An explicit [`stroke`](Self::stroke)
+    /// brush wins for the stroke, and an explicit [`fill`](Self::fill) or
+    /// [`no_fill`](Self::no_fill) for the area. Block columns ignore it (use
+    /// [`tone`](Self::tone)).
+    pub fn tone_along_value(mut self, tone: Tone) -> Self {
+        self.tone_along = Some(tone);
         self
     }
 }
@@ -276,6 +292,7 @@ struct Spec {
     shared_domain: bool,
     domain: YDomain,
     style: PlotStyle,
+    smooth: bool,
     corner: f32,
     grid: Vec<f32>,
     grid_color: Option<Color>,
@@ -307,6 +324,7 @@ impl Spec {
             || self.shared_domain != old.shared_domain
             || self.domain != old.domain
             || self.style != old.style
+            || self.smooth != old.smooth
             || self.corner != old.corner
             || self.grid != old.grid
             || self.grid_color != old.grid_color
@@ -354,6 +372,7 @@ pub fn time_series<S: 'static>() -> TimeSeriesView<S> {
             shared_domain: false,
             domain: YDomain::percent(),
             style: PlotStyle::Area,
+            smooth: false,
             corner: 0.0,
             grid: Vec::new(),
             grid_color: None,
@@ -419,6 +438,15 @@ impl<S: 'static> TimeSeriesView<S> {
     /// How samples are drawn (default [`PlotStyle::Area`]).
     pub fn style(mut self, style: PlotStyle) -> Self {
         self.spec.style = style;
+        self
+    }
+
+    /// Draw line and area edges as a monotone cubic curve through the samples instead of
+    /// straight segments (default `false`). The curve passes through every sample and never
+    /// overshoots between two; runs and gaps break as before, and a run of two is a straight
+    /// segment.
+    pub fn smooth(mut self, smooth: bool) -> Self {
+        self.spec.smooth = smooth;
         self
     }
 
@@ -575,12 +603,48 @@ struct CacheKey {
     orientation: Orientation,
     domain: (f32, f32),
     style: PlotStyle,
+    smooth: bool,
     stroke_width: f32,
+}
+
+/// The inputs a tone gradient was built from.
+#[derive(Clone, Debug, PartialEq)]
+struct ToneKey {
+    tone: Tone,
+    plot: Rect,
+    orientation: Orientation,
+    domain: (f32, f32),
+}
+
+/// A tone's stroke and fill brushes in widget-local coordinates.
+#[derive(Clone, Debug)]
+struct ToneBrushes {
+    key: ToneKey,
+    stroke: Brush,
+    fill: Brush,
+}
+
+impl ToneBrushes {
+    fn build(key: ToneKey) -> Self {
+        let make = |alpha: f32| {
+            let g = tone_gradient(&key.tone, key.domain, key.plot, key.orientation, alpha);
+            Brush::Gradient(
+                Gradient::new_linear((0.0, g.start_y), (0.0, g.end_y))
+                    .with_stops(g.stops.as_slice()),
+            )
+        };
+        Self {
+            stroke: make(1.0),
+            fill: make(FILL_ALPHA.0),
+            key,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 struct LayerCache {
     key: Option<CacheKey>,
+    tone: Option<ToneBrushes>,
     fills: Vec<BezPath>,
     strokes: Vec<BezPath>,
     dots: Vec<BezPath>,
@@ -599,6 +663,7 @@ impl LayerCache {
             orientation,
             domain,
             style,
+            smooth,
             stroke_width,
             ..
         } = key;
@@ -625,8 +690,12 @@ impl LayerCache {
                     }
                     PlotStyle::Area | PlotStyle::Line => {
                         if area {
-                            self.fills =
-                                area_paths(slots.iter(), capacity, domain, plot, orientation);
+                            let build = if smooth {
+                                smooth_area_paths
+                            } else {
+                                area_paths
+                            };
+                            self.fills = build(slots.iter(), capacity, domain, plot, orientation);
                         }
                         Some(line_segments(
                             slots.iter(),
@@ -642,8 +711,12 @@ impl LayerCache {
                 let (window, gap_after) = (series.window_secs(), series.gap_after_secs());
                 series.with_points(|points| {
                     if area {
-                        self.fills =
-                            timed_area_paths(points, window, gap_after, domain, plot, orientation);
+                        let build = if smooth {
+                            smooth_timed_area_paths
+                        } else {
+                            timed_area_paths
+                        };
+                        self.fills = build(points, window, gap_after, domain, plot, orientation);
                     }
                     Some(timed_line_segments(
                         points,
@@ -657,7 +730,11 @@ impl LayerCache {
             }
         };
         if let Some(line) = line {
-            self.strokes = line.paths();
+            self.strokes = if smooth {
+                line.smooth_paths()
+            } else {
+                line.paths()
+            };
             let radius = MIN_DOT_DIAMETER.max(2.0 * f64::from(stroke_width)) / 2.0;
             self.dots = line
                 .points
@@ -1178,10 +1255,25 @@ impl TimeSeriesWidget {
             orientation,
             domain,
             style,
+            smooth: self.spec.smooth,
             stroke_width: layer.style.stroke_width,
         };
         let cache = &mut self.caches[index];
         cache.refresh(&layer.series, key);
+        match &layer.style.tone_along {
+            Some(tone) => {
+                let key = ToneKey {
+                    tone: tone.clone(),
+                    plot: rect,
+                    orientation,
+                    domain,
+                };
+                if cache.tone.as_ref().map(|b| &b.key) != Some(&key) {
+                    cache.tone = Some(ToneBrushes::build(key));
+                }
+            }
+            None => cache.tone = None,
+        }
         let series_style = &layer.style;
         let color = series_style.color.unwrap_or(default_color);
 
@@ -1204,7 +1296,10 @@ impl TimeSeriesWidget {
 
         if style == PlotStyle::Area {
             let fill = match &series_style.fill {
-                SeriesFill::Gradient => Some(derived_fill(color, rect, orientation, origin)),
+                SeriesFill::Gradient => Some(match &cache.tone {
+                    Some(tone) => at_origin(&tone.fill, origin),
+                    None => derived_fill(color, rect, orientation, origin),
+                }),
                 SeriesFill::Brush(brush) => Some(at_origin(brush, origin)),
                 SeriesFill::None => None,
             };
@@ -1214,10 +1309,11 @@ impl TimeSeriesWidget {
                 }
             }
         }
-        let stroke = series_style
-            .stroke
-            .as_ref()
-            .map_or(Brush::Solid(color), |brush| at_origin(brush, origin));
+        let stroke = match (&series_style.stroke, &cache.tone) {
+            (Some(brush), _) => at_origin(brush, origin),
+            (None, Some(tone)) => at_origin(&tone.stroke, origin),
+            (None, None) => Brush::Solid(color),
+        };
         let width = f64::from(series_style.stroke_width);
         if width > 0.0 {
             for path in &cache.strokes {
@@ -1378,6 +1474,7 @@ mod tests {
             orientation: Orientation::Upright,
             domain: (0.0, 100.0),
             style: PlotStyle::Area,
+            smooth: false,
             stroke_width: 1.5,
         }
     }
