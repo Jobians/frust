@@ -18,7 +18,7 @@
 //             none, "" = dot), tab<i>IconRev (0 = no icon)
 //   Selected: selectedIndex (-1 = none)
 //   TopBar:   hasTop          Title: title          Subtitle: subtitle (absent/null = none)
-//   Leading:  leading = "none" | "back" | "image" | "icon"   LargeTitle: largeTitle (ignored here)
+//   Leading:  leading = "none" | "back" | "image" | "icon"   LargeTitle: largeTitle (true = collapsing bar)
 //   Actions:  actionCount, action<i>Title, action<i>HasIcon, action<i>MenuCount,
 //             action<i>Badge (absent/null = none, "" = dot), action<i>Prominent (absent = false),
 //             menu<i>_<j>Title, menu<i>_<j>Destructive, menu<i>_<j>Enabled,
@@ -29,8 +29,7 @@
 //   Brightness: dark
 //   ActionBadges (apply only, never beside Actions): action<i>Badge and toolbar<i>Badge
 //             for every entry (null = none); the counts are unchanged
-// largeTitle = true builds the medium collapsing top bar (the class doc's Large title);
-// the table's "(ignored here)" is stale and stays only because a Rust test pins it verbatim.
+// largeTitle = true builds the medium collapsing top bar (the class doc's Large title).
 // Toolbar entry i reports as action index actionCount + i (its menu likewise).
 // "floating" gathers the items into one Material floating toolbar beside the primary;
 // toolbarPrimaryLabel shows an icon primary's title too (the class doc's Toolbar).

@@ -165,7 +165,8 @@ pub(crate) struct TopBarSpec {
     pub(crate) subtitle: Option<String>,
     pub(crate) leading: Leading,
     pub(crate) actions: Vec<ActionItem>,
-    /// iOS large-title display; ignored where the platform has none.
+    /// Large-title display: the iOS large title, a collapsing medium top bar on
+    /// Android; ignored where the platform has none.
     pub(crate) large_title: bool,
 }
 
@@ -1575,7 +1576,7 @@ pub(crate) mod android_wire {
 //             none, "" = dot), tab<i>IconRev (0 = no icon)
 //   Selected: selectedIndex (-1 = none)
 //   TopBar:   hasTop          Title: title          Subtitle: subtitle (absent/null = none)
-//   Leading:  leading = "none" | "back" | "image" | "icon"   LargeTitle: largeTitle (ignored here)
+//   Leading:  leading = "none" | "back" | "image" | "icon"   LargeTitle: largeTitle (true = collapsing bar)
 //   Actions:  actionCount, action<i>Title, action<i>HasIcon, action<i>MenuCount,
 //             action<i>Badge (absent/null = none, "" = dot), action<i>Prominent (absent = false),
 //             menu<i>_<j>Title, menu<i>_<j>Destructive, menu<i>_<j>Enabled,

@@ -306,7 +306,8 @@ impl<V> NativeScaffoldView<V> {
         self
     }
 
-    /// Large-title display where the platform has one (iOS); ignored elsewhere.
+    /// Large-title display: the iOS large title, a collapsing medium top bar on
+    /// Android; ignored elsewhere.
     pub fn large_title(mut self, large: bool) -> Self {
         self.top_mut().large_title = large;
         self
