@@ -42,7 +42,7 @@ use frust::{
 use frust_glyph::{baseline, toast_host};
 use frust_native_widgets::{
     ActionId, ActionItem, ChromeEvent, Leading, MenuItem, MenuItemId, NativeScaffoldView, TabIcon,
-    TabId, TabItem, ToolbarSpec, native_scaffold,
+    TabId, TabItem, ToolbarSpec, ToolbarStyle, native_scaffold,
 };
 
 // ---------------------------------------------------------------------------
@@ -926,7 +926,8 @@ impl NativeWidgetsDemoApp {
 
     /// The Comment/Info toolbar while Home shows a detail page with its
     /// composer closed: an open composer sits at the column's foot, where the
-    /// toolbar would cover it. Empty (shown as nothing) otherwise.
+    /// toolbar would cover it. Empty (shown as nothing) otherwise. Floating:
+    /// on Android, Info in a floating toolbar beside a labelled Comment.
     fn toolbar(tab: Tab, detail: Option<&DetailRoute>, composer_open: bool) -> ToolbarSpec {
         if tab != Tab::Home || detail.is_none() || composer_open {
             return ToolbarSpec::new();
@@ -937,6 +938,8 @@ impl NativeWidgetsDemoApp {
                 ActionItem::new(COMMENT, "Comment")
                     .icon(chrome_icon("text.bubble", Tab::Dialogs.png())),
             )
+            .style(ToolbarStyle::Floating)
+            .primary_label(true)
     }
 
     /// The scroll controller the bars follow: the detail body's while a page
