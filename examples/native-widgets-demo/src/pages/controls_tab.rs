@@ -28,7 +28,7 @@ use std::time::Duration;
 use frust::{
     AnyView, Axis, Component, CrossAxisAlignment, EdgeInsets, FlexChild, FlexView, Get,
     GetUntracked, Padding, RwSignal, ScrollController, Set, SizedBox, checkbox, component,
-    inflexible, text,
+    inflexible, row, text,
 };
 use frust_native_widgets::{NativeButtonStyle, native_button};
 
@@ -303,38 +303,31 @@ impl Component for ButtonStyles {
                     .size(112.0, 44.0)
                     .on_press(move || last_sig.set(format!("{label} ({style:?})")))
             };
-            let cell = |button| inflexible(Padding(EdgeInsets::all(4.0), button));
+            let pad = EdgeInsets::all(4.0);
             let [plain, prominent, destructive, glass, prominent_glass] = BUTTON_STYLES;
             children.push(inflexible(
-                FlexView::new(
-                    Axis::Horizontal,
-                    vec![
-                        cell(styled(plain.0, plain.1)),
-                        cell(styled(prominent.0, prominent.1)),
-                        cell(styled(destructive.0, destructive.1)),
-                    ],
-                )
-                .cross_axis(CrossAxisAlignment::Center),
+                row()
+                    .child(Padding(pad, styled(plain.0, plain.1)))
+                    .child(Padding(pad, styled(prominent.0, prominent.1)))
+                    .child(Padding(pad, styled(destructive.0, destructive.1)))
+                    .cross_axis(CrossAxisAlignment::Center),
             ));
             children.push(inflexible(
-                FlexView::new(
-                    Axis::Horizontal,
-                    vec![
-                        cell(styled(glass.0, glass.1)),
-                        cell(styled(prominent_glass.0, prominent_glass.1)),
-                        cell(
-                            native_button("Cycle")
-                                .style(cycled)
-                                .size(112.0, 44.0)
-                                .on_press(move || {
-                                    let current = cycled_sig.get_untracked();
-                                    last_sig.set(format!("Cycle ({current:?})"));
-                                    cycled_sig.set(next_style(current));
-                                }),
-                        ),
-                    ],
-                )
-                .cross_axis(CrossAxisAlignment::Center),
+                row()
+                    .child(Padding(pad, styled(glass.0, glass.1)))
+                    .child(Padding(pad, styled(prominent_glass.0, prominent_glass.1)))
+                    .child(Padding(
+                        pad,
+                        native_button("Cycle")
+                            .style(cycled)
+                            .size(112.0, 44.0)
+                            .on_press(move || {
+                                let current = cycled_sig.get_untracked();
+                                last_sig.set(format!("Cycle ({current:?})"));
+                                cycled_sig.set(next_style(current));
+                            }),
+                    ))
+                    .cross_axis(CrossAxisAlignment::Center),
             ));
             children.push(inflexible(SizedBox(None, Some(6.0))));
             children.push(inflexible(
