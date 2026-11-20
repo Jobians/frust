@@ -1,5 +1,6 @@
-//! The y axis: [`YDomain`] picks the value range a chart maps onto its height, and
-//! [`nice_max`] rounds an automatic top up to a readable number.
+//! The value axis: [`YDomain`] picks the value range a chart maps onto its height (or, for a
+//! horizontal chart, its width), and [`nice_max`] rounds an automatic top up to a readable
+//! number.
 
 /// The value range a chart's y axis spans.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -19,6 +20,16 @@ pub enum YDomain {
         /// Round the span above `floor` up with [`nice_max`].
         nice: bool,
         /// The smallest span above `floor`, so a flat or empty series still has a scale.
+        min_span: f32,
+    },
+    /// From the data's smallest value to its largest, at least `min_span` tall, with both
+    /// ends rounded outward to round numbers when `nice` is set. See
+    /// [`resolve_range`](Self::resolve_range).
+    AutoRange {
+        /// Round both ends outward to whole multiples of a 1, 2, 2.5 or 5 times a power of
+        /// ten step, the step family [`ticks`](crate::ticks) draws from.
+        nice: bool,
+        /// The smallest span, so a flat or empty data set still has a scale.
         min_span: f32,
     },
 }
@@ -43,13 +54,31 @@ impl YDomain {
         }
     }
 
+    /// An automatic range spanning the data from its minimum to its maximum, both ends
+    /// rounded outward to round numbers, at least 1 tall.
+    pub const fn auto() -> Self {
+        Self::AutoRange {
+            nice: true,
+            min_span: 1.0,
+        }
+    }
+
     /// The `(min, max)` to draw against, given the data's largest value (`None` when there
     /// is none, see [`Series::max`](crate::Series::max)).
+    ///
+    /// Only the data's maximum is known here, so an [`AutoRange`](Self::AutoRange) domain
+    /// treats the data as running from 0 to `data_max`: it resolves as
+    /// [`resolve_range`](Self::resolve_range) does for `Some((0.0, data_max))` (or for `None`
+    /// when `data_max` is `None` or non-finite). Use `resolve_range` when the data's minimum
+    /// is known.
     ///
     /// Always finite with `max > min`: a reversed fixed range is swapped, and a degenerate or
     /// non-finite one is widened, so a caller can divide by `max - min` unguarded.
     pub fn resolve(&self, data_max: Option<f32>) -> (f32, f32) {
         match *self {
+            Self::AutoRange { .. } => {
+                self.resolve_range(data_max.filter(|v| v.is_finite()).map(|max| (0.0, max)))
+            }
             Self::Fixed { min, max } => {
                 let (lo, hi) = if min <= max { (min, max) } else { (max, min) };
                 non_degenerate(lo, hi)
@@ -72,6 +101,136 @@ impl YDomain {
             }
         }
     }
+}
+
+impl YDomain {
+    /// The `(min, max)` to draw against, given the data's smallest and largest values (`None`
+    /// when there are none).
+    ///
+    /// - [`Fixed`](Self::Fixed) ignores the data and resolves as [`resolve`](Self::resolve)
+    ///   does.
+    /// - [`Auto`](Self::Auto) uses its floor and the data's maximum, exactly as `resolve`
+    ///   does for `Some(max)`.
+    /// - [`AutoRange`](Self::AutoRange) spans the data. A span shorter than `min_span` is
+    ///   widened evenly about its middle; no data spans `0..min_span`. With `nice` set, both
+    ///   ends then move outward to whole multiples of the smallest 1, 2, 2.5 or 5 times a power
+    ///   of ten step that divides the span into at most four parts, so `(3.2, 87.0)` resolves
+    ///   to `(0.0, 100.0)` and `(-40.0, 12.0)` to `(-40.0, 20.0)`, and a tick step from that
+    ///   family lands on both ends.
+    ///
+    /// A non-finite end of `data` is ignored (the other end stands for both), a reversed pair
+    /// is swapped, and the result is always finite with `max > min`, as for `resolve`.
+    pub fn resolve_range(&self, data: Option<(f32, f32)>) -> (f32, f32) {
+        let data = data.and_then(finite_range);
+        match *self {
+            Self::Fixed { .. } => self.resolve(None),
+            Self::Auto { .. } => self.resolve(data.map(|(_, max)| max)),
+            Self::AutoRange { nice, min_span } => auto_range(data, nice, min_span),
+        }
+    }
+}
+
+/// `(min, max)` of the finite ends of `(a, b)`; one finite end stands for both.
+fn finite_range((a, b): (f32, f32)) -> Option<(f32, f32)> {
+    match (a.is_finite(), b.is_finite()) {
+        (true, true) => Some((a.min(b), a.max(b))),
+        (true, false) => Some((a, a)),
+        (false, true) => Some((b, b)),
+        (false, false) => None,
+    }
+}
+
+/// How many parts at most a nice [`YDomain::AutoRange`] step divides the data's span into.
+const RANGE_PARTS: f64 = 4.0;
+
+/// How many steps outward a nice end may walk to cover the data before the data's own ends
+/// are used instead.
+const COVER_STEPS: usize = 3;
+
+/// The [`YDomain::AutoRange`] resolution of finite, ordered `data`.
+fn auto_range(data: Option<(f32, f32)>, nice: bool, min_span: f32) -> (f32, f32) {
+    let min_span = if min_span.is_finite() {
+        f64::from(min_span.max(0.0))
+    } else {
+        0.0
+    };
+    let (lo, hi) = data.map_or((0.0, min_span), |(lo, hi)| (f64::from(lo), f64::from(hi)));
+    let (lo, hi) = if hi - lo < min_span {
+        let middle = lo + (hi - lo) / 2.0;
+        (middle - min_span / 2.0, middle + min_span / 2.0)
+    } else {
+        (lo, hi)
+    };
+    let rounded = if nice { nice_ends(lo, hi) } else { None };
+    let (lo, hi) = rounded.unwrap_or((lo as f32, hi as f32));
+    non_degenerate(lo, hi)
+}
+
+/// `lo..hi` widened to whole multiples of the smallest nice step at least `(hi - lo) / 4`,
+/// or `None` when the span is empty, a rounded end does not fit in `f32`, or the step is too
+/// fine for `f32` at that magnitude to cover the data. A returned range always covers
+/// `lo..hi` as `f32` values.
+fn nice_ends(lo: f64, hi: f64) -> Option<(f32, f32)> {
+    let span = hi - lo;
+    if !(span.is_finite() && span > 0.0) {
+        return None;
+    }
+    let (mantissa, exponent) = nice_step(span / RANGE_PARTS)?;
+    let size = mantissa * 10f64.powi(exponent);
+    // The tolerance keeps an end that is a whole multiple of the step (up to the rounding of
+    // the f32 it came from) on that multiple instead of a step further out. It is capped at
+    // half a step: far from zero the uncapped value would span several steps and carry an
+    // end deep into the data.
+    let tolerance = |x: f64| (1e-6 * x.abs().max(1.0)).min(0.5);
+    let (first, last) = (lo / size, hi / size);
+    let first = (first + tolerance(first)).floor();
+    let last = (last - tolerance(last)).ceil();
+    let value = |index: f64| {
+        // The integer multiple of the mantissa is exact and the power of ten is applied once,
+        // so an end is the correctly rounded multiple rather than an accumulated sum.
+        let scaled = index * mantissa;
+        let value = if exponent >= 0 {
+            scaled * 10f64.powi(exponent)
+        } else {
+            scaled / 10f64.powi(-exponent)
+        };
+        value as f32
+    };
+    // An end the tolerance left inside the data moves out a step at a time until the range
+    // covers it. One step is enough while a step is wider than the f32 spacing at that
+    // magnitude; when it is not, the walk gives up and the caller keeps the data's own ends.
+    let (data_lo, data_hi) = (lo as f32, hi as f32);
+    let (mut first, mut last) = (first, last);
+    for _ in 0..COVER_STEPS {
+        if value(first) > data_lo {
+            first -= 1.0;
+        }
+        if value(last) < data_hi {
+            last += 1.0;
+        }
+    }
+    if value(first) > data_lo || value(last) < data_hi {
+        return None;
+    }
+    let (lo, hi) = (value(first), value(last));
+    (lo.is_finite() && hi.is_finite() && hi > lo).then_some((lo, hi))
+}
+
+/// The smallest `mantissa * 10^exponent` with a mantissa from [`NICE_STEPS`] that is `>= raw`.
+fn nice_step(raw: f64) -> Option<(f64, i32)> {
+    if !(raw.is_finite() && raw > 0.0) {
+        return None;
+    }
+    // Start a decade low so an exponent `log10` rounds up by one still finds the answer.
+    let decade = raw.log10().floor() as i32 - 1;
+    for exponent in decade..=decade + 2 {
+        for mantissa in NICE_STEPS {
+            if mantissa * 10f64.powi(exponent) >= raw {
+                return Some((mantissa, exponent));
+            }
+        }
+    }
+    None
 }
 
 impl Default for YDomain {
