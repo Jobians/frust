@@ -9,9 +9,10 @@
 //!
 //! Charts are display-only and tap-transparent by default, so a tap reaches whatever lies
 //! beneath. Setting `on_scrub` on a `time_series` opts in to scrubbing: its plot then handles
-//! presses. A [`YAxis`] adds tick rules and labels, also opt-in. A chart's colours come from
-//! the caller first, then the installed theme, then the fallback constants on [`Tone`].
-//! [`YDomain`] and [`nice_max`] pick the y range.
+//! presses. A [`YAxis`] adds tick rules and labels, also opt-in; on an automatic domain it asks
+//! for one layout pass when new data changes its ticks, the only time a write leads to more
+//! than a repaint. A chart's colours come from the caller first, then the installed theme,
+//! then the fallback constants on [`Tone`]. [`YDomain`] and [`nice_max`] pick the y range.
 //!
 //! ```
 //! use frust_charts::{Samples, Series, YDomain};

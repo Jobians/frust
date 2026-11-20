@@ -142,7 +142,8 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   by default, so a tap reaches whatever is beneath them, except a `time_series` that sets
   `on_scrub`. `frust plugin add charts` adds it to an app.
 - `frust-charts` gains five opt-in features. `TimeSeriesView::y_axis(YAxis)` draws round tick rules
-  and labels (`AxisSide`, `TickFormat`, `ticks`) in place of the `.grid` fractions. `TimedSeries`
+  and labels (`AxisSide`, `TickFormat`, `ticks`) in place of the `.grid` fractions; on an automatic
+  domain it asks for one layout pass when new data changes its ticks. `TimedSeries`
   keeps timestamped points bounded by a capacity and/or a time window, with `gap_after`;
   `SeriesSource` lets `series`, `mirrored` and `sparkline` take either handle, and block styles draw
   a line for timed data. `TimeSeriesView::on_scrub` and `crosshair` report a `ScrubEvent` (with a

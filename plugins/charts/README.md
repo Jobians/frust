@@ -33,9 +33,12 @@ let tone = Tone::load(calm, busy, critical); // busy from 60, critical from 85
 
 A write never rebuilds or lays out: it bumps the handle's revision and calls
 `frust::request_repaint()` once per call, so a chart painting from the handle
-updates on the next frame with no frame loop. Charts are display-only and
-tap-transparent unless a `time_series` sets `on_scrub` (see Scrub). Colours come from the caller, then the installed theme, then
-the fallback constants on `Tone`.
+updates on the next frame with no frame loop. The one exception is a
+`time_series` with a y axis on an automatic domain: when new data changes its
+ticks, the chart asks for one layout pass to shape the new labels. Charts are
+display-only and tap-transparent unless a `time_series` sets `on_scrub` (see
+Scrub). Colours come from the caller, then the installed theme, then the
+fallback constants on `Tone`.
 
 `YDomain` picks the y range: `fixed(min, max)`, `percent()` (0..100) or
 `auto_from_zero()`, which rounds the data's top up with `nice_max` (1, 2, 2.5,
@@ -84,8 +87,8 @@ time_series::<App>()
 Off by default. With `on_scrub` set the plot handles presses, so it is no longer tap-transparent.
 The callback gets a `ScrubEvent` (`sample`, one value per series, `x`, `position`) while the
 pointer is down, and `None` on release. Inside a vertical scroll view a sideways drag stays with
-the chart; a horizontal scroll view takes the drag after the touch slop, and the `None` then
-arrives on the rebuild that follows.
+the chart, while a horizontal scroll view takes the drag after the touch slop. Whenever a scroll
+view takes the drag, the `None` arrives on the rebuild that follows.
 
 ## Line refinements
 
