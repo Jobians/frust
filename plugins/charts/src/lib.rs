@@ -23,14 +23,17 @@
 //! cores.slot(3).set(97.5);
 //! ```
 
+mod axis;
 mod geometry;
 mod heat;
 mod meter;
 mod samples;
 mod scale;
+mod scrub;
 mod series;
 mod sparkline;
 mod time_series;
+mod timed;
 mod tone;
 
 pub use samples::{SampleSlot, Samples};
