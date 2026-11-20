@@ -10,6 +10,7 @@
 //! Every color resolves from the live [`Theme`] (Glyph baseline fallback), so
 //! each page follows the brightness toggle.
 
+use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -37,33 +38,55 @@ pub type S = NativeWidgetsDemoState;
 // ---------------------------------------------------------------------------
 
 /// Defines a `fn $name() -> RwSignal<$ty>` returning a page-local signal
-/// cached in a `thread_local!`, self-healing across a disposed owner (a
-/// headless test tears its owner down between runs; the next read mints a
-/// fresh signal instead of touching a disposed one). Page state no other page
-/// reads lives here rather than in [`NativeWidgetsDemoState`], which holds
-/// only what the shell itself needs.
+/// cached in the one shared slot map ([`local_slot`]), self-healing across a
+/// disposed owner (a headless test tears its owner down between runs; the next
+/// read mints a fresh signal instead of touching a disposed one). Page state no
+/// other page reads lives here rather than in [`NativeWidgetsDemoState`], which
+/// holds only what the shell itself needs.
+///
+/// Every slot shares a single `thread_local!` rather than declaring its own,
+/// because on Android each thread-local static costs one pthread key and the
+/// per-process key limit is small and never refilled.
 macro_rules! local_sig {
     ($name:ident, $ty:ty, $init:expr) => {
         fn $name() -> frust::RwSignal<$ty> {
-            use frust::GetUntracked as _;
-            thread_local! {
-                static SLOT: std::cell::RefCell<Option<frust::RwSignal<$ty>>> =
-                    const { std::cell::RefCell::new(None) };
-            }
-            SLOT.with(|cell| {
-                if let Some(sig) = *cell.borrow()
-                    && sig.try_get_untracked().is_some()
-                {
-                    return sig;
-                }
-                let sig = frust::RwSignal::new($init);
-                *cell.borrow_mut() = Some(sig);
-                sig
-            })
+            // A type unique to this invocation: its `TypeId` keys the slot.
+            struct Slot;
+            $crate::pages::common::local_slot::<$ty>(std::any::TypeId::of::<Slot>(), || $init)
         }
     };
 }
 pub(crate) use local_sig;
+
+thread_local! {
+    /// Every [`local_sig!`] slot, type-erased, keyed by the invoking slot's
+    /// marker type. One thread-local for all of them.
+    static LOCAL_SLOTS: RefCell<HashMap<TypeId, Box<dyn Any>>> = RefCell::new(HashMap::new());
+}
+
+/// The signal cached under `key`: the same one on every call, re-minted with
+/// `init` when its owner was disposed. `init` runs only when minting and with
+/// no borrow of the slot map held, so it may itself call another slot.
+pub(crate) fn local_slot<T: Clone + Send + Sync + 'static>(
+    key: TypeId,
+    init: impl FnOnce() -> T,
+) -> frust::RwSignal<T> {
+    let cached = LOCAL_SLOTS.with(|slots| {
+        slots
+            .borrow()
+            .get(&key)
+            .and_then(|any| any.downcast_ref::<frust::RwSignal<T>>())
+            .copied()
+    });
+    if let Some(sig) = cached
+        && sig.try_get_untracked().is_some()
+    {
+        return sig;
+    }
+    let sig = frust::RwSignal::new(init());
+    LOCAL_SLOTS.with(|slots| slots.borrow_mut().insert(key, Box::new(sig)));
+    sig
+}
 
 /// Bump a `u32` counter signal by one — from an event handler only (a native
 /// listener or a frust `on_*` callback), never from `build`.
@@ -774,5 +797,40 @@ impl Widget for AnchorProbeWidget {
 
     fn visit_children(&self, visitor: &mut dyn FnMut(&ChildPod)) {
         visitor(&self.child);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use reactive_graph::owner::Owner;
+    use reactive_graph::traits::{GetUntracked, Set};
+
+    local_sig!(slot_a, u32, 1);
+    local_sig!(slot_b, u32, 2);
+    local_sig!(slot_dependent, u32, slot_a().get_untracked() + 10);
+
+    fn owner() -> Owner {
+        let _ = frust_reactive::ReactiveRuntime::init(std::sync::Arc::new(|| {}));
+        let o = Owner::new();
+        o.set();
+        o
+    }
+
+    #[test]
+    fn slots_are_independent_and_stable() {
+        let _o = owner();
+        slot_a().set(7);
+        assert_eq!(slot_a().get_untracked(), 7);
+        assert_eq!(slot_b().get_untracked(), 2);
+        assert_eq!(slot_a(), slot_a());
+    }
+
+    #[test]
+    fn init_may_read_another_slot() {
+        let _o = owner();
+        assert_eq!(
+            slot_dependent().get_untracked(),
+            slot_a().get_untracked() + 10
+        );
     }
 }
