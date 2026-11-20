@@ -43,6 +43,10 @@ enum PendingStep {
     /// The `.gitignore` line for the `ios/<package>` link a manifest-described
     /// plugin's [`Contribution::SwiftPackageRef`] makes.
     GitignoreLink,
+    /// A [`Contribution::AndroidThemeParent`] the add refuses: the app's
+    /// activity does not use a defined `FrustAppTheme` and names no accepted
+    /// Material theme, so the missing edits are the app's own.
+    AppThemeMissing,
 }
 
 impl PendingContribution {
@@ -56,6 +60,29 @@ impl PendingContribution {
             _ => self.contribution.describe(),
         }
     }
+
+    /// The project edits to make by hand before adding the plugin applies
+    /// this row, as one clause, or `None` when the add applies it itself.
+    /// `Some` exactly for a [`Contribution::AndroidThemeParent`] the add
+    /// refuses with [`PluginAddError::AndroidAppThemeMissing`]: the
+    /// `FrustAppTheme` style in `res/values/themes.xml` and the manifest
+    /// theme naming it.
+    pub fn manual_edits(&self) -> Option<String> {
+        match (&self.contribution, self.step) {
+            (Contribution::AndroidThemeParent { parent }, PendingStep::AppThemeMissing) => {
+                let style = apply::APP_THEME_STYLE;
+                Some(format!(
+                    "add `<style name=\"{style}\" parent=\"{parent}\" />` inside `<resources>` \
+                     in {themes} (create the file if it is missing) and set \
+                     android:theme=\"@style/{style}\" on both the <application> and the \
+                     <activity> element of {manifest}",
+                    themes = apply::THEMES_REL,
+                    manifest = apply::MANIFEST_REL,
+                ))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The tracked contributions of `entry` — its base and the requested
@@ -64,7 +91,7 @@ impl PendingContribution {
 /// predicate its applier skips by: the dependency line, the Cargo feature,
 /// the `uses-permission`, the `Info.plist` `<key>`, both Gradle include
 /// lines, the repository url, the `FrustAppTheme` parent (or an activity
-/// theme that is already Material 3), all six pbxproj package sites, the framework
+/// theme that is already an accepted Material one), all six pbxproj package sites, the framework
 /// in every `OTHER_LDFLAGS` list, a manifest-described plugin's `ios/<package>`
 /// link in the root `.gitignore` (when the app has one), and an entitlement's key in every file the
 /// Runner configurations sign with plus `CODE_SIGN_ENTITLEMENTS` in each of
@@ -86,10 +113,19 @@ pub fn pending_contributions(
     let mut pending = Vec::new();
     for contribution in contributions {
         if is_pending(project_root, entry, &doc, contribution)? {
+            let step = match contribution {
+                Contribution::AndroidThemeParent { parent }
+                    if apply::android_theme_parent(project_root, parent)?
+                        == apply::ThemeParent::NoAppTheme =>
+                {
+                    PendingStep::AppThemeMissing
+                }
+                _ => PendingStep::Contribution,
+            };
             pending.push(PendingContribution {
                 plugin_id: entry.spec.id.clone(),
                 contribution: contribution.clone(),
-                step: PendingStep::Contribution,
+                step,
             });
         }
         if let Contribution::SwiftPackageRef { package_name, .. } = contribution
@@ -264,8 +300,7 @@ fn check_anchors(
             }
             // Pending means rewritable or unthemed; only the second refuses.
             Contribution::AndroidThemeParent { parent }
-                if apply::android_theme_parent(project_root, parent)?
-                    == apply::ThemeParent::NoAppTheme =>
+                if row.step == PendingStep::AppThemeMissing =>
             {
                 return Err(apply::android_app_theme_missing(&row.plugin_id, parent));
             }
@@ -1671,6 +1706,156 @@ mod tests {
         ));
         assert_eq!(snapshot(&stock), before);
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Every theme shape the rule distinguishes, judged by
+    /// `pending_contributions`, the pre-write check and the add itself: they
+    /// agree on each, and only a rewritable parent changes `themes.xml`.
+    #[test]
+    fn pending_agrees_with_the_add_on_every_theme_shape() {
+        const PLATFORM: &str = "@android:style/Theme.Material.NoActionBar";
+        let root = temp_root("theme-shapes");
+        let entry = theme_entry();
+        let add = |app: &Path| apply::add_entry_with(&StubLocator::new(), app, &entry, &[]);
+        let styles = |body: &str| {
+            format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n{body}</resources>\n")
+        };
+        let parent_style = |parent: &str| {
+            styles(&format!(
+                "    <style name=\"FrustAppTheme\" parent=\"{parent}\" />\n"
+            ))
+        };
+
+        enum Expect {
+            Satisfied,
+            Rewritten,
+            Refused,
+        }
+        // (case, themes.xml text or none, manifest theme, expectation)
+        let cases: Vec<(&str, Option<String>, &str, Expect)> = vec![
+            (
+                "m3-light",
+                Some(parent_style("Theme.Material3.Light.NoActionBar")),
+                "@style/FrustAppTheme",
+                Expect::Satisfied,
+            ),
+            (
+                "m3-expressive",
+                Some(parent_style(
+                    "Theme.Material3Expressive.DayNight.NoActionBar",
+                )),
+                "@style/FrustAppTheme",
+                Expect::Satisfied,
+            ),
+            (
+                "app-style-m3",
+                Some(styles(
+                    "    <style name=\"Brand\" parent=\"Theme.Material3.Light\" />\n\
+                     \x20   <style name=\"FrustAppTheme\" parent=\"Brand\" />\n",
+                )),
+                "@style/FrustAppTheme",
+                Expect::Satisfied,
+            ),
+            (
+                "app-style-platform",
+                Some(styles(
+                    "    <style name=\"Brand\" parent=\"android:Theme.Material.Light\" />\n\
+                     \x20   <style name=\"FrustAppTheme\" parent=\"Brand\" />\n",
+                )),
+                "@style/FrustAppTheme",
+                Expect::Rewritten,
+            ),
+            (
+                "app-style-unresolved",
+                Some(parent_style("Theme.AppCompat.Light.NoActionBar")),
+                "@style/FrustAppTheme",
+                Expect::Satisfied,
+            ),
+            (
+                "material-components-manifest",
+                None,
+                "@style/Theme.MaterialComponents.DayNight.NoActionBar",
+                Expect::Satisfied,
+            ),
+            (
+                "unused-style",
+                Some(parent_style("android:Theme.Material.NoActionBar")),
+                PLATFORM,
+                Expect::Refused,
+            ),
+        ];
+
+        for (case, themes, manifest_theme, expect) in cases {
+            let app = scaffold_app(&root.join(case));
+            match &themes {
+                Some(text) => fs::write(app.join(apply::THEMES_REL), text).unwrap(),
+                None => fs::remove_file(app.join(apply::THEMES_REL)).unwrap(),
+            }
+            let manifest = read(&app, apply::MANIFEST_REL);
+            fs::write(
+                app.join(apply::MANIFEST_REL),
+                manifest.replace("@style/FrustAppTheme", manifest_theme),
+            )
+            .unwrap();
+            let pending = pending_contributions(&app, &entry, &[]).unwrap();
+            let before = snapshot(&app);
+            match expect {
+                Expect::Satisfied => {
+                    assert!(pending.is_empty(), "{case}: {pending:?}");
+                    let report = add(&app).unwrap();
+                    assert_eq!(
+                        report.items[0].outcome,
+                        AddOutcome::AlreadyPresent,
+                        "{case}"
+                    );
+                    assert_eq!(snapshot(&app), before, "{case}: nothing written");
+                }
+                Expect::Rewritten => {
+                    assert_eq!(pending.len(), 1, "{case}: {pending:?}");
+                    assert_eq!(pending[0].manual_edits(), None, "{case}");
+                    check_anchors(&app, &pending).unwrap();
+                    let report = add(&app).unwrap();
+                    assert_eq!(report.items[0].outcome, AddOutcome::Applied, "{case}");
+                    let after = read(&app, apply::THEMES_REL);
+                    assert!(
+                        after.contains(
+                            "<style name=\"FrustAppTheme\" parent=\"Theme.Material3.DayNight.NoActionBar\" />"
+                        ),
+                        "{case}: {after}"
+                    );
+                    assert!(
+                        after.contains("parent=\"android:Theme.Material.Light\""),
+                        "{case}: the app's own style keeps its parent: {after}"
+                    );
+                    assert!(
+                        pending_contributions(&app, &entry, &[]).unwrap().is_empty(),
+                        "{case}: nothing pending after the add"
+                    );
+                }
+                Expect::Refused => {
+                    assert_eq!(pending.len(), 1, "{case}: {pending:?}");
+                    let edits = pending[0].manual_edits().expect("manual edits");
+                    assert!(edits.contains(apply::THEMES_REL), "{edits}");
+                    assert!(edits.contains(apply::MANIFEST_REL), "{edits}");
+                    assert!(
+                        matches!(
+                            check_anchors(&app, &pending),
+                            Err(PluginAddError::AndroidAppThemeMissing { .. })
+                        ),
+                        "{case}"
+                    );
+                    assert!(
+                        matches!(
+                            add(&app),
+                            Err(PluginAddError::AndroidAppThemeMissing { .. })
+                        ),
+                        "{case}"
+                    );
+                    assert_eq!(snapshot(&app), before, "{case}: nothing written");
+                }
+            }
+        }
         let _ = fs::remove_dir_all(&root);
     }
 

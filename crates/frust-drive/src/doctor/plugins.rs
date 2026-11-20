@@ -28,7 +28,9 @@ pub enum PluginFinding {
         pending: Vec<String>,
         /// The limitation entry explaining a pending contribution, if any.
         limitation: Option<&'static str>,
-        /// The command that applies the edits.
+        /// What applies the edits: the add command, preceded by the manual
+        /// edits when the add would refuse a pending contribution
+        /// ([`crate::plugin::PendingContribution::manual_edits`]).
         fix: String,
     },
     /// A check that could not be made; never a failure.
@@ -90,8 +92,15 @@ pub fn plugin_findings(project_root: &Path) -> Vec<PluginFinding> {
                         .iter()
                         .any(|p| matches!(p.contribution, Contribution::AndroidThemeParent { .. }))
                         .then_some(THEME_LIMITATION);
+                    let manual: Vec<String> =
+                        pending.iter().filter_map(|p| p.manual_edits()).collect();
+                    let fix = if manual.is_empty() {
+                        format!("frust plugin add {id}")
+                    } else {
+                        format!("{}, then re-run frust plugin add {id}", manual.join("; "))
+                    };
                     findings.push(PluginFinding::Pending {
-                        fix: format!("frust plugin add {id}"),
+                        fix,
                         pending: pending.iter().map(|p| p.describe()).collect(),
                         plugin_id: id,
                         limitation,
@@ -224,13 +233,75 @@ mod tests {
         )
         .unwrap();
         let findings = plugin_findings(&root);
-        let [PluginFinding::Pending { limitation, .. }] = findings.as_slice() else {
+        let [
+            PluginFinding::Pending {
+                limitation, fix, ..
+            },
+        ] = findings.as_slice()
+        else {
             panic!("{findings:?}");
         };
         assert_eq!(*limitation, Some(THEME_LIMITATION));
+        // A platform parent is rewritable: the add itself is the fix.
+        assert_eq!(fix, "frust plugin add native-widgets");
         let lines = findings[0].lines().join("\n");
         assert!(lines.contains(THEME_LIMITATION), "{lines}");
         assert!(lines.contains("Android theme `FrustAppTheme`"), "{lines}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An activity theme that is neither `FrustAppTheme` nor a Material one
+    /// makes `frust plugin add` refuse, so the fix names the two manual edits
+    /// before the add.
+    #[test]
+    fn an_unthemed_activity_names_the_manual_edits_then_the_add() {
+        let root = app_with_native_widgets("unthemed");
+        let manifest = root.join("android/app/src/main/AndroidManifest.xml");
+        let text = fs::read_to_string(&manifest).unwrap();
+        assert!(text.contains("@style/FrustAppTheme"));
+        fs::write(
+            &manifest,
+            text.replace(
+                "@style/FrustAppTheme",
+                "@android:style/Theme.Material.NoActionBar",
+            ),
+        )
+        .unwrap();
+        let findings = plugin_findings(&root);
+        let [
+            PluginFinding::Pending {
+                limitation, fix, ..
+            },
+        ] = findings.as_slice()
+        else {
+            panic!("{findings:?}");
+        };
+        assert_eq!(*limitation, Some(THEME_LIMITATION));
+        assert_ne!(fix, "frust plugin add native-widgets");
+        assert!(
+            fix.contains(
+                "`<style name=\"FrustAppTheme\" parent=\"Theme.Material3.DayNight.NoActionBar\" />`"
+            ),
+            "{fix}"
+        );
+        assert!(
+            fix.contains("android/app/src/main/res/values/themes.xml"),
+            "{fix}"
+        );
+        assert!(
+            fix.contains("android:theme=\"@style/FrustAppTheme\" on both the <application> and the <activity>"),
+            "{fix}"
+        );
+        assert!(
+            fix.contains("android/app/src/main/AndroidManifest.xml"),
+            "{fix}"
+        );
+        assert!(
+            fix.ends_with("then re-run frust plugin add native-widgets"),
+            "{fix}"
+        );
+        let lines = findings[0].lines().join("\n");
+        assert!(lines.contains(&format!("fix: {fix}")), "{lines}");
         let _ = fs::remove_dir_all(&root);
     }
 
