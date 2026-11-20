@@ -45,7 +45,9 @@ use frust_drive::web_build::{self, WebPreflight};
 /// "Platform packages" heading prints where the project's Android, iOS and
 /// web embeddings resolve — the directories `frust run`/`frust build` wire
 /// the host projects to — or why they could not be located. Informational
-/// too: it never moves the exit code.
+/// too: it never moves the exit code. A "Plugins" heading follows it, listing
+/// built-in plugins the app depends on whose project edits are still pending
+/// (see [`plugin_lines`]); it is absent when nothing is pending.
 pub fn run_in(runner: &dyn ProcessRunner, verbose: bool) -> Result<u8> {
     let env = RealEnv;
     let ctx = DoctorCtx {
@@ -89,8 +91,30 @@ fn run_with(
             println!("{line}");
         }
     }
+    for line in plugin_lines(project_dir) {
+        println!("{line}");
+    }
 
     exit_code(&results)
+}
+
+/// The "Plugins" heading's lines: one row group per built-in plugin the app
+/// depends on but has not finished wiring, and nothing at all when there are
+/// none or when `project_dir` is no Frust project (holds no `frust.toml`).
+/// Informational: never moves the exit code.
+fn plugin_lines(project_dir: &Path) -> Vec<String> {
+    if !project_dir.join("frust.toml").is_file() {
+        return Vec::new();
+    }
+    let findings = frust_drive::doctor::plugin_findings(project_dir);
+    if findings.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec!["Plugins".to_string()];
+    for finding in &findings {
+        lines.extend(finding.lines());
+    }
+    lines
 }
 
 /// The "Platform packages" heading's lines: one row per platform naming the
@@ -581,5 +605,105 @@ mod tests {
             },
             true,
         );
+    }
+
+    /// `frust.toml` plus an app with native-widgets whose Gradle include was
+    /// removed.
+    fn project_with_pending_plugin(tag: &str) -> PathBuf {
+        let dir = empty_dir(tag);
+        let ctx = frust_drive::scaffold::TemplateContext {
+            project_name: "acme_app".into(),
+            title_case_name: "Acme App".into(),
+            org: "com.example".into(),
+            description: "A test app.".into(),
+            frust_version: "0.1.0".into(),
+            frust: frust_drive::scaffold::FrustDependency::Registry {
+                version: "0.1.0".into(),
+            },
+            deeplink_scheme: None,
+            deeplink_host: None,
+        };
+        frust_drive::scaffold::generate(&dir, &ctx, None, false, None).unwrap();
+        std::fs::write(dir.join("frust.toml"), "").unwrap();
+        let locator =
+            frust_drive::packages::StubLocator::new().with("frust-native-widgets", dir.join("nw"));
+        frust_drive::plugin::add_plugin_with(&locator, &dir, "native-widgets", &[]).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_plugins_block_is_empty_when_nothing_is_pending() {
+        let dir = project_with_pending_plugin("plugins-ok");
+        assert!(plugin_lines(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Drops the native-widgets Gradle include, leaving that plugin pending.
+    fn remove_gradle_include(dir: &Path) {
+        let settings = dir.join("android/settings.gradle.kts");
+        let kept: String = std::fs::read_to_string(&settings)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.contains("frust-native-widgets"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&settings, kept).unwrap();
+    }
+
+    #[test]
+    fn the_plugins_block_lists_a_pending_plugin_and_never_changes_the_exit_code() {
+        let dir = project_with_pending_plugin("plugins-pending");
+        remove_gradle_include(&dir);
+        let lines = plugin_lines(&dir);
+        assert_eq!(lines[0], "Plugins");
+        assert!(
+            lines.iter().any(|l| l.contains("native-widgets")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("frust plugin add native-widgets")),
+            "{lines:?}"
+        );
+        let runner = FakeProcessRunner::new();
+        let env = EmptyEnv;
+        assert_eq!(
+            run_with(&ctx(&runner, &env), &fixed(&[Status::Pass]), &dir, false),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_project_prints_one_note_and_exits_zero() {
+        let dir = empty_dir("plugins-note");
+        std::fs::write(dir.join("frust.toml"), "").unwrap();
+        let lines = plugin_lines(&dir);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], "Plugins");
+        assert!(lines[1].contains("note:"), "{lines:?}");
+        let runner = FakeProcessRunner::new();
+        let env = EmptyEnv;
+        assert_eq!(
+            run_with(&ctx(&runner, &env), &fixed(&[Status::Pass]), &dir, false),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same app with a pending plugin prints the block inside a Frust
+    /// project and nothing once `frust.toml` is gone.
+    #[test]
+    fn no_frust_toml_means_no_plugins_block() {
+        let dir = project_with_pending_plugin("plugins-no-toml");
+        remove_gradle_include(&dir);
+        assert!(
+            !plugin_lines(&dir).is_empty(),
+            "precondition: a pending plugin"
+        );
+        std::fs::remove_file(dir.join("frust.toml")).unwrap();
+        assert_eq!(plugin_lines(&dir), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

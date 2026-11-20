@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The app's own activity theme: AndroidManifest.xml names it on both the
+         application and the activity element. Its parent is the platform theme;
+         a plugin whose native controls need another theme family (Material 3)
+         changes only the parent attribute when it is added. -->
+    <style name="FrustAppTheme" parent="android:Theme.Material.NoActionBar" />
+</resources>

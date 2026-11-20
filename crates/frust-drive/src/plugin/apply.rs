@@ -29,6 +29,11 @@ pub(super) const SETTINGS_GRADLE_REL: &str = "android/settings.gradle.kts";
 pub(super) const APP_BUILD_GRADLE_REL: &str = "android/app/build.gradle.kts";
 pub(super) const PBXPROJ_REL: &str = "ios/Runner.xcodeproj/project.pbxproj";
 pub(super) const LIB_RS_REL: &str = "src/lib.rs";
+pub(super) const THEMES_REL: &str = "android/app/src/main/res/values/themes.xml";
+
+/// The app-owned activity style the app template defines in [`THEMES_REL`]
+/// and names in its manifest ([`Contribution::AndroidThemeParent`]).
+pub(super) const APP_THEME_STYLE: &str = "FrustAppTheme";
 
 /// The insertion anchors of `AndroidManifest.xml` and `Info.plist`.
 pub(super) const MANIFEST_ANCHOR: &str = "</manifest>";
@@ -304,6 +309,18 @@ pub(super) fn prepare_add<'e>(
             {
                 return Err(missing_repositories_marker());
             }
+        }
+    }
+
+    // A theme parent needs an activity that uses the app-owned style (or a
+    // manifest theme that is already an accepted Material one); any other
+    // app is refused here, before the Cargo dependency or any Gradle line is
+    // written.
+    for contribution in &contributions {
+        if let Contribution::AndroidThemeParent { parent } = contribution
+            && android_theme_parent(project_root, parent)? == ThemeParent::NoAppTheme
+        {
+            return Err(android_app_theme_missing(&spec.id, parent));
         }
     }
 
@@ -846,6 +863,9 @@ fn apply_contribution(
             groups,
             comment,
         } => apply_maven_repository(project_root, url, groups, comment),
+        Contribution::AndroidThemeParent { parent } => {
+            apply_android_theme_parent(project_root, &resolution.spec.id, parent)
+        }
         Contribution::SwiftPackageRef { package_name, .. } => {
             let pbxproj = apply_swift_package_ref(project_root, package_name)?;
             if matches!(resolution.form, DepForm::Manifest { .. })
@@ -2004,6 +2024,323 @@ fn apply_maven_repository(
 /// Whether `settings.gradle.kts` text `src` already names repository `url`.
 pub(super) fn maven_repository_present(src: &str, url: &str) -> bool {
     src.contains(&format!("uri(\"{}\")", kotlin_string_escape(url)))
+}
+
+/// Where an app stands against a [`Contribution::AndroidThemeParent`] — the
+/// one answer its applier and `pending.rs` both act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ThemeParent {
+    /// Nothing to write: the app has no `android/` directory, its activity
+    /// theme is itself an accepted Material theme
+    /// ([`is_accepted_material_theme`]), or the activity uses `FrustAppTheme`
+    /// and that style's parent is the requested one, an accepted Material
+    /// theme, or an app-owned style that does not lead to a platform theme.
+    Satisfied,
+    /// The activity uses `FrustAppTheme` and the style has no parent, a
+    /// platform parent, or an app-owned parent chain that ends in a platform
+    /// theme: the whole [`THEMES_REL`] text with only `FrustAppTheme`'s own
+    /// parent attribute rewritten.
+    Rewrite(String),
+    /// The activity theme is neither `FrustAppTheme` nor an accepted Material
+    /// theme, or it is `FrustAppTheme` and [`THEMES_REL`] does not define
+    /// the style — refused.
+    NoAppTheme,
+}
+
+/// The Material theme families a plugin's native Material views run under.
+const MATERIAL_THEME_FAMILIES: [&str; 3] = [
+    "Theme.Material3",
+    "Theme.Material3Expressive",
+    "Theme.MaterialComponents",
+];
+
+/// How many app-owned parents [`style_ancestry`] follows before it gives up.
+const STYLE_CHAIN_LIMIT: usize = 16;
+
+/// Whether style name `name` (optionally `@style/`-prefixed) is an accepted
+/// Material theme: one of [`MATERIAL_THEME_FAMILIES`], or one of them
+/// followed by `.` and more.
+pub(super) fn is_accepted_material_theme(name: &str) -> bool {
+    let style = name.strip_prefix("@style/").unwrap_or(name);
+    MATERIAL_THEME_FAMILIES.iter().any(|family| {
+        style
+            .strip_prefix(family)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    })
+}
+
+/// Whether style reference `name` is a platform theme (`android:…` or
+/// `@android:style/…`), which Material views refuse.
+fn is_platform_theme(name: &str) -> bool {
+    name.starts_with("android:") || name.starts_with("@android:")
+}
+
+/// Where a parent chain of app-owned styles leads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ancestry {
+    /// An accepted Material theme.
+    Material,
+    /// A platform theme.
+    Platform,
+    /// A style the resources text does not define, a cycle, or a chain
+    /// longer than [`STYLE_CHAIN_LIMIT`]: owned by the app, left alone.
+    Unresolved,
+}
+
+/// The [`Ancestry`] of style reference `parent`, the parent of style `child`,
+/// within resources text `src`: follows each app-owned style defined in `src`
+/// to its parent (or, for a dotted name without a `parent` attribute, to its
+/// implicit parent, the name before the last `.`) until an accepted Material
+/// or a platform theme is reached.
+fn style_ancestry(src: &str, child: &str, parent: &str) -> Ancestry {
+    let mut seen = vec![child.to_string()];
+    let mut current = parent.to_string();
+    for _ in 0..STYLE_CHAIN_LIMIT {
+        if is_accepted_material_theme(&current) {
+            return Ancestry::Material;
+        }
+        if is_platform_theme(&current) {
+            return Ancestry::Platform;
+        }
+        let name = current
+            .strip_prefix("@style/")
+            .unwrap_or(&current)
+            .to_string();
+        if seen.contains(&name) {
+            return Ancestry::Unresolved;
+        }
+        current = match style_parent(src, &name) {
+            None => return Ancestry::Unresolved,
+            Some(Some(next)) => next.to_string(),
+            Some(None) => match name.rsplit_once('.') {
+                Some((implicit, _)) => implicit.to_string(),
+                None => return Ancestry::Unresolved,
+            },
+        };
+        seen.push(name);
+    }
+    Ancestry::Unresolved
+}
+
+/// The [`ThemeParent`] of the app at `project_root` for `parent`. Reads only.
+/// The manifest decides first: its activity theme (the first `<activity>`'s
+/// `android:theme`, else the `<application>`'s) must be an accepted Material
+/// theme or `@style/FrustAppTheme`; only then does `FrustAppTheme`'s parent
+/// in [`THEMES_REL`] matter. A missing [`THEMES_REL`] is an app without the
+/// style; a missing `AndroidManifest.xml` (with `android/` present) fails as
+/// every manifest contribution does. A `parent` that cannot be written into
+/// an XML attribute is a registry bug, refused.
+pub(super) fn android_theme_parent(
+    project_root: &Path,
+    parent: &str,
+) -> Result<ThemeParent, PluginAddError> {
+    if parent.is_empty()
+        || parent.contains(['"', '\'', '<', '>', '&'])
+        || parent.contains(char::is_whitespace)
+    {
+        return Err(PluginAddError::InvalidContribution(format!(
+            "Android theme parent `{parent}` is not a style name"
+        )));
+    }
+    if !project_root.join(ANDROID_DIR_REL).is_dir() {
+        return Ok(ThemeParent::Satisfied);
+    }
+    let manifest = read_required(&project_root.join(MANIFEST_REL), MANIFEST_REL)?;
+    match activity_theme(&manifest).as_deref() {
+        Some(theme) if is_accepted_material_theme(theme) => return Ok(ThemeParent::Satisfied),
+        Some(theme) if theme.strip_prefix("@style/") == Some(APP_THEME_STYLE) => {}
+        _ => return Ok(ThemeParent::NoAppTheme),
+    }
+    let themes_path = project_root.join(THEMES_REL);
+    if !themes_path.is_file() {
+        return Ok(ThemeParent::NoAppTheme);
+    }
+    let src = read_required(&themes_path, THEMES_REL)?;
+    let rewrite = match style_parent(&src, APP_THEME_STYLE) {
+        None => return Ok(ThemeParent::NoAppTheme),
+        Some(None) => true,
+        Some(Some(current)) if current == parent => false,
+        Some(Some(current)) => style_ancestry(&src, APP_THEME_STYLE, current) == Ancestry::Platform,
+    };
+    if !rewrite {
+        return Ok(ThemeParent::Satisfied);
+    }
+    Ok(match set_style_parent(&src, APP_THEME_STYLE, parent) {
+        Some(Some(out)) => ThemeParent::Rewrite(out),
+        _ => ThemeParent::Satisfied,
+    })
+}
+
+/// The refusal of a [`ThemeParent::NoAppTheme`] app, naming plugin `plugin`.
+pub(super) fn android_app_theme_missing(plugin: &str, parent: &'static str) -> PluginAddError {
+    PluginAddError::AndroidAppThemeMissing {
+        plugin: plugin.into(),
+        parent,
+    }
+}
+
+/// [`Contribution::AndroidThemeParent`]: rewrite the style's parent when
+/// [`android_theme_parent`] says so; nothing else in the file changes.
+fn apply_android_theme_parent(
+    project_root: &Path,
+    plugin: &str,
+    parent: &'static str,
+) -> Result<AddOutcome, PluginAddError> {
+    match android_theme_parent(project_root, parent)? {
+        ThemeParent::Satisfied => Ok(AddOutcome::AlreadyPresent),
+        ThemeParent::Rewrite(out) => {
+            write_file(&project_root.join(THEMES_REL), THEMES_REL, &out)?;
+            Ok(AddOutcome::Applied)
+        }
+        ThemeParent::NoAppTheme => Err(android_app_theme_missing(plugin, parent)),
+    }
+}
+
+/// The parent of style `name` in resources text `src` set to `parent`:
+/// `None` when no such `<style>` exists, `Some(None)` when its parent already
+/// is `parent`, otherwise `Some(Some(text))` — `src` with only the parent
+/// attribute's value replaced (or, for a style without one, a `parent`
+/// attribute inserted after its `name`).
+fn set_style_parent(src: &str, name: &str, parent: &str) -> Option<Option<String>> {
+    for tag in xml_start_tags(src, "style") {
+        let text = &src[tag.clone()];
+        let Some(name_at) = xml_attr(text, "name") else {
+            continue;
+        };
+        if &text[name_at.clone()] != name {
+            continue;
+        }
+        let (at, insert) = match xml_attr(text, "parent") {
+            Some(value) if &text[value.clone()] == parent => return Some(None),
+            Some(value) => (
+                tag.start + value.start..tag.start + value.end,
+                parent.to_string(),
+            ),
+            // Past the closing quote of the `name` value.
+            None => {
+                let end = tag.start + name_at.end + 1;
+                (end..end, format!(" parent=\"{parent}\""))
+            }
+        };
+        let mut out = String::with_capacity(src.len() + insert.len());
+        out.push_str(&src[..at.start]);
+        out.push_str(&insert);
+        out.push_str(&src[at.end..]);
+        return Some(Some(out));
+    }
+    None
+}
+
+/// The parent of the first `<style>` named `name` in resources text `src`:
+/// `None` when no such style exists, `Some(None)` when it has no `parent`
+/// attribute.
+fn style_parent<'s>(src: &'s str, name: &str) -> Option<Option<&'s str>> {
+    xml_start_tags(src, "style").into_iter().find_map(|tag| {
+        let text = &src[tag];
+        let name_at = xml_attr(text, "name")?;
+        (&text[name_at] == name).then(|| xml_attr(text, "parent").map(|value| &text[value]))
+    })
+}
+
+/// The activity theme manifest text `src` names: the first `<activity>`'s
+/// `android:theme`, or the `<application>`'s when the activity names none.
+fn activity_theme(src: &str) -> Option<String> {
+    let theme_of = |element: &str| {
+        xml_start_tags(src, element)
+            .into_iter()
+            .next()
+            .and_then(|tag| {
+                let text = &src[tag];
+                xml_attr(text, "android:theme").map(|value| text[value].to_string())
+            })
+    };
+    theme_of("activity").or_else(|| theme_of("application"))
+}
+
+/// The byte ranges of every `<element …>` start tag in XML text `src`, `<`
+/// through `>`, skipping comments; a `>` inside a quoted attribute value
+/// does not end the tag. An unterminated tag or comment ends the scan.
+fn xml_start_tags(src: &str, element: &str) -> Vec<Range<usize>> {
+    let bytes = src.as_bytes();
+    let mut tags = Vec::new();
+    let mut at = 0;
+    while let Some(offset) = src[at..].find('<') {
+        let start = at + offset;
+        if src[start..].starts_with("<!--") {
+            let Some(close) = src[start + 4..].find("-->") else {
+                break;
+            };
+            at = start + 4 + close + 3;
+            continue;
+        }
+        let mut quote = None;
+        let mut end = None;
+        for (i, &b) in bytes.iter().enumerate().skip(start + 1) {
+            match (quote, b) {
+                (Some(q), _) if b == q => quote = None,
+                (Some(_), _) => {}
+                (None, b'"' | b'\'') => quote = Some(b),
+                (None, b'>') => {
+                    end = Some(i + 1);
+                    break;
+                }
+                (None, _) => {}
+            }
+        }
+        let Some(end) = end else {
+            break;
+        };
+        let after_name = src[start + 1..].strip_prefix(element);
+        if after_name
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|c| c.is_whitespace() || c == '/' || c == '>')
+        {
+            tags.push(start..end);
+        }
+        at = end;
+    }
+    tags
+}
+
+/// The byte range, within start-tag text `tag` (`<name a="v" …>`), of
+/// attribute `attr`'s value, quotes excluded.
+fn xml_attr(tag: &str, attr: &str) -> Option<Range<usize>> {
+    let bytes = tag.as_bytes();
+    // Past `<` and the element name.
+    let mut i = 1 + tag[1..].find(|c: char| c.is_whitespace() || c == '/' || c == '>')?;
+    loop {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b'/') {
+            i += 1;
+        }
+        let name_start = i;
+        while i < bytes.len()
+            && !(bytes[i].is_ascii_whitespace() || matches!(bytes[i], b'=' | b'>' | b'/'))
+        {
+            i += 1;
+        }
+        if i == name_start {
+            return None;
+        }
+        let name = &tag[name_start..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'=') {
+            // A bare attribute (not XML, but tolerated): no value.
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let quote = *bytes.get(i).filter(|b| matches!(b, b'"' | b'\''))?;
+        let value_start = i + 1;
+        let value_end = value_start + tag[value_start..].find(quote as char)?;
+        if name == attr {
+            return Some(value_start..value_end);
+        }
+        i = value_end + 1;
+    }
 }
 
 /// The `settings.gradle.kts` block one [`Contribution::GradleModule`] adds —
@@ -6921,5 +7258,478 @@ mod tests {
         assert_eq!(gradle_assignment(src, MIN_SDK_VALUE), Some("30"));
         assert_eq!(gradle_assignment(src, MIN_SDK), Some("24"));
         assert_eq!(gradle_assignment(src, "targetSdk"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // `Contribution::AndroidThemeParent`
+    // -----------------------------------------------------------------------
+
+    const M3_PARENT: &str = "Theme.Material3.DayNight.NoActionBar";
+    const PLATFORM_THEME: &str = "@android:style/Theme.Material.NoActionBar";
+
+    /// A fresh scaffold as an app generated before the template defined
+    /// `FrustAppTheme`: no `themes.xml`, and the manifest naming `theme`
+    /// directly on both elements.
+    fn without_app_theme(root: &Path, theme: &str) {
+        fs::remove_file(root.join(THEMES_REL)).unwrap();
+        rewrite(root, MANIFEST_REL, "@style/FrustAppTheme", theme);
+    }
+
+    fn theme_item(report: &AddReport) -> &AddItem {
+        report
+            .items
+            .iter()
+            .find(|i| i.description.starts_with("Android theme"))
+            .unwrap_or_else(|| panic!("{report:?}"))
+    }
+
+    #[test]
+    fn theme_parent_on_a_fresh_scaffold_rewrites_only_the_style_parent() {
+        let root = scaffold_project("theme-parent-fresh");
+        let before = snapshot_tree(&root);
+        let themes_before = fs::read_to_string(root.join(THEMES_REL)).unwrap();
+
+        assert_eq!(
+            apply_android_theme_parent(&root, "native-widgets", M3_PARENT).unwrap(),
+            AddOutcome::Applied
+        );
+
+        let mut after = snapshot_tree(&root);
+        let themes = String::from_utf8(after.remove(THEMES_REL).unwrap()).unwrap();
+        let mut rest = before.clone();
+        rest.remove(THEMES_REL);
+        assert_eq!(after, rest, "only themes.xml changes");
+        assert_eq!(
+            themes,
+            themes_before.replace(
+                "parent=\"android:Theme.Material.NoActionBar\"",
+                &format!("parent=\"{M3_PARENT}\"")
+            )
+        );
+        assert_ne!(themes, themes_before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn theme_parent_twice_is_already_present_and_writes_nothing() {
+        let root = scaffold_project("theme-parent-twice");
+        let first = add_plugin(&root, "native-widgets", &[]).unwrap();
+        assert_eq!(theme_item(&first).outcome, AddOutcome::Applied, "{first:?}");
+        assert_eq!(
+            theme_item(&first).description,
+            format!("Android theme `FrustAppTheme` parent `{M3_PARENT}`")
+        );
+
+        let after_first = snapshot_tree(&root);
+        let second = add_plugin(&root, "native-widgets", &[]).unwrap();
+        assert_eq!(
+            theme_item(&second).outcome,
+            AddOutcome::AlreadyPresent,
+            "{second:?}"
+        );
+        assert_eq!(
+            apply_android_theme_parent(&root, "native-widgets", M3_PARENT).unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        assert_eq!(snapshot_tree(&root), after_first);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An app whose manifest already names an accepted Material style (the
+    /// in-tree native-widgets demo's shape) needs no `FrustAppTheme`.
+    #[test]
+    fn a_material3_manifest_theme_is_already_present() {
+        for theme in [
+            "@style/Theme.Material3.DayNight.NoActionBar",
+            "@style/Theme.Material3Expressive.DayNight.NoActionBar",
+            "@style/Theme.MaterialComponents.DayNight.NoActionBar",
+        ] {
+            let root = scaffold_project("theme-parent-m3-manifest");
+            without_app_theme(&root, theme);
+            let report = add_plugin(&root, "native-widgets", &[]).unwrap();
+            assert_eq!(
+                theme_item(&report).outcome,
+                AddOutcome::AlreadyPresent,
+                "{theme}: {report:?}"
+            );
+            assert!(
+                !root.join(THEMES_REL).exists(),
+                "{theme}: nothing is created"
+            );
+            assert!(
+                fs::read_to_string(root.join(MANIFEST_REL))
+                    .unwrap()
+                    .contains(theme)
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// An app with neither the style nor a Material 3 manifest theme is
+    /// refused before anything is written, the Cargo dependency and Gradle
+    /// include included, and the refusal names both manual edits.
+    #[test]
+    fn an_app_without_the_style_or_a_material3_theme_is_refused_untouched() {
+        let root = scaffold_project("theme-parent-refused");
+        without_app_theme(&root, PLATFORM_THEME);
+        let cargo = fs::read_to_string(root.join(CARGO_TOML_REL)).unwrap();
+        let settings = fs::read_to_string(root.join(SETTINGS_GRADLE_REL)).unwrap();
+        let before = snapshot_tree(&root);
+
+        let err = add_plugin(&root, "native-widgets", &[]).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                PluginAddError::AndroidAppThemeMissing { plugin, parent }
+                    if &**plugin == "native-widgets" && *parent == M3_PARENT
+            ),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!(
+                "`<style name=\"FrustAppTheme\" parent=\"{M3_PARENT}\" />`"
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("android/app/src/main/res/values/themes.xml"),
+            "{text}"
+        );
+        assert!(
+            text.contains("android:theme=\"@style/FrustAppTheme\" on both the <application> and the <activity>"),
+            "{text}"
+        );
+        assert!(
+            text.contains("android/app/src/main/AndroidManifest.xml"),
+            "{text}"
+        );
+
+        assert_eq!(
+            fs::read_to_string(root.join(CARGO_TOML_REL)).unwrap(),
+            cargo
+        );
+        assert_eq!(
+            fs::read_to_string(root.join(SETTINGS_GRADLE_REL)).unwrap(),
+            settings
+        );
+        assert_eq!(snapshot_tree(&root), before);
+        assert!(matches!(
+            apply_android_theme_parent(&root, "native-widgets", M3_PARENT),
+            Err(PluginAddError::AndroidAppThemeMissing { .. })
+        ));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Once the two manual edits are made, the add goes through.
+    #[test]
+    fn the_refused_app_is_addable_after_the_two_named_edits() {
+        let root = scaffold_project("theme-parent-fixed");
+        let themes = fs::read_to_string(root.join(THEMES_REL)).unwrap();
+        without_app_theme(&root, PLATFORM_THEME);
+        assert!(add_plugin(&root, "native-widgets", &[]).is_err());
+
+        fs::write(root.join(THEMES_REL), themes).unwrap();
+        rewrite(&root, MANIFEST_REL, PLATFORM_THEME, "@style/FrustAppTheme");
+        let report = add_plugin(&root, "native-widgets", &[]).unwrap();
+        assert_eq!(
+            theme_item(&report).outcome,
+            AddOutcome::Applied,
+            "{report:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_app_without_android_skips_the_theme_parent() {
+        let root = scaffold_project("theme-parent-no-android");
+        fs::remove_dir_all(root.join(ANDROID_DIR_REL)).unwrap();
+        assert_eq!(
+            android_theme_parent(&root, M3_PARENT).unwrap(),
+            ThemeParent::Satisfied
+        );
+        assert_eq!(
+            apply_android_theme_parent(&root, "native-widgets", M3_PARENT).unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        assert!(!root.join(ANDROID_DIR_REL).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_theme_parent_that_is_not_a_style_name_is_refused() {
+        let root = scaffold_project("theme-parent-invalid");
+        for parent in ["", "Theme\" foo=\"x", "a b", "<x>"] {
+            assert!(
+                matches!(
+                    android_theme_parent(&root, parent),
+                    Err(PluginAddError::InvalidContribution(_))
+                ),
+                "{parent:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn style_parent_rewrite_touches_only_the_named_style() {
+        let src = "<resources>\n\
+                   \x20   <!-- <style name=\"FrustAppTheme\" parent=\"Commented\" /> -->\n\
+                   \x20   <style name=\"Other\" parent=\"Keep\" />\n\
+                   \x20   <style parent='Old' name='FrustAppTheme'>\n\
+                   \x20       <item name=\"android:x\">y</item>\n\
+                   \x20   </style>\n\
+                   </resources>\n";
+        let out = set_style_parent(src, APP_THEME_STYLE, "New")
+            .unwrap()
+            .unwrap();
+        assert_eq!(out, src.replace("parent='Old'", "parent='New'"));
+        assert_eq!(set_style_parent(&out, APP_THEME_STYLE, "New"), Some(None));
+        assert_eq!(set_style_parent(src, "Missing", "New"), None);
+
+        let bare = "<resources><style name=\"FrustAppTheme\"/></resources>";
+        assert_eq!(
+            set_style_parent(bare, APP_THEME_STYLE, "New")
+                .unwrap()
+                .unwrap(),
+            "<resources><style name=\"FrustAppTheme\" parent=\"New\"/></resources>"
+        );
+        // `<styles>` is not a `<style>`.
+        assert_eq!(
+            set_style_parent("<styles name=\"FrustAppTheme\"/>", APP_THEME_STYLE, "New"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_activity_theme_falls_back_to_the_application_theme() {
+        let manifest = |application: &str, activity: &str| {
+            format!(
+                "<manifest>\n<application android:label=\"a > b\"{application}>\n\
+                 <!-- <activity android:theme=\"@style/Theme.Material3.Light\"> -->\n\
+                 <activity android:name=\".MainActivity\"{activity}>\n\
+                 </activity>\n</application>\n</manifest>\n"
+            )
+        };
+        let theme = |name: &str| format!(" android:theme=\"{name}\"");
+        let effective = |application: &str, activity: &str| {
+            activity_theme(&manifest(&theme(application), &theme(activity)))
+        };
+        assert_eq!(
+            activity_theme(&manifest("", &theme(M3_PARENT))).as_deref(),
+            Some(M3_PARENT)
+        );
+        assert_eq!(
+            activity_theme(&manifest(&theme("@style/Theme.Material3"), "")).as_deref(),
+            Some("@style/Theme.Material3")
+        );
+        assert_eq!(
+            effective("@style/Theme.Material3.DayNight", PLATFORM_THEME).as_deref(),
+            Some(PLATFORM_THEME)
+        );
+        assert_eq!(activity_theme(&manifest("", "")), None);
+    }
+
+    #[test]
+    fn the_accepted_material_families_are_name_prefixes_ending_at_a_dot() {
+        for name in [
+            "Theme.Material3",
+            "Theme.Material3.DayNight.NoActionBar",
+            "Theme.Material3.Light.NoActionBar",
+            "@style/Theme.Material3Expressive",
+            "Theme.Material3Expressive.DayNight.NoActionBar",
+            "Theme.MaterialComponents",
+            "@style/Theme.MaterialComponents.DayNight.NoActionBar",
+        ] {
+            assert!(is_accepted_material_theme(name), "{name}");
+        }
+        for name in [
+            "",
+            "Theme.Material3Fake",
+            "Theme.MaterialComponentsX.Light",
+            "Theme.Material",
+            "android:Theme.Material.NoActionBar",
+            PLATFORM_THEME,
+            "@style/FrustAppTheme",
+            "Theme.AppCompat.Light",
+            "@android:style/Theme.Material3.Light",
+        ] {
+            assert!(!is_accepted_material_theme(name), "{name}");
+        }
+    }
+
+    /// `themes.xml` holding `styles` as its whole `<resources>` body.
+    fn write_themes(root: &Path, styles: &str) -> String {
+        let text = format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n{styles}</resources>\n"
+        );
+        fs::write(root.join(THEMES_REL), &text).unwrap();
+        text
+    }
+
+    /// A deliberately chosen Material parent on `FrustAppTheme` is the app's:
+    /// the add answers already present, nothing is pending, the file is
+    /// untouched.
+    #[test]
+    fn an_accepted_material_parent_is_already_present_and_untouched() {
+        for parent in [
+            "Theme.Material3.Light.NoActionBar",
+            "Theme.Material3Expressive.DayNight.NoActionBar",
+            "@style/Theme.MaterialComponents.DayNight.NoActionBar",
+        ] {
+            let root = scaffold_project("theme-parent-accepted");
+            let themes = write_themes(
+                &root,
+                &format!("    <style name=\"FrustAppTheme\" parent=\"{parent}\" />\n"),
+            );
+            assert_eq!(
+                android_theme_parent(&root, M3_PARENT).unwrap(),
+                ThemeParent::Satisfied,
+                "{parent}"
+            );
+            let report = add_plugin(&root, "native-widgets", &[]).unwrap();
+            assert_eq!(
+                theme_item(&report).outcome,
+                AddOutcome::AlreadyPresent,
+                "{parent}: {report:?}"
+            );
+            assert_eq!(fs::read_to_string(root.join(THEMES_REL)).unwrap(), themes);
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// An app-owned parent defined in the same file is followed to the first
+    /// Material or platform ancestor; only a platform one is rewritten, and
+    /// then only `FrustAppTheme`'s own parent.
+    #[test]
+    fn an_app_style_parent_is_followed_to_its_material_or_platform_ancestor() {
+        let root = scaffold_project("theme-parent-app-style");
+        for styles in [
+            "    <style name=\"Brand\" parent=\"Theme.Material3.Light.NoActionBar\" />\n\
+             \x20   <style name=\"FrustAppTheme\" parent=\"Brand\" />\n",
+            // A dotted style without a parent inherits from its prefix.
+            "    <style name=\"Brand\" parent=\"@style/Theme.MaterialComponents.Light\" />\n\
+             \x20   <style name=\"Brand.Dark\" />\n\
+             \x20   <style name=\"FrustAppTheme\" parent=\"@style/Brand.Dark\" />\n",
+        ] {
+            let themes = write_themes(&root, styles);
+            assert_eq!(
+                android_theme_parent(&root, M3_PARENT).unwrap(),
+                ThemeParent::Satisfied,
+                "{styles}"
+            );
+            assert_eq!(
+                apply_android_theme_parent(&root, "native-widgets", M3_PARENT).unwrap(),
+                AddOutcome::AlreadyPresent
+            );
+            assert_eq!(fs::read_to_string(root.join(THEMES_REL)).unwrap(), themes);
+        }
+
+        let themes = write_themes(
+            &root,
+            "    <style name=\"Base\" parent=\"@android:style/Theme.Material.Light\" />\n\
+             \x20   <style name=\"Brand\" parent=\"Base\" />\n\
+             \x20   <style name=\"FrustAppTheme\" parent=\"Brand\" />\n",
+        );
+        let expected = themes.replace(
+            "name=\"FrustAppTheme\" parent=\"Brand\"",
+            &format!("name=\"FrustAppTheme\" parent=\"{M3_PARENT}\""),
+        );
+        assert_ne!(expected, themes);
+        assert_eq!(
+            android_theme_parent(&root, M3_PARENT).unwrap(),
+            ThemeParent::Rewrite(expected.clone())
+        );
+        assert_eq!(
+            apply_android_theme_parent(&root, "native-widgets", M3_PARENT).unwrap(),
+            AddOutcome::Applied
+        );
+        assert_eq!(fs::read_to_string(root.join(THEMES_REL)).unwrap(), expected);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A parent this file cannot resolve — a style defined elsewhere, a
+    /// cycle, `FrustAppTheme` naming itself — is the app's and never
+    /// rewritten.
+    #[test]
+    fn an_unresolvable_app_style_parent_is_satisfied() {
+        let root = scaffold_project("theme-parent-unresolved");
+        for styles in [
+            "    <style name=\"FrustAppTheme\" parent=\"Theme.AppCompat.Light.NoActionBar\" />\n",
+            "    <style name=\"FrustAppTheme\" parent=\"@style/Brand\" />\n",
+            "    <style name=\"A\" parent=\"B\" />\n\
+             \x20   <style name=\"B\" parent=\"A\" />\n\
+             \x20   <style name=\"FrustAppTheme\" parent=\"A\" />\n",
+            "    <style name=\"FrustAppTheme\" parent=\"FrustAppTheme\" />\n",
+        ] {
+            let themes = write_themes(&root, styles);
+            assert_eq!(
+                android_theme_parent(&root, M3_PARENT).unwrap(),
+                ThemeParent::Satisfied,
+                "{styles}"
+            );
+            assert_eq!(
+                apply_android_theme_parent(&root, "native-widgets", M3_PARENT).unwrap(),
+                AddOutcome::AlreadyPresent
+            );
+            assert_eq!(fs::read_to_string(root.join(THEMES_REL)).unwrap(), themes);
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The style only counts when the activity uses it: a manifest still on
+    /// a platform theme is refused although `themes.xml` defines
+    /// `FrustAppTheme`, and nothing is written.
+    #[test]
+    fn a_defined_style_the_manifest_does_not_use_is_refused_untouched() {
+        let root = scaffold_project("theme-parent-unused-style");
+        rewrite(&root, MANIFEST_REL, "@style/FrustAppTheme", PLATFORM_THEME);
+        assert!(root.join(THEMES_REL).is_file());
+        let before = snapshot_tree(&root);
+        assert_eq!(
+            android_theme_parent(&root, M3_PARENT).unwrap(),
+            ThemeParent::NoAppTheme
+        );
+        let err = add_plugin(&root, "native-widgets", &[]).unwrap_err();
+        assert!(
+            matches!(err, PluginAddError::AndroidAppThemeMissing { .. }),
+            "{err:?}"
+        );
+        assert_eq!(snapshot_tree(&root), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The manifest uses `FrustAppTheme` but `themes.xml` does not define
+    /// it: refused.
+    #[test]
+    fn a_used_style_the_resources_lack_is_refused() {
+        let root = scaffold_project("theme-parent-undefined-style");
+        write_themes(
+            &root,
+            "    <style name=\"Other\" parent=\"Theme.Material3\" />\n",
+        );
+        assert_eq!(
+            android_theme_parent(&root, M3_PARENT).unwrap(),
+            ThemeParent::NoAppTheme
+        );
+        fs::remove_file(root.join(THEMES_REL)).unwrap();
+        assert_eq!(
+            android_theme_parent(&root, M3_PARENT).unwrap(),
+            ThemeParent::NoAppTheme
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn style_parent_reads_the_first_named_style() {
+        let src = "<resources>\n\
+                   <!-- <style name=\"A\" parent=\"Commented\" /> -->\n\
+                   <style name=\"A\" parent='First' />\n\
+                   <style name=\"A\" parent=\"Second\" />\n\
+                   <style name=\"Bare\" />\n\
+                   </resources>\n";
+        assert_eq!(style_parent(src, "A"), Some(Some("First")));
+        assert_eq!(style_parent(src, "Bare"), Some(None));
+        assert_eq!(style_parent(src, "Missing"), None);
     }
 }

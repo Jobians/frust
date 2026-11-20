@@ -1427,7 +1427,8 @@ mod tests {
     /// byte-identical to its pre-deep-link-support rendering (no
     /// `android:launchMode`, no second `<intent-filter>`). The baseline
     /// carries the `dev.frust.nativeLibrary` `<meta-data>` element —
-    /// `FrustActivity` reads it to resolve the app's Rust library name.
+    /// `FrustActivity` reads it to resolve the app's Rust library name — and
+    /// names the app-owned `@style/FrustAppTheme` on both elements.
     #[test]
     fn generate_android_manifest_without_deeplink_is_byte_identical_to_pre_task_baseline() {
         let dest = unique_temp_dir("manifest-no-deeplink");
@@ -1447,7 +1448,7 @@ mod tests {
              \x20\x20\x20\x20\x20\x20\x20\x20android:icon=\"@mipmap/ic_launcher\"\n\
              \x20\x20\x20\x20\x20\x20\x20\x20android:label=\"${{frustAppLabel}}\"\n\
              \x20\x20\x20\x20\x20\x20\x20\x20android:roundIcon=\"@mipmap/ic_launcher_round\"\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20android:theme=\"@android:style/Theme.Material.NoActionBar\">\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20android:theme=\"@style/FrustAppTheme\">\n\
              \n\
              \x20\x20\x20\x20\x20\x20\x20\x20<!-- Read by dev.frust.FrustActivity to load this app's Rust library. -->\n\
              \x20\x20\x20\x20\x20\x20\x20\x20<meta-data android:name=\"dev.frust.nativeLibrary\" android:value=\"{project}\" />\n\
@@ -1457,7 +1458,7 @@ mod tests {
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20android:exported=\"true\"\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20android:configChanges=\"orientation|screenSize|keyboardHidden|uiMode|fontScale\"\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20android:windowSoftInputMode=\"adjustResize\"\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20android:theme=\"@android:style/Theme.Material.NoActionBar\">\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20android:theme=\"@style/FrustAppTheme\">\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<intent-filter>\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<action android:name=\"android.intent.action.MAIN\" />\n\
              \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<category android:name=\"android.intent.category.LAUNCHER\" />\n\
@@ -1469,6 +1470,28 @@ mod tests {
             project = ctx.project_name,
         );
         assert_eq!(manifest, expected);
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// The `FrustAppTheme` the manifest names is defined by the scaffold
+    /// itself, with today's platform theme as its parent: an app no plugin
+    /// has touched looks exactly as one that named the platform theme
+    /// directly.
+    #[test]
+    fn generate_android_app_theme_has_the_platform_parent() {
+        let dest = unique_temp_dir("android-app-theme");
+        generate(&dest, &test_context(), None, false, None).unwrap();
+
+        let themes =
+            fs::read_to_string(dest.join("android/app/src/main/res/values/themes.xml")).unwrap();
+        assert!(
+            themes.contains(
+                "<style name=\"FrustAppTheme\" parent=\"android:Theme.Material.NoActionBar\" />"
+            ),
+            "{themes}"
+        );
+        assert_eq!(themes.matches("<style ").count(), 1, "{themes}");
 
         let _ = fs::remove_dir_all(&dest);
     }
