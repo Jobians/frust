@@ -1,11 +1,13 @@
 //! The `sparkline` widget: a tiny, axis-free line or block-column strip over a
-//! [`Series`], cheap enough to show dozens at once.
+//! [`Series`](crate::Series) or a [`TimedSeries`](crate::TimedSeries), cheap enough to show
+//! dozens at once.
 //!
 //! There are no axes, grid or text. Slots are right-aligned (the newest at the right edge) and
-//! a gap draws nothing. The geometry (a line's paths, or a block strip's rectangles) is cached
-//! against the series revision, the size, the style and the domain, so a paint with none of
-//! them changed only redraws it. A write to the series repaints with no rebuild; the widget
-//! never animates, requests no frames and takes no input.
+//! a gap draws nothing; timed points are placed by time, the newest at the right edge, and
+//! draw as a line whatever the style. The geometry (a line's paths, or a block strip's
+//! rectangles) is cached against the series revision and timing, the size, the style and the
+//! domain, so a paint with none of them changed only redraws it. A write to the series
+//! repaints with no rebuild; the widget never animates, requests no frames and takes no input.
 //!
 //! Colours: the caller's, then the installed theme's `primary`, then [`Tone::FALLBACK_CALM`].
 //! A [`Tone`] colours each block by its own value, or a whole line by its latest value.
@@ -17,8 +19,9 @@ use frust::authoring::{
 };
 use frust::{Color, Theme};
 
-use crate::geometry::{Orientation, block_columns, line_segments, polyline};
-use crate::{Series, Tone, YDomain};
+use crate::geometry::{Orientation, block_columns, line_segments, polyline, timed_line_segments};
+use crate::timed::SourceShape;
+use crate::{SeriesSource, Tone, YDomain};
 
 const DEFAULT_HEIGHT: f64 = 24.0;
 const DEFAULT_LINE_WIDTH: f32 = 1.0;
@@ -33,7 +36,9 @@ pub enum SparkStyle {
         /// The stroke width in logical px (default 1).
         width: f32,
     },
-    /// One column per present sample, as tall as its value.
+    /// One column per present sample, as tall as its value. A
+    /// [`TimedSeries`](crate::TimedSeries) has no columns: it draws as [`SparkStyle::line`]
+    /// instead.
     Blocks {
         /// The column width in logical px, snapped to a whole pixel (default 2).
         column_width: f32,
@@ -63,7 +68,7 @@ impl SparkStyle {
 
 #[derive(Clone, Debug)]
 struct Spec {
-    series: Series,
+    series: SeriesSource,
     style: SparkStyle,
     color: Option<Color>,
     tone: Option<Tone>,
@@ -93,12 +98,13 @@ impl Spec {
     }
 }
 
-/// A sparkline over `series`: block columns by default, expanding to the available width and
-/// 24 px tall, with the domain `0..100`.
-pub fn sparkline(series: Series) -> SparklineView {
+/// A sparkline over `series`, a [`Series`](crate::Series) or a
+/// [`TimedSeries`](crate::TimedSeries): block columns by default (a line for a timed series),
+/// expanding to the available width and 24 px tall, with the domain `0..100`.
+pub fn sparkline(series: impl Into<SeriesSource>) -> SparklineView {
     SparklineView {
         spec: Spec {
-            series,
+            series: series.into(),
             style: SparkStyle::default(),
             color: None,
             tone: None,
@@ -117,7 +123,8 @@ pub struct SparklineView {
 }
 
 impl SparklineView {
-    /// Blocks or a line (default blocks).
+    /// Blocks or a line (default blocks). A [`TimedSeries`](crate::TimedSeries) always draws a
+    /// line: blocks fall back to [`SparkStyle::line`].
     pub fn style(mut self, style: SparkStyle) -> Self {
         self.spec.style = style;
         self
@@ -192,6 +199,8 @@ impl<State: 'static> View<State> for SparklineView {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Key {
     revision: u64,
+    /// The capacity of a series, or the window, gap threshold and time span of a timed one.
+    source: SourceShape,
     width: f64,
     height: f64,
     style: SparkStyle,
@@ -225,10 +234,46 @@ pub struct SparklineWidget {
 }
 
 impl SparklineWidget {
+    /// The style drawn: the spec's, except that a timed series has no block columns and
+    /// falls back to a line.
+    fn style(&self) -> SparkStyle {
+        match self.spec.style {
+            SparkStyle::Blocks { .. } if self.spec.series.is_timed() => SparkStyle::line(),
+            style => style,
+        }
+    }
+
     fn compute(&self, key: Key) -> Shapes {
         #[cfg(test)]
         REBUILDS.with(|n| n.set(n.get() + 1));
-        let series = &self.spec.series;
+        let series = match &self.spec.series {
+            SeriesSource::Series(series) => series,
+            SeriesSource::Timed(series) => {
+                let (window, gap_after) = (series.window_secs(), series.gap_after_secs());
+                return series.with_points(|points| {
+                    let max = points.iter().map(|p| p.1).reduce(f32::max);
+                    let domain = key.domain.resolve(max);
+                    let width = match key.style {
+                        SparkStyle::Line { width } => width,
+                        SparkStyle::Blocks { .. } => DEFAULT_LINE_WIDTH,
+                    };
+                    let plot = line_plot(width, key.width, key.height);
+                    let geometry = timed_line_segments(
+                        points,
+                        window,
+                        gap_after,
+                        domain,
+                        plot,
+                        Orientation::Upright,
+                    );
+                    Shapes::Line {
+                        paths: geometry.polylines.iter().map(|run| polyline(run)).collect(),
+                        dots: geometry.points,
+                        latest: points.last().map(|p| p.1),
+                    }
+                });
+            }
+        };
         let capacity = series.capacity();
         series.with_slots(|slots| {
             let max = slots.iter().flatten().reduce(f32::max);
@@ -248,8 +293,7 @@ impl SparklineWidget {
                     Shapes::Blocks(columns.into_iter().map(|c| (c.rect, c.value)).collect())
                 }
                 SparkStyle::Line { width } => {
-                    let dot = dot_radius(width);
-                    let plot = Rect::new(dot, dot, key.width - dot, key.height - dot);
+                    let plot = line_plot(width, key.width, key.height);
                     let geometry =
                         line_segments(slots.iter(), capacity, domain, plot, Orientation::Upright);
                     Shapes::Line {
@@ -261,6 +305,12 @@ impl SparklineWidget {
             }
         })
     }
+}
+
+/// The rect a line is drawn in: the bounds inset by the dot radius on every side.
+fn line_plot(width: f32, w: f64, h: f64) -> Rect {
+    let dot = dot_radius(width);
+    Rect::new(dot, dot, w - dot, h - dot)
 }
 
 /// The radius of the dot a lone sample becomes; it also insets a line from the edges so the
@@ -315,11 +365,13 @@ impl Widget for SparklineWidget {
         {
             return;
         }
+        let (revision, source) = self.spec.series.shape();
         let key = Key {
-            revision: self.spec.series.revision(),
+            revision,
+            source,
             width: size.width,
             height: size.height,
-            style: self.spec.style,
+            style: self.style(),
             domain: self.spec.domain,
         };
         if self.cache.as_ref().is_none_or(|cache| cache.key != key) {
@@ -354,7 +406,7 @@ impl Widget for SparklineWidget {
                 if paths.is_empty() && dots.is_empty() {
                     return;
                 }
-                let SparkStyle::Line { width } = spec.style else {
+                let SparkStyle::Line { width } = cache.key.style else {
                     return;
                 };
                 let color = match (&spec.tone, latest) {
@@ -398,6 +450,7 @@ mod tests {
     use frust_core::RenderRoot;
 
     use super::*;
+    use crate::Series;
 
     struct Null;
 
