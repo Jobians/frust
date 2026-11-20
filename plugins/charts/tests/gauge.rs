@@ -208,6 +208,11 @@ fn last_point(path: &BezPath) -> Point {
         .expect("a non-empty path")
 }
 
+/// An angle handed to the gauge as `f32` radians, in the `f64` degrees the gauge works with.
+fn degrees_of(radians: f32) -> f64 {
+    f64::from(radians).to_degrees()
+}
+
 fn on_arc(radius: f64, degrees: f64) -> Point {
     point_on_circle(CENTER, radius, degrees.to_radians())
 }
@@ -283,10 +288,12 @@ fn value_arc_sweeps_its_share_of_the_arc_and_clamps() {
 #[test]
 fn angles_range_thickness_and_cap_shape_the_arcs() {
     let _g = hold();
+    let (start, sweep) = (std::f32::consts::PI, -std::f32::consts::PI);
+    let (from, turn) = (degrees_of(start), degrees_of(sweep));
     let rec = paint(
         g(30.0)
             .range(-10.0, 90.0)
-            .angles(180.0, -180.0)
+            .angles(start, sweep)
             .thickness(20.0)
             .cap(GaugeCap::Butt)
             .color(RED)
@@ -294,17 +301,22 @@ fn angles_range_thickness_and_cap_shape_the_arcs() {
     );
     let (track, width, cap) = &rec.strokes_in(GREY)[0];
     assert_eq!((*width, *cap), (20.0, StrokeCap::Butt));
-    assert_arc(track, 90.0, 180.0, 0.0);
+    assert_arc(track, 90.0, from, from + turn);
     assert!(
-        (swept_degrees(track) + 180.0).abs() < 1e-6,
+        (swept_degrees(track) - turn).abs() < 1e-6,
         "counter-clockwise"
     );
     // 30 is 40 % of -10..90: 72 degrees counter-clockwise from 9 o'clock.
     let (value, _, _) = &rec.strokes_in(RED)[0];
-    assert_arc(value, 90.0, 180.0, 108.0);
-    assert!((swept_degrees(value) + 72.0).abs() < 1e-6);
+    assert!((0.4 * turn + 72.0).abs() < 1e-4);
+    assert_arc(value, 90.0, from, from + 0.4 * turn);
+    assert!((swept_degrees(value) - 0.4 * turn).abs() < 1e-6);
 
-    let full = paint(g(50.0).angles(-90.0, 720.0).track(GREY));
+    let full = paint(
+        g(50.0)
+            .angles(-std::f32::consts::FRAC_PI_2, 2.0 * std::f32::consts::TAU)
+            .track(GREY),
+    );
     let (ring, _, cap) = &full.strokes_in(GREY)[0];
     assert_eq!(*cap, StrokeCap::Butt, "a closed ring has no ends to round");
     assert!(
@@ -454,7 +466,12 @@ fn ticks_are_evenly_spaced_marks_inside_the_track() {
         assert!(near_point(*inner, on_arc(INNER - 8.0, degrees)), "tick {i}");
     }
 
-    let ring = paint(g(None).angles(-90.0, 360.0).ticks(4, 6.0, BLUE));
+    let top = -std::f32::consts::FRAC_PI_2;
+    let ring = paint(
+        g(None)
+            .angles(top, std::f32::consts::TAU)
+            .ticks(4, 6.0, BLUE),
+    );
     let (path, _, _) = &ring.strokes_in(BLUE)[0];
     let starts: Vec<Point> = path
         .elements()
@@ -466,7 +483,7 @@ fn ticks_are_evenly_spaced_marks_inside_the_track() {
         .collect();
     assert_eq!(starts.len(), 4);
     for (i, p) in starts.iter().enumerate() {
-        let degrees = -90.0 + 90.0 * i as f64;
+        let degrees = degrees_of(top) + 90.0 * i as f64;
         assert!(
             near_point(*p, on_arc(INNER - 2.0, degrees)),
             "no doubled tick"
