@@ -384,13 +384,22 @@ pub enum Contribution {
     /// and its `<activity>` element. For a plugin whose native controls need
     /// a theme family the platform theme is not (Material 3).
     ///
-    /// Satisfied — [`AddOutcome::AlreadyPresent`], nothing written — when the
-    /// style's parent already equals `parent`, or when the app has no
-    /// `FrustAppTheme` but its manifest's activity theme already names a
-    /// `Theme.Material3` or `Theme.Material3Expressive` style. A style with
-    /// another parent has only that attribute rewritten in place
-    /// ([`AddOutcome::Applied`]). An app with neither (one generated before
-    /// the template defined the style) is refused with
+    /// An accepted Material theme is a style named `Theme.Material3`,
+    /// `Theme.Material3Expressive` or `Theme.MaterialComponents`, or one of
+    /// those followed by `.` (an `@style/` prefix allowed). The manifest's
+    /// activity theme (the first `<activity>`'s, else the `<application>`'s)
+    /// decides first. When it is itself an accepted Material theme, the
+    /// contribution is satisfied — [`AddOutcome::AlreadyPresent`], nothing
+    /// written. When it is `@style/FrustAppTheme`, the style's parent
+    /// decides: the requested `parent`, an accepted Material theme, or an
+    /// app-owned style is satisfied and never rewritten (an app-owned parent
+    /// defined in the same `themes.xml` is followed to its first Material or
+    /// platform ancestor; one the file cannot resolve is left to the app);
+    /// no parent, a platform parent (`android:…`, `@android:style/…`) or an
+    /// app-owned chain ending in one has only `FrustAppTheme`'s own parent
+    /// attribute rewritten in place ([`AddOutcome::Applied`]). Any other
+    /// manifest theme, or `FrustAppTheme` without the style defined (an app
+    /// generated before the template defined it), is refused with
     /// [`PluginAddError::AndroidAppThemeMissing`] before `add_plugin` writes
     /// anything; an app without `android/` skips it.
     ///
@@ -799,18 +808,21 @@ pub enum PluginAddError {
         /// What to change, as a sentence.
         hint: &'static str,
     },
-    /// A [`Contribution::AndroidThemeParent`] found no `FrustAppTheme` style
-    /// to set the parent of, and the manifest's activity theme is not a
-    /// Material 3 one: an app generated before the template defined the
-    /// style. Raised before anything is written; the two edits that make the
-    /// app addable are named.
+    /// A [`Contribution::AndroidThemeParent`] found an activity that does
+    /// not use a defined `FrustAppTheme` style and whose manifest theme is
+    /// not an accepted Material one: typically an app generated before the
+    /// template defined the style. Raised before anything is written; the
+    /// two edits that make the app addable are named, as is the alternative
+    /// of a Material manifest theme.
     #[error(
         "plugin `{plugin}` sets the parent of the app's `FrustAppTheme` Android style to \
-         `{parent}`, but this app has no such style. Add \
+         `{parent}`, but this app's activity does not use such a style. Add \
          `<style name=\"FrustAppTheme\" parent=\"{parent}\" />` inside `<resources>` in \
          android/app/src/main/res/values/themes.xml (create the file if it is missing), set \
          android:theme=\"@style/FrustAppTheme\" on both the <application> and the <activity> \
-         element of android/app/src/main/AndroidManifest.xml, then re-run"
+         element of android/app/src/main/AndroidManifest.xml, then re-run (an activity theme \
+         that already names a Theme.Material3, Theme.Material3Expressive or \
+         Theme.MaterialComponents style works too)"
     )]
     AndroidAppThemeMissing {
         /// The plugin's id.

@@ -90,9 +90,9 @@ fn run_with(
         for line in package_dir_lines(&locator, project_dir) {
             println!("{line}");
         }
-        for line in plugin_lines(project_dir) {
-            println!("{line}");
-        }
+    }
+    for line in plugin_lines(project_dir) {
+        println!("{line}");
     }
 
     exit_code(&results)
@@ -100,8 +100,12 @@ fn run_with(
 
 /// The "Plugins" heading's lines: one row group per built-in plugin the app
 /// depends on but has not finished wiring, and nothing at all when there are
-/// none. Informational: never moves the exit code.
+/// none or when `project_dir` is no Frust project (holds no `frust.toml`).
+/// Informational: never moves the exit code.
 fn plugin_lines(project_dir: &Path) -> Vec<String> {
+    if !project_dir.join("frust.toml").is_file() {
+        return Vec::new();
+    }
     let findings = frust_drive::doctor::plugin_findings(project_dir);
     if findings.is_empty() {
         return Vec::new();
@@ -634,9 +638,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn the_plugins_block_lists_a_pending_plugin_and_never_changes_the_exit_code() {
-        let dir = project_with_pending_plugin("plugins-pending");
+    /// Drops the native-widgets Gradle include, leaving that plugin pending.
+    fn remove_gradle_include(dir: &Path) {
         let settings = dir.join("android/settings.gradle.kts");
         let kept: String = std::fs::read_to_string(&settings)
             .unwrap()
@@ -645,6 +648,12 @@ mod tests {
             .map(|l| format!("{l}\n"))
             .collect();
         std::fs::write(&settings, kept).unwrap();
+    }
+
+    #[test]
+    fn the_plugins_block_lists_a_pending_plugin_and_never_changes_the_exit_code() {
+        let dir = project_with_pending_plugin("plugins-pending");
+        remove_gradle_include(&dir);
         let lines = plugin_lines(&dir);
         assert_eq!(lines[0], "Plugins");
         assert!(
@@ -683,17 +692,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The same app with a pending plugin prints the block inside a Frust
+    /// project and nothing once `frust.toml` is gone.
     #[test]
-    fn no_frust_toml_means_no_plugins_block_call() {
-        // `run_with` only reaches `plugin_lines` inside a project; here the
-        // directory is not one, so the run is the plain exit-code rule.
-        let dir = empty_dir("plugins-none");
-        let runner = FakeProcessRunner::new();
-        let env = EmptyEnv;
-        assert_eq!(
-            run_with(&ctx(&runner, &env), &fixed(&[Status::Pass]), &dir, false),
-            0
+    fn no_frust_toml_means_no_plugins_block() {
+        let dir = project_with_pending_plugin("plugins-no-toml");
+        remove_gradle_include(&dir);
+        assert!(
+            !plugin_lines(&dir).is_empty(),
+            "precondition: a pending plugin"
         );
+        std::fs::remove_file(dir.join("frust.toml")).unwrap();
+        assert_eq!(plugin_lines(&dir), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
