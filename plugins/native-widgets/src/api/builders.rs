@@ -638,11 +638,56 @@ impl ParamsBody {
 // Button
 // ============================================================================
 
+/// How a [`NativeButtonView`] presents itself — set with
+/// [`NativeButtonView::style`].
+///
+/// | Style | Android | iOS | macOS |
+/// |---|---|---|---|
+/// | `Plain` | Material text button | system button | push button |
+/// | `Prominent` | filled button | filled configuration | accent-tinted push button |
+/// | `Destructive` | filled, error colour | filled, system red | red push button, destructive flag |
+/// | `Glass` | tonal button | glass configuration (iOS 26; plain before) | push button |
+/// | `ProminentGlass` | filled button | prominent glass (iOS 26; filled before) | accent-tinted push button |
+///
+/// A non-`Plain` style leaves the fill and caption colour to the platform
+/// style instead of folding the app theme's accent into them; `Plain` keeps
+/// the themed look. A style change on a live button is an update, never a
+/// remount.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NativeButtonStyle {
+    /// The ordinary platform button — the default.
+    #[default]
+    Plain,
+    /// A filled, primary-emphasis button.
+    Prominent,
+    /// A filled button in the platform's destructive colour.
+    Destructive,
+    /// The translucent glass button (iOS 26); tonal on Android.
+    Glass,
+    /// The prominent glass button (iOS 26); filled on Android.
+    ProminentGlass,
+}
+
+impl NativeButtonStyle {
+    /// The control layer's mirror of this style.
+    fn control_style(self) -> button::ButtonStyle {
+        match self {
+            Self::Plain => button::ButtonStyle::Plain,
+            Self::Prominent => button::ButtonStyle::Prominent,
+            Self::Destructive => button::ButtonStyle::Destructive,
+            Self::Glass => button::ButtonStyle::Glass,
+            Self::ProminentGlass => button::ButtonStyle::ProminentGlass,
+        }
+    }
+}
+
 /// A real `android.widget.Button` rendered from pure Rust — see the
 /// [module docs](self). Build one with [`native_button`].
 #[derive(Clone)]
 pub struct NativeButtonView {
     text: String,
+    style: NativeButtonStyle,
     enabled: bool,
     content_description: Option<String>,
     size: Option<(f64, f64)>,
@@ -653,6 +698,7 @@ pub struct NativeButtonView {
 pub fn native_button(text: impl Into<String>) -> NativeButtonView {
     NativeButtonView {
         text: text.into(),
+        style: NativeButtonStyle::Plain,
         enabled: true,
         content_description: None,
         size: None,
@@ -661,6 +707,14 @@ pub fn native_button(text: impl Into<String>) -> NativeButtonView {
 }
 
 impl NativeButtonView {
+    /// The button's [`NativeButtonStyle`] — default
+    /// [`Plain`](NativeButtonStyle::Plain). Changing it on a live button
+    /// restyles it in place.
+    pub fn style(mut self, style: NativeButtonStyle) -> Self {
+        self.style = style;
+        self
+    }
+
     /// `View.setEnabled` — default `true`.
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
@@ -700,10 +754,19 @@ impl NativeButtonView {
         body.push_raw(ENABLED, self.enabled);
         body.push_opt_str(CONTENT_DESCRIPTION, self.content_description.as_deref());
         body.push_raw(DARK, tokens.is_some_and(|t| t.dark));
+        // Plain is the absent key, so a default button's payload is unchanged.
+        let style = self.style.control_style();
+        if style != button::ButtonStyle::Plain {
+            body.push_raw(button::BUTTON_STYLE, style.wire());
+        }
         if let Some(t) = tokens {
-            body.push_raw(TEXT_COLOR, t.on_accent_fill);
-            body.push_raw(BACKGROUND_COLOR, t.accent_fill);
-            body.push_raw(CORNER_RADIUS_DP, t.corner_radius_dp);
+            // A styled button wears the platform's own style, not the theme's
+            // accent fill.
+            if style == button::ButtonStyle::Plain {
+                body.push_raw(TEXT_COLOR, t.on_accent_fill);
+                body.push_raw(BACKGROUND_COLOR, t.accent_fill);
+                body.push_raw(CORNER_RADIUS_DP, t.corner_radius_dp);
+            }
             body.push_raw(TEXT_SIZE_SP, t.button_text_size_sp);
             body.push_str(TYPEFACE, t.button_typeface.wire());
         }
@@ -2860,6 +2923,70 @@ mod tests {
             "{\"__frustControl\":\"button\",\"__frustSlot\":7,\"text\":\"Save\",\"enabled\":false,\
              \"contentDescription\":\"Save the note\",\"dark\":false}"
         );
+    }
+
+    #[test]
+    fn a_default_button_style_leaves_the_payload_unchanged() {
+        let plain = native_button("Save");
+        assert_eq!(
+            plain.params_for(7, None),
+            native_button("Save")
+                .style(NativeButtonStyle::Plain)
+                .params_for(7, None)
+        );
+        assert!(!plain.params_for(7, None).contains("buttonStyle"));
+        assert_eq!(NativeButtonStyle::default(), NativeButtonStyle::Plain);
+    }
+
+    #[test]
+    fn each_button_style_encodes_its_wire_value_and_decodes_back() {
+        use crate::controls::button::{ButtonProps, ButtonStyle};
+        let cases = [
+            (NativeButtonStyle::Prominent, 1, ButtonStyle::Prominent),
+            (NativeButtonStyle::Destructive, 2, ButtonStyle::Destructive),
+            (NativeButtonStyle::Glass, 3, ButtonStyle::Glass),
+            (
+                NativeButtonStyle::ProminentGlass,
+                4,
+                ButtonStyle::ProminentGlass,
+            ),
+        ];
+        for (public, wire, control) in cases {
+            let params = native_button("Go").style(public).params_for(7, None);
+            assert!(
+                params.contains(&format!("\"buttonStyle\":{wire}")),
+                "{params}"
+            );
+            let props = ButtonProps::decode(&crate::runtime::Params::new(&params)).unwrap();
+            assert_eq!(props.style, control);
+        }
+    }
+
+    #[test]
+    fn a_styled_button_drops_the_theme_fill_but_keeps_the_text_size() {
+        let tokens = dark_tokens();
+        let plain = native_button("Go").params_for(7, Some(tokens));
+        let styled = native_button("Go")
+            .style(NativeButtonStyle::Prominent)
+            .params_for(7, Some(tokens));
+        assert!(plain.contains("backgroundColor") && plain.contains("cornerRadiusDp"));
+        assert!(!styled.contains("backgroundColor"));
+        assert!(!styled.contains("cornerRadiusDp"));
+        assert!(!styled.contains("\"textColor\""));
+        assert!(styled.contains("textSizeSp"));
+    }
+
+    #[test]
+    fn a_button_style_change_keeps_the_slot_and_is_an_update() {
+        use crate::controls::button::ButtonProps;
+        let a = native_button("Go").style(NativeButtonStyle::Prominent);
+        let b = native_button("Go").style(NativeButtonStyle::Destructive);
+        let old =
+            ButtonProps::decode(&crate::runtime::Params::new(&a.params_for(7, None))).unwrap();
+        let new =
+            ButtonProps::decode(&crate::runtime::Params::new(&b.params_for(7, None))).unwrap();
+        assert_eq!(old.slot, new.slot);
+        assert!(ButtonProps::style_change(&old, &new).is_some());
     }
 
     #[test]

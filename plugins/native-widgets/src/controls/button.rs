@@ -31,6 +31,60 @@ use crate::runtime::Params;
 /// `__frustControl` (`crate::runtime`'s generic-factory contract).
 pub(crate) const KIND: &str = "button";
 
+/// `"buttonStyle"` — the button's [`ButtonStyle`] wire value. Absent means
+/// [`ButtonStyle::Plain`]: the api layer omits the key for a plain button, so
+/// a default button's payload is byte-for-byte what it was before styles
+/// existed. The values are append-only.
+pub(crate) const BUTTON_STYLE: &str = "buttonStyle";
+
+/// How a button presents itself — the control layer's mirror of the public
+/// `NativeButtonStyle`.
+///
+/// Each platform maps it onto its own idiom (Material text / filled /
+/// error-coloured / tonal / filled buttons on Android; `UIButtonConfiguration`
+/// on iOS; bezel colours on macOS). The wire values are append-only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ButtonStyle {
+    /// The platform's ordinary button. Wire `0` (omitted).
+    #[default]
+    Plain,
+    /// A filled, primary-emphasis button. Wire `1`.
+    Prominent,
+    /// A filled button in the platform's destructive colour. Wire `2`.
+    Destructive,
+    /// The translucent "glass" button (iOS 26); a tonal button on Android.
+    /// Wire `3`.
+    Glass,
+    /// The prominent glass button (iOS 26); a filled button on Android.
+    /// Wire `4`.
+    ProminentGlass,
+}
+
+impl ButtonStyle {
+    /// The append-only wire value.
+    pub(crate) fn wire(self) -> i64 {
+        match self {
+            Self::Plain => 0,
+            Self::Prominent => 1,
+            Self::Destructive => 2,
+            Self::Glass => 3,
+            Self::ProminentGlass => 4,
+        }
+    }
+
+    /// Decode a wire value; an unknown one (a newer api layer) degrades to
+    /// [`Self::Plain`] rather than killing the slot.
+    pub(crate) fn from_wire(value: i64) -> Self {
+        match value {
+            1 => Self::Prominent,
+            2 => Self::Destructive,
+            3 => Self::Glass,
+            4 => Self::ProminentGlass,
+            _ => Self::Plain,
+        }
+    }
+}
+
 /// The marker type registered under [`KIND`]; its
 /// [`NativeWidget`](crate::runtime::NativeWidget) impl is the Android half
 /// below.
@@ -68,6 +122,11 @@ pub(crate) struct ButtonProps {
     /// [`Typeface::System`] when absent (an older api layer, or a control
     /// built with no theme threaded).
     pub(crate) typeface: Typeface,
+    /// The button's [`ButtonStyle`]. Not part of the setter [`Plan`] (a style
+    /// swap is a platform restyle of the live view, not a property write):
+    /// the platform arms read it through [`Self::style_change`] and apply it
+    /// ahead of the plan, so a change is an update, never a remount.
+    pub(crate) style: ButtonStyle,
 }
 
 impl ButtonProps {
@@ -86,6 +145,7 @@ impl ButtonProps {
             content_description: None,
             corner_radius_dp: None,
             typeface: Typeface::System,
+            style: ButtonStyle::Plain,
         }
     }
 
@@ -110,7 +170,21 @@ impl ButtonProps {
             content_description: owned_text(params, CONTENT_DESCRIPTION),
             corner_radius_dp: params.float(CORNER_RADIUS_DP).map(|radius| radius as f32),
             typeface: typeface::decode(params, TYPEFACE),
+            style: params
+                .int(BUTTON_STYLE)
+                .map_or(ButtonStyle::Plain, ButtonStyle::from_wire),
         })
+    }
+
+    /// The style to apply for `old` → `new`, `None` when it did not change.
+    /// Platform arms apply it BEFORE the [`Self::plan`]: a restyle can reset
+    /// the caption and colours the plan then re-applies.
+    #[cfg_attr(
+        not(any(target_os = "android", target_os = "ios", target_os = "macos")),
+        allow(dead_code)
+    )]
+    pub(crate) fn style_change(old: &Self, new: &Self) -> Option<ButtonStyle> {
+        (old.style != new.style).then_some(new.style)
     }
 
     /// The setter-call plan for `old` → `new`: one entry per field that
@@ -169,19 +243,43 @@ pub(crate) mod platform {
     //! The Android half: build the `Button` and hand its planned setters to
     //! [`crate::controls::platform`].
 
-    use jni::objects::JObject;
+    use jni::objects::{JObject, JValue};
     use jni::refs::Global;
+    use jni::{jni_sig, jni_str};
 
-    use super::{Button, ButtonProps};
+    use super::{Button, ButtonProps, ButtonStyle};
     use crate::NativeWidgetError;
     use crate::android::{NativeCtx, NativeView};
     use crate::controls::platform::{FRAME_CAPACITY, apply_all};
     use crate::events::{EventPayload, decode_click};
     use crate::runtime::{NativeEvent, NativeWidget, Params};
 
-    /// `android.widget.Button` — the framework class, not a support/material
-    /// one: this plugin never assumes an app dependency it did not ship.
-    const CLASS: &str = "android.widget.Button";
+    /// The factory class that hosts the `@JvmStatic` button helpers (binary
+    /// name). `buttonCreate` builds a `MaterialButton` in the requested style
+    /// and falls back to a plain `android.widget.Button` under a theme
+    /// Material cannot inflate under, so an app without a Material theme
+    /// keeps the framework button it always had.
+    const FACTORY_CLASS: &str = "dev.frust.nativewidgets.FrustNativeControlFactory";
+
+    /// `FrustNativeControlFactory.buttonSetStyle(button, style)`: restyle a
+    /// live button in place.
+    fn set_style(
+        ctx: &mut NativeCtx<'_, '_>,
+        view: &JObject<'_>,
+        style: ButtonStyle,
+    ) -> Result<(), NativeWidgetError> {
+        let class = ctx.class(FACTORY_CLASS)?;
+        let wire = i32::try_from(style.wire()).unwrap_or(0);
+        ctx.run_jni("FrustNativeControlFactory.buttonSetStyle", |env| {
+            env.call_static_method(
+                &class,
+                jni_str!("buttonSetStyle"),
+                jni_sig!("(Landroid/view/View;I)V"),
+                &[JValue::Object(view), JValue::Int(wire)],
+            )?
+            .v()
+        })
+    }
 
     /// A live button's retained state.
     pub(crate) struct ButtonState {
@@ -207,7 +305,28 @@ pub(crate) mod platform {
             ctx: &mut NativeCtx<'_, '_>,
             props: &Self::Props,
         ) -> Result<(NativeView, Self::State), NativeWidgetError> {
-            let view = ctx.new_view(CLASS)?;
+            let wire = i32::try_from(props.style.wire()).unwrap_or(0);
+            let view = ctx.with_frame(FRAME_CAPACITY, |ctx| {
+                let class = ctx.class(FACTORY_CLASS)?;
+                let activity = ctx.activity()?;
+                let qualified = ctx.context()?;
+                let view = ctx.run_jni("FrustNativeControlFactory.buttonCreate", |env| {
+                    env.call_static_method(
+                        &class,
+                        jni_str!("buttonCreate"),
+                        jni_sig!(
+                            "(Landroid/app/Activity;Landroid/content/Context;I)Landroid/view/View;"
+                        ),
+                        &[
+                            JValue::Object(activity),
+                            JValue::Object(qualified),
+                            JValue::Int(wire),
+                        ],
+                    )?
+                    .l()
+                })?;
+                ctx.retain(&view)
+            })?;
             let plan = ButtonProps::plan(&ButtonProps::platform_default(props.slot), props);
             ctx.with_frame(FRAME_CAPACITY, |ctx| apply_all(ctx, &view, &plan))?;
             // Attached after the initial plan, matching `Switch`/`Slider`'s
@@ -217,11 +336,10 @@ pub(crate) mod platform {
             let listener = ctx.new_listener(props.slot)?;
             ctx.set_on_click_listener(&view, &listener)?;
             let handle = ctx.retain(&view)?;
-            let retained = ctx.retain(&view)?;
             let listener_ref = ctx.retain(&listener)?;
             Ok((
                 NativeView::with_extra(handle, vec![listener_ref]),
-                ButtonState { view: retained },
+                ButtonState { view },
             ))
         }
 
@@ -231,6 +349,11 @@ pub(crate) mod platform {
             old: &Self::Props,
             new: &Self::Props,
         ) -> Result<(), NativeWidgetError> {
+            // The restyle goes first: the plan then re-applies any colour the
+            // new style leaves to the theme fold.
+            if let Some(style) = ButtonProps::style_change(old, new) {
+                ctx.with_frame(FRAME_CAPACITY, |ctx| set_style(ctx, &state.view, style))?;
+            }
             let plan = ButtonProps::plan(old, new);
             ctx.with_frame(FRAME_CAPACITY, |ctx| apply_all(ctx, &state.view, &plan))
         }
@@ -289,12 +412,13 @@ pub(crate) mod platform {
     //! `Switch`/`Slider` this control needs no echo guard, on either
     //! platform.
 
-    use objc2::MainThreadMarker;
     use objc2::rc::Retained;
+    use objc2::runtime::{AnyClass, AnyObject};
+    use objc2::{MainThreadMarker, msg_send, sel};
     use objc2_foundation::NSString;
-    use objc2_ui_kit::{UIButton, UIButtonType, UIControlState};
+    use objc2_ui_kit::{UIButton, UIButtonType, UIColor, UIControlState};
 
-    use super::{Button, ButtonProps, KIND};
+    use super::{Button, ButtonProps, ButtonStyle, KIND};
     use crate::NativeWidgetError;
     use crate::apple::{FrustNativeControlTarget, NativeCtx, NativeView};
     use crate::controls::platform;
@@ -343,7 +467,13 @@ pub(crate) mod platform {
             let mtm = ctx.mtm();
             let view = UIButton::buttonWithType(UIButtonType::System, mtm);
             let mut font = platform::FontState::platform_default();
-            let plan = ButtonProps::plan(&ButtonProps::platform_default(props.slot), props);
+            let default = ButtonProps::platform_default(props.slot);
+            // The style first: installing a configuration resets the caption,
+            // which the plan then writes.
+            if let Some(style) = ButtonProps::style_change(&default, props) {
+                apply_style(&view, style, &props.text);
+            }
+            let plan = ButtonProps::plan(&default, props);
             apply_all(mtm, &view, &mut font, &plan);
             // Attached after the initial plan, matching the Android arm's
             // create order (`switch.rs`'s module doc) — a click setter never
@@ -360,6 +490,9 @@ pub(crate) mod platform {
             old: &Self::Props,
             new: &Self::Props,
         ) -> Result<(), NativeWidgetError> {
+            if let Some(style) = ButtonProps::style_change(old, new) {
+                apply_style(&state.view, style, &new.text);
+            }
             apply_all(
                 ctx.mtm(),
                 &state.view,
@@ -388,6 +521,82 @@ pub(crate) mod platform {
         }
     }
 
+    /// The `UIButtonConfiguration` for `style`, `None` for the legacy
+    /// system button.
+    ///
+    /// `objc2-ui-kit`'s `UIButtonConfiguration` binding sits behind a cargo
+    /// feature this crate does not enable, so the class is reached by name at
+    /// run time, the way the chrome's bar-item badge is: every constructor
+    /// is `responds_to`-guarded, which is also what makes the glass styles
+    /// safe below iOS 26. A glass style falls back to its non-glass
+    /// counterpart ([`ButtonStyle::Glass`] to plain,
+    /// [`ButtonStyle::ProminentGlass`] to filled) when the system has no
+    /// glass configuration.
+    fn configuration_for(style: ButtonStyle) -> Option<Retained<AnyObject>> {
+        let class = AnyClass::get(c"UIButtonConfiguration")?;
+        let filled = class.responds_to(sel!(filledButtonConfiguration));
+        // SAFETY: each selector is a documented class method of
+        // `UIButtonConfiguration` returning a configuration object, and was
+        // just checked with `responds_to`.
+        unsafe {
+            match style {
+                ButtonStyle::Plain => None,
+                ButtonStyle::Prominent | ButtonStyle::Destructive if filled => {
+                    msg_send![class, filledButtonConfiguration]
+                }
+                ButtonStyle::Glass if class.responds_to(sel!(glassButtonConfiguration)) => {
+                    msg_send![class, glassButtonConfiguration]
+                }
+                ButtonStyle::ProminentGlass
+                    if class.responds_to(sel!(prominentGlassButtonConfiguration)) =>
+                {
+                    msg_send![class, prominentGlassButtonConfiguration]
+                }
+                ButtonStyle::ProminentGlass if filled => {
+                    msg_send![class, filledButtonConfiguration]
+                }
+                _ => None,
+            }
+        }
+    }
+
+    /// Restyle `view` in place and put `text` back: installing (or
+    /// removing) a configuration replaces the caption the legacy
+    /// per-state title held.
+    fn apply_style(view: &UIButton, style: ButtonStyle, text: &str) {
+        let configuration = configuration_for(style);
+        if let Some(configuration) = &configuration {
+            if style == ButtonStyle::Destructive {
+                let red = UIColor::systemRedColor();
+                // SAFETY: `setBaseBackgroundColor:` takes a nullable `UIColor`.
+                let _: () = unsafe { msg_send![&**configuration, setBaseBackgroundColor: &*red] };
+            }
+            let title = NSString::from_str(text);
+            // SAFETY: `setTitle:` takes a nullable `NSString`.
+            let _: () = unsafe { msg_send![&**configuration, setTitle: &*title] };
+        }
+        // SAFETY: `setConfiguration:` takes a nullable `UIButtonConfiguration`
+        // and copies it; nil restores the legacy system button.
+        let _: () = unsafe { msg_send![view, setConfiguration: configuration.as_deref()] };
+        view.setTitle_forState(Some(&NSString::from_str(text)), UIControlState::Normal);
+    }
+
+    /// Set the caption. A configuration-styled button shows its
+    /// configuration's title, so the copy it hands back is updated too.
+    fn set_title(view: &UIButton, text: &str) {
+        let title = NSString::from_str(text);
+        view.setTitle_forState(Some(&title), UIControlState::Normal);
+        // SAFETY: `configuration` returns a copy (or nil on the legacy
+        // button); `setTitle:` and `setConfiguration:` are nullable setters.
+        unsafe {
+            let current: Option<Retained<AnyObject>> = msg_send![view, configuration];
+            if let Some(current) = current {
+                let _: () = msg_send![&*current, setTitle: &*title];
+                let _: () = msg_send![view, setConfiguration: &*current];
+            }
+        }
+    }
+
     /// Execute a whole [`Plan`], front to back — the same order contract the
     /// Android arm's `apply_all` keeps.
     fn apply_all(
@@ -412,9 +621,7 @@ pub(crate) mod platform {
             // A `UIButton`'s caption is per-control-state, unlike a
             // `TextView`'s: `Normal` is the base every other state falls back
             // to, so setting it alone is what "the button's title" means.
-            Setter::Text(text) => {
-                view.setTitle_forState(Some(&NSString::from_str(text)), UIControlState::Normal);
-            }
+            Setter::Text(text) => set_title(view, text),
             Setter::Enabled(enabled) => view.setEnabled(enabled),
             Setter::TextColor(argb) => {
                 view.setTitleColor_forState(
@@ -483,10 +690,10 @@ pub(crate) mod platform {
     //! so no echo guard.
 
     use objc2::rc::Retained;
-    use objc2_app_kit::{NSBezelStyle, NSButton, NSButtonType};
+    use objc2_app_kit::{NSBezelStyle, NSButton, NSButtonType, NSColor};
     use objc2_foundation::NSString;
 
-    use super::{Button, ButtonProps, KIND};
+    use super::{Button, ButtonProps, ButtonStyle, KIND};
     use crate::NativeWidgetError;
     use crate::appkit::{FrustNativeControlTarget, NativeCtx, NativeView};
     use crate::controls::platform;
@@ -525,7 +732,11 @@ pub(crate) mod platform {
             view.setBezelStyle(NSBezelStyle::Push);
             // Module doc: land exactly on `platform_default`'s empty caption.
             view.setTitle(&NSString::from_str(""));
-            let plan = ButtonProps::plan(&ButtonProps::platform_default(props.slot), props);
+            let default = ButtonProps::platform_default(props.slot);
+            if let Some(style) = ButtonProps::style_change(&default, props) {
+                apply_style(&view, style);
+            }
+            let plan = ButtonProps::plan(&default, props);
             apply_all(&view, &plan);
             // Attached after the initial plan, matching the other two arms'
             // create order.
@@ -540,6 +751,9 @@ pub(crate) mod platform {
             old: &Self::Props,
             new: &Self::Props,
         ) -> Result<(), NativeWidgetError> {
+            if let Some(style) = ButtonProps::style_change(old, new) {
+                apply_style(&state.view, style);
+            }
             apply_all(&state.view, &ButtonProps::plan(old, new));
             Ok(())
         }
@@ -557,6 +771,30 @@ pub(crate) mod platform {
             // releases the target's only retain.
             state.target.detach(&state.view);
             Ok(())
+        }
+    }
+
+    /// Restyle `view` in place: the push bezel, tinted with the accent colour
+    /// for the prominent styles and the system red (with AppKit's destructive
+    /// flag) for [`ButtonStyle::Destructive`]. `NSBezelStyle::Glass` needs
+    /// macOS 26 and this crate has no cheap version gate, so
+    /// [`ButtonStyle::Glass`] keeps the plain push bezel and
+    /// [`ButtonStyle::ProminentGlass`] is the accent-tinted one.
+    fn apply_style(view: &NSButton, style: ButtonStyle) {
+        view.setBezelStyle(NSBezelStyle::Push);
+        match style {
+            ButtonStyle::Plain | ButtonStyle::Glass => {
+                view.setBezelColor(None);
+                view.setHasDestructiveAction(false);
+            }
+            ButtonStyle::Prominent | ButtonStyle::ProminentGlass => {
+                view.setBezelColor(Some(&NSColor::controlAccentColor()));
+                view.setHasDestructiveAction(false);
+            }
+            ButtonStyle::Destructive => {
+                view.setBezelColor(Some(&NSColor::systemRedColor()));
+                view.setHasDestructiveAction(true);
+            }
         }
     }
 
@@ -743,5 +981,62 @@ mod tests {
             "identical typeface Props must plan no setter — the whole-struct \
              PartialEq gate this crate's `Props: PartialEq` contract relies on"
         );
+    }
+
+    // --- button styles ---------------------------------------------------
+
+    #[test]
+    fn a_default_button_decodes_plain_and_plans_no_restyle() {
+        let props = decode("");
+        assert_eq!(props.style, ButtonStyle::Plain);
+        assert_eq!(
+            ButtonProps::style_change(&ButtonProps::platform_default(7), &props),
+            None
+        );
+    }
+
+    #[test]
+    fn every_style_round_trips_through_its_wire_value() {
+        for style in [
+            ButtonStyle::Plain,
+            ButtonStyle::Prominent,
+            ButtonStyle::Destructive,
+            ButtonStyle::Glass,
+            ButtonStyle::ProminentGlass,
+        ] {
+            let props = decode(&format!("\"{BUTTON_STYLE}\":{}", style.wire()));
+            assert_eq!(props.style, style);
+        }
+    }
+
+    #[test]
+    fn the_wire_values_are_append_only() {
+        assert_eq!(
+            [
+                ButtonStyle::Plain.wire(),
+                ButtonStyle::Prominent.wire(),
+                ButtonStyle::Destructive.wire(),
+                ButtonStyle::Glass.wire(),
+                ButtonStyle::ProminentGlass.wire(),
+            ],
+            [0, 1, 2, 3, 4]
+        );
+        // A value from a newer api layer degrades to Plain.
+        assert_eq!(decode("\"buttonStyle\":99").style, ButtonStyle::Plain);
+    }
+
+    #[test]
+    fn a_style_change_is_an_update_not_a_remount() {
+        let old = decode("\"text\":\"Go\",\"buttonStyle\":1");
+        let new = decode("\"text\":\"Go\",\"buttonStyle\":2");
+        assert_ne!(old, new, "the style is a diffed prop");
+        assert_eq!(
+            ButtonProps::style_change(&old, &new),
+            Some(ButtonStyle::Destructive)
+        );
+        // Same slot, no setter planned: the platform restyles the live view.
+        assert_eq!(old.slot, new.slot);
+        assert_eq!(ButtonProps::plan(&old, &new), vec![]);
+        assert_eq!(ButtonProps::style_change(&new, &new), None);
     }
 }

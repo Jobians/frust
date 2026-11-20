@@ -33,6 +33,7 @@ import android.view.View
 import android.widget.LinearLayout
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.button.MaterialButtonToggleGroup
+import com.google.android.material.color.MaterialColors
 import dev.frust.FrustPlatformViewFactory
 
 class FrustNativeControlFactory : FrustPlatformViewFactory {
@@ -79,6 +80,94 @@ class FrustNativeControlFactory : FrustPlatformViewFactory {
      */
     companion object {
         private const val TAG = "FrustNativeWidgets"
+
+        // The button style wire values — `buttonStyle` in the button's params,
+        // mirrored from `controls/button.rs`'s `ButtonStyle::wire` (append-only;
+        // `tests/kotlin_conformance.rs` pins the pairing). An unknown value is
+        // read as plain.
+        private const val BUTTON_STYLE_PLAIN = 0
+        private const val BUTTON_STYLE_PROMINENT = 1
+        private const val BUTTON_STYLE_DESTRUCTIVE = 2
+        private const val BUTTON_STYLE_GLASS = 3
+        private const val BUTTON_STYLE_PROMINENT_GLASS = 4
+
+        /**
+         * The theme attribute whose style gives [style] its Material look:
+         * the text button for plain, the tonal button for glass, the filled
+         * button for the rest (destructive is filled in the error colour,
+         * applied by [styleExtras]).
+         */
+        private fun buttonStyleAttr(style: Int): Int = when (style) {
+            BUTTON_STYLE_GLASS -> com.google.android.material.R.attr.materialButtonTonalStyle
+            BUTTON_STYLE_PROMINENT,
+            BUTTON_STYLE_DESTRUCTIVE,
+            BUTTON_STYLE_PROMINENT_GLASS -> com.google.android.material.R.attr.materialButtonStyle
+            else -> androidx.appcompat.R.attr.borderlessButtonStyle
+        }
+
+        /**
+         * What a style adds on top of its attribute style: the error fill, or
+         * a cleared tint for plain.
+         */
+        private fun styleExtras(button: MaterialButton, style: Int) {
+            if (style == BUTTON_STYLE_PLAIN) {
+                // The text button's transparent background tint would also
+                // tint a themed fill drawn over it, hiding it.
+                button.backgroundTintList = null
+                return
+            }
+            if (style != BUTTON_STYLE_DESTRUCTIVE) return
+            val context = button.context
+            val error = MaterialColors.getColor(context, androidx.appcompat.R.attr.colorError, 0xFFB3261E.toInt())
+            val onError = MaterialColors.getColor(context, com.google.android.material.R.attr.colorOnError, 0xFFFFFFFF.toInt())
+            val disabled = intArrayOf(-android.R.attr.state_enabled)
+            val resting = button.backgroundTintList
+            val disabledFill = resting?.getColorForState(disabled, error) ?: error
+            button.backgroundTintList = ColorStateList(
+                arrayOf(disabled, intArrayOf()),
+                intArrayOf(disabledFill, error),
+            )
+            button.setTextColor(onError)
+        }
+
+        /**
+         * The native button, in [style]. A `MaterialButton` under a Material3
+         * app theme; under any other theme the Material inflation throws, and
+         * the slot gets the framework `Button` the plugin always built (a
+         * later [buttonSetStyle] on it is a no-op).
+         */
+        @JvmStatic
+        fun buttonCreate(activity: Activity, qualified: Context, style: Int): View {
+            try {
+                val button = MaterialButton(
+                    FrustMaterialContext.wrap(activity, qualified),
+                    null,
+                    buttonStyleAttr(style),
+                )
+                styleExtras(button, style)
+                return button
+            } catch (t: Throwable) {
+                Log.w(TAG, "native_button needs a Material3 app theme for its styles; using a plain Button", t)
+                return android.widget.Button(qualified)
+            }
+        }
+
+        /**
+         * Restyle a live button in place (a style change is an update, never
+         * a remount): the target style's colours are read off a reference
+         * button built from its attribute style and copied across.
+         */
+        @JvmStatic
+        fun buttonSetStyle(view: View, style: Int) {
+            val button = view as? MaterialButton ?: return
+            val reference = MaterialButton(button.context, null, buttonStyleAttr(style))
+            button.backgroundTintList = reference.backgroundTintList
+            button.strokeColor = reference.strokeColor
+            button.strokeWidth = reference.strokeWidth
+            button.rippleColor = reference.rippleColor
+            button.setTextColor(reference.textColors)
+            styleExtras(button, style)
+        }
 
         /**
          * A single-selection, selection-required toggle group wired to a
