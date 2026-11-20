@@ -178,6 +178,46 @@ the Photos page's Picker panel (*Share picked*, see the Photo-library manual tes
 A gate for `frust-qr` (`plugins/qr`), against the same URL page: scan the 160 px tile with a phone
 camera and confirm it decodes to the payload field's text; edit the payload and rescan.
 
+## Charts manual test (desktop + Android + iOS)
+
+A gate for `frust-charts` (`plugins/charts`): open the **Charts** section of `examples/playground`
+(`examples/playground/src/pages/charts.rs`). One background thread feeds every chart.
+
+- **Live:** the charts keep moving. The `builds:` and `samples:` labels stay still while data flows;
+  they catch up only when a control rebuilds the page. Lines, bars and cells stay crisp.
+- **Gap:** tap `inject gap`. The time series show a gap for about two seconds, then resume.
+- **Idle:** tap `pause feed`. The charts stop and the page is idle; `resume feed` restarts them.
+- **Dim:** tick `dim`. The chart column fades to a stale look and back.
+- **Pushed page:** tap `open in page`. The pushed chart is live over the same handles; `Back` returns.
+- **Taps:** tap the block chart. `chart taps:` counts it, since charts take no input.
+
+Device record, 2026-11-19 and 2026-11-20: Android at `053d69a3`, iPhone and macOS at `041d8b7b`
+(the only change between them is a heat-grid layout fix).
+
+| Check | Pixel 4a, Android 16 (2.75x) | iPhone 13 mini, iOS 27.2 (3x) | macOS 27.0.1 (2x) |
+|-------|------------------------------|-------------------------------|-------------------|
+| 1 Live (about twice a second) | PASS (60 encoded frames per 30 s) | PASS | PASS |
+| 2 No build (`builds:` still 60 s) | PASS (still 62 s, advances on a control tap) | PASS | PASS |
+| 3 Pushed page, Back | PASS | PASS | not run |
+| 4 Idle when paused | PASS, coarse: screen identical 90 s, under 60 frames (zero not proven); CPU 3.5 % paused vs 9-10 % running | PASS for frames: screen identical 30 s, no frame log line; CPU 1.3-1.7 % vs 3.9-6.0 %; about 125 wakeups/s in both states | PASS: 0.0 % CPU, about 1 wakeup/s paused; 1.2-1.7 % running |
+| 5 Gaps (line and fill break) | PARTIAL (break shown; isolated sample not produced) | PASS (isolated block column after the gap) | PASS |
+| 6 Crispness | PASS at 2.75x | PASS at 3x | not run |
+| 7 Dim | PASS | PASS | not run |
+| 8 Tap-through (`chart taps:`) | PASS | PASS | PASS |
+| 9 Lifecycle (30 s background, rotation) | PASS | PASS | not applicable |
+| 10 Accessibility | PARTIAL (labelled images; TalkBack speech not listened to) | PARTIAL (same, from an accessibility snapshot; VoiceOver not run) | not run |
+
+Findings, all open:
+
+- macOS: `builds:` climbs by thousands per second while the page scrolls or a button animates
+  (about 16,900 for one scroll down and up, about 7,800 per button click); the data path causes none.
+- Phones: scrolling the page rebuilds it about once per frame.
+- Rotation re-creates the Charts page, so its counters and feed restart.
+- iPhone: the idle wakeup rate does not drop when the feed is paused.
+- Accessibility: charts carry a label but no value; meters expose unrounded float values.
+- The pushed page's title draws under the status bar; corner labels can overlap data at extremes.
+- The playground page cannot produce an isolated sample between two gaps on demand.
+
 ## Auth-session manual test (Android + iOS + macOS)
 
 A device gate for `frust-auth-session` (`plugins/auth-session`), driven from `examples/playground`'s

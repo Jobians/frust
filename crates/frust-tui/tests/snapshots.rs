@@ -682,9 +682,8 @@ fn add_plugin_select_step_100x30() {
 
 /// The select step with the cursor on the *last* registry card: the registry
 /// is taller than the workbench body at 100x30, so the card list scrolls, and
-/// the window follows the cursor to keep `background-task` (the final
-/// `known_plugins()` row, reachable only once the window scrolls) drawn and
-/// focus-marked.
+/// the window follows the cursor to keep the final `known_plugins()` row
+/// (reachable only once the window scrolls) drawn and focus-marked.
 ///
 /// Both contracts are asserted explicitly rather than left to the snapshot
 /// alone — a cell grid records chrome overdraw as faithfully as it records a
