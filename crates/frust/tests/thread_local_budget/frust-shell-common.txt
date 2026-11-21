@@ -1,0 +1,4 @@
+budget android 2
+crates/frust-shell-common/src/perf.rs MARKERS_FORCE_ENABLED test
+crates/frust-shell-common/src/perf.rs PENDING android
+crates/frust-shell-common/src/perf.rs STAGED android
