@@ -25,7 +25,7 @@
 //! the explicit [`BackHandler`]/[`attach_back_handler`], constructed in
 //! `Component::init` and driven by [`track`](BackHandler::track) from every
 //! `Component::build` (Huddle's shape). Both funnel through one process-wide
-//! (UI-thread-affine) [`SHARED`] marker, so a press is consumed **exactly
+//! (UI-thread-affine) [`BackLocals::shared`] marker, so a press is consumed **exactly
 //! once**: whichever entry point runs first in a rebuild consumes it, the other
 //! sees the same already-consumed count and no-ops — never a double-pop.
 //!
@@ -129,7 +129,7 @@
 //! provider ([`set_can_pop_provider`]) reading `controller.back_interest()`,
 //! which `frust_reactive::handles_back` prefers to the flag: it reads CURRENT
 //! interest at press time, after `apply_ops` published it. UI-thread-affine (it
-//! reads an `Rc`-backed controller through [`SHARED`]); `frust_reactive::back`'s
+//! reads an `Rc`-backed controller through [`BackLocals::shared`]); `frust_reactive::back`'s
 //! module docs carry the source-side contract.
 
 use std::cell::{Cell, RefCell};
@@ -140,14 +140,10 @@ use frust_reactive::{CanPopRegistration, back_presses, set_can_pop_provider, set
 use frust_widgets::{NavigatorController, NavigatorId};
 use reactive_graph::traits::{Get, GetUntracked};
 
-thread_local! {
-    /// The UI-thread monotonic source of [`BackFallback`] ids
-    /// ([`RegistrantId::Fallback`]). Kept apart from [`SHARED`] so nothing that
-    /// resets the arbitration state can ever hand out an id twice.
-    static NEXT_FALLBACK_ID: Cell<u64> = const { Cell::new(0) };
-}
-
-thread_local! {
+/// Both per-thread slots of this module, held by the one [`LOCALS`] static: on Android each
+/// `thread_local!` static takes one of 128 process-wide pthread keys, and a field costs per
+/// access what its own static did.
+struct BackLocals {
     /// The process-wide (UI-thread-affine) back-press wiring shared by BOTH the
     /// automatic [`navigator`](crate::navigator) path and the explicit
     /// [`BackHandler`]. A single shared marker is the "single consumption
@@ -160,7 +156,29 @@ thread_local! {
     /// UI-thread-affine because every [`Registrant`] holds an `Rc`-backed
     /// `NavigatorController` or [`BackFallback`] (`!Send`), exactly like
     /// frust-reactive's live provider slot it feeds.
-    static SHARED: RefCell<SharedBack> = const { RefCell::new(SharedBack::new()) };
+    shared: RefCell<SharedBack>,
+    /// The UI-thread monotonic source of [`BackFallback`] ids
+    /// ([`RegistrantId::Fallback`]). Kept apart from [`shared`](Self::shared) so nothing that
+    /// resets the arbitration state can ever hand out an id twice.
+    next_fallback_id: Cell<u64>,
+}
+
+impl BackLocals {
+    const fn new() -> Self {
+        Self {
+            shared: RefCell::new(SharedBack::new()),
+            next_fallback_id: Cell::new(0),
+        }
+    }
+}
+
+thread_local! {
+    static LOCALS: BackLocals = const { BackLocals::new() };
+}
+
+/// Run `f` on the shared back state (see [`BackLocals::shared`]).
+fn with_shared<R>(f: impl FnOnce(&RefCell<SharedBack>) -> R) -> R {
+    LOCALS.with(|locals| f(&locals.shared))
 }
 
 /// What a registrant *is*, which is what R44-back ranks it by — taken from the
@@ -192,7 +210,7 @@ enum Role {
 enum RegistrantId {
     /// A navigator, by its controller's id.
     Navigator(NavigatorId),
-    /// A [`BackFallback`], by the id [`NEXT_FALLBACK_ID`] gave it.
+    /// A [`BackFallback`], by the id [`BackLocals::next_fallback_id`] gave it.
     Fallback(u64),
 }
 
@@ -218,20 +236,20 @@ struct Registrant {
     /// now? For a fallback, its wrappers' mount count > 0 or the first-wire
     /// grace (see the module docs). A `true` here vetoes the one-cycle prune
     /// (see the module docs' release rules). Only ever reads `Cell`s, so it is
-    /// safe to call under the [`SHARED`] borrow.
+    /// safe to call under the [`BackLocals::shared`] borrow.
     mounted: Box<dyn Fn() -> bool>,
     /// `controller.back_interest()` — does this navigator claim the next press?
     /// Already `false` for a navigator whose hosting page input cannot reach
     /// (the R23 gate in `frust-widgets`; see the module docs), which is why
     /// nothing here filters on visibility. For a fallback, the app's interest
     /// closure, gated on the fallback's liveness. An `Rc` so it is cloned out
-    /// and called with **no** [`SHARED`] borrow outstanding — a fallback's
+    /// and called with **no** [`BackLocals::shared`] borrow outstanding — a fallback's
     /// probe runs app code.
     interest: Rc<dyn Fn() -> bool>,
     /// `controller.request_back()` — deliver the press to this navigator,
     /// honoring its top page's `BackPolicy` (a fallback's `on_back`). An `Rc`
     /// rather than a `Box` so [`route_back`] can clone it out and call it with
-    /// **no** [`SHARED`] borrow outstanding.
+    /// **no** [`BackLocals::shared`] borrow outstanding.
     request_back: Rc<dyn Fn()>,
 }
 
@@ -264,7 +282,7 @@ impl Registrant {
     }
 }
 
-/// The shared back state behind [`SHARED`] (see its docs).
+/// The shared back state behind [`BackLocals::shared`] (see its docs).
 struct SharedBack {
     /// The last back-press count consumed by *any* entry point; `None` until
     /// the first observation. A press up to this count has already been routed
@@ -310,7 +328,7 @@ impl SharedBack {
 /// the live provider and the polled `handles_back` flag publish.
 ///
 /// The interest probes are CLONED OUT of the list and called with **no**
-/// [`SHARED`] borrow outstanding: a navigator's probe is a plain `Cell` read,
+/// [`BackLocals::shared`] borrow outstanding: a navigator's probe is a plain `Cell` read,
 /// but a [`BackFallback`]'s runs the app's interest closure, which must be free
 /// to read anything — this module included — without a `RefCell` panic.
 fn any_interest() -> bool {
@@ -318,9 +336,9 @@ fn any_interest() -> bool {
 }
 
 /// Every registrant's interest probe, in arbitration order, cloned out of
-/// [`SHARED`] so the caller can run them with no borrow outstanding.
+/// [`BackLocals::shared`] so the caller can run them with no borrow outstanding.
 fn interest_probes() -> Vec<Rc<dyn Fn() -> bool>> {
-    SHARED.with(|shared| {
+    with_shared(|shared| {
         shared
             .borrow()
             .registrants
@@ -376,7 +394,7 @@ fn register(
     interest: Rc<dyn Fn() -> bool>,
     request_back: Rc<dyn Fn()>,
 ) {
-    SHARED.with(|shared| {
+    with_shared(|shared| {
         let mut shared = shared.borrow_mut();
         shared.seq += 1;
         let seq = shared.seq;
@@ -399,7 +417,7 @@ fn register(
                 // tree — drop it rather than let it keep claiming presses. The
                 // mounted probe only reads `Cell`s (a navigator's controller, a
                 // fallback's mount count and grace) and never re-enters this
-                // module, so calling it under the `SHARED` borrow is safe.
+                // module, so calling it under the `shared` borrow is safe.
                 shared
                     .registrants
                     .retain(|r| r.id == id || r.seq >= previous || (r.mounted)());
@@ -429,7 +447,7 @@ fn register(
         shared.registrants.insert(at, entry);
         if shared.provider.is_none() {
             // Register the stable live provider ONCE. It reads whatever
-            // registrants are currently wired from `SHARED`, so a new
+            // registrants are currently wired from `shared`, so a new
             // registrant joining the list needs no re-registration.
             shared.provider = Some(set_can_pop_provider(Box::new(any_interest)));
         }
@@ -456,22 +474,21 @@ fn register(
 /// returned to the platform.
 fn route_back() {
     // Both the interest probes and the claimant's `request_back` are CLONED OUT
-    // of the list (that is what the `Rc`s are for) and called with NO `SHARED`
+    // of the list (that is what the `Rc`s are for) and called with NO `shared`
     // borrow outstanding. A navigator's are a `Cell` read and an op enqueue, but
     // a fallback's are app closures, and a re-entry into this module under a
     // borrow would panic on the already-borrowed `RefCell`.
-    let claimant = SHARED
-        .with(|shared| {
-            shared
-                .borrow()
-                .registrants
-                .iter()
-                .map(|r| (Rc::clone(&r.interest), Rc::clone(&r.request_back)))
-                .collect::<Vec<_>>()
-        })
-        .into_iter()
-        .find(|(interest, _)| interest())
-        .map(|(_, request_back)| request_back);
+    let claimant = with_shared(|shared| {
+        shared
+            .borrow()
+            .registrants
+            .iter()
+            .map(|r| (Rc::clone(&r.interest), Rc::clone(&r.request_back)))
+            .collect::<Vec<_>>()
+    })
+    .into_iter()
+    .find(|(interest, _)| interest())
+    .map(|(_, request_back)| request_back);
     if let Some(request_back) = claimant {
         request_back();
     }
@@ -489,7 +506,7 @@ fn route_back() {
 fn consume_press() -> bool {
     // Tracked read — subscribes the rebuild to the back-press counter.
     let count = back_presses().count.get();
-    SHARED.with(|shared| {
+    with_shared(|shared| {
         let mut shared = shared.borrow_mut();
         match shared.consumed {
             // A fresh process/marker: seed to the current count WITHOUT firing,
@@ -531,7 +548,7 @@ fn consume_back() {
 /// already seeded the marker on an earlier rebuild.
 fn seed_consumed() {
     let count = back_presses().count.get_untracked();
-    SHARED.with(|shared| {
+    with_shared(|shared| {
         let mut shared = shared.borrow_mut();
         if shared.consumed.is_none() {
             shared.consumed = Some(count);
@@ -760,7 +777,8 @@ impl BackFallback {
     /// pass, like a navigator's `request_back`.
     pub fn new(interest: impl Fn() -> bool + 'static, on_back: impl Fn() + 'static) -> Self {
         seed_consumed();
-        let id = NEXT_FALLBACK_ID.with(|next| {
+        let id = LOCALS.with(|locals| {
+            let next = &locals.next_fallback_id;
             let id = next.get();
             next.set(id + 1);
             id
@@ -910,7 +928,7 @@ mod tests {
 
     /// Serializes every test in this module: they all touch `frust-reactive`'s
     /// process-wide back-press counter / `handles_back` flag / live-provider slot
-    /// AND this module's `SHARED` marker, so concurrent runs would race the
+    /// AND this module's `shared` marker, so concurrent runs would race the
     /// shared counter (one test's `push_back_press` advancing it under another's
     /// feet). `reset()` (below) additionally clears the per-thread state a reused
     /// harness thread would otherwise carry between tests.
@@ -923,7 +941,7 @@ mod tests {
     fn reset() {
         clear_can_pop_provider();
         set_handles_back(false);
-        SHARED.with(|shared| *shared.borrow_mut() = SharedBack::new());
+        with_shared(|shared| *shared.borrow_mut() = SharedBack::new());
     }
 
     fn page() -> AnyView<()> {
@@ -984,6 +1002,23 @@ mod tests {
         fn depth(&self) -> usize {
             self.controller.depth()
         }
+    }
+
+    /// A thread that wires a navigator and exits tears its registrants down
+    /// with the thread-local state; dropping them must not reach back into
+    /// that state, so the join returns cleanly.
+    #[test]
+    fn registrants_drop_cleanly_at_thread_exit() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let wired = std::thread::spawn(|| {
+            let _rt = ReactiveRuntime::init(Arc::new(|| {}));
+            reset();
+            let _h = Harness::new(auto_wire);
+            registrants().len()
+        })
+        .join()
+        .expect("thread exit must not panic while dropping registrants");
+        assert_eq!(wired, 1, "the spawned thread wired its navigator");
     }
 
     /// Criterion 1: an app using the AUTOMATIC `frust::navigator` auto-wiring
@@ -1221,7 +1256,7 @@ mod tests {
 
     /// The whole arbitration list, fallbacks included, in order.
     fn registrants() -> Vec<RegistrantId> {
-        SHARED.with(|shared| shared.borrow().registrants.iter().map(|r| r.id).collect())
+        with_shared(|shared| shared.borrow().registrants.iter().map(|r| r.id).collect())
     }
 
     /// **R44-back**: with a root overlay open, the press goes to the HOST even

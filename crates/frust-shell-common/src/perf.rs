@@ -611,10 +611,10 @@ impl FrameStats {
     /// Two sources, both belonging to **this** thread — which is what makes
     /// the split and the inline executor one rule rather than two:
     ///
-    /// - [`STAGED`] — markers put there by [`stage_markers`] when the render
+    /// - [`MarkerQueues::staged`] — markers put there by [`stage_markers`] when the render
     ///   channel handed this thread the very frame now being recorded. The
     ///   render-thread-split leg.
-    /// - [`PENDING`] — this thread's own raise queue. The inline (no render
+    /// - [`MarkerQueues::pending`] — this thread's own raise queue. The inline (no render
     ///   thread) executor's leg, where the thread that raises a marker is the
     ///   same one that records the frame. On a render thread this is
     ///   *structurally* empty: a render thread raises no marker of its own,
@@ -894,7 +894,7 @@ pub(crate) struct ScenarioMarker {
     name: Box<str>,
 }
 
-/// The most markers any one leg of the route ([`PENDING`], [`STAGED`],
+/// The most markers any one leg of the route ([`MarkerQueues::pending`], [`MarkerQueues::staged`],
 /// [`crate::render_split`]'s inbox queue) holds at once.
 ///
 /// A leg only grows while markers are raised faster than frames are
@@ -978,8 +978,10 @@ impl MarkerQueue {
     }
 }
 
+/// Both of the calling thread's marker queues, held by the one [`MARKERS`] static: on Android
+/// each `thread_local!` static takes one of 128 process-wide pthread keys.
 #[cfg(feature = "perf-trace")]
-thread_local! {
+struct MarkerQueues {
     /// The markers **this** thread has raised and not yet handed on:
     /// [`mark_scenario_start`]/[`mark_scenario_end`] push here, nothing else
     /// does.
@@ -1000,16 +1002,31 @@ thread_local! {
     /// Bounded at [`MARKER_QUEUE_CAP`].
     ///
     /// [`RenderSender::send_scene`]: crate::render_split::RenderSender::send_scene
-    static PENDING: RefCell<MarkerQueue> = const { RefCell::new(MarkerQueue::new()) };
+    pending: RefCell<MarkerQueue>,
 
     /// The markers handed to *this* thread for the very next frame it
     /// records — the render thread's leg of the route. [`stage_markers`]
     /// appends, [`FrameStats::record`] drains. Per-thread for the same reason
-    /// [`PENDING`] is: the draining thread is by construction the one that
+    /// [`pending`](Self::pending) is: the draining thread is by construction the one that
     /// took the batch out of the inbox and is about to render and record it,
     /// so no lock is needed and no other thread's frame can pick these up by
     /// accident. Bounded at [`MARKER_QUEUE_CAP`].
-    static STAGED: RefCell<MarkerQueue> = const { RefCell::new(MarkerQueue::new()) };
+    staged: RefCell<MarkerQueue>,
+}
+
+#[cfg(feature = "perf-trace")]
+impl MarkerQueues {
+    const fn new() -> Self {
+        Self {
+            pending: RefCell::new(MarkerQueue::new()),
+            staged: RefCell::new(MarkerQueue::new()),
+        }
+    }
+}
+
+#[cfg(feature = "perf-trace")]
+thread_local! {
+    static MARKERS: MarkerQueues = const { MarkerQueues::new() };
 }
 
 /// Take the calling thread's raised-but-not-handed-on markers, leaving its
@@ -1030,11 +1047,11 @@ pub(crate) fn take_pending_markers() -> MarkerQueue {
     if !markers_enabled() {
         return MarkerQueue::new();
     }
-    PENDING.with(|pending| pending.borrow_mut().take())
+    MARKERS.with(|queues| queues.pending.borrow_mut().take())
 }
 
 /// Hand markers to the calling thread's next recorded frame, appending to
-/// whatever is already staged there (see [`STAGED`]). Called by the render
+/// whatever is already staged there (see [`MarkerQueues::staged`]). Called by the render
 /// thread as it takes a scene out of the inbox; the frame it records next is
 /// the one that scene belongs to.
 ///
@@ -1052,7 +1069,7 @@ pub(crate) fn stage_markers(markers: MarkerQueue) {
     if markers.is_empty() {
         return;
     }
-    STAGED.with(|staged| staged.borrow_mut().absorb(markers));
+    MARKERS.with(|queues| queues.staged.borrow_mut().absorb(markers));
 }
 
 /// Take this thread's staged markers, leaving the slot empty. `is_empty`
@@ -1060,8 +1077,8 @@ pub(crate) fn stage_markers(markers: MarkerQueue) {
 /// must not allocate.
 #[cfg(feature = "perf-trace")]
 fn take_staged_markers() -> MarkerQueue {
-    STAGED.with(|staged| {
-        let mut staged = staged.borrow_mut();
+    MARKERS.with(|queues| {
+        let mut staged = queues.staged.borrow_mut();
         if staged.is_empty() {
             MarkerQueue::new()
         } else {
@@ -1103,8 +1120,8 @@ impl Drop for MarkerTestGuard {
 /// Empty both of the calling thread's marker queues.
 #[cfg(all(test, feature = "perf-trace"))]
 fn reset_marker_route() {
-    PENDING.with(|pending| pending.borrow_mut().clear());
-    STAGED.with(|staged| staged.borrow_mut().clear());
+    MARKERS.with(|queues| queues.pending.borrow_mut().clear());
+    MARKERS.with(|queues| queues.staged.borrow_mut().clear());
 }
 
 /// Start this thread's use of the marker route from a pristine queue pair
@@ -1139,7 +1156,7 @@ fn markers_enabled() -> bool {
     enabled()
 }
 
-/// Queue one marker onto the calling thread's [`PENDING`] queue — the single
+/// Queue one marker onto the calling thread's [`MarkerQueues::pending`] queue — the single
 /// body behind both [`mark_scenario_start`] and [`mark_scenario_end`], so the
 /// two edges can never drift apart.
 #[cfg(feature = "perf-trace")]
@@ -1147,8 +1164,8 @@ fn push_marker(edge: MarkerEdge, name: &str) {
     if !markers_enabled() {
         return;
     }
-    PENDING.with(|pending| {
-        pending.borrow_mut().push(ScenarioMarker {
+    MARKERS.with(|queues| {
+        queues.pending.borrow_mut().push(ScenarioMarker {
             edge,
             name: name.into(),
         });

@@ -1,4 +1,3 @@
-budget android 2
-crates/frust/src/back_glue.rs NEXT_FALLBACK_ID android
-crates/frust/src/back_glue.rs SHARED android
+budget android 1
+crates/frust/src/back_glue.rs LOCALS android
 crates/frust/src/testing/tester.rs CLOCK test
