@@ -207,6 +207,9 @@ extension FrustView {
         if text == "\n" || text == "\r" || text == "\r\n",
             markedRange.location == NSNotFound
         {
+            // No state, or an inactive one, means the Return's handler (a submit)
+            // took focus away: nothing to reconcile, and the per-frame focus
+            // sync resigns the responder.
             if let state = imeAction?(0) ?? nil, (state["active"] as? Bool) == true {
                 reconcileMirror(to: state)
             }

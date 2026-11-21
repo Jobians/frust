@@ -87,9 +87,8 @@ pub use frust_shell_common::{AppTree, new_boxed_app, new_boxed_app_with};
 /// Bind a generated app's `State`/`build` to the fixed iOS C-ABI exports
 /// (Makepad `app_main!` precedent).
 ///
-/// Stamps out the twenty-four `frust_*` symbols the generated Swift app
-/// declares
-/// (the seven lifecycle/input exports, the four text-input exports —
+/// Stamps out the `frust_*` symbols the generated Swift app declares
+/// (the lifecycle/input exports, the four text-input exports —
 /// `frust_ime_apply`, `frust_ime_action`, `frust_ime_state_json`, `frust_string_free` —
 /// the four clipboard/system-edit-menu exports — `frust_edit_command`,
 /// `frust_take_clipboard_write`, `frust_take_paste_request` and

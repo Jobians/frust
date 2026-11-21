@@ -116,6 +116,14 @@ fn insert_text_routes_a_lone_return_before_touching_the_mirror() {
         action < write,
         "imeAction must come before the mirror write"
     );
+    assert!(
+        b[action..write].contains("return"),
+        "the lone-Return branch must `return` before the mirror write"
+    );
+    assert!(
+        b[..action].contains("markedRange.location == NSNotFound"),
+        "the lone-Return branch must be guarded by the no-marked-text check"
+    );
 }
 
 #[test]
