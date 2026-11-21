@@ -1,8 +1,8 @@
 //! The app-facing front door to native presentations (`crate::present`):
-//! [`show_native_alert`] / [`show_native_sheet`], the awaitable forms, and
-//! [`show_native_alert_into`] / [`show_native_sheet_into`], the
-//! events-as-signals forms (`super::signals`' idiom) that need no `async`
-//! block at all.
+//! [`show_native_alert`] / [`show_native_sheet`] / [`show_native_toast`], the
+//! awaitable forms, and [`show_native_alert_into`] / [`show_native_sheet_into`]
+//! / [`show_native_toast_into`], the events-as-signals forms
+//! (`super::signals`' idiom) that need no `async` block at all.
 //!
 //! # The contract both forms keep
 //!
@@ -15,10 +15,16 @@
 //!   callback after the first is dropped by the presentation's generation
 //!   guard. A sheet's detent changes are intermediate events
 //!   ([`SheetSpec::on_detent`]), not outcomes.
-//! - **One at a time, across kinds.** A request while another presentation
-//!   of any kind is live is refused [`PresentError::Busy`] at once — never
-//!   queued, never replacing the live one; an alert and a sheet share the
-//!   one slot.
+//! - **One sheet, and one alert above it.** An alert requested while a sheet
+//!   is live is presented above that sheet — a sheet's confirmation, opened
+//!   from a row [`SheetSpec::on_row_tap`] keeps open — and resolves
+//!   `Cancelled` if the sheet ends first. Every other overlap is refused
+//!   [`PresentError::Busy`] at once — a second alert, a second sheet, a
+//!   sheet while an alert is live — never queued, never replacing the live
+//!   one.
+//! - **A toast takes no slot.** [`show_native_toast`] is never refused
+//!   `Busy` and never waits for an alert or a sheet; a newer toast replaces
+//!   the current one, which resolves [`ToastOutcome::Dismissed`].
 //! - **Nothing blocks.** Both forms return immediately; the outcome arrives
 //!   when the user answers, driven by the platform's main thread.
 //!
@@ -42,15 +48,17 @@ use frust::{RwSignal, Set, Theme};
 use super::theme::{argb_u32, is_dark};
 use crate::present::{
     self, AlertOutcome, AlertSpec, PresentError, Presentation, PresentationHandle, SheetHandle,
-    SheetOutcome, SheetSpec,
+    SheetOutcome, SheetSpec, ToastOutcome, ToastSpec,
 };
 
 /// Present a native alert and await its one outcome.
 ///
 /// Resolves `Ok(outcome)` once the user (or [`crate::present::dismiss`], or
-/// the host going away) ends the alert, or `Err`: an invalid spec, `Busy`,
-/// no host to present over, or `Unsupported` on a platform without a native
-/// alert arm. The returned [`Presentation`] is a plain [`Future`] — await it
+/// the host going away, or the sheet it is presented over ending) ends the
+/// alert, or `Err`: an invalid spec, `Busy` (another alert is live), no host
+/// to present over, or `Unsupported` on a platform without a native alert
+/// arm. While a sheet is live the alert is presented above it. The returned
+/// [`Presentation`] is a plain [`Future`] — await it
 /// from `frust::spawn_local` or any executor — and its
 /// [`Presentation::handle`] is what [`crate::present::dismiss`] takes.
 /// Dropping it frees the one-at-a-time slot but leaves the platform alert on
@@ -119,7 +127,7 @@ pub fn show_native_alert_into(
 ///
 /// Resolves `Ok(outcome)` once the user (an action row, a swipe-down on a
 /// dismissible sheet), [`SheetHandle::dismiss`] or the host going away ends
-/// the sheet, or `Err`: an invalid spec, `Busy` (any other presentation is
+/// the sheet, or `Err`: an invalid spec, `Busy` (a sheet or an alert is
 /// live), no host to present over, or `Unsupported` — every platform but
 /// iOS/iPadOS today (macOS and Android sheet arms are follow-up work). Take
 /// [`Presentation::sheet_handle`] before awaiting to move or dismiss it.
@@ -175,6 +183,52 @@ pub fn show_native_sheet_into(
     sheet_handle.ok_or_else(|| {
         PresentError::Platform("an accepted native sheet carried no handle".to_string())
     })
+}
+
+/// Show a native toast — a short message above the app's own native chrome,
+/// optionally with one action — and await its one outcome.
+///
+/// Resolves `Ok(`[`ToastOutcome::TimedOut`]`)` when its duration runs out,
+/// `Ok(`[`ToastOutcome::Action`]`)` when the user taps its action, or
+/// `Ok(`[`ToastOutcome::Dismissed`]`)` when the user swipes it away, a newer
+/// toast replaces it, [`crate::present::dismiss`] takes it down or its host
+/// goes away; or `Err`: an invalid spec (an empty message or action label),
+/// no host, or `Unsupported` on every platform but Android (a Material
+/// Snackbar) and iOS/iPadOS (a plugin-owned capsule above the tab bar and
+/// the keyboard). Never `Busy`: a toast uses neither the alert nor the sheet
+/// slot, and shows whether or not either is up.
+///
+/// ```ignore
+/// let spec = ToastSpec::new("Message archived").with_action("Undo");
+/// frust::spawn_local(async move {
+///     if let Ok(ToastOutcome::Action) = show_native_toast(spec).await {
+///         messages.update(|m| m.restore_last());
+///     }
+/// });
+/// ```
+pub fn show_native_toast(spec: ToastSpec) -> Presentation<ToastOutcome> {
+    present::show_toast(spec)
+}
+
+/// Show a native toast and write its one outcome into `signal` as
+/// `Some(outcome)` — the no-`async` form, with exactly
+/// [`show_native_alert_into`]'s contract (module doc's *Controlled*):
+/// a refusal on the spot comes back as `Err` and never touches `signal`; a
+/// later platform error is logged, not written. Must be called on the UI
+/// thread.
+///
+/// # Errors
+/// `InvalidSpec`, or a platform refusal decided on the spot (`Unsupported`
+/// off Android and iOS, `NoHost`).
+pub fn show_native_toast_into(
+    spec: ToastSpec,
+    signal: RwSignal<Option<ToastOutcome>>,
+) -> Result<PresentationHandle, PresentError> {
+    deliver_into(
+        show_native_toast(spec),
+        move |outcome| signal.set(Some(outcome)),
+        frust::spawn_local,
+    )
 }
 
 impl SheetSpec {
@@ -241,8 +295,8 @@ mod tests {
     use frust::GetUntracked;
 
     use super::*;
-    use crate::present::test_support::{pending_pair, with_slot_held};
-    use crate::present::{ActionRole, AlertStyle, DismissReason, SheetContent};
+    use crate::present::test_support::{pending_pair, with_sheet_held, with_slot_held};
+    use crate::present::{ActionRole, AlertStyle, DismissReason, SheetContent, ToastSpec};
 
     fn spec() -> AlertSpec {
         AlertSpec::new("Delete draft?", "This cannot be undone.")
@@ -395,6 +449,27 @@ mod tests {
         });
     }
 
+    /// A live sheet refuses a second sheet, but not an alert above it: the
+    /// alert reaches the platform arm (which, on a host without one, refuses
+    /// it `Unsupported` rather than `Busy`).
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
+    #[test]
+    fn a_live_sheet_refuses_a_sheet_but_not_an_alert() {
+        with_sheet_held(|| {
+            let signal: RwSignal<Option<SheetOutcome>> = RwSignal::new(None);
+            assert_eq!(
+                show_native_sheet_into(sheet(), signal),
+                Err(PresentError::Busy)
+            );
+            let alert: RwSignal<Option<AlertOutcome>> = RwSignal::new(None);
+            assert_eq!(
+                show_native_alert_into(spec(), alert),
+                Err(PresentError::Unsupported)
+            );
+            assert_eq!(alert.get_untracked(), None);
+        });
+    }
+
     /// Off iOS the sheet arm refuses on the spot, so the signal form answers
     /// synchronously and never needs its spawner.
     #[cfg(not(target_os = "ios"))]
@@ -407,6 +482,51 @@ mod tests {
             Err(PresentError::Unsupported)
         );
         assert_eq!(signal.get_untracked(), None);
+    }
+
+    /// Off Android and iOS the toast arm refuses on the spot — even with
+    /// the alert slot held, which a toast never waits for.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn the_toast_forms_are_unsupported_off_android_and_ios_and_never_busy() {
+        with_slot_held(|| {
+            let mut toast = show_native_toast(ToastSpec::new("Saved"));
+            assert_eq!(toast.handle(), None);
+            assert_eq!(
+                Pin::new(&mut toast).poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(PresentError::Unsupported))
+            );
+            let signal: RwSignal<Option<ToastOutcome>> = RwSignal::new(None);
+            assert_eq!(
+                show_native_toast_into(ToastSpec::new("Saved"), signal),
+                Err(PresentError::Unsupported)
+            );
+            assert_eq!(signal.get_untracked(), None);
+        });
+    }
+
+    #[test]
+    fn an_invalid_toast_surfaces_as_err_from_the_signal_form() {
+        let _guard = crate::present::test_support::serialize();
+        let signal: RwSignal<Option<ToastOutcome>> = RwSignal::new(None);
+        assert!(matches!(
+            show_native_toast_into(ToastSpec::new(""), signal),
+            Err(PresentError::InvalidSpec(_))
+        ));
+        assert_eq!(signal.get_untracked(), None);
+    }
+
+    #[test]
+    fn the_adapter_writes_a_toast_outcome_exactly_once() {
+        let signal: RwSignal<Option<ToastOutcome>> = RwSignal::new(None);
+        let (tx, presentation) = pending_pair::<ToastOutcome>();
+        let (spawned, spawn) = capture();
+        deliver_into(presentation, move |o| signal.set(Some(o)), spawn).expect("accepted");
+        let mut task = spawned.borrow_mut().pop().expect("one task spawned");
+        assert_eq!(poll(&mut task), Poll::Pending);
+        assert!(tx.send(Ok(ToastOutcome::Action)));
+        assert_eq!(poll(&mut task), Poll::Ready(()));
+        assert_eq!(signal.get_untracked(), Some(ToastOutcome::Action));
     }
 
     #[test]

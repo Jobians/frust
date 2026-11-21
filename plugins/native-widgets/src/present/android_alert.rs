@@ -5,15 +5,28 @@
 //!
 //! # The contract
 //!
-//! Two more members alongside `android_host`'s module doc's table, both
+//! Three more members alongside `android_host`'s module doc's table, all
 //! called Rust → Kotlin — plain `@JvmStatic fun`s, not `external fun`s, so
-//! neither adds to the frozen export set `tests/kotlin_conformance.rs`
+//! none adds to the frozen export set `tests/kotlin_conformance.rs`
 //! pins:
 //!
 //! | Kotlin | Contract |
 //! |---|---|
-//! | `@JvmStatic fun showAlert(generation, title, message, labels, roles, cancelable)` | Builds and shows the dialog; `labels`/`roles` are parallel, spec-ordered arrays (`roles`' wire codes below) |
-//! | `@JvmStatic fun dismiss(generation)` | Takes the live dialog down, if it is still `generation`'s |
+//! | `@JvmStatic fun showAlert(generation, title, message, labels, roles, cancelable, overSheet)` | Builds and shows the dialog; `labels`/`roles` are parallel, spec-ordered arrays (`roles`' wire codes below); `overSheet` is the generation of the sheet the alert goes above (`super::sheet_under`), `0` for none |
+//! | `@JvmStatic fun dismiss(generation)` | Takes the live alert down → `OUTCOME_DISMISSED`, if it is still `generation`'s |
+//! | `@JvmStatic fun cancelAlert(generation)` | The same → `OUTCOME_CANCELLED`: the sheet under it is ending ([`AlertHost::cancel`]) |
+//!
+//! # Over a sheet
+//!
+//! An alert accepted while a sheet is live is shown above that sheet's
+//! `BottomSheetDialog` — a second dialog window on the same `Activity`,
+//! stacked on top — and the sheet stays up. When the sheet ends by any path
+//! (`dismissSheet`, the user, the Activity destroyed), the presenter closes
+//! the alert first and reports it `OUTCOME_CANCELLED` before the sheet's own
+//! outcome; [`AlertHost::cancel`] is the Rust side's request for the same,
+//! which then finds the alert already resolved. An `overSheet` sheet that is
+//! already gone when `showAlert` runs resolves the alert `Cancelled` without
+//! showing it.
 //!
 //! # Mapping
 //!
@@ -49,7 +62,7 @@
 //! Every path resolves through the ONE callback
 //! `android_host::Java_dev_frust_nativewidgets_FrustNativePresenter_nativeOnOutcome`,
 //! guarded exactly once **on the Kotlin side** (`FrustNativePresenter`'s own
-//! `liveDialog`-null check — independent of, and in addition to,
+//! `liveAlert`-null check — independent of, and in addition to,
 //! `android_host`'s `LIVE` generation-keyed parking on the Rust side):
 //!
 //! - **An action** (button tap) → `DialogInterface.OnClickListener` →
@@ -75,26 +88,30 @@
 //!   change, e.g. rotation, or the user leaving the app) →
 //!   `Application.ActivityLifecycleCallbacks.onActivityDestroyed` →
 //!   [`wire::OUTCOME_HOST_LOST`], and the dialog is dismissed with it
-//!   (module doc's *Retention*).
+//!   (module doc's *Retention*) — except an alert shown over a sheet, which
+//!   goes with that sheet as [`wire::OUTCOME_CANCELLED`] (*Over a sheet*).
+//! - **The sheet under it ending** → [`wire::OUTCOME_CANCELLED`] (*Over a
+//!   sheet*).
 //!
 //! # A displaced presentation
 //!
-//! A caller that drops its [`super::Presentation`] frees the process-wide
-//! Busy slot but not the dialog on screen, so a newer `show_alert` can find
-//! the older one still parked. Its Rust-side resolver is resolved at once
-//! as `android_host::install_live` displaces it — discarded, since its
-//! receiver is already gone (the module doc's own contract: dropping the
-//! future frees only Rust-side bookkeeping). The stale `AlertDialog` itself
-//! is taken down on Kotlin's side, inside `showAlert`, before the new one is
-//! built, so the two never show stacked.
+//! A caller that drops its [`super::Presentation`] frees its Busy slot but
+//! not the dialog on screen, so a newer `show_alert` can find the older one
+//! still parked. Its Rust-side resolver is resolved at once as
+//! `android_host::install_live` displaces it — discarded, since its receiver
+//! is already gone (the module doc's own contract: dropping the future frees
+//! only Rust-side bookkeeping) — and so is a parked sheet that is not the
+//! one this alert goes over (an abandoned sheet). The stale dialogs
+//! themselves are taken down on Kotlin's side, inside `showAlert`, before
+//! the new one is built, so two alerts never show stacked.
 //!
 //! # Retention
 //!
 //! Unlike the Apple arms, which retain the platform objects themselves
 //! (`Retained<UIAlertController>`, a delegate) in Rust-owned storage
 //! (`apple_host`'s `LIVE`), the `AlertDialog` and its listeners are retained
-//! entirely on the JVM side: `FrustNativePresenter`'s own `liveDialog`/
-//! `liveActivity` fields, reachable from the `object` singleton (a GC root)
+//! entirely on the JVM side: `FrustNativePresenter`'s own `liveAlert` record (its dialog and
+//! Activity), reachable from the `object` singleton (a GC root)
 //! for as long as the presentation is live. `android_host`'s `LIVE` holds
 //! only what Rust itself needs to resolve the presentation later — the
 //! boxed [`Sender`] and the spec's action ids
@@ -104,7 +121,7 @@
 //!
 //! Unlike the Apple arms, which always bounce onto the main queue
 //! (`apple_host::on_main`) because a request can arrive from any thread,
-//! this arm calls `FrustNativePresenter.showAlert`/`dismiss` **directly**,
+//! this arm calls `FrustNativePresenter.showAlert`/`dismiss`/`cancelAlert` **directly**,
 //! synchronously, with no Handler post: the whole frust Android runtime is
 //! thread-confined to the platform main `Looper` (`android/mod.rs`'s
 //! *Threading*; `docs/PLUGINS_CODE_STANDARDS.md`'s events-as-signals
@@ -132,7 +149,8 @@ use jni::sys::jlong;
 use jni::{Env, jni_sig, jni_str};
 
 use super::android_host::{
-    alert_resolver, has_resumed_activity, install_live, take_live, with_presenter,
+    LiveKind, alert_resolver, has_resumed_activity, install_live, take_live, take_stale,
+    with_presenter,
 };
 use super::{
     ActionRole, AlertAction, AlertHost, AlertOutcome, AlertSpec, PresentError, Sender, wire,
@@ -180,15 +198,22 @@ impl AlertHost for Host {
             .iter()
             .map(|action| action.id.clone())
             .collect();
+        let over_sheet = super::sheet_under(generation);
         let resolve = alert_resolver(tx, action_ids);
-        if let Some(displaced) = install_live(generation, resolve) {
-            // Module doc's *A displaced presentation*: resolved here for
-            // Rust's own bookkeeping, discarded on arrival (its receiver is
-            // already gone) — Kotlin's `showAlert` takes the stale dialog
-            // itself down.
-            displaced(wire::OUTCOME_DISMISSED, -1);
+        let displaced = install_live(LiveKind::Alert, generation, resolve, None);
+        // Module doc's *A displaced presentation*: resolved here for Rust's
+        // own bookkeeping, discarded on arrival (their receivers are already
+        // gone) — Kotlin's `showAlert` takes the stale dialogs themselves
+        // down.
+        for stale in displaced
+            .into_iter()
+            .chain(take_stale(LiveKind::Sheet, over_sheet))
+        {
+            stale(wire::OUTCOME_DISMISSED, -1);
         }
-        let result = with_presenter(|env, class| call_show_alert(env, class, generation, &spec));
+        let result = with_presenter(|env, class| {
+            call_show_alert(env, class, generation, &spec, over_sheet.unwrap_or(0))
+        });
         if result.is_err() {
             // `showAlert` never ran (or the call to reach it never
             // returned), so nothing will ever call this presentation's
@@ -202,21 +227,30 @@ impl AlertHost for Host {
     }
 
     fn dismiss(generation: u64) {
-        if let Err(err) = with_presenter(|env, class| call_dismiss(env, class, generation)) {
+        if let Err(err) = with_presenter(|env, class| call_end(env, class, generation, false)) {
             log::warn!(
                 "frust-native-widgets: FrustNativePresenter.dismiss({generation}) failed: {err}"
+            );
+        }
+    }
+
+    fn cancel(generation: u64) {
+        if let Err(err) = with_presenter(|env, class| call_end(env, class, generation, true)) {
+            log::warn!(
+                "frust-native-widgets: FrustNativePresenter.cancelAlert({generation}) failed: {err}"
             );
         }
     }
 }
 
 /// `FrustNativePresenter.showAlert(generation, title, message, labels,
-/// roles, cancelable)` — see the module doc's contract table.
+/// roles, cancelable, overSheet)` — see the module doc's contract table.
 fn call_show_alert(
     env: &mut Env<'_>,
     class: &Global<JClass<'static>>,
     generation: u64,
     spec: &AlertSpec,
+    over_sheet: u64,
 ) -> Result<(), PresentError> {
     jni_call(env, "FrustNativePresenter.showAlert", |env| {
         let title = env.new_string(&spec.title)?;
@@ -226,39 +260,46 @@ fn call_show_alert(
         env.call_static_method(
             class,
             jni_str!("showAlert"),
-            jni_sig!("(JLjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[IZ)V"),
+            jni_sig!("(JLjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[IZJ)V"),
             &[
                 // `u64` → `jlong` is a reinterpretation, not a truncation —
                 // the presenter treats it as opaque and echoes the same 64
                 // bits back through `nativeOnOutcome` (`android_host`'s own
-                // doc comment on the inverse cast).
+                // doc comment on the inverse cast). `over_sheet` crosses the
+                // same way; `0` (never a generation) means no sheet.
                 JValue::Long(generation as jlong),
                 JValue::Object(&title),
                 JValue::Object(&message),
                 JValue::Object(&labels),
                 JValue::Object(&roles),
                 JValue::Bool(spec.cancelable),
+                JValue::Long(over_sheet as jlong),
             ],
         )?
         .v()
     })
 }
 
-/// `FrustNativePresenter.dismiss(generation)`.
-fn call_dismiss(
+/// `FrustNativePresenter.dismiss(generation)`, or `cancelAlert(generation)`
+/// when `cancel` — the sheet under the alert is ending.
+fn call_end(
     env: &mut Env<'_>,
     class: &Global<JClass<'static>>,
     generation: u64,
+    cancel: bool,
 ) -> Result<(), PresentError> {
-    jni_call(env, "FrustNativePresenter.dismiss", |env| {
-        env.call_static_method(
-            class,
-            jni_str!("dismiss"),
-            jni_sig!("(J)V"),
-            &[JValue::Long(generation as jlong)],
-        )?
-        .v()
-    })
+    let args = [JValue::Long(generation as jlong)];
+    if cancel {
+        jni_call(env, "FrustNativePresenter.cancelAlert", |env| {
+            env.call_static_method(class, jni_str!("cancelAlert"), jni_sig!("(J)V"), &args)?
+                .v()
+        })
+    } else {
+        jni_call(env, "FrustNativePresenter.dismiss", |env| {
+            env.call_static_method(class, jni_str!("dismiss"), jni_sig!("(J)V"), &args)?
+                .v()
+        })
+    }
 }
 
 /// Build a `String[]` of each action's label, in spec order — `showAlert`'s

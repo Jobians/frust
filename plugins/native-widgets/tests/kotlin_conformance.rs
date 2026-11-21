@@ -108,6 +108,17 @@
 //! [`chrome_toolbar_style_spellings_match_between_kotlin_and_rust`] the same
 //! for the `TOOLBAR_STYLE_*` constants and `android_wire::toolbar_style_name`,
 //! with both appended toolbar keys read under the spelling Rust writes.
+//!
+//! # The toast twins (`FrustNativePresenter.kt`)
+//!
+//! [`toast_wire_matches_between_kotlin_and_rust`] pins the toast's half of
+//! the presenter contract: Kotlin's `OUTCOME_TIMED_OUT` against
+//! `present::wire`'s, every outcome Kotlin's `toastCode` can report against
+//! the codes `present::toast::wire::toast_outcome` decodes as an outcome, the
+//! Rust duration wire (milliseconds, never Material's `LENGTH_*`
+//! constants, which Android 10+ collapses into one), the `showToast`/`dismissToast` signatures against the JNI
+//! descriptors `src/present/android_toast.rs` calls them with, and the two
+//! chrome hooks the presenter places a toast with.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -1226,4 +1237,134 @@ fn button_style_wire_values_match_between_kotlin_and_rust() {
         rust.contains("\"buttonStyle\""),
         "{RUST_BUTTON_PATH} lost the `buttonStyle` wire key"
     );
+}
+
+// --- the toast twins ---------------------------------------------------------
+
+/// The presenter object: the toast's Kotlin half.
+const KOTLIN_PRESENTER_PATH: &str = "plugins/native-widgets/platform/android/src/main/kotlin/\
+                                     dev/frust/nativewidgets/FrustNativePresenter.kt";
+/// `present::wire`'s outcome codes.
+const RUST_PRESENT_MOD_PATH: &str = "plugins/native-widgets/src/present/mod.rs";
+/// `present::toast::wire`: the duration codes and the report decoding.
+const RUST_TOAST_PATH: &str = "plugins/native-widgets/src/present/toast.rs";
+/// The Android toast arm's JNI calls.
+const RUST_ANDROID_TOAST_PATH: &str = "plugins/native-widgets/src/present/android_toast.rs";
+
+/// The `OUTCOME_*` names inside the body of `fun <name>(` / `fn <name>(` in
+/// `contents` (the body ends at the first line closing its indentation).
+fn outcome_names_in(contents: &str, opener: &str, end: &str, source_path: &str) -> Vec<String> {
+    let body = contents
+        .split_once(opener)
+        .and_then(|(_, rest)| rest.split_once(end))
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("no `{opener}` body found in {source_path}"));
+    let mut names: Vec<String> = body
+        .split("OUTCOME_")
+        .skip(1)
+        .map(|rest| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_uppercase() || *c == '_')
+                .collect()
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+#[test]
+fn toast_wire_matches_between_kotlin_and_rust() {
+    let kotlin = read(KOTLIN_PRESENTER_PATH);
+    let rust_mod = read(RUST_PRESENT_MOD_PATH);
+    let rust_toast = read(RUST_TOAST_PATH);
+    let rust_arm = read(RUST_ANDROID_TOAST_PATH);
+
+    let kotlin_timed_out = kotlin_const_int(&kotlin, "OUTCOME_TIMED_OUT", KOTLIN_PRESENTER_PATH);
+    let rust_timed_out = quoted_free_int_after(
+        &rust_mod,
+        "pub(crate) const OUTCOME_TIMED_OUT: i32 = ",
+        RUST_PRESENT_MOD_PATH,
+    );
+    assert_eq!(
+        kotlin_timed_out, rust_timed_out,
+        "{KOTLIN_PRESENTER_PATH}'s OUTCOME_TIMED_OUT drifted from present::wire's"
+    );
+
+    // Every outcome Kotlin's `toastCode` reports is one Rust decodes as an
+    // outcome, not as an unknown code.
+    let reported = outcome_names_in(&kotlin, "fun toastCode(", "\n\n", KOTLIN_PRESENTER_PATH);
+    let decoded = outcome_names_in(
+        &rust_toast,
+        "fn toast_outcome(",
+        "\n    }\n",
+        RUST_TOAST_PATH,
+    );
+    assert_eq!(
+        reported,
+        ["ACTION", "CANCELLED", "DISMISSED", "TIMED_OUT"],
+        "{KOTLIN_PRESENTER_PATH}'s toastCode"
+    );
+    for name in &reported {
+        assert!(
+            decoded.contains(name),
+            "{KOTLIN_PRESENTER_PATH}'s toastCode reports OUTCOME_{name}, which \
+             {RUST_TOAST_PATH}'s toast_outcome does not decode"
+        );
+    }
+    // The Activity going away is reported for a toast too.
+    assert!(
+        kotlin.contains("resolveToast(it, OUTCOME_HOST_LOST)")
+            && decoded.contains(&"HOST_LOST".to_string()),
+        "a toast's lost host must be reported and decoded"
+    );
+
+    // The duration crosses as milliseconds: Material's `LENGTH_SHORT`
+    // (-1) would come back from the accessibility timeout as `LENGTH_LONG`.
+    let wire_fn = rust_toast
+        .split_once("fn duration_code(")
+        .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("no `fn duration_code(` body found in {RUST_TOAST_PATH}"));
+    assert!(
+        wire_fn.contains("as_millis()") && !wire_fn.contains("DURATION_"),
+        "{RUST_TOAST_PATH}'s duration_code must send milliseconds"
+    );
+    assert!(
+        kotlin.contains("Snackbar.make(context, added, message, duration)"),
+        "{KOTLIN_PRESENTER_PATH} must hand the duration to Snackbar.make unchanged"
+    );
+
+    // The members android_toast.rs calls, with matching JNI descriptors.
+    for (member, name, descriptor) in [
+        (
+            "fun showToast(generation: Long, message: String, action: String?, duration: Int)",
+            "showToast",
+            "(JLjava/lang/String;Ljava/lang/String;I)V",
+        ),
+        ("fun dismissToast(generation: Long)", "dismissToast", "(J)V"),
+    ] {
+        assert!(
+            kotlin.contains(member),
+            "{KOTLIN_PRESENTER_PATH} must declare `{member}`"
+        );
+        assert!(
+            rust_arm.contains(&format!("jni_str!(\"{name}\")"))
+                && rust_arm.contains(&format!("jni_sig!(\"{descriptor}\")")),
+            "{RUST_ANDROID_TOAST_PATH} must call {name} as {descriptor}"
+        );
+    }
+
+    // The chrome hooks the presenter places a toast with.
+    let chrome = read(KOTLIN_CHROME_PATH);
+    for hook in ["toastAnchor", "toastContext"] {
+        assert!(
+            chrome.contains(&format!("internal fun {hook}(activity: Activity)")),
+            "{KOTLIN_CHROME_PATH} lost `{hook}`, which the toast uses"
+        );
+        assert!(
+            kotlin.contains(&format!("FrustNativeChrome.{hook}(")),
+            "{KOTLIN_PRESENTER_PATH} no longer calls FrustNativeChrome.{hook}"
+        );
+    }
 }
