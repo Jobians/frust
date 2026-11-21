@@ -315,6 +315,9 @@ pub(crate) fn render_scene(
             // for the platform-view release gate. `Skipped` presents nothing,
             // so it does neither.
             signals.record_present(frame_id);
+            // Once-only (latched inside), after the first frame is on screen.
+            #[cfg(debug_assertions)]
+            crate::tls_keys::log_after_first_present();
             // First successful present: close out the cold-start recorder once.
             if let Some(mut spans) = startup_spans.take() {
                 // The first frame's submit decomposition, timed inside
