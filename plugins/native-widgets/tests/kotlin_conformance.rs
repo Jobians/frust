@@ -103,7 +103,9 @@
 //! `android_wire::field_name` does, are the only place Kotlin spells them, and
 //! that Kotlin's `INSTALL_FIELDS` and `SEARCH_FIELDS` name `android_wire`'s;
 //! [`chrome_search_keys_are_read_under_the_spelling_rust_writes`] the search
-//! keys; and
+//! keys, and [`a_chrome_rebuild_opens_the_search_only_from_the_live_field`]
+//! that no rebuild opens the field from the last-applied model, which the
+//! user's own reports keep; and
 //! [`chrome_leading_spellings_match_between_kotlin_and_rust`] that Kotlin's
 //! `LEADING_*` constants are exactly the `leading` values
 //! `android_wire::leading_name` writes; and
@@ -1132,6 +1134,64 @@ fn chrome_search_keys_are_read_under_the_spelling_rust_writes() {
             "{RUST_CHROME_MOD_PATH} never writes {key}"
         );
     }
+}
+
+/// The body of the Kotlin member `opener` (`fun <name>(`, or `val <name> =`
+/// holding an `object` expression) in `contents`, to the first line closing
+/// it: at the four-space indent of an `object` member for a `fun`, at eight
+/// for a `val`'s object.
+fn kotlin_member_body<'a>(contents: &'a str, opener: &str) -> &'a str {
+    let start = contents
+        .find(opener)
+        .unwrap_or_else(|| panic!("no `{opener}` in {KOTLIN_CHROME_PATH}"));
+    let after = &contents[start..];
+    let close = if opener.starts_with("val ") {
+        "\n        }\n"
+    } else {
+        "\n    }\n"
+    };
+    let end = after
+        .find(close)
+        .unwrap_or_else(|| panic!("no closing `}}` for `{opener}` in {KOTLIN_CHROME_PATH}"));
+    &after[..end]
+}
+
+#[test]
+fn a_chrome_rebuild_opens_the_search_only_from_the_live_field() {
+    let kotlin = read(KOTLIN_CHROME_PATH);
+    // A rebuilt menu or bar never reads the expanded state the app last
+    // applied: it keeps the item, or restores the old field's snapshot.
+    for opener in [
+        "fun addSearchItem(",
+        "fun applyActions(",
+        "fun restoreSearch(",
+        "fun rebuildBars(",
+        "fun swapTopBar(",
+    ] {
+        let body = kotlin_member_body(&kotlin, opener);
+        assert!(
+            !body.contains("model.searchActive"),
+            "`{opener}` opens the search from the model in {KOTLIN_CHROME_PATH}"
+        );
+    }
+    // The user's own reports keep the model, so it never holds a state the
+    // field left.
+    let expansion = kotlin_member_body(&kotlin, "val searchExpansion =");
+    for update in [
+        "model.searchActive = true",
+        "model.searchActive = false",
+        "model.searchText = \"\"",
+    ] {
+        assert!(
+            expansion.contains(update),
+            "searchExpansion lacks `{update}` in {KOTLIN_CHROME_PATH}"
+        );
+    }
+    let text = kotlin_member_body(&kotlin, "val searchText =");
+    assert!(
+        text.contains("model.searchText = newText"),
+        "searchText does not keep the user's text in {KOTLIN_CHROME_PATH}"
+    );
 }
 
 /// Every string literal in `text`, in order (no escapes in these bodies).

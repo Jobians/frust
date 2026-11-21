@@ -581,6 +581,9 @@ pub struct NativeWidgetsDemoState {
     /// Whether Home's search field is expanded, written back from `Began`
     /// and `Ended`; leaving Home's root ends the search.
     pub search_active: RwSignal<bool>,
+    /// Whether Home's bar hides its bell: the Search card flips it to rebuild
+    /// the bar's actions on demand, around the search field.
+    pub bell_hidden: RwSignal<bool>,
     /// Navigator changes chrome handlers asked for, append-only.
     pub chrome_requests: RwSignal<Vec<ChromeRequest>>,
     /// Back at a tab's root returns to Home; at Home's root it exits.
@@ -627,6 +630,7 @@ impl NativeWidgetsDemoState {
             notifications: RwSignal::new(0),
             search_query: RwSignal::new(String::new()),
             search_active: RwSignal::new(false),
+            bell_hidden: RwSignal::new(false),
             chrome_requests: RwSignal::new(Vec::new()),
             home_fallback,
             applied_requests: Cell::new(0),
@@ -798,7 +802,7 @@ impl Component for NativeWidgetsDemoApp {
             .actions(Self::actions(
                 tab,
                 state.route(tab).depth() > 1,
-                state.notifications.get(),
+                (!state.bell_hidden.get()).then(|| state.notifications.get()),
             ))
             .toolbar(Self::toolbar(tab, detail.as_ref(), composer_open))
             .search_if(Self::search(state, tab))
@@ -964,9 +968,10 @@ impl NativeWidgetsDemoApp {
     }
 
     /// Above a root: the page's Share/Copy link menu. At a root: Home's
-    /// prominent '+' menu and the bell (badged with `unread`), then every
-    /// tab's overflow menu. Home's search is its search item, not an action.
-    fn actions(tab: Tab, pushed: bool, unread: u32) -> Vec<ActionItem> {
+    /// prominent '+' menu and the bell (badged with `unread`; `None` while
+    /// hidden), then every tab's overflow menu. Home's search is its search
+    /// item, not an action.
+    fn actions(tab: Tab, pushed: bool, unread: Option<u32>) -> Vec<ActionItem> {
         if pushed {
             return vec![
                 Self::action(DETAIL_MORE, "More", "ellipsis.circle", more_png()).menu(vec![
@@ -976,15 +981,13 @@ impl NativeWidgetsDemoApp {
             ];
         }
         let home = (tab == Tab::Home).then(|| {
-            [
-                Self::action(ADD, "New", "plus", plus_png())
-                    .prominent(true)
-                    .menu(vec![
-                        MenuItem::new("new-issue", "New issue"),
-                        MenuItem::new("new-repository", "New repository"),
-                    ]),
-                Self::bell(unread),
-            ]
+            let add = Self::action(ADD, "New", "plus", plus_png())
+                .prominent(true)
+                .menu(vec![
+                    MenuItem::new("new-issue", "New issue"),
+                    MenuItem::new("new-repository", "New repository"),
+                ]);
+            std::iter::once(add).chain(unread.map(Self::bell))
         });
         home.into_iter()
             .flatten()
@@ -1666,7 +1669,7 @@ mod chrome_action_tests {
 
     #[test]
     fn home_shows_a_prominent_new_the_bell_and_more() {
-        let actions = NativeWidgetsDemoApp::actions(Tab::Home, false, 2);
+        let actions = NativeWidgetsDemoApp::actions(Tab::Home, false, Some(2));
         let ids: Vec<&str> = actions.iter().map(|a| a.id().as_str()).collect();
         assert_eq!(ids, [ADD, BELL, MORE]);
         assert_ne!(
@@ -1675,9 +1678,12 @@ mod chrome_action_tests {
             "New is the prominent action"
         );
         assert_eq!(actions[1], NativeWidgetsDemoApp::bell(2));
-        let others = NativeWidgetsDemoApp::actions(Tab::Lab, false, 2);
+        let others = NativeWidgetsDemoApp::actions(Tab::Lab, false, Some(2));
         let ids: Vec<&str> = others.iter().map(|a| a.id().as_str()).collect();
         assert_eq!(ids, [MORE], "the bell is Home's alone");
+        let hidden = NativeWidgetsDemoApp::actions(Tab::Home, false, None);
+        let ids: Vec<&str> = hidden.iter().map(|a| a.id().as_str()).collect();
+        assert_eq!(ids, [ADD, MORE], "a hidden bell rebuilds Home's actions");
     }
 
     #[test]
