@@ -187,13 +187,25 @@
 //! to UIKit. One `FrustChromeSearchDelegate` per install, retained by the
 //! chrome, is every controller's updater and delegate and its bar's
 //! delegate; it reports through `crate::chrome::deliver_event` and drops a
-//! repeat of the text the slot knows. The app's text and expanded state are
-//! applied quietly (no report), the expanded state on the shown page only,
-//! an expansion focusing the bar on the next main-queue turn and a collapse
-//! emptying it. The bar taking first responder ends frust's focus session,
-//! so a focused frust field blurs; a frust field taking the responder back
-//! leaves the search presented. A controller is unhooked
-//! (`detach_search`) before its page or the chrome goes.
+//! repeat of the text the slot knows. The bar taking first responder ends
+//! frust's focus session, so a focused frust field blurs; a frust field
+//! taking the responder back leaves the search presented. A controller is
+//! unhooked (`detach_search`) before its page or the chrome goes.
+//!
+//! There is one search state, the slot's (`crate::chrome::live_search_field`),
+//! and only the shown page (the one holding the frust controller) shows it:
+//! every other page's controller is inactive and empty, and the delegate
+//! ignores every callback but the shown controller's. The app's expanded
+//! state and text are applied quietly (no report): an open to the shown page
+//! (focusing its bar on the next main-queue turn), a collapse and an empty
+//! text to every page. When the shown page changes (a native tab tap, an
+//! app-driven selection, the shown page going away), the page left has its
+//! search dismissed without animation and emptied, quietly; once the change
+//! settles (the next apply, or a tap's settle deadline) the shown page is
+//! brought to the slot's state, quietly and without focusing its bar
+//! (`Chrome::follow_search`). A page that cannot present it (no controller,
+//! out of the window) reports the end instead — `Changed("")` first for a
+//! non-empty text, then `Ended` — so the app's state matches the screen.
 //!
 //! # Limitations
 //!
@@ -700,6 +712,9 @@ struct Chrome {
     pending: Option<NativeSelect>,
     /// Native tab taps so far: the last one's number.
     taps: u64,
+    /// The shown page changed since the search last followed the slot
+    /// (module doc, Search): [`Self::follow_search`] is owed.
+    search_owed: Cell<bool>,
 }
 
 impl Chrome {
@@ -732,6 +747,7 @@ impl Chrome {
             search: FrustChromeSearchDelegate::new(mtm, generation),
             pending: None,
             taps: 0,
+            search_owed: Cell::new(false),
         };
         chrome.target.attach_tab_bar_controller(&chrome.tabs);
         let cover = chrome.sync_pages(mtm, spec);
@@ -752,6 +768,12 @@ impl Chrome {
         detach_from_parent(&chrome.frust);
         chrome.select(spec, cover);
         chrome.apply_tab_bar_visibility(false);
+        chrome.mark_shown_search();
+        chrome.search_owed.set(true);
+        // An install showing an open search is the app's open: focus it.
+        if chrome.follow_search() {
+            focus_search_bar(generation);
+        }
         chrome
     }
 
@@ -799,6 +821,9 @@ impl Chrome {
                 diff.contains(field)
             });
         }
+        self.mark_shown_search();
+        self.apply_search_state(diff);
+        self.follow_search();
         // Animate only a push/pop inside the selected tab (module doc, Toolbar).
         let toolbar_changed = toolbar_was_shown != shown_toolbar(&self.spec).is_some();
         let animated = toolbar_changed && self.tabs.selectedIndex() == tab_before;
@@ -904,10 +929,12 @@ impl Chrome {
             self.select_tab(index);
         } else {
             let cover = cover.or_else(|| self.snapshot_cover());
+            let left = self.pages.iter().position(|page| page.page.holds());
             for page in &self.pages {
                 page.page.release();
             }
             target.page.hold(&self.frust, &self.host);
+            self.leave_search(left);
             self.select_tab(index);
             if let Some(view) = self.tabs.view() {
                 view.layoutIfNeeded();
@@ -958,10 +985,12 @@ impl Chrome {
         if from == to {
             return false;
         }
+        let left = self.pages.iter().position(|page| page.page.holds());
         for page in &self.pages {
             page.page.release();
         }
         self.pages[to].page.hold(&self.frust, &self.host);
+        self.leave_search(left);
         self.taps += 1;
         let tap = self.taps;
         let deadline = Instant::now() + SETTLE_WINDOW;
@@ -985,7 +1014,7 @@ impl Chrome {
     /// app never confirmed the newest tap ([`expire`]).
     fn settle_expired(&mut self, tap: u64) {
         match expire(self.pending.as_ref(), tap, selected_index(&self.spec)) {
-            Expiry::Superseded => {}
+            Expiry::Superseded => return,
             Expiry::Settled => self.pending = None,
             Expiry::SnapBack(page) => {
                 self.pending = None;
@@ -995,6 +1024,134 @@ impl Chrome {
                 self.show_page(page, None);
             }
         }
+        self.follow_search();
+    }
+
+    /// Point the search delegate at the shown page's controller, the only
+    /// one whose callbacks it hears (module doc, Search).
+    fn mark_shown_search(&self) {
+        let shown = self.pages.iter().find(|page| page.page.holds());
+        self.search
+            .set_shown(shown.and_then(|page| page.search.as_ref()));
+    }
+
+    /// The frust controller just moved off page `left` (its index, if one
+    /// held it): hear only the new page's controller, dismiss the left page's
+    /// search without animation and empty it, quietly, and owe
+    /// [`Self::follow_search`] for the page now shown.
+    fn leave_search(&self, left: Option<usize>) {
+        self.mark_shown_search();
+        let left = left.and_then(|index| self.pages.get(index));
+        if let Some(controller) = left
+            .filter(|page| !page.page.holds())
+            .and_then(|page| page.search.as_ref())
+        {
+            dismiss_quietly(controller, &self.search);
+        }
+        self.search_owed.set(true);
+    }
+
+    /// Apply the app's expanded state and text from `diff` (module doc,
+    /// Search): an open to the shown page only, a collapse and an empty text
+    /// to every page, any other text to the shown page.
+    fn apply_search_state(&self, diff: &ChromeDiff<'_>) {
+        let Some(search) = diff.spec.search.as_ref() else {
+            return;
+        };
+        let delegate = &self.search;
+        if diff.contains(ChromeField::SearchActive) {
+            if search.active {
+                let shown = self.pages.iter().find(|page| page.page.holds());
+                if let Some(controller) = shown.and_then(|page| page.search.as_ref()) {
+                    if !controller.isActive() {
+                        delegate.quietly(|| controller.setActive(true));
+                    }
+                    delegate.note_active(true);
+                    focus_search_bar(self.generation);
+                }
+            } else {
+                for page in &self.pages {
+                    let Some(controller) = &page.search else {
+                        continue;
+                    };
+                    if page.page.holds() {
+                        // The shown page collapses the usual, animated way.
+                        if controller.isActive() {
+                            delegate.quietly(|| controller.setActive(false));
+                        }
+                        delegate.quietly(|| controller.searchBar().setText(None));
+                    } else {
+                        dismiss_quietly(controller, delegate);
+                    }
+                }
+                delegate.note_active(false);
+                delegate.note_text("");
+            }
+        }
+        if diff.contains(ChromeField::SearchText) {
+            for page in &self.pages {
+                let Some(controller) = &page.search else {
+                    continue;
+                };
+                if !page.page.holds() && !search.text.is_empty() {
+                    continue;
+                }
+                set_bar_text(controller, delegate, &search.text);
+            }
+            delegate.note_text(&search.text);
+        }
+    }
+
+    /// When owed ([`Self::leave_search`]), bring the shown page's search to
+    /// the slot's state, quietly and without focusing its bar. A page that
+    /// cannot present an open search (no controller, out of the window, or
+    /// UIKit declining) reports its end on the next main-queue turn instead.
+    /// Whether the shown page now presents an open search.
+    fn follow_search(&self) -> bool {
+        if !self.search_owed.replace(false) {
+            return false;
+        }
+        let Some(field) = chrome::live_search_field(self.generation) else {
+            return false;
+        };
+        let delegate = &self.search;
+        let shown = self.pages.iter().find(|page| page.page.holds());
+        let controller = shown.and_then(|page| page.search.clone());
+        let mut active = field.active;
+        if let Some(controller) = &controller {
+            if active && !controller.isActive() {
+                let in_window = shown
+                    .and_then(|page| page.page.view())
+                    .is_some_and(|view| view.window().is_some());
+                if in_window {
+                    delegate.quietly(|| controller.setActive(true));
+                }
+                active = controller.isActive();
+            } else if !active && controller.isActive() {
+                dismiss_quietly(controller, delegate);
+            }
+        } else {
+            active = false;
+        }
+        let ended = field.active && !active;
+        let text = if ended {
+            String::new()
+        } else {
+            field.text.clone()
+        };
+        if let Some(controller) = &controller {
+            set_bar_text(controller, delegate, &text);
+        }
+        delegate.note_active(active);
+        delegate.note_text(&text);
+        if ended {
+            log::debug!(
+                "frust-native-widgets: the shown chrome page cannot present the open search; \
+                 reporting its end"
+            );
+            report_search_end(self.generation, !field.text.is_empty());
+        }
+        active
     }
 
     /// The host as it shows now and its frame in the tab bar controller's
@@ -1674,10 +1831,10 @@ fn rebadge(
     }
 }
 
-/// Mirror the search item's `wants` fields onto `page` (module doc, Search):
-/// its `UISearchController` built or dropped, the placeholder and placement,
-/// the app's text and expanded state applied quietly. Expanding acts on the
-/// page holding the frust controller only (the one on screen).
+/// Mirror the search item's [`ChromeField::Search`] onto `page` (module doc,
+/// Search): its `UISearchController` built or dropped, the placeholder and
+/// placement. The expanded state and the text are the chrome's to apply
+/// ([`Chrome::apply_search_state`], [`Chrome::follow_search`]).
 fn apply_search(
     mtm: MainThreadMarker,
     page: &mut Page,
@@ -1712,32 +1869,47 @@ fn apply_search(
             });
         }
     }
-    let Some(controller) = page.search.clone() else {
-        return;
-    };
+}
+
+/// Show `text` in `controller`'s bar, quietly, unless it already does.
+fn set_bar_text(controller: &UISearchController, delegate: &FrustChromeSearchDelegate, text: &str) {
     let bar = controller.searchBar();
-    if wants(ChromeField::SearchActive) && page.page.holds() {
-        let active = search.active;
-        if controller.isActive() != active {
-            delegate.quietly(|| controller.setActive(active));
-        }
-        if active {
-            delegate.note_active(true);
-            focus_search_bar(delegate.ivars().generation);
-        } else {
-            // Collapsing empties the field (the slot's model of it).
-            delegate.quietly(|| bar.setText(None));
-            delegate.note_active(false);
-            delegate.note_text("");
-        }
+    let shown = bar.text().map(|text| text.to_string()).unwrap_or_default();
+    if shown != text {
+        let text = (!text.is_empty()).then(|| NSString::from_str(text));
+        delegate.quietly(|| bar.setText(text.as_deref()));
     }
-    if wants(ChromeField::SearchText) {
-        let shown = bar.text().map(|text| text.to_string()).unwrap_or_default();
-        if shown != search.text {
-            delegate.quietly(|| bar.setText(Some(&NSString::from_str(&search.text))));
+}
+
+/// Dismiss `controller`'s search without animation and empty its bar,
+/// quietly: a page that is not (or no longer) the shown one.
+fn dismiss_quietly(controller: &UISearchController, delegate: &FrustChromeSearchDelegate) {
+    let target = controller.retain();
+    let block = RcBlock::new(move || {
+        if target.isActive() {
+            target.setActive(false);
         }
-        delegate.note_text(&search.text);
-    }
+        target.searchBar().setText(None);
+    });
+    delegate.quietly(|| UIView::performWithoutAnimation(&block, controller.mtm()));
+}
+
+/// Report that the open search ended where the shown page could not present
+/// it — `Changed("")` first when it held text — on the next main-queue turn,
+/// outside the chrome's apply.
+fn report_search_end(generation: u64, had_text: bool) {
+    on_main(move |_| {
+        let mut events = Vec::with_capacity(2);
+        if had_text {
+            events.push(SearchEvent::Changed(String::new()));
+        }
+        events.push(SearchEvent::Ended);
+        for event in events {
+            if !chrome::deliver_event(generation, &ChromeEvent::Search(event)) {
+                log::debug!("frust-native-widgets: a chrome search end report was dropped");
+            }
+        }
+    });
 }
 
 /// A fresh search controller on `page`'s navigation item, results shown by
@@ -1774,7 +1946,7 @@ fn detach_search(page: &Page, delegate: &FrustChromeSearchDelegate) {
         return;
     };
     if controller.isActive() {
-        delegate.quietly(|| controller.setActive(false));
+        dismiss_quietly(controller, delegate);
     }
     controller.setSearchResultsUpdater(None);
     controller.setDelegate(None);
@@ -1810,6 +1982,9 @@ struct SearchIvars {
     reported: RefCell<String>,
     /// Whether the field was last reported (or applied) expanded.
     active: Cell<bool>,
+    /// The shown page's controller, the only one whose callbacks count
+    /// (module doc, Search); weak, as the page owns it.
+    shown: RefCell<Option<Weak<UISearchController>>>,
 }
 
 define_class!(
@@ -1832,6 +2007,9 @@ define_class!(
         #[unsafe(method(updateSearchResultsForSearchController:))]
         fn update_search_results(&self, controller: &UISearchController) {
             self.guarded("updateSearchResultsForSearchController:", || {
+                if !self.is_shown(controller) {
+                    return;
+                }
                 let text = controller
                     .searchBar()
                     .text()
@@ -1845,14 +2023,21 @@ define_class!(
     unsafe impl UISearchBarDelegate for FrustChromeSearchDelegate {
         /// The field took the keyboard: a focused frust text field blurs.
         #[unsafe(method(searchBarTextDidBeginEditing:))]
-        fn text_did_begin_editing(&self, _bar: &UISearchBar) {
-            self.guarded("searchBarTextDidBeginEditing:", chrome::release_frust_focus);
+        fn text_did_begin_editing(&self, bar: &UISearchBar) {
+            self.guarded("searchBarTextDidBeginEditing:", || {
+                if self.is_shown_bar(bar) {
+                    chrome::release_frust_focus();
+                }
+            });
         }
 
         /// The keyboard's search key: submit, then lower the keyboard.
         #[unsafe(method(searchBarSearchButtonClicked:))]
         fn search_button_clicked(&self, bar: &UISearchBar) {
             self.guarded("searchBarSearchButtonClicked:", || {
+                if !self.is_shown_bar(bar) {
+                    return;
+                }
                 let text = bar.text().map(|text| text.to_string()).unwrap_or_default();
                 self.ivars().reported.replace(text.clone());
                 self.report(SearchEvent::Submitted(text));
@@ -1863,8 +2048,11 @@ define_class!(
 
     unsafe impl UISearchControllerDelegate for FrustChromeSearchDelegate {
         #[unsafe(method(willPresentSearchController:))]
-        fn will_present(&self, _controller: &UISearchController) {
+        fn will_present(&self, controller: &UISearchController) {
             self.guarded("willPresentSearchController:", || {
+                if !self.is_shown(controller) {
+                    return;
+                }
                 if !self.ivars().active.replace(true) {
                     self.report(SearchEvent::Began);
                 }
@@ -1873,8 +2061,11 @@ define_class!(
 
         /// Cancel: a non-empty field reports its emptying, then the end.
         #[unsafe(method(willDismissSearchController:))]
-        fn will_dismiss(&self, _controller: &UISearchController) {
+        fn will_dismiss(&self, controller: &UISearchController) {
             self.guarded("willDismissSearchController:", || {
+                if !self.is_shown(controller) {
+                    return;
+                }
                 self.text_changed(String::new());
                 if self.ivars().active.replace(false) {
                     self.report(SearchEvent::Ended);
@@ -1891,6 +2082,7 @@ impl FrustChromeSearchDelegate {
             applying: Cell::new(false),
             reported: RefCell::new(String::new()),
             active: Cell::new(false),
+            shown: RefCell::new(None),
         });
         // SAFETY: `NSObject`'s `init` on a freshly allocated instance whose
         // ivars are set (the page controller's idiom).
@@ -1913,6 +2105,26 @@ impl FrustChromeSearchDelegate {
 
     fn note_active(&self, active: bool) {
         self.ivars().active.set(active);
+    }
+
+    /// Hear only `controller`'s callbacks from now on (`None`: none).
+    fn set_shown(&self, controller: Option<&Retained<UISearchController>>) {
+        *self.ivars().shown.borrow_mut() = controller.map(Weak::from_retained);
+    }
+
+    /// The shown page's controller, while it lives.
+    fn shown(&self) -> Option<Retained<UISearchController>> {
+        self.ivars().shown.borrow().as_ref().and_then(Weak::load)
+    }
+
+    fn is_shown(&self, controller: &UISearchController) -> bool {
+        self.shown()
+            .is_some_and(|shown| std::ptr::eq(&*shown, controller))
+    }
+
+    fn is_shown_bar(&self, bar: &UISearchBar) -> bool {
+        self.shown()
+            .is_some_and(|shown| std::ptr::eq(&*shown.searchBar(), bar))
     }
 
     /// Report `text` as the field's new text unless it is what the slot

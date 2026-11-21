@@ -126,7 +126,12 @@
 //! frame later. A frust text field taking focus back needs nothing here: its
 //! surface takes the Android focus from the search field, which stays
 //! expanded. While expanded, back collapses the field (an
-//! `OnBackPressedCallback` on the host Activity's dispatcher).
+//! `OnBackPressedCallback` on the host Activity's dispatcher). Kotlin's
+//! model follows the field's own reports, and a rebuilt menu or bar never
+//! opens the field from it: a menu rebuild keeps the search item as it is,
+//! and a new bar re-opens only a field the old one showed expanded, without
+//! taking the focus unless that field had it — so the slot's `FieldState`
+//! and the field never part.
 //!
 //! # No unwind across FFI
 //!

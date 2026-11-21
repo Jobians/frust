@@ -67,6 +67,7 @@ import android.view.ViewGroup
 import android.view.ViewTreeObserver
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.PopupMenu
@@ -189,8 +190,16 @@ import kotlin.math.roundToInt
  * nothing. Gaining the input focus calls [nativeOnChromeSearchFocus], which
  * blurs a focused frust field; frust's shell then lowers the keyboard of the
  * window, which is raised again for this field two frames later. While
- * expanded, back collapses the field. A rebuilt menu or bar re-opens a field
- * the rebuild closed, with its text.
+ * expanded, back collapses the field.
+ *
+ * The model follows the user's reports as well as the app's applies, and a
+ * rebuild never opens the field from it: a rebuilt menu keeps the search item
+ * (only the actions around it are replaced), and a rebuilt or swapped bar
+ * re-opens the field only when the old one was expanded, from a snapshot of
+ * it — its text, and its focus and selection if it had them. Without the
+ * focus it is re-opened unfocusable, so a focused frust field keeps the focus
+ * and the keyboard. Only the app's open ([applySearchActive], an install with
+ * `searchActive`) or the user's tap opens it with the keyboard.
  *
  * ## Threading and ordering
  *
@@ -369,8 +378,18 @@ object FrustNativeChrome {
         var searchItem: MenuItem? = null
     }
 
-    /** What a search field showed, for the field that replaces it (a rebuilt menu or bar). */
-    private class SearchSnapshot(val expanded: Boolean, val text: String)
+    /**
+     * What a search field showed, for the field that replaces it (a rebuilt
+     * bar): expanded or not, its text, whether it held the input focus and its
+     * selection (`-1` when unknown).
+     */
+    private class SearchSnapshot(
+        val expanded: Boolean,
+        val text: String,
+        val focused: Boolean,
+        val selectionStart: Int,
+        val selectionEnd: Int,
+    )
 
     private class Bars(
         val context: Context,
@@ -490,6 +509,12 @@ object FrustNativeChrome {
         try {
             attach(installed)
             applyAll(installed)
+            // The one place the model opens the field: an app-requested open
+            // at install. A rebuild later restores only what the field showed.
+            if (model.searchActive) {
+                applySearchActive(installed)
+                applySearchText(installed)
+            }
         } catch (t: Throwable) {
             live = null
             detachQuietly(installed)
@@ -894,7 +919,7 @@ object FrustNativeChrome {
             return
         }
         dismissPopup()
-        val search = retireSearch(installed, installed.bars.top)
+        val search = retireSearch(installed, installed.bars.top, collapse = false)
         removeBars(installed)
         installed.bars = fresh
         if (installed.lifted) fresh.appBar.setLifted(true)
@@ -922,7 +947,7 @@ object FrustNativeChrome {
         val fresh = buildTopBar(bars.context, large)
         dismissPopup()
         val index = max(0, installed.content.indexOfChild(old.outer))
-        val search = retireSearch(installed, old)
+        val search = retireSearch(installed, old, collapse = false)
         releaseTopBar(old)
         installed.content.removeView(old.outer)
         bars.top = fresh
@@ -1249,12 +1274,22 @@ object FrustNativeChrome {
         val bars = installed.bars
         val menu = bars.toolbar.menu
         detachActionBadges(bars)
-        // Clearing collapses an expanded search field: the rebuilt one takes its place.
-        val search = snapshotSearch(bars.top)
-        quietly { menu.clear() }
-        bars.top.searchItem = null
         val tint = ColorStateList.valueOf(MaterialColors.getColor(bars.toolbar, com.google.android.material.R.attr.colorOnSurfaceVariant))
-        addSearchItem(installed, menu, tint)
+        val kept = bars.top.searchItem?.takeIf { installed.model.hasSearch }
+        if (kept != null) {
+            // The search item stays as it is — expanded or not, its text,
+            // caret, composition, focus and keyboard — and only the actions
+            // around it are rebuilt: clearing the menu would collapse it.
+            for (i in menu.size() - 1 downTo 0) {
+                val id = menu.getItem(i).itemId
+                if (id != SEARCH_ITEM_ID) menu.removeItem(id)
+            }
+            labelSearchItem(installed, kept)
+        } else {
+            quietly { menu.clear() }
+            bars.top.searchItem = null
+            addSearchItem(installed, menu, tint)
+        }
         val primary = MaterialColors.getColor(bars.toolbar, androidx.appcompat.R.attr.colorPrimary)
         installed.model.actions.forEachIndexed { index, action ->
             // A prominent title-only item is drawn in the primary colour.
@@ -1269,7 +1304,6 @@ object FrustNativeChrome {
             }
         }
         applyActionBadges(installed)
-        restoreSearch(installed, search)
     }
 
     // --- search --------------------------------------------------------------
@@ -1288,7 +1322,9 @@ object FrustNativeChrome {
     /**
      * Add the model's search action, first, to `menu`: a magnifying glass
      * that expands into [TopBar.searchView] across the toolbar (an AppCompat
-     * collapsible action view), expanded at once for an active model.
+     * collapsible action view). It is added collapsed: only the app's open
+     * ([applySearchActive]) or a field the rebuild found expanded
+     * ([restoreSearch]) expands it, never the last-applied model.
      */
     private fun addSearchItem(installed: Installed, menu: Menu, tint: ColorStateList) {
         val model = installed.model
@@ -1304,26 +1340,25 @@ object FrustNativeChrome {
         }
         if (top.searchView == null) installed.searchReported = ""
         val view = top.searchView ?: buildSearchView(installed, top)
-        view.queryHint = model.searchPlaceholder
-        val context = installed.bars.context
-        val title = model.searchPlaceholder.ifEmpty {
-            context.getString(androidx.appcompat.R.string.abc_searchview_description_search)
-        }
-        val item = menu.add(Menu.NONE, SEARCH_ITEM_ID, 0, title)
+        val item = menu.add(Menu.NONE, SEARCH_ITEM_ID, 0, "")
         item.setShowAsAction(MenuItem.SHOW_AS_ACTION_ALWAYS or MenuItem.SHOW_AS_ACTION_COLLAPSE_ACTION_VIEW)
-        item.contentDescription = title
-        item.icon = AppCompatResources.getDrawable(context, androidx.appcompat.R.drawable.abc_ic_search_api_material)
+        item.icon = AppCompatResources.getDrawable(installed.bars.context, androidx.appcompat.R.drawable.abc_ic_search_api_material)
         item.iconTintList = tint
         item.actionView = view
         item.setOnActionExpandListener(searchExpansion)
         top.searchItem = item
-        if (model.searchActive) {
-            quietly {
-                item.expandActionView()
-                view.setQuery(model.searchText, false)
-            }
-            installed.searchReported = model.searchText
+        labelSearchItem(installed, item)
+    }
+
+    /** The model's placeholder on `item` and its field: the hint, the title and the accessibility label. */
+    private fun labelSearchItem(installed: Installed, item: MenuItem) {
+        val model = installed.model
+        val title = model.searchPlaceholder.ifEmpty {
+            installed.bars.context.getString(androidx.appcompat.R.string.abc_searchview_description_search)
         }
+        installed.bars.top.searchView?.queryHint = model.searchPlaceholder
+        item.title = title
+        item.contentDescription = title
     }
 
     /** `top`'s search field, wired to report its text, submit and focus. */
@@ -1338,40 +1373,83 @@ object FrustNativeChrome {
         return view
     }
 
+    /** The text field inside `view` (AppCompat's `search_src_text`), or `null` if the layout lacks it. */
+    private fun searchField(view: SearchView): EditText? = view.findViewById(androidx.appcompat.R.id.search_src_text)
+
     /** What `top`'s search field shows, or `null` without one. */
     private fun snapshotSearch(top: TopBar): SearchSnapshot? {
         val view = top.searchView ?: return null
         val expanded = top.searchItem?.isActionViewExpanded == true
-        return SearchSnapshot(expanded, view.query?.toString().orEmpty())
+        val field = searchField(view)
+        return SearchSnapshot(
+            expanded,
+            view.query?.toString().orEmpty(),
+            field?.hasFocus() == true,
+            field?.selectionStart ?: -1,
+            field?.selectionEnd ?: -1,
+        )
     }
 
     /**
-     * Re-open a field the rebuild that just ran closed, with its text, when
-     * the model still has one: the user was mid-search and nothing they did
-     * ended it.
+     * Re-open, on a rebuilt bar, the field the old bar showed expanded, with
+     * its text, when the model still has one: the user was mid-search and
+     * nothing they did ended it. Only the live field's snapshot decides —
+     * never the model, which a user's collapse leaves behind. A field that
+     * held the input focus takes it back with its selection; one that did not
+     * is expanded unfocusable, so the focus and the keyboard stay with
+     * whoever has them (a frust text field).
      */
     private fun restoreSearch(installed: Installed, snapshot: SearchSnapshot?) {
         if (snapshot == null || !snapshot.expanded || !installed.model.hasSearch) return
         val top = installed.bars.top
         val item = top.searchItem ?: return
         val view = top.searchView ?: return
+        val field = searchField(view)
         quietly {
-            if (!item.isActionViewExpanded) item.expandActionView()
+            if (!item.isActionViewExpanded) {
+                if (snapshot.focused || field == null) item.expandActionView() else unfocusable(field) { item.expandActionView() }
+            }
             if (view.query?.toString() != snapshot.text) view.setQuery(snapshot.text, false)
+            if (field != null && snapshot.focused) {
+                val length = field.text?.length ?: 0
+                val start = snapshot.selectionStart
+                val end = snapshot.selectionEnd
+                if (start in 0..length && end in 0..length) field.setSelection(start, end)
+            }
         }
         installed.searchReported = snapshot.text
     }
 
     /**
-     * `top` is leaving (a swapped or rebuilt bar, teardown): collapse its
-     * field quietly and stop back from reaching it; answers what it showed so
-     * its replacement can carry on.
+     * Run `block` with `field` refusing focus: SearchView's expansion asks it
+     * for the focus and the keyboard, which a quiet restore must not take.
      */
-    private fun retireSearch(installed: Installed, top: TopBar): SearchSnapshot? {
+    private inline fun unfocusable(field: View, block: () -> Unit) {
+        val focusable = field.isFocusable
+        val inTouchMode = field.isFocusableInTouchMode
+        field.isFocusable = false
+        field.isFocusableInTouchMode = false
+        try {
+            block()
+        } finally {
+            field.isFocusable = focusable
+            field.isFocusableInTouchMode = inTouchMode
+        }
+    }
+
+    /**
+     * `top` is leaving (a swapped or rebuilt bar, teardown): stop its field
+     * reporting and back from reaching it; answers what it showed so its
+     * replacement can carry on. Teardown collapses it quietly too; a bar being
+     * replaced is left as it is, since a collapse lowers the window's keyboard
+     * even when another view owns it.
+     */
+    private fun retireSearch(installed: Installed, top: TopBar, collapse: Boolean = true): SearchSnapshot? {
         val snapshot = snapshotSearch(top)
         removeSearchBack(installed)
         val item = top.searchItem
-        if (item != null && item.isActionViewExpanded) quietly { item.collapseActionView() }
+        if (collapse && item != null && item.isActionViewExpanded) quietly { item.collapseActionView() }
+        item?.setOnActionExpandListener(null)
         top.searchView?.setOnQueryTextListener(null)
         top.searchView?.setOnQueryTextFocusChangeListener(null)
         top.searchItem = null
@@ -1382,20 +1460,13 @@ object FrustNativeChrome {
     /** A Search change alone: the hint in place, or the menu rebuilt for a search item coming or going. */
     private fun applySearch(installed: Installed) {
         val top = installed.bars.top
-        val model = installed.model
         val shown = top.searchItem != null
-        if (shown != model.hasSearch) {
-            if (!model.hasSearch) retireSearch(installed, top)
+        if (shown != installed.model.hasSearch) {
+            if (!installed.model.hasSearch) retireSearch(installed, top)
             applyActions(installed)
             return
         }
-        val item = top.searchItem ?: return
-        val title = model.searchPlaceholder.ifEmpty {
-            installed.bars.context.getString(androidx.appcompat.R.string.abc_searchview_description_search)
-        }
-        top.searchView?.queryHint = model.searchPlaceholder
-        item.title = title
-        item.contentDescription = title
+        top.searchItem?.let { labelSearchItem(installed, it) }
     }
 
     /** The app's expanded state, applied quietly; expanding raises the keyboard, collapsing empties the field. */
@@ -1418,14 +1489,17 @@ object FrustNativeChrome {
     /**
      * The user's expansion begins the search (back then collapses it), the
      * collapse ends it — a non-empty field reports its emptying first, as
-     * the field empties itself on the way.
+     * the field empties itself on the way. The model follows what the user
+     * did, so it never holds a state the field left.
      */
     private val searchExpansion =
         object : MenuItem.OnActionExpandListener {
             override fun onMenuItemActionExpand(item: MenuItem): Boolean {
                 val installed = live ?: return true
                 addSearchBack(installed)
-                if (!applyingSearch) emitSearch(FrustNativeListener.KIND_CHROME_SEARCH_BEGAN, "")
+                if (applyingSearch) return true
+                installed.model.searchActive = true
+                emitSearch(FrustNativeListener.KIND_CHROME_SEARCH_BEGAN, "")
                 return true
             }
 
@@ -1433,6 +1507,8 @@ object FrustNativeChrome {
                 val installed = live ?: return true
                 removeSearchBack(installed)
                 if (applyingSearch) return true
+                installed.model.searchActive = false
+                installed.model.searchText = ""
                 // Read before emptying: the quiet emptying updates it too.
                 val reported = installed.searchReported
                 val view = installed.bars.top.searchView
@@ -1449,7 +1525,8 @@ object FrustNativeChrome {
     /**
      * Every edit reports the whole text (IME composing text included — a
      * report never writes the field back, so a composition stays intact);
-     * the keyboard's search key submits and lowers the keyboard.
+     * the keyboard's search key submits and lowers the keyboard. The model
+     * keeps the user's text too.
      */
     private val searchText =
         object : SearchView.OnQueryTextListener {
@@ -1457,7 +1534,9 @@ object FrustNativeChrome {
                 val installed = live ?: return true
                 val repeat = newText == installed.searchReported
                 installed.searchReported = newText
-                if (!applyingSearch && !repeat) emitSearch(FrustNativeListener.KIND_CHROME_SEARCH_CHANGED, newText)
+                if (applyingSearch) return true
+                installed.model.searchText = newText
+                if (!repeat) emitSearch(FrustNativeListener.KIND_CHROME_SEARCH_CHANGED, newText)
                 return true
             }
 

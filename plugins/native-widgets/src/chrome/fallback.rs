@@ -33,15 +33,15 @@
 //! - No keyboard focus: each target publishes a clickable semantics node,
 //!   which assistive technology activates as a tap. The one exception is the
 //!   search row under the top bar, a frust text field reporting the search
-//!   events ([`fallback_search_row`]).
+//!   events beside a close button ([`fallback_search_row`]).
 
 use std::sync::{Arc, OnceLock};
 
 use frust::authoring::text::{FontWeight, TextContext, TextLayout, TextStyle};
 use frust::authoring::{Brush, ImageSource, teardown_child};
 use frust::{
-    Color, ColorScheme, EdgeInsets, FocusHandle, IconData, Padding, Theme, container, icons,
-    text_input, use_context,
+    Color, ColorScheme, EdgeInsets, FocusHandle, IconData, Padding, Theme, container, icon_button,
+    icons, row, shortcuts, text_input, use_context,
 };
 use frust_core::accesskit::{Action, Node, Rect as AccessRect, Role};
 use frust_core::{
@@ -52,7 +52,7 @@ use kurbo::{Affine, BezPath, Point, Rect, Size};
 
 use super::{
     ActionItem, ChromeEvent, ChromeGeneration, ChromeSpec, Leading, SearchEvent, ToolbarSpec,
-    ToolbarStyle, TopBarSpec, deliver, deliver_event, encode_event,
+    ToolbarStyle, TopBarSpec, deliver, deliver_event, encode_event, search_field,
 };
 use crate::api::{TabIcon, TabItem};
 
@@ -476,9 +476,13 @@ const SEARCH_PAD: (f64, f64) = (16.0, 8.0);
 /// frust text field showing `text` (what the field holds, the slot's
 /// `FieldState`) that reports exactly as an arm's field does, under
 /// `generation` — each edit a `Changed` with the whole text, the Enter key
-/// a `Submitted`, gaining focus `Began` and losing it `Ended` (keeping its
-/// text: a blur is no cancel). `focus` lets the scaffold open and close it
-/// for the app's `active`.
+/// a `Submitted`, gaining focus `Began` — and a trailing close button. A
+/// blur alone ends nothing, as a native field's keyboard going away does
+/// not; the close button, and Escape while the search is open, end it the
+/// native way ([`close_search`]): `Changed("")` for a non-empty field, then
+/// `Ended`, the field emptied. `focus` lets the scaffold open and close it
+/// for the app's `active`; the app's close empties it quietly (the slot's
+/// collapse).
 pub(crate) fn fallback_search_row<Outer: 'static>(
     spec: &ChromeSpec,
     generation: ChromeGeneration,
@@ -490,6 +494,7 @@ pub(crate) fn fallback_search_row<Outer: 'static>(
         .as_ref()
         .map(|search| search.placeholder.clone())
         .unwrap_or_default();
+    let open = !text.is_empty() || search_field(generation).is_some_and(|field| field.active);
     let field = text_input(text, move |_: &mut Outer, text: String| {
         report_search(generation, SearchEvent::Changed(text));
     })
@@ -499,22 +504,44 @@ pub(crate) fn fallback_search_row<Outer: 'static>(
         report_search(generation, SearchEvent::Submitted(text));
     })
     .on_focus_change(move |_: &mut Outer, focused: bool| {
-        let event = if focused {
-            SearchEvent::Began
-        } else {
-            SearchEvent::Ended
-        };
-        report_search(generation, event);
+        if focused {
+            report_search(generation, SearchEvent::Began);
+        }
     })
-    .focus_handle(focus);
+    .focus_handle(focus.clone());
+    let close_focus = focus.clone();
+    let close = icon_button(icons::CLOSE, "Close search", move |_: &mut Outer| {
+        close_search(generation, &close_focus);
+    });
+    let row = row().flex(1, field).child(close);
+    // Escape ends an open search; a closed one leaves the key to the app.
+    let row = if open {
+        shortcuts(row).on("Escape", "Close search", move |_: &mut Outer| {
+            close_search(generation, &focus);
+        })
+    } else {
+        shortcuts(row)
+    };
     let fill = theme_or_neutral(use_context::<Theme>().as_ref())
         .scheme()
         .surface;
     any(container(Padding(
         EdgeInsets::symmetric(SEARCH_PAD.0, SEARCH_PAD.1),
-        field,
+        row,
     ))
     .fill(fill))
+}
+
+/// The user closed the fallback search (its close button, Escape): report
+/// what a native field's collapse does — `Changed("")` when it held text,
+/// then `Ended` — and give the focus up. The slot drops whichever says
+/// nothing new, and the field shows the emptied text on the next build.
+fn close_search(generation: ChromeGeneration, focus: &FocusHandle) {
+    if search_field(generation).is_some_and(|field| !field.text.is_empty()) {
+        report_search(generation, SearchEvent::Changed(String::new()));
+    }
+    report_search(generation, SearchEvent::Ended);
+    focus.release();
 }
 
 /// Tear down a pod [`fallback_search_row`] built.
@@ -2033,13 +2060,55 @@ mod tests {
             ]
         );
         // The typing stays in the field although this app never writes it
-        // back; a tap on the body blurs it, ending the search.
+        // back; a tap on the body blurs it, which ends nothing.
         app.tap(100.0, seen.origin.y + 200.0);
-        assert_eq!(app.take_log(), ["search:Ended"]);
+        assert_eq!(app.take_log(), Vec::<String>::new());
         // The slot holds what the field shows.
         let generation = crate::chrome::live_generation().expect("live");
         let shown = crate::chrome::search_field(generation).expect("a field");
-        assert_eq!(shown.text, "iss");
+        assert_eq!((shown.text.as_str(), shown.active), ("iss", true));
+        // The close button ends it as a native collapse does: the emptying,
+        // then the end, and the field shows the empty text.
+        let close = (
+            SIZES[0].0 - SEARCH_PAD.0 - SLOT / 2.0,
+            TOP_BAR_HEIGHT + row / 2.0,
+        );
+        app.tap(close.0, close.1);
+        assert_eq!(app.take_log(), ["search:Changed(\"\")", "search:Ended"]);
+        assert_eq!(
+            crate::chrome::search_field(generation),
+            Some(crate::chrome::FieldState::default())
+        );
+        app.frame();
+        assert!(
+            app.take_log().is_empty(),
+            "the emptied field reports nothing"
+        );
+        // Escape does the same from the focused field.
+        app.tap(100.0, TOP_BAR_HEIGHT + row / 2.0);
+        app.root
+            .event(&mut (), &InputEvent::Ime(ImeEvent::Commit("x".into())));
+        app.frame();
+        let escape = InputEvent::Key(KeyEvent {
+            key: Key::Named(NamedKey::Escape),
+            modifiers: Modifiers::default(),
+            repeat: false,
+        });
+        app.root.event(&mut (), &escape);
+        app.frame();
+        assert_eq!(
+            app.take_log(),
+            [
+                "search:Began",
+                "search:Changed(\"x\")",
+                "search:Changed(\"\")",
+                "search:Ended",
+            ]
+        );
+        // A closed, empty search leaves Escape alone.
+        app.root.event(&mut (), &escape);
+        app.frame();
+        assert!(app.take_log().is_empty());
     }
 
     #[test]

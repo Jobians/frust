@@ -929,7 +929,9 @@ impl FieldState {
 /// the app changed that the field does not already hold, so an app writing
 /// back what the field reported sends nothing. A search item appearing or
 /// going away starts the field fresh (empty, collapsed); collapsing it
-/// empties it.
+/// empties it. An expanded state the app confirmed in this publish (its open,
+/// or the field's own begin written back) also sends the app's text whenever
+/// the field holds another, so a re-open shows the query the app kept.
 pub(crate) fn track_search(
     field: &mut FieldState,
     old: Option<&SearchSpec>,
@@ -955,8 +957,9 @@ pub(crate) fn track_search(
         }
         active = true;
     }
+    let opened = new.active && !old.active && field.active;
     let mut text = false;
-    if new.text != old.text && new.text != field.text {
+    if (new.text != old.text || opened) && new.text != field.text {
         field.text.clone_from(&new.text);
         text = true;
     }
@@ -1083,6 +1086,11 @@ impl<H: ChromeHost> ChromeSlot<H> {
             ChromeField::SearchActive => active,
             _ => true,
         });
+        // A confirmed open sends the app's text even when the spec kept it.
+        if text && !diff.contains(ChromeField::SearchText) {
+            diff.changed.push(ChromeField::SearchText);
+            diff.changed.sort_by_key(|field| declaration_rank(*field));
+        }
         if diff.is_empty() {
             // The retained spec still adopts the app's values, so the next
             // diff compares against what the app last said.
@@ -1359,6 +1367,14 @@ pub(crate) fn live_search_generation() -> Option<u64> {
 /// shows one: the frust-drawn fallback field shows this text.
 pub(crate) fn search_field(generation: ChromeGeneration) -> Option<FieldState> {
     lock_slot().field(generation).cloned()
+}
+
+/// [`search_field`] for the raw generation an arm stamps its reports with:
+/// what a page the arm newly shows must be brought to. Never with the slot
+/// locked.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+pub(crate) fn live_search_field(generation: u64) -> Option<FieldState> {
+    search_field(ChromeGeneration(generation))
 }
 
 /// The native search field took the platform's input focus: end frust's
@@ -2816,6 +2832,91 @@ mod tests {
                 ChromeEvent::Search(SearchEvent::Submitted("is".into())),
             ]
         );
+    }
+
+    #[test]
+    fn a_re_open_with_the_text_the_app_kept_sends_that_text() {
+        let (mut slot, generation, _) = search_slot();
+        slot.publish(Some(generation), searching("pull", true));
+        slot.host_mut().take_calls();
+        // The app closes but keeps its query: the collapse empties the field.
+        let closed = searching("pull", false);
+        slot.publish(Some(generation), closed.clone());
+        assert_eq!(
+            slot.host_mut().take_calls(),
+            [HostCall::Apply {
+                changed: vec![ChromeField::SearchActive],
+                spec: closed,
+            }]
+        );
+        assert_eq!(slot.field(generation), Some(&FieldState::default()));
+        // Re-opened with the same query: the field gets it back.
+        let reopened = searching("pull", true);
+        assert_eq!(
+            slot.publish(Some(generation), reopened.clone()),
+            PublishOutcome::Applied(generation)
+        );
+        assert_eq!(
+            slot.host_mut().take_calls(),
+            [HostCall::Apply {
+                changed: vec![ChromeField::SearchText, ChromeField::SearchActive],
+                spec: reopened,
+            }]
+        );
+        let field = slot.field(generation).expect("a field");
+        assert_eq!((field.text.as_str(), field.active), ("pull", true));
+        // A user open the app confirms while keeping its query does the same.
+        assert!(report_search(
+            &mut slot,
+            generation,
+            SearchEvent::Changed(String::new())
+        ));
+        assert!(report_search(&mut slot, generation, SearchEvent::Ended));
+        slot.publish(Some(generation), searching("pull", false));
+        assert!(report_search(&mut slot, generation, SearchEvent::Began));
+        slot.host_mut().take_calls();
+        let confirmed = searching("pull", true);
+        slot.publish(Some(generation), confirmed.clone());
+        assert_eq!(
+            slot.host_mut().take_calls(),
+            [HostCall::Apply {
+                changed: vec![ChromeField::SearchText],
+                spec: confirmed,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_user_collapse_after_an_app_open_leaves_nothing_to_re_open() {
+        let opened = searching("pull", true);
+        // Whether the app writes the collapse back or not, a later apply for
+        // something else carries no search state.
+        for app in [searching("", false), opened.clone()] {
+            let (mut slot, generation, seen) = search_slot();
+            slot.publish(Some(generation), opened.clone());
+            slot.host_mut().take_calls();
+            // The user collapses the field the app opened.
+            assert!(report_search(
+                &mut slot,
+                generation,
+                SearchEvent::Changed(String::new())
+            ));
+            assert!(report_search(&mut slot, generation, SearchEvent::Ended));
+            assert_eq!(slot.field(generation), Some(&FieldState::default()));
+            let mut next = app;
+            next.top.as_mut().unwrap().actions.pop();
+            assert_eq!(
+                slot.publish(Some(generation), next.clone()),
+                PublishOutcome::Applied(generation)
+            );
+            let calls = slot.host_mut().take_calls();
+            let [HostCall::Apply { changed, .. }] = calls.as_slice() else {
+                panic!("one apply: {calls:?}");
+            };
+            assert_eq!(*changed, [ChromeField::Actions]);
+            assert_eq!(slot.field(generation), Some(&FieldState::default()));
+            assert_eq!(seen.lock().unwrap().len(), 2);
+        }
     }
 
     #[test]

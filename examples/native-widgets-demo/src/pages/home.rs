@@ -2,8 +2,8 @@
 //! icon-tile rows that each push a [`detail`](super::detail) page, filtered
 //! live by the bar's search field, a "Favorites" card whose one control is a
 //! real native button, a "Notifications" card driving the bar's bell badge, a
-//! "Search" card that drives the search field from the app and holds a frust
-//! text field, and a "Shortcuts" note. The body is frust, the bars are the
+//! "Search" card that drives the search field from the app, rebuilds the bar
+//! around it on demand and holds a frust text field, and a "Shortcuts" note. The body is frust, the bars are the
 //! shell's native chrome, and the button that stays put is native.
 
 use frust::authoring::text::FontWeight;
@@ -31,6 +31,10 @@ const TILE: f64 = 40.0;
 
 /// Width and height of the native "Add Favorites" button.
 const FAVORITES_BUTTON: (f64, f64) = (180.0, 44.0);
+
+/// How long the Search card's rebuild chip waits before it flips the bell:
+/// time to focus a field or type into the search first.
+const REBUILD_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// One "My Work" row: its label, icon, the theme colour that fills its tile,
 /// and the colour of the icon on it.
@@ -265,10 +269,12 @@ fn notifications_body(state: &S) -> Vec<FlexChild<S>> {
 }
 
 /// The Search card: the bar field's state, chips that drive it from the app
-/// (a preset query that opens it, a clear), and a frust text field to move the
-/// keyboard to and from.
+/// (a preset query that opens it, a clear, a close that keeps the query), a
+/// chip that rebuilds the bar's actions a few seconds later (it hides or
+/// shows the bell), and a frust text field to move the keyboard to and from.
 fn search_body(state: &S) -> Vec<FlexChild<S>> {
     let (query, active) = (state.search_query.get(), state.search_active.get());
+    let bell_hidden = state.bell_hidden;
     let note = note_field();
     vec![
         inflexible(readout(describe_search(&query, active))),
@@ -287,6 +293,26 @@ fn search_body(state: &S) -> Vec<FlexChild<S>> {
                 state.search_query.set(String::new());
             })),
         ])),
+        gap(8.0),
+        inflexible(chip("Close, keep the query", |state: &mut S| {
+            state.search_active.set(false);
+        })),
+        gap(8.0),
+        inflexible(chip(
+            "Toggle the bell in 3 s (rebuilds the bar)",
+            move |_: &mut S| {
+                frust::spawn_local(async move {
+                    match frust::spawn_blocking(|| std::thread::sleep(REBUILD_DELAY)).await {
+                        Ok(()) => bell_hidden.update(|hidden| *hidden = !*hidden),
+                        Err(join_err) => {
+                            log::warn!(
+                                "native-widgets-demo search: rebuild timer panicked: {join_err}"
+                            );
+                        }
+                    }
+                });
+            },
+        )),
         gap(12.0),
         inflexible(
             text_input(note.get(), move |_: &mut S, value: String| note.set(value))
