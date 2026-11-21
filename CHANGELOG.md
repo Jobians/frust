@@ -504,9 +504,18 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 - `scripts/ci/tls-key-count.sh <unstripped .so> [budget]` counts the thread-local statics linked into
   an Android library, with a per-crate breakdown, and exits 1 when a given budget is exceeded
   (`android-thread-local-key-limit`).
+- `frust::thread_slot!` and `frust::ThreadSlot<T>`: per-thread state for app and plugin code that
+  takes no pthread key on Android (`with`, `get`, `set`, `try_with`).
+- Debug Android builds log `frust: pthread keys` lines at library load and after the first frame,
+  with the keys in use and free, and warn when fewer than 24 are free.
+- Contributor note: `crates/frust/tests/thread_local_budget.rs` fails on a `thread_local!` static not
+  listed under `crates/frust/tests/thread_local_budget/` or on a crate over its Android budget.
 
 ### Changed
 
+- The framework's Android pthread key use: each crate keeps its per-thread state in one struct, so
+  the framework links 7 thread-local statics (57 before). On a OnePlus 9 (Android 15) the native-widgets
+  demo links 33 in all (84 before) and ends a full walk with 82 pthread keys free (40 before).
 - `frust-drive`: `Info.plist` keys and values written by a plugin add are now XML-escaped, and `--`
   in their comments is collapsed. No existing registry entry is affected.
 - New apps build with NDK 28.2.13676358, and `frust doctor` recommends r28 (earlier NDKs produce

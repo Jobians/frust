@@ -234,6 +234,14 @@ The repository already contains substantial non-pixel coverage:
   comments stay at most 25 % of any region of 80+ lines, `///`/`//` runs at most 12 lines, `//!`
   runs at most 24, and per-file caps only tighten. Run
   `cargo test -p frust-ui --test comment_density_budget`.
+- `crates/frust/tests/thread_local_budget.rs`: source-scan gate over `crates/*/src` and
+  `plugins/*/src`; every `thread_local!` static must be listed with a class in
+  `crates/frust/tests/thread_local_budget/<crate>.txt` (`other.txt` for unlisted crates), and each
+  list's `budget android <N>` caps its crate's Android-linked statics (Android keeps one pthread key
+  per static, see `android-thread-local-key-limit`). When it fails, fold the new state into the
+  crate's per-thread struct or use `frust::thread_slot!`; add a list line only for a static that
+  is test-only, platform-only or a plugin, and raise a budget only with the device key count.
+  Run `cargo test -p frust-ui --test thread_local_budget`.
 - `crates/frust-tui/tests/snapshots.rs`: terminal rendering snapshots using
   ratatui's `TestBackend` and `insta`.
 - `crates/frust-render`: render-path selection, the engine's adapter capability gate, and
