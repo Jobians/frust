@@ -119,10 +119,9 @@ objc2-ui-kit = { version = "0.3", default-features = false, features = [
     "UIAction",
     # Gates `resolvedColorWithTraitCollection:` (the chrome's concrete page backdrop).
     "UITraitCollection",
-    # The toast capsule: `UIVisualEffect` gates both effect classes (`UIGlassEffect`,
-    # `UIBlurEffect`), `UIKeyboardLayoutGuide`/`UITrackingLayoutGuide` gate
-    # `keyboardLayoutGuide`, the pan recognizer its swipe, `UIAccessibilityConstants`
-    # its VoiceOver announcement.
+    # The toast capsule: `UIVisualEffect` gates both effect classes, the two layout-guide
+    # features gate `keyboardLayoutGuide`, the pan recognizer is its swipe and
+    # `UIAccessibilityConstants` its VoiceOver announcement.
     "UIVisualEffect",
     "UIVisualEffectView",
     "UIGlassEffect",
