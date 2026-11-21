@@ -401,13 +401,10 @@ where
 }
 
 /// Lowers the calling blocking-pool thread to [`ThreadClass::Background`] the
-/// first time it runs a job; a thread-local flag makes later jobs free.
+/// first time it runs a job; a per-thread flag makes later jobs free.
 #[cfg(not(target_arch = "wasm32"))]
-fn lower_blocking_thread_once() {
-    thread_local! {
-        static LOWERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    }
-    if !LOWERED.with(|l| l.replace(true)) {
+pub(crate) fn lower_blocking_thread_once() {
+    if !crate::thread_state::with(|t| t.lowered.replace(true)) {
         // Best-effort: a thread the OS refuses to lower keeps the priority it
         // inherited.
         let _ = thread_policy::set_current_thread_class(ThreadClass::Background);

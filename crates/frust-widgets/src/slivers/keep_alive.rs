@@ -42,7 +42,7 @@
 //! [`ChildKey`]: crate::ChildKey
 
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use frust_core::{
@@ -51,30 +51,26 @@ use frust_core::{
 };
 use kurbo::{Point, Size};
 
+use crate::thread_state;
+
 /// How many keep-alive requests one row's handles hold.
-type Requests = Rc<Cell<u32>>;
+pub(crate) type Requests = Rc<Cell<u32>>;
 
-thread_local! {
-    /// The rows currently being built or rebuilt, innermost last — the scopes
-    /// a [`KeepAliveHandle`] binds to. UI-thread-affine like the build pass.
-    static ROW_SCOPES: RefCell<Vec<Requests>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Pops [`ROW_SCOPES`] on drop, so an unwinding build cannot leave a stale
+/// Pops the row scope stack on drop, so an unwinding build cannot leave a stale
 /// scope behind.
 struct ScopeGuard;
 
 impl Drop for ScopeGuard {
     fn drop(&mut self) {
-        ROW_SCOPES.with(|scopes| {
-            scopes.borrow_mut().pop();
+        let _ = thread_state::try_with(|locals| {
+            locals.row_scopes.borrow_mut().pop();
         });
     }
 }
 
 /// Run `f` with `requests` as the innermost row scope.
 fn with_row_scope<R>(requests: &Requests, f: impl FnOnce() -> R) -> R {
-    ROW_SCOPES.with(|scopes| scopes.borrow_mut().push(Rc::clone(requests)));
+    thread_state::with(|locals| locals.row_scopes.borrow_mut().push(Rc::clone(requests)));
     let _guard = ScopeGuard;
     f()
 }
@@ -92,12 +88,12 @@ impl KeepAliveHandle {
     /// list's row, where keep-alive means nothing. The handle starts holding no
     /// request.
     pub fn acquire() -> Option<Self> {
-        ROW_SCOPES
-            .with(|scopes| scopes.borrow().last().cloned())
-            .map(|requests| Self {
+        thread_state::with(|locals| locals.row_scopes.borrow().last().cloned()).map(|requests| {
+            Self {
                 requests,
                 held: false,
-            })
+            }
+        })
     }
 
     /// Hold (`true`) or withdraw (`false`) this handle's request. Idempotent:

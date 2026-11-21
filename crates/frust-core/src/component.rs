@@ -345,7 +345,7 @@ impl<C: Component> Widget for ComponentWidget<C> {
         let hover_epoch = ctx.hover_epoch();
         let hover_eligible = ctx.is_hover_eligible();
         // A cursor request needs no threading: it rides a pass-scoped slot (see
-        // `crate::event`'s `CURSOR_REQUEST`).
+        // `crate::event::pass`'s cursor slot).
         let (result, needs_redraw, layout, captured, hover_claimed, focus_req, focus_rel, ime) = {
             #[cfg(feature = "hotpatch")]
             let state_any: &mut dyn Any = self

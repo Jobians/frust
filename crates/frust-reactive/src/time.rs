@@ -41,6 +41,7 @@ use reactive_graph::owner::{Owner, on_cleanup};
 
 use crate::AppLifecycleListener;
 use crate::executor::is_ui_thread;
+use crate::thread_state;
 
 /// Completes once `duration` of wall time has passed. Await it in `spawn_local`,
 /// [`spawn_local_scoped`] or `spawn`; on wasm the future is `!Send`, so `spawn_local` only.
@@ -92,8 +93,8 @@ mod virtual_clock {
     }
 
     // Clippy's `missing_const_for_thread_local` flags even an already-const initializer on
-    // the mobile targets, so this `tls` module is allow-scoped (as the flush-registry
-    // `tls` module further down is).
+    // the mobile targets, and a per-static `#[allow]` does not survive the macro's expansion
+    // there, so this `tls` module is allow-scoped.
     #[allow(clippy::missing_const_for_thread_local)]
     mod tls {
         use super::*;
@@ -437,7 +438,7 @@ enum State {
     Cancelled,
 }
 
-struct TimerInner {
+pub(crate) struct TimerInner {
     callback: RefCell<Option<Box<dyn FnOnce()>>>,
     abort: AbortHandle,
     owner: Option<Owner>,
@@ -665,30 +666,14 @@ impl fmt::Debug for Timer {
     }
 }
 
-// Allow-scoped for the reason `executor.rs` gives: on the mobile targets clippy's
-// `missing_const_for_thread_local` flags even an already-const initializer.
-#[allow(clippy::missing_const_for_thread_local)]
-mod tls {
-    use super::*;
-
-    thread_local! {
-        pub(super) static FLUSH_REGISTRY: RefCell<Vec<Weak<TimerInner>>> =
-            const { RefCell::new(Vec::new()) };
-        /// Created by the first flagged timer and never dropped: it lives as long as the
-        /// UI thread.
-        pub(super) static FLUSH_LISTENER: RefCell<Option<AppLifecycleListener>> =
-            const { RefCell::new(None) };
-    }
-}
-use tls::{FLUSH_LISTENER, FLUSH_REGISTRY};
-
 fn register_flush(inner: &Rc<TimerInner>) {
-    FLUSH_REGISTRY.with_borrow_mut(|registry| {
-        registry.retain(|timer| timer.upgrade().is_some_and(|timer| timer.is_active()));
-        registry.push(Rc::downgrade(inner));
-    });
-    FLUSH_LISTENER.with_borrow_mut(|listener| {
-        listener.get_or_insert_with(|| {
+    thread_state::with(|t| {
+        {
+            let mut registry = t.flush_registry.borrow_mut();
+            registry.retain(|timer| timer.upgrade().is_some_and(|timer| timer.is_active()));
+            registry.push(Rc::downgrade(inner));
+        }
+        t.flush_listener.borrow_mut().get_or_insert_with(|| {
             let owner = std::thread::current().id();
             AppLifecycleListener::new()
                 .on_inactive(move || drain_on_owner(owner))
@@ -710,9 +695,10 @@ fn drain_on_owner(owner: std::thread::ThreadId) {
 /// Inactive drain is consumed at the Hidden edge of the same exit; one armed during the
 /// Hidden drain waits for the next exit. Runs at Inactive and at Hidden; a timer fires at
 /// most once, because the drain empties the registry and `fire_now` is a no-op after the
-/// first. [`TimerInner::run_callback`] isolates each panic.
+/// first. [`TimerInner::run_callback`] isolates each panic. Drains nothing once the thread's
+/// teardown has destroyed the registry.
 fn drain_flush_registry() {
-    let timers = FLUSH_REGISTRY.with_borrow_mut(std::mem::take);
+    let timers = thread_state::try_with(|t| t.flush_registry.take()).unwrap_or_default();
     let drain_start = FlushStopwatch::start();
     let mut fired = 0usize;
     for timer in timers.iter().filter_map(Weak::upgrade) {
@@ -1285,7 +1271,7 @@ mod tests {
             drop(Timer::new(LONG, || {}).flush_on_background());
         }
         let _live = Timer::new(LONG, || {}).flush_on_background();
-        assert_eq!(FLUSH_REGISTRY.with_borrow(Vec::len), 1);
+        assert_eq!(thread_state::with(|t| t.flush_registry.borrow().len()), 1);
     }
 
     #[test]

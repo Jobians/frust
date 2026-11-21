@@ -1165,13 +1165,9 @@ impl Default for NativeRuntime {
     }
 }
 
-thread_local! {
-    /// The main thread's runtime (module doc's *main-thread confinement*).
-    /// Seeded with the platform backend's own control kinds on first touch.
-    static RUNTIME: RefCell<NativeRuntime> = RefCell::new(seeded_runtime());
-}
-
-/// A runtime with every kind this build's platform backend serves.
+/// A runtime with every kind this build's platform backend serves — what the
+/// thread's runtime (module doc's *main-thread confinement*) is seeded with on
+/// first touch, in [`with_runtime`].
 fn seeded_runtime() -> NativeRuntime {
     #[allow(unused_mut)]
     let mut runtime = NativeRuntime::new();
@@ -1190,10 +1186,12 @@ fn seeded_runtime() -> NativeRuntime {
 /// the re-entrancy case the module doc describes (a platform setter firing its
 /// own listener synchronously). Dropping that callback is strictly better than
 /// panicking near an FFI boundary, and the control-side fix is the
-/// set-without-notify idiom.
+/// set-without-notify idiom. Also `None` once the thread's teardown has
+/// destroyed its state (`crate::thread_state`).
 pub(crate) fn with_runtime<T>(f: impl FnOnce(&mut NativeRuntime) -> T) -> Option<T> {
-    RUNTIME
-        .try_with(|cell| match cell.try_borrow_mut() {
+    crate::thread_state::try_with(|state| {
+        let cell = state.runtime.get_or_init(|| RefCell::new(seeded_runtime()));
+        match cell.try_borrow_mut() {
             Ok(mut runtime) => Some(f(&mut runtime)),
             Err(_) => {
                 log::warn!(
@@ -1202,8 +1200,9 @@ pub(crate) fn with_runtime<T>(f: impl FnOnce(&mut NativeRuntime) -> T) -> Option
                 );
                 None
             }
-        })
-        .unwrap_or_default()
+        }
+    })
+    .unwrap_or_default()
 }
 
 // --- host stand-ins for the platform types ----------------------------------

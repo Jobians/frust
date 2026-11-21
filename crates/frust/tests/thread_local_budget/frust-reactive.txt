@@ -1,14 +1,7 @@
-budget android 8
-crates/frust-reactive/src/back.rs CAN_POP_NEXT_ID android
-crates/frust-reactive/src/back.rs CAN_POP_PROVIDER android
+budget android 1
 crates/frust-reactive/src/back.rs COUNTER_HERE test
 crates/frust-reactive/src/back.rs HANDLES_BACK_HERE test
-crates/frust-reactive/src/executor.rs IS_UI_THREAD android
-crates/frust-reactive/src/executor.rs LOCAL_POOL android
-crates/frust-reactive/src/executor.rs LOCAL_SPAWNER android
-crates/frust-reactive/src/runtime.rs LOWERED android
+crates/frust-reactive/src/thread_state.rs REACTIVE android
 crates/frust-reactive/src/time.rs BUDGET_WARNINGS test
-crates/frust-reactive/src/time.rs FLUSH_LISTENER android
-crates/frust-reactive/src/time.rs FLUSH_REGISTRY android
 crates/frust-reactive/src/time.rs LAST_DRAIN_FIRED test
 crates/frust-reactive/src/time.rs SOURCE test

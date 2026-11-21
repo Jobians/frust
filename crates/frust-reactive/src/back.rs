@@ -78,7 +78,6 @@
 //! `set_can_pop_provider` panics if called off the UI thread — the same
 //! wiring-bug convention `push_back_press`/`Executor::spawn_local` enforce.
 
-use std::cell::RefCell;
 #[cfg(not(feature = "test-support"))]
 use std::sync::OnceLock;
 #[cfg(not(feature = "test-support"))]
@@ -89,6 +88,7 @@ use reactive_graph::traits::Update;
 
 use crate::ReactiveRuntime;
 use crate::executor::is_ui_thread;
+use crate::thread_state;
 
 /// The app-facing back-press read surface (see the module docs). Obtained via
 /// [`back_presses`] (`frust::back_presses()` at the facade).
@@ -126,27 +126,9 @@ thread_local! {
     static HANDLES_BACK_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-thread_local! {
-    /// The live "can the framework pop?" provider (see the module docs' timing
-    /// section). UI-thread-affine because the closure the facade's `BackHandler`
-    /// registers captures an `Rc`-backed `NavigatorController` (`!Send`); it
-    /// therefore lives here in `thread_local` storage rather than a global, and
-    /// [`set_can_pop_provider`] panics off the UI thread. When set,
-    /// [`handles_back`] consults it in preference to the polled [`HANDLES_BACK`]
-    /// flag, so a back press reads the navigator's CURRENT depth (post-
-    /// `apply_ops`) rather than a stale rebuild-time snapshot.
-    static CAN_POP_PROVIDER: RefCell<Option<RegisteredProvider>> =
-        const { RefCell::new(None) };
-
-    /// Monotonic id source for [`CanPopRegistration`] tokens (UI-thread-only,
-    /// like the slot itself), so a stale registration's cleanup can be told
-    /// apart from the live one's.
-    static CAN_POP_NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
-}
-
 /// A registered live provider: its registration id + the closure itself
 /// (see [`CanPopRegistration`] for the id's role).
-type RegisteredProvider = (u64, Box<dyn Fn() -> bool>);
+pub(crate) type RegisteredProvider = (u64, Box<dyn Fn() -> bool>);
 
 /// Proof-of-registration token returned by [`set_can_pop_provider`].
 ///
@@ -168,10 +150,11 @@ impl CanPopRegistration {
     /// Unregister this provider **iff it is still the live registration**;
     /// a stale token (already replaced by a newer [`set_can_pop_provider`]
     /// call) is a harmless no-op, leaving the newer provider intact. Safe on
-    /// any thread (a non-UI thread's slot is empty, so it no-ops).
+    /// any thread (a non-UI thread's slot is empty, so it no-ops), and during the
+    /// thread's teardown (the slot is gone, so it no-ops).
     pub fn unregister(self) {
-        CAN_POP_PROVIDER.with(|slot| {
-            let mut slot = slot.borrow_mut();
+        thread_state::try_with(|t| {
+            let mut slot = t.can_pop_provider.borrow_mut();
             if slot.as_ref().is_some_and(|(id, _)| *id == self.0) {
                 *slot = None;
             }
@@ -307,12 +290,12 @@ pub fn set_can_pop_provider(provider: Box<dyn Fn() -> bool>) -> CanPopRegistrati
              `Executor::spawn_local` enforce."
         );
     }
-    let id = CAN_POP_NEXT_ID.with(|next| {
-        let id = next.get();
-        next.set(id + 1);
+    let id = thread_state::with(|t| {
+        let id = t.can_pop_next_id.get();
+        t.can_pop_next_id.set(id + 1);
+        *t.can_pop_provider.borrow_mut() = Some((id, provider));
         id
     });
-    CAN_POP_PROVIDER.with(|slot| *slot.borrow_mut() = Some((id, provider)));
     CanPopRegistration(id)
 }
 
@@ -325,7 +308,7 @@ pub fn set_can_pop_provider(provider: Box<dyn Fn() -> bool>) -> CanPopRegistrati
 /// and it carries no thread constraint (clearing another thread's empty slot
 /// is a harmless no-op).
 pub fn clear_can_pop_provider() {
-    CAN_POP_PROVIDER.with(|slot| *slot.borrow_mut() = None);
+    thread_state::try_with(|t| *t.can_pop_provider.borrow_mut() = None);
 }
 
 /// Whether the framework wants to consume the next back press. A shell polls
@@ -344,7 +327,9 @@ pub fn handles_back() -> bool {
     // the whole point of the slot is to bypass the polled flag's one-frame lag.
     // The closure only reads the controller's depth cell (never re-enters this
     // module), so calling it under the borrow is safe.
-    if let Some(answer) = CAN_POP_PROVIDER.with(|slot| slot.borrow().as_ref().map(|(_, f)| f())) {
+    if let Some(answer) =
+        thread_state::try_with(|t| t.can_pop_provider.borrow().as_ref().map(|(_, f)| f())).flatten()
+    {
         return answer;
     }
     #[cfg(not(feature = "test-support"))]

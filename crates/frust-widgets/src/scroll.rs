@@ -243,7 +243,9 @@
 //! owns only its viewport, its content measurement and its one child's origin
 //! (the [`ScrollSurface`] seam), so the two surfaces cannot drift apart.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+#[cfg(test)]
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use frust_core::accesskit::Role;
@@ -260,6 +262,7 @@ use crate::physics::{ScrollMetrics, ScrollPhysics, default_overscroll_effect};
 use crate::scroll_controller::ScrollController;
 use crate::scroll_core::{ScrollSurface, ScrollSurfaceCore};
 use crate::scrollbar::ScrollbarStyle;
+use crate::thread_state;
 // The in-file tests reach these through `use super::*`; production code here
 // no longer names them since the machinery moved into `crate::scroll_core`.
 #[cfg(test)]
@@ -458,46 +461,15 @@ impl InnerScrollState {
     }
 }
 
-thread_local! {
-    /// The stack of per-surface **inner-scroll claim** cells for the scroll
-    /// surfaces currently forwarding a pointer `Down` — the seam a nested
-    /// scrollable reports itself to its nearest enclosing one through
-    /// (mirrors `nav::ambient`'s `SWIPE_CLAIM`/`with_swipe_claim`).
-    ///
-    /// A `Down` does not decide anything: the outer surface captures, forwards
-    /// it, and only at the later `Move` slop does it choose between taking the
-    /// drag over and deferring — by which point dispatch order has already put
-    /// it upstream of the inner. So the outer pushes a fresh cell before
-    /// forwarding the `Down` ([`with_scroll_claim`]), the nested surface writes
-    /// its [`InnerScrollState`] into whatever cell is ambient
-    /// ([`ambient_scroll_claim`]) as that `Down` reaches it, and the outer
-    /// reads it back once forwarding returns.
-    ///
-    /// A **stack**, not a single slot, because the pairing must be
-    /// *nearest*-inner: a surface writes its own state into the ambient cell
-    /// **before** pushing its own cell for its own children, so its write lands
-    /// in its enclosing surface's cell while everything deeper lands in its
-    /// own. Three levels deep, the outermost therefore learns only about the
-    /// middle surface and the middle only about the innermost — nothing
-    /// propagates a grandchild's claim up past its own parent, which is what
-    /// makes each layer arbitrate against the layer it actually contains.
-    ///
-    /// Reactive-free by construction (`frust-widgets` carries no
-    /// `reactive_graph` dependency): a plain `Rc<Cell<_>>`, never a signal, and
-    /// UI-thread-affine for the same reason `nav::ambient`'s cells are.
-    static SCROLL_CLAIM: RefCell<Vec<Rc<Cell<InnerScrollState>>>> =
-        const { RefCell::new(Vec::new()) };
-}
-
-/// Pops [`SCROLL_CLAIM`] on drop, so an unwinding child dispatch cannot leave a
+/// Pops `scroll_claim` on drop, so an unwinding child dispatch cannot leave a
 /// stale scope behind for the rest of the thread's life (mirrors
 /// `nav::ambient`'s `SwipeClaimGuard`).
 struct ScrollClaimGuard;
 
 impl Drop for ScrollClaimGuard {
     fn drop(&mut self) {
-        SCROLL_CLAIM.with(|stack| {
-            stack.borrow_mut().pop();
+        let _ = thread_state::try_with(|locals| {
+            locals.scroll_claim.borrow_mut().pop();
         });
     }
 }
@@ -507,10 +479,10 @@ impl Drop for ScrollClaimGuard {
 /// surface reached underneath can report itself into it via
 /// [`ambient_scroll_claim`].
 ///
-/// The [`SCROLL_CLAIM`] borrow is released *before* `f` runs, so `f` may itself
+/// The `scroll_claim` borrow is released *before* `f` runs, so `f` may itself
 /// nest another `with_scroll_claim` call (a third level of scroll nesting).
 pub(crate) fn with_scroll_claim<R>(claim: &Rc<Cell<InnerScrollState>>, f: impl FnOnce() -> R) -> R {
-    SCROLL_CLAIM.with(|stack| stack.borrow_mut().push(Rc::clone(claim)));
+    thread_state::with(|locals| locals.scroll_claim.borrow_mut().push(Rc::clone(claim)));
     let _guard = ScrollClaimGuard;
     f()
 }
@@ -519,39 +491,18 @@ pub(crate) fn with_scroll_claim<R>(claim: &Rc<Cell<InnerScrollState>>, f: impl F
 /// *nearest enclosing* one — or `None` if none is (a top-level surface's own
 /// `Down`, or any non-`Down` event).
 pub(crate) fn ambient_scroll_claim() -> Option<Rc<Cell<InnerScrollState>>> {
-    SCROLL_CLAIM.with(|stack| stack.borrow().last().cloned())
+    thread_state::with(|locals| locals.scroll_claim.borrow().last().cloned())
 }
 
-thread_local! {
-    /// The stack of per-surface **multi-contact veto** cells for the scroll
-    /// surfaces currently forwarding a pointer `Down` — [`SCROLL_CLAIM`]'s
-    /// live counterpart (the module docs' *Multi-contact veto*). A nested
-    /// recognizer that opts into the gesture's other contacts
-    /// (`pinch_detector`, [`crate::pan_zoom`]'s child-owned-press branch)
-    /// captures the ambient cell on the claimant's `Down`, while it is still
-    /// reachable, and keeps writing to it for the rest of the gesture — long
-    /// after the `Down` forward that exposed it has returned, which is
-    /// exactly what a `Down`-time snapshot like [`InnerScrollState`] cannot
-    /// do (it is read back once, synchronously, before a second contact can
-    /// possibly have arrived).
-    ///
-    /// A separate stack from [`SCROLL_CLAIM`] rather than a field folded into
-    /// it: `InnerScrollState` stays `Copy` (and byte-identical) for
-    /// [`crate::list_view::ListViewWidget`]'s existing consumption of it, and
-    /// a plain `Rc<Cell<bool>>` is exactly as `Copy`-free a value as this
-    /// seam needs.
-    static MULTI_CONTACT_VETO: RefCell<Vec<Rc<Cell<bool>>>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Pops [`MULTI_CONTACT_VETO`] on drop, so an unwinding child dispatch cannot
+/// Pops `multi_contact_veto` on drop, so an unwinding child dispatch cannot
 /// leave a stale scope behind for the rest of the thread's life (mirrors
 /// [`ScrollClaimGuard`]).
 struct MultiContactVetoGuard;
 
 impl Drop for MultiContactVetoGuard {
     fn drop(&mut self) {
-        MULTI_CONTACT_VETO.with(|stack| {
-            stack.borrow_mut().pop();
+        let _ = thread_state::try_with(|locals| {
+            locals.multi_contact_veto.borrow_mut().pop();
         });
     }
 }
@@ -561,10 +512,10 @@ impl Drop for MultiContactVetoGuard {
 /// underneath that opts into the gesture's other contacts can capture it and
 /// raise it later, once a second contact actually joins the gesture.
 ///
-/// The [`MULTI_CONTACT_VETO`] borrow is released *before* `f` runs, mirroring
+/// The `multi_contact_veto` borrow is released *before* `f` runs, mirroring
 /// [`with_scroll_claim`].
 pub(crate) fn with_scroll_veto<R>(veto: &Rc<Cell<bool>>, f: impl FnOnce() -> R) -> R {
-    MULTI_CONTACT_VETO.with(|stack| stack.borrow_mut().push(Rc::clone(veto)));
+    thread_state::with(|locals| locals.multi_contact_veto.borrow_mut().push(Rc::clone(veto)));
     let _guard = MultiContactVetoGuard;
     f()
 }
@@ -573,10 +524,10 @@ pub(crate) fn with_scroll_veto<R>(veto: &Rc<Cell<bool>>, f: impl FnOnce() -> R) 
 /// `Down` — the *nearest enclosing* one — or `None` outside that forward (a
 /// top-level surface's own `Down`, or any non-`Down` event).
 pub(crate) fn ambient_scroll_veto() -> Option<Rc<Cell<bool>>> {
-    MULTI_CONTACT_VETO.with(|stack| stack.borrow().last().cloned())
+    thread_state::with(|locals| locals.multi_contact_veto.borrow().last().cloned())
 }
 
-/// Every veto cell on [`MULTI_CONTACT_VETO`] right now, nearest first — the
+/// Every veto cell on `multi_contact_veto` right now, nearest first — the
 /// whole chain of scroll surfaces currently forwarding this `Down`, not only
 /// the nearest enclosing one [`ambient_scroll_veto`] hands back.
 ///
@@ -587,7 +538,15 @@ pub(crate) fn ambient_scroll_veto() -> Option<Rc<Cell<bool>>> {
 /// grandparent surface whose cell was never raised still takes the gesture
 /// over at its own slop even while the nearest surface correctly defers.
 pub(crate) fn ambient_scroll_vetoes() -> Vec<Rc<Cell<bool>>> {
-    MULTI_CONTACT_VETO.with(|stack| stack.borrow().iter().rev().cloned().collect())
+    thread_state::with(|locals| {
+        locals
+            .multi_contact_veto
+            .borrow()
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
+    })
 }
 
 /// What a surface sitting at `metrics` under `physics` claims it could do with

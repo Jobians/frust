@@ -13,38 +13,17 @@
 //! broadcast (wrapped in an overlay event for a stamped one); the declarer answers `Handled`, and
 //! an unanswered delivery falls through to the next candidate.
 //!
-//! The thread-locals below are single-threaded RAII brackets, each scoped to one root's pass at a
-//! time and safe to re-enter: `SHORTCUT_TABLE` collects a paint pass's declarations and
-//! `SHORTCUT_PASS_OPEN` guards it; `CURRENT_OVERLAY` stamps those made while a pod paints;
-//! `SHORTCUT_HANDLED` and `KEY_FORWARD`/`KEY_FORWARD_OPEN` bracket one key dispatch.
+//! The per-thread slots behind it are single-threaded RAII brackets, each scoped to one root's pass
+//! at a time and safe to re-enter: `shortcut_table` collects a paint pass's declarations and
+//! `shortcut_pass_open` guards it; `current_overlay` stamps those made while a pod paints;
+//! `shortcut_handled` and `key_forward`/`key_forward_open` bracket one key dispatch.
 
-use std::cell::Cell;
 use std::fmt;
 use std::rc::Rc;
 
 use crate::event::{Key, KeyEvent, Modifiers, NamedKey, PassBracket};
 use crate::overlay::OverlayKey;
-
-thread_local! {
-    /// The next [`ShortcutId::next`] value; starts at `1` so `0` is never handed out.
-    static NEXT_SHORTCUT_ID: Cell<u64> = const { Cell::new(1) };
-
-    /// Declarations made so far in this thread's open paint pass, in paint order.
-    static SHORTCUT_TABLE: Cell<Vec<ShortcutEntry>> = const { Cell::new(Vec::new()) };
-
-    static SHORTCUT_PASS_OPEN: Cell<bool> = const { Cell::new(false) };
-
-    /// The floated pod the root is painting, stamped onto every declaration it makes.
-    static CURRENT_OVERLAY: Cell<Option<OverlayKey>> = const { Cell::new(None) };
-
-    /// Raised when a widget answers a shortcut delivery `Handled` (containers drop the result).
-    static SHORTCUT_HANDLED: Cell<bool> = const { Cell::new(false) };
-
-    /// The pod this event pass asked declined keys be forwarded to.
-    static KEY_FORWARD: Cell<Option<OverlayKey>> = const { Cell::new(None) };
-
-    static KEY_FORWARD_OPEN: Cell<bool> = const { Cell::new(false) };
-}
+use crate::thread_state;
 
 /// Whether `Mod` means Command (Apple targets) or Ctrl (everything else, `wasm32` included).
 const MOD_IS_META: bool = cfg!(any(target_os = "macos", target_os = "ios"));
@@ -56,9 +35,9 @@ pub struct ShortcutId(u64);
 impl ShortcutId {
     /// Allocate an id unique on this thread. Call once when the declarer is built.
     pub fn next() -> Self {
-        ShortcutId(NEXT_SHORTCUT_ID.with(|next| {
-            let id = next.get();
-            next.set(id.wrapping_add(1));
+        ShortcutId(thread_state::with(|t| {
+            let id = t.next_shortcut_id.get();
+            t.next_shortcut_id.set(id.wrapping_add(1));
             id
         }))
     }
@@ -368,7 +347,10 @@ pub(crate) struct ShortcutPaintPass(PassBracket<Vec<ShortcutEntry>>);
 
 impl ShortcutPaintPass {
     pub(crate) fn enter() -> Self {
-        ShortcutPaintPass(PassBracket::enter(&SHORTCUT_TABLE, &SHORTCUT_PASS_OPEN))
+        ShortcutPaintPass(PassBracket::enter(
+            |t| &t.shortcut_table,
+            |t| &t.shortcut_pass_open,
+        ))
     }
 
     pub(crate) fn take(&self) -> Vec<ShortcutEntry> {
@@ -378,11 +360,11 @@ impl ShortcutPaintPass {
 
 /// Record `decl` in this thread's open pass, stamped with the pod being painted.
 pub(crate) fn register(decl: ShortcutDecl) {
-    let overlay = CURRENT_OVERLAY.with(Cell::get);
-    SHORTCUT_TABLE.with(|table| {
-        let mut entries = table.take();
+    thread_state::with(|t| {
+        let overlay = t.current_overlay.get();
+        let mut entries = t.shortcut_table.take();
         entries.push(ShortcutEntry { decl, overlay });
-        table.set(entries);
+        t.shortcut_table.set(entries);
     });
 }
 
@@ -391,19 +373,19 @@ pub(crate) struct OverlayStamp(Option<OverlayKey>);
 
 impl OverlayStamp {
     pub(crate) fn enter(key: OverlayKey) -> Self {
-        OverlayStamp(CURRENT_OVERLAY.with(|slot| slot.replace(Some(key))))
+        OverlayStamp(thread_state::with(|t| t.current_overlay.replace(Some(key))))
     }
 }
 
 impl Drop for OverlayStamp {
     fn drop(&mut self) {
-        CURRENT_OVERLAY.with(|slot| slot.set(self.0));
+        thread_state::with(|t| t.current_overlay.set(self.0));
     }
 }
 
 /// Note that a widget answered a shortcut delivery `Handled` (behind `ChildPod`'s dispatch).
 pub(crate) fn note_handled() {
-    SHORTCUT_HANDLED.with(|flag| flag.set(true));
+    thread_state::with(|t| t.shortcut_handled.set(true));
 }
 
 /// Brackets one delivery's handled flag: enter lowers it, drop restores the enclosing value.
@@ -411,24 +393,24 @@ pub(crate) struct DeliveryProbe(bool);
 
 impl DeliveryProbe {
     pub(crate) fn enter() -> Self {
-        DeliveryProbe(SHORTCUT_HANDLED.with(|flag| flag.replace(false)))
+        DeliveryProbe(thread_state::with(|t| t.shortcut_handled.replace(false)))
     }
 
     /// Whether a widget answered this delivery.
     pub(crate) fn handled(&self) -> bool {
-        SHORTCUT_HANDLED.with(Cell::get)
+        thread_state::with(|t| t.shortcut_handled.get())
     }
 }
 
 impl Drop for DeliveryProbe {
     fn drop(&mut self) {
-        SHORTCUT_HANDLED.with(|flag| flag.set(self.0));
+        thread_state::with(|t| t.shortcut_handled.set(self.0));
     }
 }
 
 /// Record a forward request (behind `EventCtx::forward_declined_keys_to`); last writer wins.
 pub(crate) fn request_key_forward(key: OverlayKey) {
-    KEY_FORWARD.with(|slot| slot.set(Some(key)));
+    thread_state::with(|t| t.key_forward.set(Some(key)));
 }
 
 /// The [`PassBracket`] around one event pass's forward request: enter clears, `take` drains.
@@ -436,7 +418,10 @@ pub(crate) struct KeyForwardPass(PassBracket<Option<OverlayKey>>);
 
 impl KeyForwardPass {
     pub(crate) fn enter() -> Self {
-        KeyForwardPass(PassBracket::enter(&KEY_FORWARD, &KEY_FORWARD_OPEN))
+        KeyForwardPass(PassBracket::enter(
+            |t| &t.key_forward,
+            |t| &t.key_forward_open,
+        ))
     }
 
     pub(crate) fn take(&self) -> Option<OverlayKey> {

@@ -107,7 +107,7 @@
 //! the home indicator while UIKit keeps the items above it through the bar's
 //! own safe-area layout (a device-gate observable).
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -116,6 +116,7 @@ use crate::NativeWidgetError;
 use crate::events::{EVENT_KIND_RESELECTED, EVENT_KIND_SELECTION, EventPayload, unpack_index};
 use crate::registry::SlotId;
 use crate::runtime::{NativeEvent, Params};
+use crate::thread_state::{self, PluginLocals};
 
 /// The registered kind string the api layer injects as `__frustControl`.
 pub(crate) const KIND: &str = "tab_bar";
@@ -211,19 +212,33 @@ impl ItemIconBytes {
 }
 
 /// A slot's published icon bytes and the revision they were published at.
-struct Published {
+pub(crate) struct Published {
     rev: u64,
     items: Arc<[ItemIconBytes]>,
 }
 
-thread_local! {
-    /// Main-thread confined, like `crate::controls::image`'s publish table:
-    /// the builder publishes during a main-thread rebuild and the factory
-    /// decodes during the main-thread post-frame poll.
-    static ICON_BYTES: RefCell<HashMap<SlotId, Published>> = RefCell::new(HashMap::new());
-    /// The next revision any slot publishes at — process-monotonic on this
-    /// thread, so a revision never repeats for a slot.
-    static NEXT_REV: Cell<u64> = const { Cell::new(1) };
+/// Run `f` against the calling thread's icon-bytes table, built empty on
+/// first touch. Main-thread confined, like `crate::controls::image`'s publish
+/// table: the builder publishes during a main-thread rebuild and the factory
+/// decodes during the main-thread post-frame poll.
+fn with_table<T>(f: impl FnOnce(&RefCell<HashMap<SlotId, Published>>) -> T) -> T {
+    thread_state::with(|state| f(table_of(state)))
+}
+
+fn table_of(state: &PluginLocals) -> &RefCell<HashMap<SlotId, Published>> {
+    state
+        .tab_icon_bytes
+        .get_or_init(|| RefCell::new(HashMap::new()))
+}
+
+/// The next revision any slot publishes at — process-monotonic on this
+/// thread, so a revision never repeats for a slot.
+fn next_rev() -> u64 {
+    thread_state::with(|state| {
+        let rev = state.tab_icon_next_rev.get();
+        state.tab_icon_next_rev.set(rev + 1);
+        rev
+    })
 }
 
 /// Publish `items`' icon bytes for `slot`, answering the revision the params
@@ -231,7 +246,7 @@ thread_local! {
 /// revision, different content a fresh one, and a bar with no byte icons at
 /// all publishes nothing and answers `0` (removing any earlier entry).
 pub(crate) fn publish_icon_bytes(slot: SlotId, items: Vec<ItemIconBytes>) -> u64 {
-    ICON_BYTES.with(|table| {
+    with_table(|table| {
         let mut table = table.borrow_mut();
         if items.iter().all(ItemIconBytes::is_empty) {
             table.remove(&slot);
@@ -242,11 +257,7 @@ pub(crate) fn publish_icon_bytes(slot: SlotId, items: Vec<ItemIconBytes>) -> u64
         {
             return published.rev;
         }
-        let rev = NEXT_REV.with(|next| {
-            let rev = next.get();
-            next.set(rev + 1);
-            rev
-        });
+        let rev = next_rev();
         table.insert(
             slot,
             Published {
@@ -260,7 +271,7 @@ pub(crate) fn publish_icon_bytes(slot: SlotId, items: Vec<ItemIconBytes>) -> u64
 
 /// The icon bytes currently published for `slot`, if any.
 pub(crate) fn icon_bytes(slot: SlotId) -> Option<Arc<[ItemIconBytes]>> {
-    ICON_BYTES.with(|table| {
+    with_table(|table| {
         table
             .borrow()
             .get(&slot)
@@ -270,9 +281,12 @@ pub(crate) fn icon_bytes(slot: SlotId) -> Option<Arc<[ItemIconBytes]>> {
 
 /// Drop `slot`'s entry — the builder's `on_cleanup`, exactly once per mounted
 /// component (module doc). Idempotent.
+///
+/// A no-op once the thread's state is gone (`crate::thread_state::try_with`):
+/// a teardown-time cleanup can reach it, and the table went with the state.
 pub(crate) fn retire_icon_bytes(slot: SlotId) {
-    ICON_BYTES.with(|table| {
-        table.borrow_mut().remove(&slot);
+    let _ = thread_state::try_with(|state| {
+        table_of(state).borrow_mut().remove(&slot);
     });
 }
 

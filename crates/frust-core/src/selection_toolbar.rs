@@ -7,21 +7,13 @@
 //! field floats the installed builder's view through [`crate::overlay`]. The policy
 //! and builder are process-global `Mutex` slots, callable from any thread.
 
-use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 
 use kurbo::{Rect, Size};
 
 use crate::event::PassBracket;
+use crate::thread_state;
 use crate::view::AnyView;
-
-thread_local! {
-    /// This paint pass's request, last writer wins; pass-scoped, so a pass with
-    /// no publish (a blurred field) resolves to `None`.
-    static PUBLISHED: Cell<Option<SelectionToolbarRequest>> = const { Cell::new(None) };
-
-    static PASS_OPEN: Cell<bool> = const { Cell::new(false) };
-}
 
 /// Which clipboard verbs apply to the current selection: the enabled set, not a
 /// menu layout.
@@ -141,7 +133,10 @@ pub(crate) struct SelectionToolbarPass(PassBracket<Option<SelectionToolbarReques
 
 impl SelectionToolbarPass {
     pub(crate) fn enter() -> Self {
-        SelectionToolbarPass(PassBracket::enter(&PUBLISHED, &PASS_OPEN))
+        SelectionToolbarPass(PassBracket::enter(
+            |t| &t.published,
+            |t| &t.toolbar_pass_open,
+        ))
     }
 
     pub(crate) fn take(&self) -> Option<SelectionToolbarRequest> {
@@ -151,7 +146,7 @@ impl SelectionToolbarPass {
 
 /// Record `request` in this thread's open pass (behind `PaintCtx::publish_selection_toolbar`).
 pub(crate) fn publish(request: SelectionToolbarRequest) {
-    PUBLISHED.with(|slot| slot.set(Some(request)));
+    thread_state::with(|t| t.published.set(Some(request)));
 }
 
 #[cfg(test)]
