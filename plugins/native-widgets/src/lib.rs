@@ -266,6 +266,9 @@ mod registry;
 // attribute stays for that host build rather than growing per-item `allow`s.
 #[allow(dead_code)]
 mod runtime;
+// The one `thread_local!` static compiled on Android: every per-thread table
+// the runtime, the staging table and the byte-publishing controls keep.
+mod thread_state;
 
 pub use registry::{Registry, SlotId};
 

@@ -1,4 +1,4 @@
-budget android 6
+budget android 1
 plugins/native-widgets/src/api/scaffold.rs QUEUED test
 plugins/native-widgets/src/api/scaffold.rs SEEN test
 plugins/native-widgets/src/api/scaffold.rs SEEN test
@@ -11,15 +11,10 @@ plugins/native-widgets/src/component.rs DISPATCH_GUARDS test
 plugins/native-widgets/src/component.rs LIVE_CHILDREN test
 plugins/native-widgets/src/component.rs LIVE_LISTENERS test
 plugins/native-widgets/src/component.rs RELAYED test
-plugins/native-widgets/src/component.rs STAGED android
 plugins/native-widgets/src/component.rs UPDATE_FAILED_ONCE test
-plugins/native-widgets/src/controls/image.rs NEXT_REV android
-plugins/native-widgets/src/controls/image.rs PUBLISHED android
-plugins/native-widgets/src/controls/tab_bar.rs ICON_BYTES android
-plugins/native-widgets/src/controls/tab_bar.rs NEXT_REV android
 plugins/native-widgets/src/coretext.rs MONO apple
 plugins/native-widgets/src/coretext.rs PLEX apple
 plugins/native-widgets/src/present/apple_host.rs LIVE apple
 plugins/native-widgets/src/present/mod.rs FAKE test
 plugins/native-widgets/src/present/mod.rs FAKE_SHEET test
-plugins/native-widgets/src/runtime.rs RUNTIME android
+plugins/native-widgets/src/thread_state.rs PLUGIN android
