@@ -61,7 +61,7 @@ use crate::present::{
 /// [`Presentation`] is a plain [`Future`] — await it
 /// from `frust::spawn_local` or any executor — and its
 /// [`Presentation::handle`] is what [`crate::present::dismiss`] takes.
-/// Dropping it frees the one-at-a-time slot but leaves the platform alert on
+/// Dropping it frees the alert slot but leaves the platform alert on
 /// screen until answered (that answer is then discarded).
 ///
 /// ```ignore
@@ -129,7 +129,8 @@ pub fn show_native_alert_into(
 /// dismissible sheet), [`SheetHandle::dismiss`] or the host going away ends
 /// the sheet, or `Err`: an invalid spec, `Busy` (a sheet or an alert is
 /// live), no host to present over, or `Unsupported` — every platform but
-/// iOS/iPadOS today (macOS and Android sheet arms are follow-up work). Take
+/// iOS/iPadOS and Android (a macOS sheet arm is follow-up work). An alert
+/// requested while the sheet is live is shown above it. Take
 /// [`Presentation::sheet_handle`] before awaiting to move or dismiss it.
 ///
 /// **iPad in regular width ignores detents**: the system presents a centered
@@ -168,7 +169,7 @@ pub fn show_native_sheet(spec: SheetSpec) -> Presentation<SheetOutcome> {
 ///
 /// # Errors
 /// `InvalidSpec`, `Busy`, or a platform refusal decided on the spot
-/// (`Unsupported` off iOS).
+/// (`Unsupported` off iOS and Android).
 pub fn show_native_sheet_into(
     spec: SheetSpec,
     signal: RwSignal<Option<SheetOutcome>>,

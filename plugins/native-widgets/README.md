@@ -3,7 +3,7 @@
 Render **real OS controls** from pure Rust — `native_button("Save")`,
 `native_label(...)`, `native_switch(checked)`, `native_slider(...)`,
 `native_progress(...)`, `native_image(bytes)`, `native_spinner(animating)`,
-`native_date_picker(date)`, `native_segmented(labels, selected)` (iOS/macOS only),
+`native_date_picker(date)`, `native_segmented(labels, selected)`,
 `native_stepper(value, min, max)` (iOS/macOS only),
 `native_tab_bar(items, selected)` (iOS/iPadOS only) — composed straight
 into a frust `View` tree like any other widget. Each control is backed by a
@@ -23,8 +23,9 @@ not re-export it.
 
 > **Templates stay clean.** A generated frust project ships **no**
 > native-widgets code, permissions, or plist keys. You add exactly the lines
-> below by hand — or let the frust TUI's **Add Plugin** dialog apply them for
-> you (it automates every step in this document). On Android the plugin's
+> below by hand — or let `frust plugin add native-widgets` (or the frust TUI's
+> **Add Plugin** dialog) apply them for you; it automates every step in this
+> document, including the Android Material 3 theme parent. On Android the plugin's
 > Kotlin ships as its own Gradle library module rather than as files copied
 > into your app, so there is nothing to keep in sync by hand; on iOS there is
 > nothing to add at all beyond the dependency.
@@ -55,8 +56,9 @@ Eleven controls, one Rust API, no Kotlin or Swift to write for any of them:
 
 `native_segmented` runs on iOS/iPadOS, macOS and Android (Material's
 `MaterialButtonToggleGroup`, equal-width single-line segments; it needs a
-Material3 app theme — under a stock theme construction is logged and the slot
-stays empty, never a crash). `native_stepper` is **iOS/iPadOS and macOS only**:
+Material 3 app theme, which `frust plugin add` sets up (§3) — under a stock
+theme construction is logged and the slot stays empty, never a crash; under a
+Material 3 Expressive theme it draws separate pills with clipped labels). `native_stepper` is **iOS/iPadOS and macOS only**:
 Android's framework has no increment/decrement stepper control, so there (and
 on every desktop-preview host) the builder is resolved **at compile time** to
 the same frust-drawn warning banner the translucency-refused fallback uses,
@@ -82,8 +84,11 @@ reasons. It is a
 **bare** `UITabBar`, never a `UITabBarController`: frust keeps screen
 ownership and routing, so a tap never navigates by itself. Each `TabItem`
 carries a stable app-chosen `TabId`, a title, an icon — `TabIcon::AppleSymbol`
-(an SF Symbol name) or `TabIcon::Bytes` (encoded image bytes, normalized to a
-25pt box; supply 75×75px for a crisp 3x icon) — and optionally a
+(an SF Symbol name), `TabIcon::Bytes` (encoded image bytes, normalized to a
+25pt box; supply 75×75px for a crisp 3x icon) or
+`TabIcon::apple_symbol_with_bytes(symbol, bytes)` (`TabIcon::AppleSymbolWithBytes`:
+the symbol on Apple platforms, the bytes elsewhere; this bar shows the symbol)
+— and optionally a
 `.selected_icon(…)`, a `.badge(…)` and `.enabled(false)`. `.on_select(|id| …)`
 reports the *requested* tab: route there and feed the id back as `selected`
 (controlled, like `native_segmented`). `.on_reselect(|id| …)` fires when the
@@ -206,12 +211,35 @@ impl Editor {
 }
 ```
 
+`.style(NativeButtonStyle::…)` picks the button's platform style. A style
+change on a live button restyles it in place, and the restyled button looks
+like a fresh one in the new style:
+
+| `NativeButtonStyle` | Android | iOS | macOS |
+|---|---|---|---|
+| `Plain` (default) | Material text button, themed by the app theme | system button, themed | push button, themed |
+| `Prominent` | filled button | filled configuration | accent-tinted push button |
+| `Destructive` | filled, error colour | filled, system red | red push button, destructive flag |
+| `Glass` | tonal button | glass configuration (iOS 26; plain before) | push button |
+| `ProminentGlass` | filled button | prominent glass (iOS 26; filled before) | accent-tinted push button |
+
+Only `Plain` folds the app theme's accent into the fill and caption; the other
+styles take the platform's colours. On Android the themed `Plain` button keeps
+the Material ripple. The iOS configurations are looked up at run time, so an
+older iOS gets the fallback named in the table. The iOS and macOS mappings
+have not yet been run on a device.
+
+```rust
+native_button("Delete").style(NativeButtonStyle::Destructive)
+```
+
 ---
 
 ## 1c. App chrome (`native_scaffold`)
 
 `native_scaffold(body)` puts the host's own bars around your body: a top bar
-(title, subtitle, leading item, actions, pull-down menus), a bottom tab bar and
+(title, subtitle, leading item, actions with badges, pull-down menus, a large
+title, a search field), a bottom tab bar and
 an optional bottom toolbar, published as one spec to the platform host (or, on
 a target with no chrome arm, to frust-drawn fallback bars). It is one declarative tree inside
 `Component::build`. The scaffold resizes its body to avoid the keyboard by
@@ -286,10 +314,12 @@ bar-line alpha and tail, `EdgeFade::strong()` is a heavier preset and
 `.no_edge_fade()` turns it off. On Android the Material 3 bars (`MaterialToolbar` in an `AppBarLayout`, a
 `BottomNavigationView`) are siblings of the frust surface inside the Activity's
 content view, which is padded to sit between them — the surface is never
-re-parented — so do not pad for them yourself. The Activity's theme must derive
-from `Theme.Material3.*` (or `Theme.MaterialComponents.*`): under a stock theme
-the plugin logs the fix and draws the frust fallback bars instead. The same
-requirement covers the Android sheet, segmented control and toolbar buttons.
+re-parented — so do not pad for them yourself. The Material bars need a
+Material activity theme, which `frust plugin add native-widgets` gives a
+generated app (§3); an app whose theme is not Material (generated before that,
+or reverted to a stock theme) gets the frust fallback bars instead, with the
+fix logged once, and `frust doctor` names it. The same requirement covers the
+Android sheet, segmented control and toolbar buttons.
 A second live scaffold
 publishes nothing and shows a one-line refusal above its body — one
 `native_scaffold` per app.
@@ -303,19 +333,112 @@ bar's, so action ids must be unique across both: a toolbar entry repeating an
 earlier id is dropped and a one-line banner says so. On iOS the tab bar hides
 while a toolbar is shown (the toolbar takes the bottom spot, as in the GitHub
 app), animated only for a push/pop inside a tab, and returns with the toolbar.
+`.style(ToolbarStyle::Floating)` gathers the items into one floating pill with
+the primary beside it: a Material 3 floating toolbar centred above the bottom
+navigation on Android, hidden while the keyboard shows, and one pill in the
+frust-drawn row. Its items sit in a single row with no overflow, so keep a
+floating toolbar to a few short items on a phone. `.primary_label(true)` shows
+an icon primary's title beside its icon (Android's extended floating action
+button); an icon primary otherwise shows its icon alone, with the title as its
+accessibility label. iOS ignores both settings and keeps its system toolbar.
+
+```rust
+// `comment_icon` is a `TabIcon` the app built.
+ToolbarSpec::new()
+    .style(ToolbarStyle::Floating)
+    .items(vec![ActionItem::new("info", "Info")])
+    .primary(ActionItem::new("comment", "Comment").icon(comment_icon))
+    .primary_label(true)
+```
+
+**Top-bar items.** `ActionItem::icon(TabIcon)` gives an action an icon (its
+title becomes the accessibility label), `.menu(items)` makes it a pull-down,
+`.badge(text)` puts a badge on it (a count, `"new"`, or `""` for a bare dot; a
+change of badge alone updates the shown item in place) and `.prominent(true)`
+emphasises it. `Leading::Back` reports `.on_back`; `Leading::Image(bytes)` is
+an avatar; `Leading::Icon(TabIcon)` is a plain, untappable icon; and
+`Leading::Symbol(name)` is an SF Symbol. Phones have no shared icon
+vocabulary, so give every icon as `TabIcon::apple_symbol_with_bytes(symbol,
+bytes)`: iOS shows the symbol (the bytes for a name it does not know), Android
+and the frust-drawn bars show the bytes. A symbol alone draws nothing on
+Android (`native-chrome-android-bitmap-icons` in `docs/LIMITATIONS.md`).
+
+**Large title.** `.large_title(true)` shows the iOS large title, and on Android
+Material 3's medium collapsing top bar with the title and subtitle. On Android
+the bar collapses and expands from the `.scroll(controller)` state, animated:
+it snaps between the two heights rather than following the finger. The
+frust-drawn bars ignore it.
+
+**Search.** `.search(SearchSpec)` adds a search item to the top bar (it needs
+one: set a title or another top-bar item) and `.on_search(..)` hears each
+`SearchEvent`: `Began` (the field opened), `Changed(text)` (the whole text,
+after every edit), `Submitted(text)` (the keyboard's search key) and `Ended`
+(the field closed; a field that held text reports `Changed("")` first). The
+same events also arrive as `ChromeEvent::Search` through `.events_into`. The
+app owns the query: show the results in the body, and feed the text and the
+open state back with `SearchSpec::text` and `SearchSpec::active`. The plugin
+applies them only when they differ from what the field holds, so writing the
+typed text back never disturbs the field, and flipping `active` opens or closes
+it from the app. Focusing the native field ends a frust text field's focus, and
+focusing a frust text field takes the keyboard back and leaves the search open.
+
+```rust
+// `query` and `searching` are app `RwSignal`s; `ChatState` is the app's `State`.
+native_scaffold(results(query.get()))
+    .title("Chats")
+    .search(
+        SearchSpec::new()
+            .placeholder("Search chats")
+            .text(query.get())
+            .active(searching.get()),
+    )
+    .on_search(move |event| match event {
+        SearchEvent::Began => searching.set(true),
+        SearchEvent::Changed(text) => query.set(text),
+        SearchEvent::Ended => searching.set(false),
+        _ => {}
+    })
+```
+
+| | iOS / iPadOS | Android | frust-drawn bars |
+|---|---|---|---|
+| Action badge | `UIBarButtonItem.badge`, iOS 26 and later, top bar only | Material badge, top bar and toolbar | a dot or a label |
+| Prominent action | `UIBarButtonItemStyle::Prominent` | tinted with the theme's primary colour | a primary-coloured pill |
+| Large title | the navigation bar's large title | medium collapsing bar, snaps on scroll | ignored |
+| `ToolbarStyle::Floating`, `primary_label` | ignored | floating toolbar, extended primary | one pill; the label is ignored |
+| Search field | a `UISearchController` on each page's navigation item | a search action that expands into a field across the top bar | a text-field row with a close button under the top bar |
+| `SearchPlacement` | `NavigationBar` asks for the integrated placement (iOS 16 and later) | no effect | no effect |
+| Search ends | cancel | back, or the field's collapse | the close button or Escape; a blur ends nothing |
+
+There is no bottom search placement. Nothing in the iOS column has been run on
+a device yet.
 
 ---
 
-## 1b. Native presentations (alerts, sheets)
+## 1b. Native presentations (alerts, sheets, toasts)
 
 A native **alert** is not a control in the tree: it is a request answered by
 exactly one outcome — the chosen action's id, `Cancelled`, `Dismissed` (you
 took it down with `present::dismiss(&handle)`) or `HostLost` (the presenting
 host went away first — the iOS/iPadOS window scene, the macOS presenting
-window closing, or the Android hosting `Activity` being destroyed). One
-presentation is live per process; a second request while one is up is
-refused `PresentError::Busy` at once, never queued. Nothing ever blocks
-waiting for the user.
+window closing, or the Android hosting `Activity` being destroyed). Nothing
+ever blocks waiting for the user.
+
+**Two slots: one sheet, and one alert above it.** An alert requested while a
+sheet is live is presented above that sheet (the confirmation a sheet row
+asks for, below). When the sheet ends while its alert is still up, the alert
+is taken down first and resolves `Cancelled`, then the sheet resolves its own
+outcome. Every other overlap is refused `PresentError::Busy` at once, never
+queued and never replacing the live one:
+
+| Request | No presentation live | A sheet live | An alert live (with or without a sheet) |
+|---|---|---|---|
+| alert | shown | shown above the sheet | `Busy` |
+| sheet | shown | `Busy` | `Busy` |
+| toast | shown | shown | shown |
+
+A toast takes no slot (§ Native toasts below). The alert over a sheet has
+been run on an Android phone; on iOS it is not yet run on a device.
 
 | Platform | Today |
 |---|---|
@@ -367,8 +490,8 @@ native_button("Delete").on_press(move || {
 spec, `Unsupported`) as `Err` and never writes the signal for them; an error
 found only later on the main thread (`NoHost`) is logged, not written — await
 `show_native_alert` when you need to tell those apart. Dropping the awaited
-future frees the one-at-a-time slot but leaves the alert on screen until the
-user answers it (that answer is discarded).
+future frees the alert slot but leaves the alert on screen until the user
+answers it or a newer request takes it down (that answer is discarded).
 
 **The iPad anchor rule.** An action sheet on iPad is a popover and must point
 at something: `AlertStyle::ActionSheet` with no `anchor` is refused
@@ -400,13 +523,14 @@ A **sheet** is the same kind of request: a `SheetSpec` answered by exactly
 one `SheetOutcome` — `Action(id)` (the user tapped a row; the sheet has
 already slid away), `Dismissed(DismissReason::User)` (swiped down),
 `Dismissed(DismissReason::Programmatic)` (you called `handle.dismiss()`) or
-`HostLost`. It shares the one-at-a-time slot with alerts: while an alert is
-up, a sheet request is refused `PresentError::Busy`, and the reverse.
+`HostLost`. It holds the sheet slot: a second sheet, or a sheet while an alert
+is up, is refused `PresentError::Busy`; an alert while it is up is shown above
+it (the table above).
 
 | Platform | Today |
 |---|---|
-| iOS / iPadOS | a page sheet under `UISheetPresentationController`: detents, grabber, swipe-to-dismiss |
-| Android | Material `BottomSheetDialog` (Material3 theme required): detents map to half-expanded/expanded states, one half ratio at a time; `largest_undimmed` and `scrolling_expands` are ignored; a new request supersedes the live sheet |
+| iOS / iPadOS | a page sheet under `UISheetPresentationController`: detents, grabber, swipe-to-dismiss; an alert over it is presented from the sheet's view controller |
+| Android | Material `BottomSheetDialog` (Material 3 theme required, §3): detents map to half-expanded/expanded states, one half ratio at a time; `largest_undimmed` and `scrolling_expands` are ignored; an alert over it is an alert dialog above the bottom sheet dialog |
 | macOS, desktop preview, web | `PresentError::Unsupported` (an `NSPopover` arm is follow-up work) |
 
 The content is a **constrained native schema**, not frust widgets: an
@@ -460,12 +584,91 @@ native_button("Share").on_press(move || {
 only a row or `handle.dismiss()` ends the sheet. `Detent::Custom` needs
 iOS 16; on iOS 15 it becomes the nearest of medium/large (logged once).
 
+**Event rows.** `SheetSpec::on_row_tap(id, listener)` turns the action row
+`id` into an event: a tap calls `listener` on the UI thread and the sheet
+stays up. The sheet still resolves exactly once, through another row, a
+swipe-down, a dismissal or its host going away. A row that asks for
+confirmation opens an alert from its listener, and the alert is shown above
+the sheet:
+
+```rust
+// `stop_answer` is an app `RwSignal<Option<AlertOutcome>>`.
+let spec = share_spec().on_row_tap("stop", move || {
+    let confirm = AlertSpec::new("Stop sharing?", "The link stops working.")
+        .with_action("keep", "Keep", ActionRole::Cancel)
+        .with_action("stop", "Stop", ActionRole::Destructive);
+    if let Err(err) = show_native_alert_into(confirm, stop_answer) {
+        log::warn!("no confirmation: {err}");
+    }
+});
+```
+
+An `id` that names no action row is refused `InvalidSpec` when the sheet is
+submitted.
+
 **iPad in regular width ignores detents.** UIKit presents a page sheet in a
 full-width (or large Split View) iPad window as a centered form sheet at a
 fixed size — no medium height, no detent changes; only an edge-attached sheet
 (iPhone, or an iPad window in compact width such as Slide Over) rests at its
 detents. Design the content to read well at both sizes; never rely on detent
 parity across idioms.
+
+### Native toasts (Android / iOS / iPadOS)
+
+A **toast** is a short message above the app's own native chrome, optionally
+with one action: `show_native_toast(ToastSpec)` (awaitable) or
+`show_native_toast_into(ToastSpec, signal)` (into an `RwSignal`, with the alert
+form's contract). It resolves exactly one `ToastOutcome`: `TimedOut`,
+`Action` (the user tapped its action) or `Dismissed` (swiped away, replaced by
+a newer toast, taken down with `present::dismiss(&handle)`, or its host went
+away). It takes neither slot: it is never refused `Busy` and never waits for
+an alert or a sheet. A new toast replaces the current one, which resolves
+`Dismissed`.
+
+`ToastDuration::Short` is 1.5 s, `Long` 2.75 s, and `Custom(d)` is clamped to
+1-10 s; Android may lengthen it for accessibility. An empty message or action
+label is refused `InvalidSpec`.
+
+```rust
+use frust::{RwSignal, Set, spawn_local};
+use frust_native_widgets::{ToastDuration, ToastOutcome, ToastSpec, show_native_toast};
+
+// `restore` is an app `RwSignal<bool>`.
+let spec = ToastSpec::new("Message archived")
+    .with_action("Undo")
+    .with_duration(ToastDuration::Long);
+spawn_local(async move {
+    if let Ok(ToastOutcome::Action) = show_native_toast(spec).await {
+        restore.set(true);
+    }
+});
+```
+
+| Platform | Today |
+|---|---|
+| Android | a Material `Snackbar` above the plugin's bottom navigation or toolbar when one shows, else above the keyboard and the navigation bar; a toast shown while a sheet or an alert is up draws behind that dialog; `glass` ignored |
+| iOS / iPadOS | a plugin-owned capsule above the tab and tool bars and the keyboard; `.with_glass(true)` asks for Liquid Glass on iOS 26 and a blur before; not yet run on a device |
+| macOS, desktop preview, web | `PresentError::Unsupported` |
+
+---
+
+## 1d. What stays frust-drawn
+
+This plugin wraps the native views listed above and nothing more. These stay
+frust-drawn (`frust-widgets` or a design-system plugin) on every platform:
+
+- **Text fields.** `text_input` is frust's own; only the scaffold's search
+  field is native.
+- **Context menus.** Only the top bar's and toolbar's pull-down menus
+  (`ActionItem::menu`) are native.
+- **Pull-to-refresh.**
+- **Sheet content beyond the schema.** A native sheet shows a title, a
+  message, an image and up to three rows; anything else is a frust-drawn
+  sheet. Hosting frust-drawn content inside a native sheet has been explored,
+  not shipped.
+
+An app cannot add another native control from its own crate (§5, the
+`NativeComponent` limit); request a missing control or option upstream.
 
 ---
 
@@ -483,22 +686,23 @@ This is the **only** step iOS needs — see §4.
 
 ---
 
-## 3. Android setup — include the plugin's Gradle module
+## 3. Android setup — the Gradle module and a Material 3 theme
 
-**One addition: include this plugin's Android library module.** It carries
-the plugin's Kotlin classes — `dev.frust.nativewidgets`'s
-`FrustNativeControlFactory` (the ONE platform-view factory every control
-resolves through), `FrustNativeListener` (the ONE listener class every
-control's events funnel through), `FrustNativePresenter` (alerts and sheets)
-and `FrustNativeChrome` (the app chrome) — plus the R8 keep rules they need,
-in its own `consumer-rules.pro`. The module depends on Material Components
-(`api` scope), so your **app theme must derive from `Theme.Material3.*`** for
-the chrome, sheet and segmented control. Your `AndroidManifest.xml` and
-`proguard-rules.pro` stay untouched, and there is no file to copy, so nothing
-can drift.
+**Two additions: this plugin's Android library module, and a Material 3
+activity theme.** The module carries the plugin's Kotlin classes —
+`dev.frust.nativewidgets`'s `FrustNativeControlFactory` (the ONE platform-view
+factory every control resolves through), `FrustNativeListener` (the ONE
+listener class every control's events funnel through), `FrustNativePresenter`
+(alerts, sheets and toasts) and `FrustNativeChrome` (the app chrome) — plus
+the R8 keep rules they need, in its own `consumer-rules.pro`. It depends on
+Material Components (`api` scope), whose views (the chrome, the sheet, the
+segmented control, the toolbar buttons) need a Material activity theme.
+`proguard-rules.pro` stays untouched, and there is no Kotlin file to copy, so
+nothing can drift.
 
-The TUI Add Plugin dialog (`frust tui` → Add Plugin → native-widgets) makes
-both edits below for you, idempotently. By hand:
+`frust plugin add native-widgets` (or the TUI's Add Plugin dialog, `frust tui`
+→ Add Plugin → native-widgets) makes all three edits below for you,
+idempotently. By hand:
 
 1. `android/settings.gradle.kts` — include the module, and redirect
    its build directory under your app:
@@ -525,6 +729,53 @@ both edits below for you, idempotently. By hand:
        implementation(project(":frust-native-widgets"))
    }
    ```
+
+3. `android/app/src/main/res/values/themes.xml` — give the app-owned
+   `FrustAppTheme` style a Material 3 parent:
+
+   ```xml
+   <style name="FrustAppTheme" parent="Theme.Material3.DayNight.NoActionBar" />
+   ```
+
+   A generated app's `AndroidManifest.xml` names `@style/FrustAppTheme` on
+   both its `<application>` and its `<activity>`, and the template ships the
+   style with the platform parent `android:Theme.Material.NoActionBar`; the add
+   rewrites only that `parent` attribute.
+
+The theme step leaves an app alone when it is already fine: an activity theme
+in the `Theme.Material3`, `Theme.Material3Expressive` or
+`Theme.MaterialComponents` family needs nothing, and a `FrustAppTheme` whose
+parent is already one of those, or another style of the app's own, is never
+rewritten. A parent style the add cannot follow (one defined outside
+`themes.xml`) is trusted, not checked; if it is not Material after all, the
+chrome falls back to the frust-drawn bars at run time.
+
+**An app generated before the template defined `FrustAppTheme`** (its
+activity names neither that style nor a Material theme) is refused before
+anything is written, with the two manual edits named: add
+`<style name="FrustAppTheme" parent="Theme.Material3.DayNight.NoActionBar" />`
+inside `<resources>` in `android/app/src/main/res/values/themes.xml` (create
+the file if it is missing), set `android:theme="@style/FrustAppTheme"` on both
+the `<application>` and the `<activity>` element of
+`android/app/src/main/AndroidManifest.xml`, then re-run
+`frust plugin add native-widgets`. Pointing the activity at a Material theme of
+your own works too.
+
+**Checking the wiring.** `frust plugin list` marks the plugin `<n> pending`
+while an edit is missing, and inside the project `frust doctor` prints a
+`Plugins` block naming it (informational; it never changes the exit code):
+
+```text
+Plugins
+[!] native-widgets
+    pending: Android theme `FrustAppTheme` parent `Theme.Material3.DayNight.NoActionBar`
+    see limitation: native-chrome-android-material3-theme-required
+    fix: frust plugin add native-widgets
+```
+
+A missing Gradle include shows as a `pending` row naming the Gradle module
+`:frust-native-widgets`; for an app the add would refuse, `fix` lists the two
+manual edits first.
 
 No permission is required: hosting an `android.widget` view needs none.
 
@@ -599,19 +850,28 @@ Two things differ from the mobile arms, both by design:
 
 - **`frust create --overwrite` destroys these additions.** `--overwrite`
   re-renders the generated project wholesale, silently dropping the Gradle
-  include and the module dependency. Both additions are **idempotent** — just
-  re-run the Add Plugin dialog (or re-apply §3) to restore them. The Kotlin
-  classes themselves live in the plugin's own module, so they survive — but a
-  project that no longer includes the module can't reach them.
-- **A wrong or missing module wiring fails at runtime, not at build time.**
+  include and the module dependency and putting `FrustAppTheme`'s platform
+  parent back. All three additions are **idempotent** — just re-run
+  `frust plugin add native-widgets` (or the Add Plugin dialog, or re-apply §3)
+  to restore them. The Kotlin classes themselves live in the plugin's own
+  module, so they survive — but a project that no longer includes the module
+  can't reach them.
+- **A wrong or missing wiring fails at runtime, not at build time.**
   Nothing in the Rust build references the Kotlin classes, so a missing
   `include(...)` compiles cleanly and surfaces on device as a blank slot
-  where the control should be (the host logs an unresolvable factory). A stale
-  pre-module hand copy produces the same blank slot — see §7.
+  where the control should be (the host logs an unresolvable factory), and a
+  stock activity theme surfaces as the frust-drawn fallback bars. A stale
+  pre-module hand copy produces the same blank slot — see §7. Run
+  `frust doctor` in the project: its `Plugins` block names a missing include
+  or a stock theme before you reach a device (§3).
 - **No cargo gate compiles Kotlin.** `cargo check --target
   aarch64-linux-android -p frust-native-widgets` type-checks the Rust half
-  only; a typo in the module's `.kt` files surfaces solely in a real Gradle
-  build (`docs/DEVELOPMENT.md`). `plugins/native-widgets/tests/
+  only. In this repository a separate CI lane, `scripts/ci/kotlin-compile.sh`
+  (the `kotlin-compile` job, advisory and outside the merge gate), scaffolds a
+  throwaway app, adds every built-in plugin with an Android module and
+  compiles each module's Kotlin without building Rust; in your app a typo in
+  the module's `.kt` files still surfaces only in a real Gradle build
+  (`docs/DEVELOPMENT.md`). `plugins/native-widgets/tests/
   kotlin_conformance.rs` covers the one thing a source scan can: that the
   Kotlin listener's `KIND_*` constants and value-packing arithmetic still
   agree with `src/events.rs`'s.
@@ -646,13 +906,13 @@ Two things differ from the mobile arms, both by design:
 
 ---
 
-## 6. The TUI Add Plugin dialog automates all of this
+## 6. `frust plugin add` automates all of this
 
-Everything in §2 and §3 — the Cargo.toml dependency and the
-`:frust-native-widgets` Gradle include plus its app-module dependency — is
-applied for you, idempotently, by the frust TUI's **Add Plugin** dialog
-(select `native-widgets`). This README is the manual contract that dialog
-encodes.
+Everything in §2 and §3 — the Cargo.toml dependency, the
+`:frust-native-widgets` Gradle include plus its app-module dependency, and the
+`FrustAppTheme` parent — is applied for you, idempotently, by
+`frust plugin add native-widgets` or the frust TUI's **Add Plugin** dialog
+(select `native-widgets`). This README is the manual contract both encode.
 
 ---
 
