@@ -28,11 +28,13 @@ import android.app.Activity
 import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.util.Log
 import android.view.View
 import android.widget.LinearLayout
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.button.MaterialButtonToggleGroup
+import com.google.android.material.color.MaterialColors
 import dev.frust.FrustPlatformViewFactory
 
 class FrustNativeControlFactory : FrustPlatformViewFactory {
@@ -79,6 +81,133 @@ class FrustNativeControlFactory : FrustPlatformViewFactory {
      */
     companion object {
         private const val TAG = "FrustNativeWidgets"
+
+        // The button style wire values — `buttonStyle` in the button's params,
+        // mirrored from `controls/button.rs`'s `ButtonStyle::wire` (append-only;
+        // `tests/kotlin_conformance.rs` pins the pairing). An unknown value is
+        // read as plain.
+        private const val BUTTON_STYLE_PLAIN = 0
+        private const val BUTTON_STYLE_PROMINENT = 1
+        private const val BUTTON_STYLE_DESTRUCTIVE = 2
+        private const val BUTTON_STYLE_GLASS = 3
+        private const val BUTTON_STYLE_PROMINENT_GLASS = 4
+
+        /**
+         * The theme attribute whose style gives [style] its Material look:
+         * the text button for plain, the tonal button for glass, the filled
+         * button for the rest (destructive is filled in the error colour,
+         * applied by [styleExtras]).
+         */
+        private fun buttonStyleAttr(style: Int): Int = when (style) {
+            BUTTON_STYLE_GLASS -> com.google.android.material.R.attr.materialButtonTonalStyle
+            BUTTON_STYLE_PROMINENT,
+            BUTTON_STYLE_DESTRUCTIVE,
+            BUTTON_STYLE_PROMINENT_GLASS -> com.google.android.material.R.attr.materialButtonStyle
+            else -> androidx.appcompat.R.attr.borderlessButtonStyle
+        }
+
+        /**
+         * What a style adds on top of its attribute style: the error fill for
+         * destructive. A theme fill on a plain button is not drawn over the
+         * text button's background but put into it
+         * ([buttonSetThemedBackground]), so plain needs nothing here.
+         */
+        private fun styleExtras(button: MaterialButton, style: Int) {
+            if (style != BUTTON_STYLE_DESTRUCTIVE) return
+            val context = button.context
+            val error = MaterialColors.getColor(context, androidx.appcompat.R.attr.colorError, 0xFFB3261E.toInt())
+            val onError = MaterialColors.getColor(context, com.google.android.material.R.attr.colorOnError, 0xFFFFFFFF.toInt())
+            val disabled = intArrayOf(-android.R.attr.state_enabled)
+            val resting = button.backgroundTintList
+            val disabledFill = resting?.getColorForState(disabled, error) ?: error
+            button.backgroundTintList = ColorStateList(
+                arrayOf(disabled, intArrayOf()),
+                intArrayOf(disabledFill, error),
+            )
+            button.setTextColor(onError)
+        }
+
+        /**
+         * The native button, in [style]. A `MaterialButton` under a Material3
+         * app theme; under any other theme the Material inflation throws, and
+         * the slot gets the framework `Button` the plugin always built (a
+         * later [buttonSetStyle] on it is a no-op).
+         */
+        @JvmStatic
+        fun buttonCreate(activity: Activity, qualified: Context, style: Int): View {
+            try {
+                val button = MaterialButton(
+                    FrustMaterialContext.wrap(activity, qualified),
+                    null,
+                    buttonStyleAttr(style),
+                )
+                styleExtras(button, style)
+                return button
+            } catch (t: Throwable) {
+                Log.w(TAG, "native_button needs a Material3 app theme for its styles; using a plain Button", t)
+                return android.widget.Button(qualified)
+            }
+        }
+
+        /**
+         * Restyle a live button in place (a style change is an update, never
+         * a remount). Everything a style owns is read off a reference button
+         * built from its attribute style and copied across: background tint,
+         * shape, insets, stroke, ripple and caption colours. That also drops
+         * any theme fill, corner radius or caption colour the previous props
+         * applied, so the button looks exactly like a fresh one in [style];
+         * Rust re-applies whatever theme values the new props carry
+         * afterwards. A framework `Button` (no Material theme) has no styles,
+         * but still drops the theme look back to a fresh `Button`'s.
+         */
+        @JvmStatic
+        fun buttonSetStyle(view: View, style: Int) {
+            val button = view as? MaterialButton
+            if (button == null) {
+                val plain = view as? android.widget.Button ?: return
+                val reference = android.widget.Button(plain.context)
+                plain.background = reference.background
+                plain.setTextColor(reference.textColors)
+                return
+            }
+            val reference = MaterialButton(button.context, null, buttonStyleAttr(style))
+            button.backgroundTintList = reference.backgroundTintList
+            button.shapeAppearanceModel = reference.shapeAppearanceModel
+            button.insetTop = reference.insetTop
+            button.insetBottom = reference.insetBottom
+            button.strokeColor = reference.strokeColor
+            button.strokeWidth = reference.strokeWidth
+            button.rippleColor = reference.rippleColor
+            button.setTextColor(reference.textColors)
+            styleExtras(button, style)
+        }
+
+        /**
+         * A theme fill with a corner radius ([radiusPx], device pixels) — the
+         * button's half of Rust's `Setter::ThemedBackground`. A
+         * `MaterialButton` gets them in its own background (tint and shape,
+         * with the insets dropped so the fill covers the whole view): a
+         * replaced background is never handed back to the button, and
+         * [buttonSetStyle] could then only tint the leftover drawable. The
+         * corner goes through the shape model, not `cornerRadius`, which
+         * skips a radius equal to the last one it set even after the shape
+         * was reset. A framework `Button` gets a `GradientDrawable`.
+         */
+        @JvmStatic
+        fun buttonSetThemedBackground(view: View, fill: Int, radiusPx: Float) {
+            val button = view as? MaterialButton
+            if (button == null) {
+                view.background = GradientDrawable().apply {
+                    setColor(fill)
+                    cornerRadius = radiusPx
+                }
+                return
+            }
+            button.backgroundTintList = ColorStateList.valueOf(fill)
+            button.shapeAppearanceModel = button.shapeAppearanceModel.withCornerSize(radiusPx)
+            button.insetTop = 0
+            button.insetBottom = 0
+        }
 
         /**
          * A single-selection, selection-required toggle group wired to a

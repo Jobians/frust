@@ -82,6 +82,7 @@ mod theme;
 /// crate-private `chrome` module — see [`native_scaffold`].
 pub use crate::chrome::{
     ActionId, ActionItem, ChromeEvent, Leading, MenuItem, MenuItemId, ScrollState, ToolbarSpec,
+    ToolbarStyle,
 };
 /// The date value `native_date_picker` shows and reports — defined beside the
 /// control (`crate::controls::date_picker`) because the platform-agnostic
@@ -89,11 +90,12 @@ pub use crate::chrome::{
 /// public vocabulary.
 pub use crate::controls::date_picker::CivilDate;
 pub use builders::{
-    NativeButtonView, NativeDatePickerStyle, NativeDatePickerView, NativeImageFit, NativeImageView,
-    NativeLabelView, NativeProgressView, NativeSegmentedView, NativeSliderView, NativeSpinnerSize,
-    NativeSpinnerView, NativeStepperView, NativeSwitchView, NativeTabBarView, TabIcon, TabId,
-    TabItem, native_button, native_date_picker, native_image, native_label, native_progress,
-    native_segmented, native_slider, native_spinner, native_stepper, native_switch, native_tab_bar,
+    NativeButtonStyle, NativeButtonView, NativeDatePickerStyle, NativeDatePickerView,
+    NativeImageFit, NativeImageView, NativeLabelView, NativeProgressView, NativeSegmentedView,
+    NativeSliderView, NativeSpinnerSize, NativeSpinnerView, NativeStepperView, NativeSwitchView,
+    NativeTabBarView, TabIcon, TabId, TabItem, native_button, native_date_picker, native_image,
+    native_label, native_progress, native_segmented, native_slider, native_spinner, native_stepper,
+    native_switch, native_tab_bar,
 };
 pub use mount::{NativeComponentView, native_component};
 /// The app-facing native-presentation entry points over `crate::present`:

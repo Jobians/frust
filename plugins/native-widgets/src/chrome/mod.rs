@@ -32,6 +32,8 @@
 //!   into [`chrome_actions`]: the top bar's actions, then the toolbar's items,
 //!   then its primary. So a toolbar change is diffed as
 //!   [`ChromeField::Actions`] ([`diff_specs`]): the two always travel together.
+//!   A change of badges alone, in either, is [`ChromeField::ActionBadges`],
+//!   which an arm applies to the shown items in place.
 //! - **Resolved where it was drawn.** An arm whose bars lag the slot (iOS
 //!   applies on a later main-queue turn) resolves a tap against the spec it
 //!   shows ([`resolve_tap`]) and hands the id-based event to [`deliver_event`],
@@ -163,7 +165,8 @@ pub(crate) struct TopBarSpec {
     pub(crate) subtitle: Option<String>,
     pub(crate) leading: Leading,
     pub(crate) actions: Vec<ActionItem>,
-    /// iOS large-title display; ignored where the platform has none.
+    /// Large-title display: the iOS large title, a collapsing medium top bar on
+    /// Android; ignored where the platform has none.
     pub(crate) large_title: bool,
 }
 
@@ -177,8 +180,14 @@ pub enum Leading {
     Back,
     /// Encoded image bytes (an avatar), compared by content.
     Image(Arc<[u8]>),
-    /// An Apple SF Symbol name; Android has no symbol-by-name.
+    /// An Apple SF Symbol name; Android has no symbol-by-name, so it shows
+    /// nothing there — [`Self::Icon`] with a [`TabIcon::AppleSymbolWithBytes`]
+    /// shows on both phones.
     Symbol(String),
+    /// A plain (not round, not tappable) icon: an SF Symbol where the
+    /// platform has them, encoded image bytes elsewhere, compared by content.
+    /// `Icon(TabIcon::AppleSymbol(name))` shows like [`Self::Symbol`].
+    Icon(TabIcon),
 }
 
 /// A chrome action's stable, app-chosen identity — never an index.
@@ -234,16 +243,21 @@ pub struct ActionItem {
     pub(crate) title: String,
     pub(crate) icon: Option<TabIcon>,
     pub(crate) menu: Option<Vec<MenuItem>>,
+    pub(crate) badge: Option<String>,
+    pub(crate) prominent: bool,
 }
 
 impl ActionItem {
-    /// An action `id` titled `title`, with no icon and no menu.
+    /// An action `id` titled `title`, with no icon, no menu, no badge and
+    /// the plain style.
     pub fn new(id: impl Into<ActionId>, title: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             title: title.into(),
             icon: None,
             menu: None,
+            badge: None,
+            prominent: false,
         }
     }
 
@@ -259,9 +273,68 @@ impl ActionItem {
         self
     }
 
+    /// A badge on the action, with [`TabItem::badge`]'s grammar: a count,
+    /// `"new"`, or `""` for a bare dot. Default: none. A change of badge
+    /// alone updates the shown item in place rather than rebuilding the bar.
+    /// iOS shows it on top-bar actions where `UIBarButtonItem` has a badge
+    /// (iOS 26; UIKit supports it in navigation bars only), Android as a
+    /// Material badge, the frust-drawn chrome as a dot or a label.
+    pub fn badge(mut self, badge: impl Into<String>) -> Self {
+        self.badge = Some(badge.into());
+        self
+    }
+
+    /// Whether the action is emphasised: iOS's prominent bar-item style,
+    /// the theme's primary colour on Android and in the frust-drawn chrome.
+    /// Default `false`.
+    pub fn prominent(mut self, prominent: bool) -> Self {
+        self.prominent = prominent;
+        self
+    }
+
     /// This action's id.
     pub fn id(&self) -> &ActionId {
         &self.id
+    }
+
+    /// Whether `self` and `other` differ in nothing but their badges.
+    pub(crate) fn same_but_badge(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.title == other.title
+            && self.icon == other.icon
+            && self.menu == other.menu
+            && self.prominent == other.prominent
+    }
+}
+
+/// How two lists of actions differ: not at all, only in their badges, or
+/// otherwise (an item added, removed, moved or changed beyond its badge).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActionsChange {
+    None,
+    Badges,
+    Items,
+}
+
+impl ActionsChange {
+    /// Classify the change from `old` to `new`.
+    pub(crate) fn between<'a>(
+        old: impl ExactSizeIterator<Item = &'a ActionItem>,
+        new: impl ExactSizeIterator<Item = &'a ActionItem>,
+    ) -> Self {
+        if old.len() != new.len() {
+            return Self::Items;
+        }
+        let mut change = Self::None;
+        for (old, new) in old.zip(new) {
+            if !old.same_but_badge(new) {
+                return Self::Items;
+            }
+            if old.badge != new.badge {
+                change = Self::Badges;
+            }
+        }
+        change
     }
 }
 
@@ -313,7 +386,9 @@ impl MenuItem {
 
 /// The bottom toolbar: secondary `items` and an optional `primary` action,
 /// shown trailing and emphasised — iOS navigation-controller toolbar items,
-/// Android floating action buttons, a frust-drawn row in the fallback. Its
+/// Android floating action buttons (or, for [`ToolbarStyle::Floating`], a
+/// Material floating toolbar beside the primary), a frust-drawn row in the
+/// fallback. Its
 /// actions report like the top bar's ([`ChromeEvent::ActionTapped`],
 /// [`ChromeEvent::MenuItemChosen`]), so their ids must not repeat a top-bar
 /// action's or each other's: the scaffold drops a repeat and says so.
@@ -321,12 +396,47 @@ impl MenuItem {
 pub struct ToolbarSpec {
     pub(crate) items: Vec<ActionItem>,
     pub(crate) primary: Option<ActionItem>,
+    pub(crate) style: ToolbarStyle,
+    pub(crate) primary_label: bool,
+}
+
+/// How the bottom toolbar's items are presented ([`ToolbarSpec::style`]).
+/// iOS ignores it: its toolbar is the navigation controller's own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ToolbarStyle {
+    /// Each entry its own button: on Android a column of floating action
+    /// buttons above the bottom navigation, trailing; a trailing row of
+    /// buttons in the frust-drawn chrome.
+    #[default]
+    Buttons,
+    /// The items together in one floating pill, the primary beside it: on
+    /// Android a Material 3 floating toolbar anchored bottom-centre with the
+    /// primary as a floating action button, hidden while the keyboard shows;
+    /// one pill of items in the frust-drawn chrome.
+    Floating,
 }
 
 impl ToolbarSpec {
     /// An empty toolbar, which shows nothing.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How the items are presented. Default [`ToolbarStyle::Buttons`].
+    pub fn style(mut self, style: ToolbarStyle) -> Self {
+        self.style = style;
+        self
+    }
+
+    /// Whether a primary with an icon also shows its title beside the icon
+    /// (Android's extended floating action button). Default `false`: an
+    /// icon primary shows its icon alone, its title the accessibility label.
+    /// A primary without an icon always shows its title. iOS and the
+    /// frust-drawn chrome ignore it.
+    pub fn primary_label(mut self, label: bool) -> Self {
+        self.primary_label = label;
+        self
     }
 
     /// The secondary items, leading-first.
@@ -355,6 +465,11 @@ impl ToolbarSpec {
     /// The items, then the primary: the toolbar's report order.
     pub(crate) fn entries(&self) -> impl Iterator<Item = &ActionItem> {
         self.items.iter().chain(self.primary.as_ref())
+    }
+
+    /// [`Self::entries`], collected so its length is known.
+    fn entries_exact(&self) -> std::vec::IntoIter<&ActionItem> {
+        self.entries().collect::<Vec<_>>().into_iter()
     }
 }
 
@@ -391,18 +506,50 @@ fn declaration_rank(field: ChromeField) -> u8 {
         ChromeField::LargeTitle => 7,
         ChromeField::Scroll => 8,
         ChromeField::Brightness => 9,
+        ChromeField::ActionBadges => 10,
+    }
+}
+
+/// How the toolbar changed from `old` to `new`: a badge-only change keeps
+/// both present with the same entries in the same roles, the same style and
+/// the same primary label.
+fn toolbar_change(old: Option<&ToolbarSpec>, new: Option<&ToolbarSpec>) -> ActionsChange {
+    match (old, new) {
+        _ if old == new => ActionsChange::None,
+        (Some(old), Some(new))
+            if old.primary.is_some() == new.primary.is_some()
+                && old.style == new.style
+                && old.primary_label == new.primary_label =>
+        {
+            ActionsChange::between(old.entries_exact(), new.entries_exact())
+        }
+        _ => ActionsChange::Items,
     }
 }
 
 /// [`ChromeDiff::between`], with a toolbar change reported as
-/// [`ChromeField::Actions`] (module doc, "One action index space").
+/// [`ChromeField::Actions`] (module doc, "One action index space") — or as
+/// [`ChromeField::ActionBadges`] when the toolbar, like the top bar's
+/// actions, changed in its badges alone.
 pub(crate) fn diff_specs<'a>(old: &ChromeSpec, new: &'a ChromeSpec) -> ChromeDiff<'a> {
     let mut diff = ChromeDiff::between(old, new);
-    if old.toolbar != new.toolbar && !diff.contains(ChromeField::Actions) {
-        diff.changed.push(ChromeField::Actions);
-        // Restore `ChromeField` declaration order (the `ChromeDiff::changed` contract).
-        diff.changed.sort_by_key(|field| declaration_rank(*field));
+    let field = match toolbar_change(old.toolbar.as_ref(), new.toolbar.as_ref()) {
+        ActionsChange::None => None,
+        ActionsChange::Badges => Some(ChromeField::ActionBadges),
+        ActionsChange::Items => Some(ChromeField::Actions),
+    };
+    if let Some(field) = field
+        && !diff.contains(field)
+    {
+        diff.changed.push(field);
     }
+    if diff.contains(ChromeField::Actions) {
+        // A rebuild carries every badge.
+        diff.changed
+            .retain(|field| *field != ChromeField::ActionBadges);
+    }
+    // Restore `ChromeField` declaration order (the `ChromeDiff::changed` contract).
+    diff.changed.sort_by_key(|field| declaration_rank(*field));
     diff
 }
 
@@ -948,9 +1095,25 @@ fn hand_over(routed: Option<(ChromeEvent, ChromeSink)>) -> bool {
 /// entry per `(slot, index)` the arm has handed Kotlin, re-sent only when the
 /// bytes change (compared by content, like the spec), and a revision per
 /// entry that `tab<i>IconRev` carries. Sync it before encoding: the JSON
-/// reads its revisions. An Apple symbol has no Android rendering — a tab or
-/// action carrying one is title-only and a `Leading::Symbol` encodes as
-/// `"none"` (limitation `native-chrome-android-bitmap-icons`).
+/// reads its revisions. An icon's bytes are a [`TabIcon::Bytes`] or the
+/// bytes half of a [`TabIcon::AppleSymbolWithBytes`]; an Apple symbol alone
+/// has no Android rendering — a tab or action carrying one is title-only and
+/// a `Leading::Symbol` (or a `Leading::Icon` without bytes) encodes as
+/// `"none"` (limitation `native-chrome-android-bitmap-icons`). A
+/// `Leading::Icon` with bytes encodes as `"icon"` and its bytes ride
+/// [`ICON_SLOT_LEADING`] like the avatar's.
+///
+/// # Appended keys
+///
+/// `action<i>Badge`/`toolbar<i>Badge` (the tab badge's encoding) and
+/// `action<i>Prominent`/`toolbar<i>Prominent` are written only when set — a
+/// badge present, prominent `true` — so a spec using neither encodes exactly
+/// as before they existed; Kotlin reads an absent key as none/`false`. A
+/// [`ChromeField::ActionBadges`] apply carries every action's and toolbar
+/// entry's badge key, `null` for none, and nothing else. Likewise
+/// `toolbarStyle` ([`toolbar_style_name`]) is written only for a style other
+/// than [`ToolbarStyle::Buttons`] and `toolbarPrimaryLabel` only when `true`;
+/// Kotlin reads them absent as `"buttons"`/`false`.
 ///
 /// # The toolbar
 ///
@@ -965,7 +1128,7 @@ pub(crate) mod android_wire {
     use std::sync::Arc;
 
     use super::host::ChromeField;
-    use super::{ActionItem, ChromeSpec, Leading, ToolbarSpec, TopBarSpec};
+    use super::{ActionItem, ChromeSpec, Leading, ToolbarSpec, ToolbarStyle, TopBarSpec};
     use crate::api::TabIcon;
     use crate::runtime::escape;
 
@@ -1004,6 +1167,7 @@ pub(crate) mod android_wire {
             ChromeField::LargeTitle => "LargeTitle",
             ChromeField::Scroll => "Scroll",
             ChromeField::Brightness => "Brightness",
+            ChromeField::ActionBadges => "ActionBadges",
         }
     }
 
@@ -1040,13 +1204,21 @@ pub(crate) mod android_wire {
     }
 
     /// The fields an apply names on the wire for `changed`: no
-    /// [`ChromeField::Scroll`], and [`ChromeField::Selected`] beside a
-    /// [`ChromeField::Tabs`] change (module doc), in declaration order.
+    /// [`ChromeField::Scroll`], [`ChromeField::Selected`] beside a
+    /// [`ChromeField::Tabs`] change (module doc), and
+    /// [`ChromeField::ActionBadges`] only without [`ChromeField::Actions`],
+    /// which carries the badges itself; in declaration order.
     pub(crate) fn wire_fields(changed: &[ChromeField]) -> Vec<ChromeField> {
         let tabs = changed.contains(&ChromeField::Tabs);
+        let actions = changed.contains(&ChromeField::Actions);
         INSTALL_FIELDS
             .into_iter()
-            .filter(|field| changed.contains(field) || (tabs && *field == ChromeField::Selected))
+            .chain([ChromeField::ActionBadges])
+            .filter(|field| match field {
+                ChromeField::Selected => tabs || changed.contains(field),
+                ChromeField::ActionBadges => !actions && changed.contains(field),
+                _ => changed.contains(field),
+            })
             .collect()
     }
 
@@ -1102,12 +1274,37 @@ pub(crate) mod android_wire {
                     for (t, entry) in entries.into_iter().enumerate() {
                         put_action(&mut put, ("toolbar", "toolbarMenu"), t, entry);
                     }
+                    // Appended keys, written only when set (module doc).
+                    if toolbar.style != ToolbarStyle::Buttons {
+                        put(
+                            "toolbarStyle".into(),
+                            Value::Str(toolbar_style_name(toolbar.style).into()),
+                        );
+                    }
+                    if toolbar.primary_label {
+                        put("toolbarPrimaryLabel".into(), Value::Bool(true));
+                    }
                 }
                 ChromeField::LargeTitle => {
                     put("largeTitle".into(), Value::Bool(top.large_title));
                 }
                 ChromeField::Scroll => {}
                 ChromeField::Brightness => put("dark".into(), Value::Bool(spec.dark)),
+                ChromeField::ActionBadges => {
+                    for (a, action) in top.actions.iter().enumerate() {
+                        put(
+                            format!("action{a}Badge"),
+                            Value::OptStr(action.badge.clone()),
+                        );
+                    }
+                    let entries = spec.toolbar.iter().flat_map(ToolbarSpec::entries);
+                    for (t, entry) in entries.enumerate() {
+                        put(
+                            format!("toolbar{t}Badge"),
+                            Value::OptStr(entry.badge.clone()),
+                        );
+                    }
+                }
             }
         }
         out
@@ -1128,12 +1325,19 @@ pub(crate) mod android_wire {
         );
         put(
             format!("{prefix}{a}HasIcon"),
-            Value::Bool(matches!(action.icon, Some(TabIcon::Bytes(_)))),
+            Value::Bool(action.icon.as_ref().and_then(TabIcon::bytes).is_some()),
         );
         put(
             format!("{prefix}{a}MenuCount"),
             Value::Int(count(menu.len())),
         );
+        // Appended keys, written only when set (module doc).
+        if let Some(badge) = &action.badge {
+            put(format!("{prefix}{a}Badge"), Value::Str(badge.clone()));
+        }
+        if action.prominent {
+            put(format!("{prefix}{a}Prominent"), Value::Bool(true));
+        }
         for (m, item) in menu.iter().enumerate() {
             let key = |field: &str| format!("{menu_prefix}{a}_{m}{field}");
             put(key("Title"), Value::Str(item.title.clone()));
@@ -1142,12 +1346,23 @@ pub(crate) mod android_wire {
         }
     }
 
-    /// `leading`'s wire spelling: an Apple symbol has no Android rendering.
+    /// `leading`'s wire spelling: an Apple symbol has no Android rendering,
+    /// so a leading icon is `"icon"` only when it carries bytes.
     pub(crate) fn leading_name(leading: &Leading) -> &'static str {
         match leading {
             Leading::None | Leading::Symbol(_) => "none",
             Leading::Back => "back",
             Leading::Image(_) => "image",
+            Leading::Icon(icon) if icon.bytes().is_some() => "icon",
+            Leading::Icon(_) => "none",
+        }
+    }
+
+    /// `style`'s wire spelling, the `toolbarStyle` value.
+    pub(crate) fn toolbar_style_name(style: ToolbarStyle) -> &'static str {
+        match style {
+            ToolbarStyle::Buttons => "buttons",
+            ToolbarStyle::Floating => "floating",
         }
     }
 
@@ -1313,27 +1528,33 @@ pub(crate) mod android_wire {
 
     /// Every byte icon `spec` shows, as `(slot, index, bytes)`: tab icons
     /// (the unselected one — Kotlin's bottom bar has one icon per item),
-    /// action icons, the leading image and toolbar entry icons.
+    /// action icons, the leading image or icon and toolbar entry icons. Each
+    /// is an icon's bytes ([`TabIcon::bytes`]).
     fn wanted_icons(spec: &ChromeSpec) -> Vec<(i32, usize, &Arc<[u8]>)> {
         let mut wanted = Vec::new();
         for (i, tab) in spec.tabs.iter().enumerate() {
-            if let TabIcon::Bytes(bytes) = tab.icon() {
+            if let Some(bytes) = tab.icon().bytes() {
                 wanted.push((ICON_SLOT_TAB, i, bytes));
             }
         }
         if let Some(top) = &spec.top {
             for (a, action) in top.actions.iter().enumerate() {
-                if let Some(TabIcon::Bytes(bytes)) = &action.icon {
+                if let Some(bytes) = action.icon.as_ref().and_then(TabIcon::bytes) {
                     wanted.push((ICON_SLOT_ACTION, a, bytes));
                 }
             }
-            if let Leading::Image(bytes) = &top.leading {
+            let leading = match &top.leading {
+                Leading::Image(bytes) => Some(bytes),
+                Leading::Icon(icon) => icon.bytes(),
+                Leading::None | Leading::Back | Leading::Symbol(_) => None,
+            };
+            if let Some(bytes) = leading {
                 wanted.push((ICON_SLOT_LEADING, 0, bytes));
             }
         }
         let entries = spec.toolbar.iter().flat_map(ToolbarSpec::entries);
         for (t, entry) in entries.enumerate() {
-            if let Some(TabIcon::Bytes(bytes)) = &entry.icon {
+            if let Some(bytes) = entry.icon.as_ref().and_then(TabIcon::bytes) {
                 wanted.push((ICON_SLOT_TOOLBAR, t, bytes));
             }
         }
@@ -1355,17 +1576,21 @@ pub(crate) mod android_wire {
 //             none, "" = dot), tab<i>IconRev (0 = no icon)
 //   Selected: selectedIndex (-1 = none)
 //   TopBar:   hasTop          Title: title          Subtitle: subtitle (absent/null = none)
-//   Leading:  leading = "none" | "back" | "image"   LargeTitle: largeTitle (ignored here)
+//   Leading:  leading = "none" | "back" | "image" | "icon"   LargeTitle: largeTitle (true = collapsing bar)
 //   Actions:  actionCount, action<i>Title, action<i>HasIcon, action<i>MenuCount,
+//             action<i>Badge (absent/null = none, "" = dot), action<i>Prominent (absent = false),
 //             menu<i>_<j>Title, menu<i>_<j>Destructive, menu<i>_<j>Enabled,
 //             toolbarCount, toolbarPrimary (the last entry is the primary),
-//             toolbar<i>Title, toolbar<i>HasIcon, toolbar<i>MenuCount,
-//             toolbarMenu<i>_<j>Title, toolbarMenu<i>_<j>Destructive, toolbarMenu<i>_<j>Enabled
+//             toolbar<i>Title, toolbar<i>HasIcon, toolbar<i>MenuCount, toolbar<i>Badge, toolbar<i>Prominent,
+//             toolbarMenu<i>_<j>Title, toolbarMenu<i>_<j>Destructive, toolbarMenu<i>_<j>Enabled,
+//             toolbarStyle = "buttons" | "floating" (absent = "buttons"), toolbarPrimaryLabel (absent = false)
 //   Brightness: dark
+//   ActionBadges (apply only, never beside Actions): action<i>Badge and toolbar<i>Badge
+//             for every entry (null = none); the counts are unchanged
 "#;
 
         /// Every key template [`KOTLIN_KEY_HEADER`] names.
-        const KEY_TEMPLATES: [&str; 28] = [
+        const KEY_TEMPLATES: [&str; 34] = [
             "tabCount",
             "tab<i>Title",
             "tab<i>Enabled",
@@ -1381,6 +1606,8 @@ pub(crate) mod android_wire {
             "action<i>Title",
             "action<i>HasIcon",
             "action<i>MenuCount",
+            "action<i>Badge",
+            "action<i>Prominent",
             "menu<i>_<j>Title",
             "menu<i>_<j>Destructive",
             "menu<i>_<j>Enabled",
@@ -1389,9 +1616,13 @@ pub(crate) mod android_wire {
             "toolbar<i>Title",
             "toolbar<i>HasIcon",
             "toolbar<i>MenuCount",
+            "toolbar<i>Badge",
+            "toolbar<i>Prominent",
             "toolbarMenu<i>_<j>Title",
             "toolbarMenu<i>_<j>Destructive",
             "toolbarMenu<i>_<j>Enabled",
+            "toolbarStyle",
+            "toolbarPrimaryLabel",
             "dark",
             // Not a spec key: an apply's field list.
             "changed",
@@ -1401,10 +1632,11 @@ pub(crate) mod android_wire {
             Arc::from(content.to_vec().into_boxed_slice())
         }
 
-        /// A spec exercising every key: two tabs (one byte icon, one badge),
-        /// a top bar with an icon action and a two-item menu action, and a
-        /// toolbar with a menu item and a byte-icon primary.
-        fn full_spec() -> ChromeSpec {
+        /// A spec using none of the badge, prominent or symbol-with-bytes
+        /// API: two tabs (one byte icon, one badge), a top bar with an icon
+        /// action and a two-item menu action, and a toolbar with a menu item
+        /// and a byte-icon primary.
+        fn old_shape_spec() -> ChromeSpec {
             ChromeSpec {
                 tabs: vec![
                     TabItem::new("home", "Home", TabIcon::Bytes(bytes(&[1]))).badge("3"),
@@ -1439,6 +1671,21 @@ pub(crate) mod android_wire {
                 scroll: None,
                 dark: true,
             }
+        }
+
+        /// A spec exercising every key: [`old_shape_spec`] with a badged,
+        /// prominent top-bar action, a prominent toolbar item, a dot-badged
+        /// primary, the floating style and a labelled primary.
+        fn full_spec() -> ChromeSpec {
+            let mut spec = old_shape_spec();
+            let top = spec.top.as_mut().unwrap();
+            top.actions[0] = top.actions[0].clone().badge("4").prominent(true);
+            let toolbar = spec.toolbar.take().unwrap();
+            let mut toolbar = toolbar.style(ToolbarStyle::Floating).primary_label(true);
+            toolbar.items[0] = toolbar.items[0].clone().prominent(true);
+            toolbar.primary = toolbar.primary.take().map(|primary| primary.badge(""));
+            spec.toolbar = Some(toolbar);
+            spec
         }
 
         /// `key` with its first digit run spelled `<i>` and its second `<j>`.
@@ -1672,6 +1919,185 @@ pub(crate) mod android_wire {
             icons.clear();
             assert_eq!(icons.sync(&next).len(), 3, "a cleared table re-sends all");
         }
+
+        /// [`old_shape_spec`]'s install payload as the encoder wrote it
+        /// before the badge, prominent and symbol-with-bytes keys existed.
+        const OLD_SHAPE_INSTALL: &str = concat!(
+            r#"{"tabCount":2,"tab0Title":"Home","tab0Enabled":true,"tab0Badge":"3","#,
+            r#""tab0IconRev":1,"tab1Title":"Me","tab1Enabled":false,"tab1Badge":null,"#,
+            r#""tab1IconRev":0,"selectedIndex":1,"hasTop":true,"title":"Inbox","#,
+            r#""subtitle":"2 new","leading":"image","actionCount":2,"action0Title":"Add","#,
+            r#""action0HasIcon":true,"action0MenuCount":0,"action1Title":"More","#,
+            r#""action1HasIcon":false,"action1MenuCount":2,"menu1_0Title":"Share","#,
+            r#""menu1_0Destructive":false,"menu1_0Enabled":true,"menu1_1Title":"Delete","#,
+            r#""menu1_1Destructive":true,"menu1_1Enabled":false,"toolbarCount":2,"#,
+            r#""toolbarPrimary":true,"toolbar0Title":"Sort","toolbar0HasIcon":false,"#,
+            r#""toolbar0MenuCount":1,"toolbarMenu0_0Title":"Newest","#,
+            r#""toolbarMenu0_0Destructive":false,"toolbarMenu0_0Enabled":false,"#,
+            r#""toolbar1Title":"Comment","toolbar1HasIcon":true,"toolbar1MenuCount":0,"#,
+            r#""largeTitle":true,"dark":true}"#,
+        );
+
+        #[test]
+        fn a_spec_without_the_appended_api_encodes_byte_identically() {
+            let mut icons = IconTable::new();
+            icons.sync(&old_shape_spec());
+            assert_eq!(install_json(&old_shape_spec(), &icons), OLD_SHAPE_INSTALL);
+            let json = apply_json(&old_shape_spec(), &[ChromeField::Actions], &icons).unwrap();
+            for key in ["Badge", "Prominent"] {
+                assert!(!json_keys(&json).iter().any(|k| k.contains(key)), "{json}");
+            }
+        }
+
+        #[test]
+        fn the_appended_action_keys_round_trip() {
+            let mut icons = IconTable::new();
+            icons.sync(&full_spec());
+            let json = install_json(&full_spec(), &icons);
+            for needle in [
+                r#""action0MenuCount":0,"action0Badge":"4","action0Prominent":true,"#,
+                r#""toolbar0MenuCount":1,"toolbar0Prominent":true,"#,
+                r#""toolbar1MenuCount":0,"toolbar1Badge":"","#,
+                r#""toolbarStyle":"floating","toolbarPrimaryLabel":true,"largeTitle""#,
+            ] {
+                assert!(json.contains(needle), "{needle} missing from {json}");
+            }
+            assert!(!json.contains("action1Badge"), "an absent badge is no key");
+            assert!(!json.contains("action1Prominent"), "plain is no key");
+            // The old payload plus exactly the appended keys.
+            let old: BTreeSet<String> = json_keys(OLD_SHAPE_INSTALL).into_iter().collect();
+            let new: BTreeSet<String> = json_keys(&json).into_iter().collect();
+            let added: Vec<&String> = new.difference(&old).collect();
+            assert_eq!(
+                added,
+                [
+                    "action0Badge",
+                    "action0Prominent",
+                    "toolbar0Prominent",
+                    "toolbar1Badge",
+                    "toolbarPrimaryLabel",
+                    "toolbarStyle"
+                ]
+            );
+            assert!(old.is_subset(&new));
+        }
+
+        #[test]
+        fn the_toolbar_style_and_primary_label_keys_are_written_only_when_set() {
+            let icons = IconTable::new();
+            let with = |toolbar: ToolbarSpec| ChromeSpec {
+                toolbar: Some(toolbar),
+                ..old_shape_spec()
+            };
+            let base = old_shape_spec().toolbar.unwrap();
+            // The defaults spelled out encode exactly as the old shape.
+            let explicit = with(
+                base.clone()
+                    .style(ToolbarStyle::Buttons)
+                    .primary_label(false),
+            );
+            let mut synced = IconTable::new();
+            synced.sync(&explicit);
+            assert_eq!(install_json(&explicit, &synced), OLD_SHAPE_INSTALL);
+            // Each key alone, in the Actions group, after the entries.
+            let floating = with(base.clone().style(ToolbarStyle::Floating));
+            let json = apply_json(&floating, &[ChromeField::Actions], &icons).unwrap();
+            assert!(
+                json.ends_with(
+                    r#""toolbar1MenuCount":0,"toolbarStyle":"floating","changed":["Actions"]}"#
+                ),
+                "{json}"
+            );
+            assert!(!json.contains("toolbarPrimaryLabel"), "{json}");
+            let labelled = with(base.primary_label(true));
+            let json = apply_json(&labelled, &[ChromeField::Actions], &icons).unwrap();
+            assert!(
+                json.ends_with(
+                    r#""toolbar1MenuCount":0,"toolbarPrimaryLabel":true,"changed":["Actions"]}"#
+                ),
+                "{json}"
+            );
+            assert!(!json.contains("toolbarStyle"), "{json}");
+            assert_eq!(toolbar_style_name(ToolbarStyle::Buttons), "buttons");
+            assert_eq!(toolbar_style_name(ToolbarStyle::Floating), "floating");
+            // An absent toolbar writes neither.
+            let bare = install_json(&ChromeSpec::default(), &icons);
+            assert!(!bare.contains("toolbarStyle") && !bare.contains("toolbarPrimaryLabel"));
+        }
+
+        #[test]
+        fn a_badges_apply_carries_every_entrys_badge_and_nothing_else() {
+            let icons = IconTable::new();
+            let json = apply_json(&full_spec(), &[ChromeField::ActionBadges], &icons).unwrap();
+            assert_eq!(
+                json,
+                concat!(
+                    r#"{"action0Badge":"4","action1Badge":null,"toolbar0Badge":null,"#,
+                    r#""toolbar1Badge":"","changed":["ActionBadges"]}"#
+                )
+            );
+            assert!(
+                json_keys(&json)
+                    .iter()
+                    .all(|key| names(KOTLIN_KEY_HEADER, &template(key)) || key == "changed")
+            );
+            // Beside a rebuild it is dropped: the rebuild carries the badges.
+            assert_eq!(
+                wire_fields(&[ChromeField::Actions, ChromeField::ActionBadges]),
+                [ChromeField::Actions]
+            );
+            assert_eq!(
+                wire_fields(&[ChromeField::Title, ChromeField::ActionBadges]),
+                [ChromeField::Title, ChromeField::ActionBadges]
+            );
+            assert_eq!(field_name(ChromeField::ActionBadges), "ActionBadges");
+        }
+
+        #[test]
+        fn symbol_with_bytes_icons_send_their_bytes_and_a_leading_icon_encodes_icon() {
+            let mut spec = old_shape_spec();
+            spec.tabs[1] = TabItem::new(
+                "me",
+                "Me",
+                TabIcon::apple_symbol_with_bytes("person", bytes(&[8])),
+            );
+            let top = spec.top.as_mut().unwrap();
+            top.actions[1] = top.actions[1]
+                .clone()
+                .icon(TabIcon::apple_symbol_with_bytes("ellipsis", bytes(&[3])));
+            top.leading = Leading::Icon(TabIcon::apple_symbol_with_bytes("bell", bytes(&[6])));
+            let mut icons = IconTable::new();
+            let uploads: Vec<(i32, usize)> = icons
+                .sync(&spec)
+                .iter()
+                .map(|up| (up.slot, up.index))
+                .collect();
+            assert_eq!(
+                uploads,
+                [
+                    (ICON_SLOT_TAB, 0),
+                    (ICON_SLOT_TAB, 1),
+                    (ICON_SLOT_ACTION, 0),
+                    (ICON_SLOT_ACTION, 1),
+                    (ICON_SLOT_LEADING, 0),
+                    (ICON_SLOT_TOOLBAR, 1),
+                ]
+            );
+            let json = install_json(&spec, &icons);
+            for needle in [
+                r#""tab1IconRev":2"#,
+                r#""action1HasIcon":true"#,
+                r#""leading":"icon""#,
+            ] {
+                assert!(json.contains(needle), "{needle} missing from {json}");
+            }
+            let symbol_only = Leading::Icon(TabIcon::AppleSymbol("bell".into()));
+            assert_eq!(leading_name(&symbol_only), "none");
+            assert_eq!(
+                leading_name(&Leading::Icon(TabIcon::Bytes(bytes(&[1])))),
+                "icon"
+            );
+        }
     }
 }
 
@@ -1807,7 +2233,7 @@ mod tests {
     fn every_field_is_reported_on_its_own() {
         let base = spec();
         type Edit = (ChromeField, fn(&mut ChromeSpec));
-        let edits: [Edit; 9] = [
+        let edits: [Edit; 10] = [
             (ChromeField::Tabs, |s| s.tabs.truncate(1)),
             (ChromeField::Selected, |s| s.selected = None),
             (ChromeField::Title, |s| {
@@ -1829,6 +2255,10 @@ mod tests {
                 s.scroll = Some(ScrollState::default())
             }),
             (ChromeField::Brightness, |s| s.dark = !s.dark),
+            (ChromeField::ActionBadges, |s| {
+                let actions = &mut s.top.as_mut().unwrap().actions;
+                actions[0] = actions[0].clone().badge("2");
+            }),
         ];
         for (field, edit) in edits {
             let mut next = base.clone();
@@ -1864,6 +2294,33 @@ mod tests {
                 ChromeField::Brightness
             ]
         );
+    }
+
+    #[test]
+    fn a_toolbar_style_or_primary_label_change_is_an_actions_change() {
+        let shown = with_toolbar();
+        let restyle = |change: fn(ToolbarSpec) -> ToolbarSpec| {
+            let mut new = shown.clone();
+            new.toolbar = new.toolbar.take().map(change);
+            diff_specs(&shown, &new).changed
+        };
+        assert_eq!(
+            restyle(|t| t.style(ToolbarStyle::Floating)),
+            [ChromeField::Actions],
+            "a style change rebuilds the toolbar"
+        );
+        assert_eq!(
+            restyle(|t| t.primary_label(true)),
+            [ChromeField::Actions],
+            "a primary-label change rebuilds the toolbar"
+        );
+        assert!(restyle(|t| t.style(ToolbarStyle::Buttons)).is_empty());
+        // Beside a badge change it is still a rebuild, which carries the badge.
+        let mut both = shown.clone();
+        let mut toolbar = both.toolbar.take().unwrap().style(ToolbarStyle::Floating);
+        toolbar.items[0] = toolbar.items[0].clone().badge("1");
+        both.toolbar = Some(toolbar);
+        assert_eq!(diff_specs(&shown, &both).changed, [ChromeField::Actions]);
     }
 
     #[test]
@@ -1908,6 +2365,116 @@ mod tests {
                 spec: shown,
             }]
         );
+    }
+
+    #[test]
+    fn a_badge_change_is_an_in_place_item_update_not_a_rebuild() {
+        let base = with_toolbar();
+        let badged = |spec: &ChromeSpec, badge: &str| {
+            let mut next = spec.clone();
+            let actions = &mut next.top.as_mut().unwrap().actions;
+            actions[1] = actions[1].clone().badge(badge);
+            next
+        };
+        let top = badged(&base, "3");
+        assert_eq!(diff_specs(&base, &top).changed, [ChromeField::ActionBadges]);
+        assert_eq!(
+            diff_specs(&top, &badged(&base, "")).changed,
+            [ChromeField::ActionBadges],
+            "a count becoming a dot"
+        );
+        assert_eq!(
+            diff_specs(&top, &base).changed,
+            [ChromeField::ActionBadges],
+            "a badge going away"
+        );
+        let mut toolbar = base.clone();
+        let entries = toolbar.toolbar.as_mut().unwrap();
+        entries.primary = entries.primary.take().map(|primary| primary.badge("9"));
+        assert_eq!(
+            diff_specs(&base, &toolbar).changed,
+            [ChromeField::ActionBadges],
+            "a toolbar entry's badge alone"
+        );
+        let mut both = toolbar.clone();
+        both.top.as_mut().unwrap().title.push('!');
+        both.dark = !both.dark;
+        assert_eq!(
+            diff_specs(&top, &both).changed,
+            [
+                ChromeField::Title,
+                ChromeField::Brightness,
+                ChromeField::ActionBadges
+            ]
+        );
+        // Anything beyond a badge rebuilds, and the rebuild carries the badges.
+        let mut prominent = top.clone();
+        let actions = &mut prominent.top.as_mut().unwrap().actions;
+        actions[0] = actions[0].clone().prominent(true);
+        assert_eq!(
+            diff_specs(&base, &prominent).changed,
+            [ChromeField::Actions]
+        );
+        let mut reordered = badged(&base, "3");
+        reordered.top.as_mut().unwrap().actions.reverse();
+        assert_eq!(
+            diff_specs(&base, &reordered).changed,
+            [ChromeField::Actions]
+        );
+        let mut moved = toolbar.clone();
+        let entries = moved.toolbar.as_mut().unwrap();
+        let primary = entries.primary.take().unwrap();
+        entries.items.push(primary);
+        assert_eq!(
+            diff_specs(&base, &moved).changed,
+            [ChromeField::Actions],
+            "a primary turned item is a rebuild"
+        );
+        let mut rebuilt_toolbar = top.clone();
+        rebuilt_toolbar.toolbar = None;
+        assert_eq!(
+            diff_specs(&base, &rebuilt_toolbar).changed,
+            [ChromeField::Actions],
+            "a top-bar badge beside a toolbar rebuild is carried by the rebuild"
+        );
+
+        let mut slot = slot();
+        let generation = slot.publish(None, base).generation().unwrap();
+        slot.host_mut().take_calls();
+        assert_eq!(
+            slot.publish(Some(generation), top.clone()),
+            PublishOutcome::Applied(generation)
+        );
+        assert_eq!(
+            slot.host_mut().take_calls(),
+            [HostCall::Apply {
+                changed: vec![ChromeField::ActionBadges],
+                spec: top.clone(),
+            }]
+        );
+        assert_eq!(
+            slot.publish(Some(generation), top),
+            PublishOutcome::Unchanged(generation)
+        );
+    }
+
+    #[test]
+    fn badges_and_prominence_do_not_change_what_an_action_reports() {
+        let mut spec = with_toolbar();
+        let actions = &mut spec.top.as_mut().unwrap().actions;
+        actions[0] = actions[0].clone().badge("").prominent(true);
+        for event in [
+            ChromeEvent::ActionTapped(ActionId::new("add")),
+            ChromeEvent::MenuItemChosen(ActionId::new("more"), MenuItemId::new("share")),
+        ] {
+            let (kind, detail) = encode_event(&spec, &event).expect("encodable");
+            assert_eq!(decode_event(&spec, kind, detail), Some(event));
+        }
+        let item = ActionItem::new("bell", "Bell");
+        assert!(item.same_but_badge(&item.clone().badge("1")));
+        assert!(!item.same_but_badge(&item.clone().prominent(true)));
+        assert_eq!(item.badge, None);
+        assert!(!item.prominent);
     }
 
     #[test]

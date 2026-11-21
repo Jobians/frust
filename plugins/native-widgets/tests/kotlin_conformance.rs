@@ -99,9 +99,15 @@
 //! copy of the header's JSON key table `src/chrome/mod.rs`'s encoder tests
 //! round-trip against is still verbatim; and
 //! [`chrome_changed_field_spellings_match_between_kotlin_and_rust`] that
-//! Kotlin's `FIELD_*` constants spell the ten `ChromeField`s exactly as
+//! Kotlin's `FIELD_*` constants spell the eleven `ChromeField`s exactly as
 //! `android_wire::field_name` does, are the only place Kotlin spells them, and
-//! that Kotlin's `INSTALL_FIELDS` names `android_wire::INSTALL_FIELDS`.
+//! that Kotlin's `INSTALL_FIELDS` names `android_wire::INSTALL_FIELDS`; and
+//! [`chrome_leading_spellings_match_between_kotlin_and_rust`] that Kotlin's
+//! `LEADING_*` constants are exactly the `leading` values
+//! `android_wire::leading_name` writes; and
+//! [`chrome_toolbar_style_spellings_match_between_kotlin_and_rust`] the same
+//! for the `TOOLBAR_STYLE_*` constants and `android_wire::toolbar_style_name`,
+//! with both appended toolbar keys read under the spelling Rust writes.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -970,8 +976,8 @@ fn chrome_changed_field_spellings_match_between_kotlin_and_rust() {
     let arms = rust_field_name_arms(&rust);
     assert_eq!(
         arms.len(),
-        10,
-        "{RUST_CHROME_MOD_PATH}'s field_name should spell all ten ChromeFields: {arms:?}"
+        11,
+        "{RUST_CHROME_MOD_PATH}'s field_name should spell all eleven ChromeFields: {arms:?}"
     );
     for (variant, spelling) in &arms {
         assert_eq!(
@@ -1033,5 +1039,191 @@ fn chrome_changed_field_spellings_match_between_kotlin_and_rust() {
     assert_eq!(
         kotlin_install, rust_install,
         "{KOTLIN_CHROME_PATH}'s INSTALL_FIELDS drifted from {RUST_CHROME_MOD_PATH}'s"
+    );
+}
+
+/// Every string literal in `text`, in order (no escapes in these bodies).
+fn quoted_strings(text: &str) -> Vec<String> {
+    text.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn chrome_leading_spellings_match_between_kotlin_and_rust() {
+    let kotlin = read(KOTLIN_CHROME_PATH);
+    let rust = read(RUST_CHROME_MOD_PATH);
+
+    let mut kotlin_values: Vec<String> = kotlin
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("private const val LEADING_"))
+        .filter_map(|rest| rest.split_once('=').map(|(_, value)| value))
+        .flat_map(quoted_strings)
+        .collect();
+    // `leading_name` sits inside the indented `android_wire` module.
+    let body = rust
+        .split_once("fn leading_name(")
+        .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("no `fn leading_name(` body found in {RUST_CHROME_MOD_PATH}"));
+    let mut rust_values: Vec<String> = body
+        .lines()
+        .filter(|line| line.contains("=>"))
+        .flat_map(|line| quoted_strings(line.split_once("=>").map_or("", |(_, value)| value)))
+        .collect();
+    kotlin_values.sort();
+    rust_values.sort();
+    rust_values.dedup();
+    assert_eq!(
+        kotlin_values,
+        ["back", "icon", "image", "none"],
+        "{KOTLIN_CHROME_PATH}'s LEADING_* constants"
+    );
+    assert_eq!(
+        kotlin_values, rust_values,
+        "{KOTLIN_CHROME_PATH}'s LEADING_* constants drifted from {RUST_CHROME_MOD_PATH}'s \
+         leading_name — a leading item Kotlin does not know shows nothing"
+    );
+}
+
+#[test]
+fn chrome_toolbar_style_spellings_match_between_kotlin_and_rust() {
+    let kotlin = read(KOTLIN_CHROME_PATH);
+    let rust = read(RUST_CHROME_MOD_PATH);
+
+    let mut kotlin_values: Vec<String> = kotlin
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("private const val TOOLBAR_STYLE_"))
+        .filter_map(|rest| rest.split_once('=').map(|(_, value)| value))
+        .flat_map(quoted_strings)
+        .collect();
+    // `toolbar_style_name` sits inside the indented `android_wire` module.
+    let body = rust
+        .split_once("fn toolbar_style_name(")
+        .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| {
+            panic!("no `fn toolbar_style_name(` body found in {RUST_CHROME_MOD_PATH}")
+        });
+    let mut rust_values: Vec<String> = body
+        .lines()
+        .filter(|line| line.contains("=>"))
+        .flat_map(|line| quoted_strings(line.split_once("=>").map_or("", |(_, value)| value)))
+        .collect();
+    kotlin_values.sort();
+    rust_values.sort();
+    assert_eq!(
+        kotlin_values,
+        ["buttons", "floating"],
+        "{KOTLIN_CHROME_PATH}'s TOOLBAR_STYLE_* constants"
+    );
+    assert_eq!(
+        kotlin_values, rust_values,
+        "{KOTLIN_CHROME_PATH}'s TOOLBAR_STYLE_* constants drifted from {RUST_CHROME_MOD_PATH}'s \
+         toolbar_style_name — a style Kotlin does not know shows as buttons"
+    );
+    // Both appended keys are read by Kotlin under the spelling Rust writes.
+    for (reader, key) in [
+        ("json.optString(", "\"toolbarStyle\""),
+        ("json.optBoolean(", "\"toolbarPrimaryLabel\""),
+    ] {
+        assert!(
+            kotlin.contains(&format!("{reader}{key}")),
+            "{KOTLIN_CHROME_PATH} never reads {key} with {reader}"
+        );
+        assert!(
+            rust.contains(&format!("{key}.into()")),
+            "{RUST_CHROME_MOD_PATH} never writes {key}"
+        );
+    }
+}
+
+// --- the button style twins --------------------------------------------------
+
+/// `plugins/native-widgets/src/controls/button.rs`: `ButtonStyle::wire` and the
+/// `BUTTON_STYLE` key.
+const RUST_BUTTON_PATH: &str = "plugins/native-widgets/src/controls/button.rs";
+
+#[test]
+fn button_style_wire_values_match_between_kotlin_and_rust() {
+    let kotlin = read(KOTLIN_FACTORY_PATH);
+    let rust = read(RUST_BUTTON_PATH);
+
+    // `private const val BUTTON_STYLE_<NAME> = <n>`, NAME in SCREAMING_SNAKE.
+    let mut kotlin_values: Vec<(String, i64)> = kotlin
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("private const val BUTTON_STYLE_"))
+        .filter_map(|rest| rest.split_once('='))
+        .map(|(name, value)| {
+            let value = value.trim().parse().unwrap_or_else(|e| {
+                panic!("parsing BUTTON_STYLE_{name}= {value} in {KOTLIN_FACTORY_PATH}: {e}")
+            });
+            (name.trim().replace('_', "").to_lowercase(), value)
+        })
+        .collect();
+
+    // `Self::<Variant> => <n>,` inside `fn wire(`.
+    let body = rust
+        .split_once("pub(crate) fn wire(self) -> i64 {")
+        .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("no `fn wire(self) -> i64` body found in {RUST_BUTTON_PATH}"));
+    let mut rust_values: Vec<(String, i64)> = body
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("Self::"))
+        .filter_map(|rest| rest.split_once("=>"))
+        .map(|(name, value)| {
+            let value = value
+                .trim()
+                .trim_end_matches(',')
+                .parse()
+                .unwrap_or_else(|e| {
+                    panic!("parsing `{name} => {value}` in {RUST_BUTTON_PATH}: {e}")
+                });
+            (name.trim().to_lowercase(), value)
+        })
+        .collect();
+
+    kotlin_values.sort();
+    rust_values.sort();
+    assert_eq!(
+        rust_values,
+        [
+            ("destructive".to_string(), 2),
+            ("glass".to_string(), 3),
+            ("plain".to_string(), 0),
+            ("prominent".to_string(), 1),
+            ("prominentglass".to_string(), 4),
+        ],
+        "{RUST_BUTTON_PATH}'s ButtonStyle wire values are append-only"
+    );
+    assert_eq!(
+        kotlin_values, rust_values,
+        "{KOTLIN_FACTORY_PATH}'s BUTTON_STYLE_* constants drifted from {RUST_BUTTON_PATH}'s \
+         ButtonStyle::wire"
+    );
+    for helper in [
+        "buttonCreate",
+        "buttonSetStyle",
+        "buttonSetThemedBackground",
+    ] {
+        assert!(
+            kotlin.contains(&format!("fun {helper}(")),
+            "{KOTLIN_FACTORY_PATH} lost the button helper {helper} the Android arm calls"
+        );
+        assert!(
+            rust.contains(&format!("jni_str!(\"{helper}\")")),
+            "{RUST_BUTTON_PATH} no longer calls the Kotlin button helper {helper}"
+        );
+    }
+    assert!(
+        rust.contains("\"buttonStyle\""),
+        "{RUST_BUTTON_PATH} lost the `buttonStyle` wire key"
     );
 }

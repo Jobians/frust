@@ -638,11 +638,56 @@ impl ParamsBody {
 // Button
 // ============================================================================
 
+/// How a [`NativeButtonView`] presents itself — set with
+/// [`NativeButtonView::style`].
+///
+/// | Style | Android | iOS | macOS |
+/// |---|---|---|---|
+/// | `Plain` | Material text button | system button | push button |
+/// | `Prominent` | filled button | filled configuration | accent-tinted push button |
+/// | `Destructive` | filled, error colour | filled, system red | red push button, destructive flag |
+/// | `Glass` | tonal button | glass configuration (iOS 26; plain before) | push button |
+/// | `ProminentGlass` | filled button | prominent glass (iOS 26; filled before) | accent-tinted push button |
+///
+/// A non-`Plain` style leaves the fill and caption colour to the platform
+/// style instead of folding the app theme's accent into them; `Plain` keeps
+/// the themed look. A style change on a live button is an update, never a
+/// remount.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NativeButtonStyle {
+    /// The ordinary platform button — the default.
+    #[default]
+    Plain,
+    /// A filled, primary-emphasis button.
+    Prominent,
+    /// A filled button in the platform's destructive colour.
+    Destructive,
+    /// The translucent glass button (iOS 26); tonal on Android.
+    Glass,
+    /// The prominent glass button (iOS 26); filled on Android.
+    ProminentGlass,
+}
+
+impl NativeButtonStyle {
+    /// The control layer's mirror of this style.
+    fn control_style(self) -> button::ButtonStyle {
+        match self {
+            Self::Plain => button::ButtonStyle::Plain,
+            Self::Prominent => button::ButtonStyle::Prominent,
+            Self::Destructive => button::ButtonStyle::Destructive,
+            Self::Glass => button::ButtonStyle::Glass,
+            Self::ProminentGlass => button::ButtonStyle::ProminentGlass,
+        }
+    }
+}
+
 /// A real `android.widget.Button` rendered from pure Rust — see the
 /// [module docs](self). Build one with [`native_button`].
 #[derive(Clone)]
 pub struct NativeButtonView {
     text: String,
+    style: NativeButtonStyle,
     enabled: bool,
     content_description: Option<String>,
     size: Option<(f64, f64)>,
@@ -653,6 +698,7 @@ pub struct NativeButtonView {
 pub fn native_button(text: impl Into<String>) -> NativeButtonView {
     NativeButtonView {
         text: text.into(),
+        style: NativeButtonStyle::Plain,
         enabled: true,
         content_description: None,
         size: None,
@@ -661,6 +707,14 @@ pub fn native_button(text: impl Into<String>) -> NativeButtonView {
 }
 
 impl NativeButtonView {
+    /// The button's [`NativeButtonStyle`] — default
+    /// [`Plain`](NativeButtonStyle::Plain). Changing it on a live button
+    /// restyles it in place.
+    pub fn style(mut self, style: NativeButtonStyle) -> Self {
+        self.style = style;
+        self
+    }
+
     /// `View.setEnabled` — default `true`.
     pub fn enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
@@ -700,10 +754,19 @@ impl NativeButtonView {
         body.push_raw(ENABLED, self.enabled);
         body.push_opt_str(CONTENT_DESCRIPTION, self.content_description.as_deref());
         body.push_raw(DARK, tokens.is_some_and(|t| t.dark));
+        // Plain is the absent key, so a default button's payload is unchanged.
+        let style = self.style.control_style();
+        if style != button::ButtonStyle::Plain {
+            body.push_raw(button::BUTTON_STYLE, style.wire());
+        }
         if let Some(t) = tokens {
-            body.push_raw(TEXT_COLOR, t.on_accent_fill);
-            body.push_raw(BACKGROUND_COLOR, t.accent_fill);
-            body.push_raw(CORNER_RADIUS_DP, t.corner_radius_dp);
+            // A styled button wears the platform's own style, not the theme's
+            // accent fill.
+            if style == button::ButtonStyle::Plain {
+                body.push_raw(TEXT_COLOR, t.on_accent_fill);
+                body.push_raw(BACKGROUND_COLOR, t.accent_fill);
+                body.push_raw(CORNER_RADIUS_DP, t.corner_radius_dp);
+            }
             body.push_raw(TEXT_SIZE_SP, t.button_text_size_sp);
             body.push_str(TYPEFACE, t.button_typeface.wire());
         }
@@ -2076,9 +2139,9 @@ impl std::fmt::Display for TabId {
     }
 }
 
-/// A tab's icon: encoded image bytes, or an Apple SF Symbol name — never an
-/// arbitrary string passed off as a cross-platform icon (the bar is
-/// iOS-only, and a symbol name means nothing anywhere else).
+/// A tab's icon: encoded image bytes, an Apple SF Symbol name, or both —
+/// never an arbitrary string passed off as a cross-platform icon (a symbol
+/// name means nothing outside Apple platforms).
 #[derive(Clone, Debug, PartialEq)]
 pub enum TabIcon {
     /// Encoded image bytes (PNG/JPEG — whatever `UIImage` decodes), shown as
@@ -2087,8 +2150,48 @@ pub enum TabIcon {
     Bytes(Arc<[u8]>),
     /// An SF Symbol name (`"house"`, `"gearshape.fill"`) —
     /// `UIImage.systemImageNamed:`, sized by the bar itself. An unknown name
-    /// shows the title alone (logged once).
+    /// shows the title alone (logged once). Apple-only: Android and the
+    /// frust-drawn chrome have no symbol by name.
     AppleSymbol(String),
+    /// An SF Symbol for Apple platforms and encoded image `bytes` (as
+    /// [`Self::Bytes`]) for the rest: the app chrome's iOS arm shows the
+    /// symbol (falling back to the bytes for a name it does not know), its
+    /// Android arm and the frust-drawn chrome the bytes. The bare
+    /// [`native_tab_bar`] is iOS-only and shows the symbol.
+    AppleSymbolWithBytes {
+        /// The SF Symbol name, as in [`Self::AppleSymbol`].
+        symbol: String,
+        /// The image every platform without SF Symbols shows.
+        bytes: Arc<[u8]>,
+    },
+}
+
+impl TabIcon {
+    /// An icon that is the SF Symbol `symbol` on Apple platforms and the
+    /// encoded image `bytes` everywhere else
+    /// ([`Self::AppleSymbolWithBytes`]).
+    pub fn apple_symbol_with_bytes(symbol: impl Into<String>, bytes: Arc<[u8]>) -> Self {
+        Self::AppleSymbolWithBytes {
+            symbol: symbol.into(),
+            bytes,
+        }
+    }
+
+    /// The SF Symbol name this icon carries, if any.
+    pub(crate) fn symbol(&self) -> Option<&str> {
+        match self {
+            Self::AppleSymbol(symbol) | Self::AppleSymbolWithBytes { symbol, .. } => Some(symbol),
+            Self::Bytes(_) => None,
+        }
+    }
+
+    /// The encoded image bytes a platform without SF Symbols shows, if any.
+    pub(crate) fn bytes(&self) -> Option<&Arc<[u8]>> {
+        match self {
+            Self::Bytes(bytes) | Self::AppleSymbolWithBytes { bytes, .. } => Some(bytes),
+            Self::AppleSymbol(_) => None,
+        }
+    }
 }
 
 /// One tab of a [`native_tab_bar`]: a stable [`TabId`], a title, an icon,
@@ -2171,13 +2274,12 @@ impl TabItem {
 /// The SF Symbol name one icon slot carries on the wire (byte icons ride
 /// the side table instead — `crate::controls::tab_bar`'s module doc).
 fn symbol_name(icon: Option<&TabIcon>) -> Option<&str> {
-    match icon {
-        Some(TabIcon::AppleSymbol(name)) => Some(name),
-        _ => None,
-    }
+    icon.and_then(TabIcon::symbol)
 }
 
-/// The encoded bytes one icon slot publishes, if it is a byte icon.
+/// The encoded bytes one icon slot publishes, if it is a byte icon. A
+/// symbol-with-bytes icon publishes none: the bar is iOS-only and shows its
+/// symbol.
 fn icon_bytes(icon: Option<&TabIcon>) -> Option<Arc<[u8]>> {
     match icon {
         Some(TabIcon::Bytes(bytes)) => Some(Arc::clone(bytes)),
@@ -2824,6 +2926,148 @@ mod tests {
     }
 
     #[test]
+    fn a_default_button_style_leaves_the_payload_unchanged() {
+        let plain = native_button("Save");
+        assert_eq!(
+            plain.params_for(7, None),
+            native_button("Save")
+                .style(NativeButtonStyle::Plain)
+                .params_for(7, None)
+        );
+        assert!(!plain.params_for(7, None).contains("buttonStyle"));
+        assert_eq!(NativeButtonStyle::default(), NativeButtonStyle::Plain);
+    }
+
+    #[test]
+    fn each_button_style_encodes_its_wire_value_and_decodes_back() {
+        use crate::controls::button::{ButtonProps, ButtonStyle};
+        let cases = [
+            (NativeButtonStyle::Prominent, 1, ButtonStyle::Prominent),
+            (NativeButtonStyle::Destructive, 2, ButtonStyle::Destructive),
+            (NativeButtonStyle::Glass, 3, ButtonStyle::Glass),
+            (
+                NativeButtonStyle::ProminentGlass,
+                4,
+                ButtonStyle::ProminentGlass,
+            ),
+        ];
+        for (public, wire, control) in cases {
+            let params = native_button("Go").style(public).params_for(7, None);
+            assert!(
+                params.contains(&format!("\"buttonStyle\":{wire}")),
+                "{params}"
+            );
+            let props = ButtonProps::decode(&crate::runtime::Params::new(&params)).unwrap();
+            assert_eq!(props.style, control);
+        }
+    }
+
+    #[test]
+    fn a_styled_button_drops_the_theme_fill_but_keeps_the_text_size() {
+        let tokens = dark_tokens();
+        let plain = native_button("Go").params_for(7, Some(tokens));
+        let styled = native_button("Go")
+            .style(NativeButtonStyle::Prominent)
+            .params_for(7, Some(tokens));
+        assert!(plain.contains("backgroundColor") && plain.contains("cornerRadiusDp"));
+        assert!(!styled.contains("backgroundColor"));
+        assert!(!styled.contains("cornerRadiusDp"));
+        assert!(!styled.contains("\"textColor\""));
+        assert!(styled.contains("textSizeSp"));
+    }
+
+    #[test]
+    fn a_button_style_change_keeps_the_slot_and_is_an_update() {
+        use crate::controls::button::ButtonProps;
+        let a = native_button("Go").style(NativeButtonStyle::Prominent);
+        let b = native_button("Go").style(NativeButtonStyle::Destructive);
+        let old =
+            ButtonProps::decode(&crate::runtime::Params::new(&a.params_for(7, None))).unwrap();
+        let new =
+            ButtonProps::decode(&crate::runtime::Params::new(&b.params_for(7, None))).unwrap();
+        assert_eq!(old.slot, new.slot);
+        assert!(ButtonProps::style_change(&old, &new).is_some());
+    }
+
+    #[test]
+    fn a_themed_button_restyled_away_from_plain_and_back_matches_a_fresh_one() {
+        use crate::controls::Setter;
+        use crate::controls::button::{ButtonProps, ButtonStyle, Restyle};
+        use crate::controls::typeface::Typeface;
+        // A Glyph face, so the face is a planned look field too.
+        let tokens = ResolvedTheme {
+            button_typeface: Typeface::GlyphMono,
+            ..dark_tokens()
+        };
+        let decode = |view: NativeButtonView| {
+            ButtonProps::decode(&crate::runtime::Params::new(
+                &view.params_for(7, Some(tokens)),
+            ))
+            .unwrap()
+        };
+        let plain = decode(native_button("Go"));
+        let prominent = decode(native_button("Go").style(NativeButtonStyle::Prominent));
+        let fill = plain.background_color.expect("the theme fill");
+        let radius_dp = plain.corner_radius_dp.expect("the theme radius");
+        let caption = plain.text_color.expect("the theme caption colour");
+        let size = plain.text_size_sp.expect("the theme text size");
+        let face = plain.typeface;
+        assert_eq!(face, Typeface::GlyphMono);
+        fn update<'a>(
+            old: &ButtonProps,
+            new: &'a ButtonProps,
+        ) -> (Option<Restyle>, Vec<Setter<'a>>) {
+            (
+                ButtonProps::style_change(old, new),
+                ButtonProps::plan(old, new),
+            )
+        }
+        fn fresh(props: &ButtonProps) -> (Option<Restyle>, Vec<Setter<'_>>) {
+            update(&ButtonProps::platform_default(props.slot), props)
+        }
+
+        // Plain -> Prominent: the restyle clears the theme fill, radius and
+        // caption colour; nothing re-applies them, only the size and face.
+        let (restyle, plan) = update(&plain, &prominent);
+        assert_eq!(
+            restyle,
+            Some(Restyle {
+                style: ButtonStyle::Prominent,
+                clear_background: true,
+                clear_text_color: true,
+            })
+        );
+        assert_eq!(plan, vec![Setter::TextSizeSp(size), Setter::Typeface(face)]);
+        let (fresh_restyle, fresh_plan) = fresh(&prominent);
+        assert_eq!(restyle.map(|r| r.style), fresh_restyle.map(|r| r.style));
+        assert_eq!(plan, fresh_plan[1..], "all but the caption, as on create");
+
+        // Prominent -> Plain: back to the platform's plain style, then the
+        // theme fill, radius, caption colour, size and face again.
+        let (restyle, plan) = update(&prominent, &plain);
+        assert_eq!(
+            restyle,
+            Some(Restyle {
+                style: ButtonStyle::Plain,
+                clear_background: false,
+                clear_text_color: false,
+            })
+        );
+        assert_eq!(
+            plan,
+            vec![
+                Setter::TextColor(caption),
+                Setter::ThemedBackground { fill, radius_dp },
+                Setter::TextSizeSp(size),
+                Setter::Typeface(face),
+            ]
+        );
+        let (fresh_restyle, fresh_plan) = fresh(&plain);
+        assert_eq!(fresh_restyle, None, "plain is the fresh button's style");
+        assert_eq!(plan, fresh_plan[1..], "all but the caption, as on create");
+    }
+
+    #[test]
     fn label_params_snapshot() {
         let view = native_label("42 fps");
         assert_eq!(
@@ -3281,6 +3525,26 @@ mod tests {
         assert_eq!(props.unselected_tint, Some(dark_tokens().muted as i32));
         assert_eq!(props.background, Some(dark_tokens().surface_bg as i32));
         tab_bar::retire_icon_bytes(slot);
+    }
+
+    #[test]
+    fn a_symbol_with_bytes_icon_is_its_symbol_on_the_bare_tab_bar() {
+        let bytes: Arc<[u8]> = Arc::from(vec![4u8, 2].into_boxed_slice());
+        let icon = TabIcon::apple_symbol_with_bytes("bell", Arc::clone(&bytes));
+        assert_eq!(icon.symbol(), Some("bell"));
+        assert_eq!(icon.bytes(), Some(&bytes));
+        assert_eq!(symbol("gear").bytes(), None);
+        assert_eq!(TabIcon::Bytes(Arc::clone(&bytes)).symbol(), None);
+        let view = native_tab_bar(vec![TabItem::new("a", "A", icon)], "a");
+        assert!(
+            view.params_for(8, None, 0)
+                .contains("\"tab0Symbol\":\"bell\"")
+        );
+        assert_eq!(
+            view.icon_bytes()[0].icon,
+            None,
+            "the iOS bar shows the symbol"
+        );
     }
 
     #[test]

@@ -588,9 +588,10 @@ jobs:
         env:
           BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
         run: |
-          # Every plugin's Android module, the embedding, the app template, the plugin
+          # Every plugin's Android module (a wildcard pathspec matches the whole path, so it
+          # needs the trailing /*), the embedding, the app template, the plugin
           # add engine and the scaffold that write the app's Android files, and the script.
-          paths=('plugins/*/platform/android' crates/frust-shell-android/platform crates/frust-drive/templates/app/android.tmpl crates/frust-drive/src/plugin crates/frust-drive/src/scaffold scripts/ci/kotlin-compile.sh)
+          paths=('plugins/*/platform/android/*' crates/frust-shell-android/platform crates/frust-drive/templates/app/android.tmpl crates/frust-drive/src/plugin crates/frust-drive/src/scaffold scripts/ci/kotlin-compile.sh)
           # An unusable base (a new branch's all-zero `before`) runs the leg.
           if changed="$(git diff --name-only "$BASE" HEAD -- "${paths[@]}" 2>/dev/null)" && [ -z "$changed" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
