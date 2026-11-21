@@ -7,50 +7,21 @@
 //! [`navigator`](super::navigator)'s module docs; this file holds only the
 //! thread-locals, their drop guards, and the scope/read helpers.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
+
+use crate::thread_state;
 
 // --- Back reach: the ambient "is the hosting page input-routed?" seam --------
 
-thread_local! {
-    /// The stack of per-page **back-reach** cells for the page builders currently
-    /// on the call stack — the ambient seam a *nested* navigator learns its
-    /// hosting page's input reachability through (rule **R23**: navigator reach
-    /// follows input routing, exactly).
-    ///
-    /// A navigator pushes the reach cell of the page whose builder / reconcile it
-    /// is about to run ([`with_page_reach`]) and pops it again afterwards, so any
-    /// navigator built anywhere inside that page's subtree — at any depth, through
-    /// any container — reads it with [`ambient_page_reach`]. A stack rather than a
-    /// single slot because navigators nest: each level restores its parent's cell.
-    ///
-    /// Reactive-free by construction (`frust-widgets` carries no `reactive_graph`
-    /// dependency): a plain `Rc<Cell<bool>>`, the same idiom as `depth`/
-    /// `back_interest`/`transition`, never a signal. UI-thread-affine for the same
-    /// reason those are — the cells are `Rc`-backed and only ever touched from a
-    /// build pass.
-    ///
-    /// Two widgets install reach cells. The navigator installs one per page.
-    /// [`IndexedStack`](crate::IndexedStack) is the second installer: it keeps
-    /// every child mounted but routes input to the selected one only, so it
-    /// installs one cell per child, `true` only for the selected child, and
-    /// only while the stack's own ambient parent cell (if any) is `true`. A
-    /// navigator nested in an unselected child therefore claims no back press,
-    /// which is the same rule as for a navigator on a covered page. Both
-    /// installers stay inside this crate: a public reach scope could declare
-    /// "no reach" while its children still received input, which would break
-    /// the input/back parity R23 requires.
-    static PAGE_REACH: RefCell<Vec<Rc<Cell<bool>>>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Pops [`PAGE_REACH`] on drop so an unwinding page builder cannot leave a stale
+/// Pops `page_reach` on drop so an unwinding page builder cannot leave a stale
 /// scope behind for the rest of the thread's life.
 struct PageReachGuard;
 
 impl Drop for PageReachGuard {
     fn drop(&mut self) {
-        PAGE_REACH.with(|stack| {
-            stack.borrow_mut().pop();
+        let _ = thread_state::try_with(|locals| {
+            locals.page_reach.borrow_mut().pop();
         });
     }
 }
@@ -58,11 +29,11 @@ impl Drop for PageReachGuard {
 /// Run `f` with `reach` installed as the ambient page-reach cell — i.e. declare
 /// "everything built in here lives on the page this cell describes".
 ///
-/// The [`PAGE_REACH`] borrow is released *before* `f` runs, so `f` may nest
+/// The `page_reach` borrow is released *before* `f` runs, so `f` may nest
 /// another `with_page_reach` (a navigator inside a page inside a navigator) or
 /// call [`ambient_page_reach`] freely.
 pub(crate) fn with_page_reach<R>(reach: &Rc<Cell<bool>>, f: impl FnOnce() -> R) -> R {
-    PAGE_REACH.with(|stack| stack.borrow_mut().push(Rc::clone(reach)));
+    thread_state::with(|locals| locals.page_reach.borrow_mut().push(Rc::clone(reach)));
     let _guard = PageReachGuard;
     f()
 }
@@ -70,43 +41,19 @@ pub(crate) fn with_page_reach<R>(reach: &Rc<Cell<bool>>, f: impl FnOnce() -> R) 
 /// The reach cell of the page currently being built/reconciled, or `None` at the
 /// top level (a root navigator, whose reach is unconditional).
 pub(crate) fn ambient_page_reach() -> Option<Rc<Cell<bool>>> {
-    PAGE_REACH.with(|stack| stack.borrow().last().cloned())
+    thread_state::with(|locals| locals.page_reach.borrow().last().cloned())
 }
 
 // --- R-B3-inner: the ambient "did anything below me arm an edge-swipe on this
 // Down?" seam ------------------------------------------------------------
 
-thread_local! {
-    /// The stack of per-navigator **swipe-claim** cells for the navigators
-    /// currently routing a left-edge `Down` (`R-B3-inner`, mirrors
-    /// [`PAGE_REACH`]/[`with_page_reach`]).
-    ///
-    /// A left-edge `Down` does not capture: the outer navigator only records
-    /// `edge.armed` and forwards it through [`route_top`](NavigatorWidget::route_top)
-    /// (children see `Down` first), so a nested navigator's own `event_at` runs
-    /// underneath — and may *also* arm. Preemption is not decided at `Down`; it
-    /// is decided later, at the decisive `Move` steal site, where the OUTER
-    /// navigator — upstream in parent→child routing — reaches its steal branch
-    /// before the inner ever sees the event. So a navigator pushes its own
-    /// claim cell before forwarding `Down` ([`with_swipe_claim`]), reads it back
-    /// once forwarding returns (`edge.inner_claimed`), and propagates the
-    /// combined result into whatever cell is now ambient
-    /// ([`ambient_swipe_claim`]) — its own host navigator's, if any — so a
-    /// third nesting level defers too.
-    ///
-    /// A stack (not a single slot) for the same reason `PAGE_REACH` is one:
-    /// navigators nest, and each level must see its own immediate host's cell,
-    /// not some ancestor's.
-    static SWIPE_CLAIM: RefCell<Vec<Rc<Cell<bool>>>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Pops [`SWIPE_CLAIM`] on drop, mirroring [`PageReachGuard`].
+/// Pops `swipe_claim` on drop, mirroring [`PageReachGuard`].
 struct SwipeClaimGuard;
 
 impl Drop for SwipeClaimGuard {
     fn drop(&mut self) {
-        SWIPE_CLAIM.with(|stack| {
-            stack.borrow_mut().pop();
+        let _ = thread_state::try_with(|locals| {
+            locals.swipe_claim.borrow_mut().pop();
         });
     }
 }
@@ -118,7 +65,7 @@ impl Drop for SwipeClaimGuard {
 /// The borrow is released before `f` runs, so `f` may itself nest another
 /// `with_swipe_claim` call (a third level of navigator nesting).
 pub(super) fn with_swipe_claim<R>(claim: &Rc<Cell<bool>>, f: impl FnOnce() -> R) -> R {
-    SWIPE_CLAIM.with(|stack| stack.borrow_mut().push(Rc::clone(claim)));
+    thread_state::with(|locals| locals.swipe_claim.borrow_mut().push(Rc::clone(claim)));
     let _guard = SwipeClaimGuard;
     f()
 }
@@ -127,7 +74,7 @@ pub(super) fn with_swipe_claim<R>(claim: &Rc<Cell<bool>>, f: impl FnOnce() -> R)
 /// [`route_top`](NavigatorWidget::route_top), or `None` if no navigator is (a
 /// top-level navigator's `Down` handling, or any non-`Down` event).
 pub(super) fn ambient_swipe_claim() -> Option<Rc<Cell<bool>>> {
-    SWIPE_CLAIM.with(|stack| stack.borrow().last().cloned())
+    thread_state::with(|locals| locals.swipe_claim.borrow().last().cloned())
 }
 
 /// Whether a navigator hosted under `host_reach` is itself reachable: `true` at

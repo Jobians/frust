@@ -77,6 +77,7 @@ mod stack;
 mod text;
 mod textinput;
 mod texture_view;
+mod thread_state;
 mod viewport;
 mod window_drag_region;
 mod wrap;

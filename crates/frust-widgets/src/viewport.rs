@@ -126,7 +126,7 @@
 //! the leading edge, and no overlap absorber (Flutter's
 //! `SliverOverlapAbsorber`/`NestedScrollView`).
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use frust_core::accesskit::Role;
@@ -147,6 +147,7 @@ use crate::scroll_core::{BallisticState, ScrollSurface, ScrollSurfaceCore};
 use crate::slivers::adapter::{
     axis_point, box_child_origin, box_geometry, finite_extent, non_negative,
 };
+use crate::thread_state;
 
 /// How far past each end of the visible region a [`CustomScrollView`] lays
 /// children out by default, in logical px — Flutter's
@@ -778,34 +779,27 @@ fn transpose(point: Point) -> Point {
 /// A viewport currently forwarding a primary `Down`: the claim cell it pushed
 /// around that forward, its axis, and the axis of the nested viewport that
 /// registered into that cell (if one did).
-struct AxisFrame {
-    claim: Rc<Cell<InnerScrollState>>,
-    axis: ScrollAxis,
-    inner_axis: Cell<Option<ScrollAxis>>,
+pub(crate) struct AxisFrame {
+    pub(crate) claim: Rc<Cell<InnerScrollState>>,
+    pub(crate) axis: ScrollAxis,
+    pub(crate) inner_axis: Cell<Option<ScrollAxis>>,
 }
 
-thread_local! {
-    /// The viewports currently forwarding a primary `Down`, innermost last —
-    /// what lets a nested viewport learn its enclosing surface's axis (the
-    /// module docs' *Axis*). UI-thread-affine like the claim stack it shadows.
-    static VIEWPORT_FRAMES: RefCell<Vec<Rc<AxisFrame>>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Pops [`VIEWPORT_FRAMES`] on drop, so an unwinding dispatch cannot leave a
+/// Pops the viewport frame stack on drop, so an unwinding dispatch cannot leave a
 /// stale frame behind.
 struct AxisFrameGuard;
 
 impl Drop for AxisFrameGuard {
     fn drop(&mut self) {
-        VIEWPORT_FRAMES.with(|frames| {
-            frames.borrow_mut().pop();
+        let _ = thread_state::try_with(|locals| {
+            locals.viewport_frames.borrow_mut().pop();
         });
     }
 }
 
 /// Run `f` with `frame` installed as the innermost viewport frame.
 fn with_axis_frame<R>(frame: &Rc<AxisFrame>, f: impl FnOnce() -> R) -> R {
-    VIEWPORT_FRAMES.with(|frames| frames.borrow_mut().push(Rc::clone(frame)));
+    thread_state::with(|locals| locals.viewport_frames.borrow_mut().push(Rc::clone(frame)));
     let _guard = AxisFrameGuard;
     f()
 }
@@ -814,8 +808,9 @@ fn with_axis_frame<R>(frame: &Rc<AxisFrame>, f: impl FnOnce() -> R) -> R {
 /// innermost frame, if it pushed that very cell. `None` means the enclosing
 /// surface is a `ScrollView` or a `ListView`.
 fn enclosing_viewport(host: &Rc<Cell<InnerScrollState>>) -> Option<Rc<AxisFrame>> {
-    VIEWPORT_FRAMES.with(|frames| {
-        frames
+    thread_state::with(|locals| {
+        locals
+            .viewport_frames
             .borrow()
             .last()
             .filter(|frame| Rc::ptr_eq(&frame.claim, host))

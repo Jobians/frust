@@ -226,7 +226,7 @@ pub(super) struct PageEntry<State: 'static> {
     /// by [`publish_reach`](NavigatorWidget::publish_reach) on every stack
     /// mutation and rebuild.
     ///
-    /// Installed as the ambient [`PAGE_REACH`] scope while this page's builder
+    /// Installed as the ambient `WidgetLocals::page_reach` scope while this page's builder
     /// and subtree reconcile run, so a *nested* navigator on this page can read
     /// it — the seam that makes back arbitration follow input routing (R23) even
     /// though a nested navigator has no idea what the navigator hosting it is
@@ -509,7 +509,7 @@ pub struct NavigatorWidget<State: 'static> {
     /// `None` for a navigator at the top level (a root navigator / a root
     /// [`overlay_host`], whose reach is unconditional).
     ///
-    /// Captured from the ambient [`PAGE_REACH`] scope at `build` and re-captured
+    /// Captured from the ambient `WidgetLocals::page_reach` scope at `build` and re-captured
     /// at every `rebuild`, so it always names whichever page this navigator is
     /// currently reconciled under. Read through
     /// [`reachable`](Self::reachable) — the one input this navigator has into
