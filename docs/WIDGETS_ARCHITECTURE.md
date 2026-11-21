@@ -428,7 +428,7 @@ accumulates the boundary-rejected excess as its own edge-pull state, so pull-to-
 physics too. Stretch is a paint-only affine scale about the held edge (`stretch_transform`); no layout pass reads the pull. A
 ballistic simulation that ends fully pinned outward stops early, handing the residual pull to the settle path.
 
-**Nested-scroll arbitration** runs the ambient-claim shape of the navigator's edge-swipe arming (`nav::ambient`'s `SWIPE_CLAIM`,
+**Nested-scroll arbitration** runs the ambient-claim shape of the navigator's edge-swipe arming (`nav::ambient`'s `with_swipe_claim`/`ambient_swipe_claim`,
 see *Data Flow*): a surface pushes a fresh claim cell around the `Down` it forwards, the nearest scrollable underneath reports
 what it could do with the drag (`InnerScrollState`, nearest-inner pairing), and the outer reads that at the touch-slop takeover,
 deferring when the inner can consume the direction. A claim registers only with real scroll capacity (a deliberate deviation from
