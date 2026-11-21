@@ -316,7 +316,7 @@ pub(crate) fn render_scene(
             // so it does neither.
             signals.record_present(frame_id);
             // The key count after the first frame is on screen: once-only (latched inside),
-            // and safe beside live threads: the scan holds at most one key, for an instant.
+            // and it runs beside live threads holding at most one key, for an instant.
             #[cfg(debug_assertions)]
             crate::tls_keys::log_after_first_present();
             // First successful present: close out the cold-start recorder once.

@@ -25,10 +25,10 @@
 //!
 //! The flag layout is hard-coded rather than derived, and checked at run time: the scan creates
 //! ONE key, checks that it carries the flag and an index inside the scanned range, and deletes it
-//! before scanning. Holding one key for that instant cannot make another thread's key creation
-//! fail unless the table is already completely full, in which case the create fails, the line
-//! says zero keys are free, and no scan runs. A key without the expected layout makes the line
-//! report that instead of a figure.
+//! before scanning. Holding one key for that instant can make another thread's key creation fail
+//! only when exactly one key was free, a table that is about to overflow anyway. When none is
+//! free the create fails, the line says zero keys are free, and no scan runs. A key without the
+//! expected layout makes the line report that instead of a figure.
 //!
 //! The scan is not atomic: a key created or deleted on another thread while it runs can make the
 //! count off by one.
