@@ -93,9 +93,9 @@ mod log_level;
 
 #[cfg(target_os = "android")]
 mod app;
-// Debug-only pthread key probe; see the module comment for the hazard.
 #[cfg(target_os = "android")]
 pub mod jni_glue;
+// Debug-only pthread key probe; see the module comment for the hazard.
 #[cfg(all(target_os = "android", debug_assertions))]
 mod tls_keys;
 
