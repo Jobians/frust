@@ -15,8 +15,9 @@ use crate::shortcuts::{ShortcutEntry, ShortcutId};
 use crate::widget::ChildPod;
 
 /// One field per slot; the owning modules keep the accessors. No outer cell wraps it, so nested
-/// access to two fields behaves as nested access to two statics. Fields drop in declaration order,
-/// so the registries whose pods and handles run user code as they drop come first.
+/// access to two fields behaves as nested access to two statics. Once the thread's teardown starts
+/// destroying this struct no field is reachable, whatever the order: a `Drop` that can run then
+/// (a pod or handle a registry field holds) goes through [`try_with`].
 pub(crate) struct CoreLocals {
     /// Entries registered so far in this thread's open paint pass, in order.
     pub(crate) overlay_registry: Cell<Vec<OverlayEntry>>,

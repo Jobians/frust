@@ -668,9 +668,11 @@ impl fmt::Debug for Timer {
 
 fn register_flush(inner: &Rc<TimerInner>) {
     thread_state::with(|t| {
-        let mut registry = t.flush_registry.borrow_mut();
-        registry.retain(|timer| timer.upgrade().is_some_and(|timer| timer.is_active()));
-        registry.push(Rc::downgrade(inner));
+        {
+            let mut registry = t.flush_registry.borrow_mut();
+            registry.retain(|timer| timer.upgrade().is_some_and(|timer| timer.is_active()));
+            registry.push(Rc::downgrade(inner));
+        }
         t.flush_listener.borrow_mut().get_or_insert_with(|| {
             let owner = std::thread::current().id();
             AppLifecycleListener::new()
