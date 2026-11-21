@@ -129,8 +129,8 @@ frust-drawn bars and the sheet/segmented fail soft (`PresentError::Platform` / d
 crash; adding the plugin gives the app-owned `FrustAppTheme` a Material 3 parent (the
 `AndroidThemeParent` contribution, [CLI_ARCHITECTURE.md](CLI_ARCHITECTURE.md)). On Android every
 Rust `thread_local!` static takes one pthread key from a process-wide limit of 128 shared with the
-rest of the process, so a new per-thread static is a budget item; `scripts/ci/tls-key-count.sh`
-counts the statics linked into an Android library. Once shipped, JNI export
+rest of the process, so the plugin keeps its per-thread state in one `PluginLocals` struct (`thread_state.rs`) and a new static
+must pass the `thread_local_budget` guard test; `scripts/ci/tls-key-count.sh` counts the statics linked into an Android library. Once shipped, JNI export
 symbol names and Kotlin package/class names are frozen; each Apple arm gates on its own
 `target_os` (`"ios"` for `apple/`, `"macos"` for `appkit/`), never `target_vendor = "apple"` —
 UIKit does not exist on macOS, and `coretext.rs` is the one module compiled for both; and the FFI

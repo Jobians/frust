@@ -147,12 +147,13 @@ auditable as a single surface. The exceptions are on iOS: `accessibility`'s `Ios
 all, hot-patch code included (the patch loader's `unsafe` lives in `frust-hotpatch`);
 `frust-shell-desktop` holds exactly one macOS-only block, `render.rs`'s `build_overlay_surface`;
 macOS has a second zone, `frust-shell-macos`'s `cfg(macos)` `title_buttons` AppKit section. The
-register of what each zone is permitted to do, and the `# Safety`/no-unwind rules that govern
-it, live in [CODE_STANDARDS.md](CODE_STANDARDS.md) § Language Idioms.
+register of what each zone may do, and the `# Safety`/no-unwind rules, live in [CODE_STANDARDS.md](CODE_STANDARDS.md) § Language Idioms.
 Android's zone also holds the one `OverlaySurface::new` call in `prepare_overlays`, iOS's the one in
-`take_frame_overlays` plus the overlay exports. Android's one other `unsafe` module is
-`adpf::platform` (the `dlsym` binding and `gettid`); render-thread scheduling goes through
+`take_frame_overlays` plus the overlay exports. Android's other `unsafe` modules are
+`adpf::platform` (the `dlsym` binding and `gettid`) and debug-only `tls_keys` (below); render-thread scheduling goes through
 `frust-reactive::thread_policy` (`unsafe` in its `sys` module), with a bare `libc` call only for `FRUST_NO_THREAD_TUNING`.
+Debug Android builds log the pthread keys in use and free at library load and after the first presented frame
+(`tls_keys`): a slot scan relying on bionic's key numbering and a 130-slot table measured on Android 15.
 
 `surface_mode`'s writer set is pinned by a source-scan conformance test: exactly one call site per
 platform may publish a resolved surface mode, a single-writer contract that keeps the signal-poll
