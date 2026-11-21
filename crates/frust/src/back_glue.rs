@@ -140,9 +140,11 @@ use frust_reactive::{CanPopRegistration, back_presses, set_can_pop_provider, set
 use frust_widgets::{NavigatorController, NavigatorId};
 use reactive_graph::traits::{Get, GetUntracked};
 
-/// Both per-thread slots of this module, held by the one [`LOCALS`] static: on Android each
-/// `thread_local!` static takes one of 128 process-wide pthread keys, and a field costs per
-/// access what its own static did.
+use crate::thread_slot::SlotMap;
+
+/// Every per-thread slot of the facade, held by the one [`LOCALS`] static: this module's two and
+/// the [`ThreadSlot`](crate::ThreadSlot) map. On Android each `thread_local!` static takes one of
+/// 128 process-wide pthread keys, and a field costs per access what its own static did.
 struct BackLocals {
     /// The process-wide (UI-thread-affine) back-press wiring shared by BOTH the
     /// automatic [`navigator`](crate::navigator) path and the explicit
@@ -161,6 +163,10 @@ struct BackLocals {
     /// ([`RegistrantId::Fallback`]). Kept apart from [`shared`](Self::shared) so nothing that
     /// resets the arbitration state can ever hand out an id twice.
     next_fallback_id: Cell<u64>,
+    /// The values of every [`ThreadSlot`](crate::ThreadSlot) used on this thread (see
+    /// `thread_slot`'s module docs); unrelated to back handling, kept here so the facade takes
+    /// one key.
+    slots: SlotMap,
 }
 
 impl BackLocals {
@@ -168,12 +174,19 @@ impl BackLocals {
         Self {
             shared: RefCell::new(SharedBack::new()),
             next_fallback_id: Cell::new(0),
+            slots: SlotMap::new(),
         }
     }
 }
 
 thread_local! {
     static LOCALS: BackLocals = const { BackLocals::new() };
+}
+
+/// Run `f` on this thread's [`ThreadSlot`](crate::ThreadSlot) map, or `None` once the thread's
+/// teardown has destroyed it.
+pub(crate) fn with_slot_map<R>(f: impl FnOnce(&SlotMap) -> R) -> Option<R> {
+    LOCALS.try_with(|locals| f(&locals.slots)).ok()
 }
 
 /// Run `f` on the shared back state (see [`BackLocals::shared`]).
