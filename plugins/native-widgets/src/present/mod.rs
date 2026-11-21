@@ -78,6 +78,16 @@
 //! `apple_host` holds what every Apple arm shares: host discovery, the
 //! main-queue hop and the live-presentation guard.
 //!
+//! # Toasts
+//!
+//! A toast ([`show_toast`]) is the third, independent kind: a transient
+//! message that uses **neither** slot — never `Busy`, never in an alert's or
+//! a sheet's way — and is replaced, not refused, by the next toast (the
+//! replaced one resolves [`ToastOutcome::Dismissed`]). Its seam,
+//! `toast::ToastHost`, has its own arms: `android_toast` (a Material
+//! `Snackbar`), `apple_toast` (a plugin-owned view in the iOS key window) and
+//! `unsupported` everywhere else, macOS included. See the `toast` module doc.
+//!
 //! # How an alert follows its sheet
 //!
 //! The alert slot records the sheet that was live when the alert was
@@ -98,6 +108,8 @@ mod android_alert;
 mod android_host;
 #[cfg(target_os = "android")]
 mod android_sheet;
+#[cfg(target_os = "android")]
+mod android_toast;
 #[cfg(target_os = "macos")]
 mod appkit_alert;
 #[cfg(target_os = "ios")]
@@ -106,7 +118,10 @@ mod apple_alert;
 mod apple_host;
 #[cfg(target_os = "ios")]
 mod apple_sheet;
-#[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
+#[cfg(target_os = "ios")]
+mod apple_toast;
+mod toast;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod unsupported;
 
 #[cfg(target_os = "android")]
@@ -124,6 +139,15 @@ use UnsupportedSheet as SheetPlatformHost;
 use android_sheet::Host as SheetPlatformHost;
 #[cfg(target_os = "ios")]
 use apple_sheet::Host as SheetPlatformHost;
+
+#[cfg(target_os = "android")]
+use android_toast::Host as ToastPlatformHost;
+#[cfg(target_os = "ios")]
+use apple_toast::Host as ToastPlatformHost;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use unsupported::Toast as ToastPlatformHost;
+
+pub use toast::{ToastDuration, ToastOutcome, ToastSpec, show_toast};
 
 pub(crate) use oneshot::Sender;
 
@@ -1286,11 +1310,12 @@ pub fn show_alert(spec: AlertSpec) -> Presentation<AlertOutcome> {
 
 /// Take the presentation `handle` names down; it resolves
 /// [`AlertOutcome::Dismissed`] — or, for a sheet,
-/// [`SheetOutcome::Dismissed`]`(`[`DismissReason::Programmatic`]`)` —
-/// exactly once. A stale handle — its presentation already resolved, or
+/// [`SheetOutcome::Dismissed`]`(`[`DismissReason::Programmatic`]`)`, for a
+/// toast [`ToastOutcome::Dismissed`] — exactly once. A stale handle — its presentation already resolved, or
 /// superseded — is ignored.
 pub fn dismiss(handle: &PresentationHandle) {
     dismiss_any_on::<PlatformHost, SheetPlatformHost>(handle);
+    toast::dismiss_on::<ToastPlatformHost>(handle.generation);
 }
 
 /// The sending half a sheet arm resolves through: a [`Sender`] that first
@@ -1469,6 +1494,8 @@ pub(crate) mod wire {
     /// at `actionIndex` (spec order). `android_host` streams it to that row's
     /// listener and leaves the presentation live.
     pub(crate) const OUTCOME_ROW: i32 = 7;
+    /// A toast's duration ran out (`super::toast::wire::toast_outcome`).
+    pub(crate) const OUTCOME_TIMED_OUT: i32 = 8;
 
     /// An action's [`ActionRole::Default`] wire code.
     pub(crate) const ROLE_DEFAULT: i32 = 0;
@@ -3130,6 +3157,7 @@ mod tests {
             ("FAILED".to_string(), wire::OUTCOME_FAILED),
             ("DETENT".to_string(), wire::OUTCOME_DETENT),
             ("ROW".to_string(), wire::OUTCOME_ROW),
+            ("TIMED_OUT".to_string(), wire::OUTCOME_TIMED_OUT),
         ]);
         assert_eq!(
             kotlin, rust,
@@ -3186,6 +3214,19 @@ mod tests {
             assert!(
                 PRESENTER_KT.contains(member),
                 "FrustNativePresenter.kt must declare `{member}` (android_alert.rs calls it)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_toast_presenter_members_exist_in_kotlin() {
+        for member in [
+            "fun showToast(generation: Long, message: String, action: String?, duration: Int)",
+            "fun dismissToast(generation: Long)",
+        ] {
+            assert!(
+                PRESENTER_KT.contains(member),
+                "FrustNativePresenter.kt must declare `{member}` (android_toast.rs calls it)"
             );
         }
     }

@@ -101,9 +101,15 @@
 //! on iOS/iPadOS only, a page sheet under `UISheetPresentationController`
 //! (an iPad in regular width shows a form sheet and ignores detents); every
 //! other target answers [`PresentError::Unsupported`]. Alerts and sheets
-//! share the one-at-a-time slot. With `frust-api` on, `show_native_alert` /
-//! `show_native_sheet` (the awaitable forms) and `show_native_alert_into` /
-//! `show_native_sheet_into` (writing the outcome into an `RwSignal`, spawned
+//! share the one-at-a-time slot. A **toast** ([`present::show_toast`]: a
+//! [`ToastSpec`]'s message and optional action, resolving one
+//! [`ToastOutcome`]) takes no slot — a newer toast replaces the current one
+//! — and is built on Android (a Material `Snackbar` above the plugin's bottom
+//! bars) and iOS/iPadOS (a plugin-owned capsule above the tab bar and the
+//! keyboard); every other target answers [`PresentError::Unsupported`]. With `frust-api` on, `show_native_alert` /
+//! `show_native_sheet` / `show_native_toast` (the awaitable forms) and
+//! `show_native_alert_into` / `show_native_sheet_into` /
+//! `show_native_toast_into` (writing the outcome into an `RwSignal`, spawned
 //! on `frust::spawn_local`) are the app-facing front door, re-exported at the
 //! crate root like the builders.
 //!
@@ -190,7 +196,7 @@ pub use demo::{
     DemoCardState, register_demo_components,
 };
 
-// Native presentations (alerts, sheets): imperative, host-owned modal UI resolving
+// Native presentations (alerts, sheets, toasts): imperative, host-owned UI resolving
 // one outcome through a plain `Future` — see the crate doc's *Native
 // presentations*. Deliberately outside the `frust-api` gate: it names no
 // framework type, so the bare platform plugin serves it too.
@@ -201,7 +207,7 @@ pub mod present;
 pub use present::{
     ActionRole, AlertAction, AlertOutcome, AlertSpec, AlertStyle, AnchorRect, Detent,
     DismissReason, PresentError, Presentation, PresentationHandle, SheetAction, SheetContent,
-    SheetHandle, SheetOutcome, SheetSpec,
+    SheetHandle, SheetOutcome, SheetSpec, ToastDuration, ToastOutcome, ToastSpec,
 };
 
 #[cfg(target_os = "android")]

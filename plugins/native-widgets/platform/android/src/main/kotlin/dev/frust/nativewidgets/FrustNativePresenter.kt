@@ -3,11 +3,12 @@
 // `plugins/native-widgets/src/present/android_host.rs` (host discovery, the
 // `nativeOnOutcome` callback export) and
 // `plugins/native-widgets/src/present/android_alert.rs` (the `showAlert`/
-// `dismiss`/`cancelAlert` calls below) and `plugins/native-widgets/src/present/android_sheet.rs`
-// (`showSheet`/`dismissSheet`/`selectSheetDetent`) — see those modules'
-// contract tables. Native presentations (alerts, sheets) are not
-// platform-view slots: they are shown over the resumed Activity, which this
-// object tracks.
+// `dismiss`/`cancelAlert` calls below), `plugins/native-widgets/src/present/android_sheet.rs`
+// (`showSheet`/`dismissSheet`/`selectSheetDetent`) and
+// `plugins/native-widgets/src/present/android_toast.rs` (`showToast`/`dismissToast`)
+// — see those modules' contract tables. Native presentations (alerts,
+// sheets, toasts) are not platform-view slots: they are shown over the
+// resumed Activity, which this object tracks.
 //
 // Package `dev.frust.nativewidgets` and the object name are baked into the
 // mangled JNI symbol of `nativeOnOutcome`
@@ -34,12 +35,16 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.util.TypedValue
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.coordinatorlayout.widget.CoordinatorLayout
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.core.widget.NestedScrollView
 import com.google.android.material.bottomsheet.BottomSheetBehavior
 import com.google.android.material.bottomsheet.BottomSheetDialog
@@ -47,15 +52,18 @@ import com.google.android.material.bottomsheet.BottomSheetDragHandleView
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.shape.MaterialShapeDrawable
+import com.google.android.material.snackbar.BaseTransientBottomBar
+import com.google.android.material.snackbar.Snackbar
 import org.json.JSONObject
 import java.lang.ref.WeakReference
+import kotlin.math.max
 
 /**
  * Tracks the resumed [Activity] a native presentation is shown over, shows
- * the two presentation kinds this plugin ships (an [android.app.AlertDialog]
- * and a Material [BottomSheetDialog]), and carries the one callback every
- * presentation reports its outcome — and a sheet its detent changes —
- * through.
+ * the presentation kinds this plugin ships (an [android.app.AlertDialog], a
+ * Material [BottomSheetDialog] and a Material [Snackbar] toast), and carries
+ * the one callback every presentation reports its outcome — and a sheet its
+ * detent changes — through.
  *
  * ## Why this object tracks the Activity itself
  *
@@ -95,6 +103,21 @@ import java.lang.ref.WeakReference
  * members hop there themselves ([onMain]), and the dialogs' own listeners
  * plus `Application.ActivityLifecycleCallbacks` are always delivered there by
  * the platform.
+ *
+ * ## The toast
+ *
+ * [showToast] shows a [Snackbar] independent of both dialogs: it never
+ * waits for or closes one (a dialog is its own window, so a toast shown
+ * while one is up draws behind it). [liveToast] is its own exactly-once
+ * guard. Each toast gets its own [ToastLayer], a [CoordinatorLayout] added
+ * last to the Activity's content view (so it draws above the frust surface
+ * and [FrustNativeChrome]'s bars, and the Snackbar gets its swipe-to-dismiss
+ * behaviour), removed again when that toast is gone. The layer consumes the
+ * window insets itself: the Snackbar sits above [FrustNativeChrome.toastAnchor]
+ * while the chrome shows a bottom bar or toolbar, else above the larger of
+ * the keyboard and the navigation bar ([placeToast]). A newer toast replaces
+ * the current one through Material's own queue (the old one is dismissed as
+ * consecutive, then the new one shows); the replaced one reports nothing.
  */
 object FrustNativePresenter {
     /** The user chose the action at `actionIndex` (spec order). */
@@ -120,6 +143,9 @@ object FrustNativePresenter {
 
     /** Not terminal: the user tapped the live sheet's event row at `actionIndex`. */
     const val OUTCOME_ROW = 7
+
+    /** A toast's duration ran out. */
+    const val OUTCOME_TIMED_OUT = 8
 
     /** An ordinary action — [showAlert]'s `roles` wire code for `Default`. */
     private const val ROLE_DEFAULT = 0
@@ -170,6 +196,9 @@ object FrustNativePresenter {
 
     /** The sheet [showSheet] currently has up, or `null` between sheets. */
     private var liveSheet: LiveSheet? = null
+
+    /** The toast [showToast] currently has up (or queued behind the one it replaces), or `null`. */
+    private var liveToast: LiveToast? = null
 
     /**
      * Guards a single [Application.registerActivityLifecycleCallbacks] call.
@@ -652,6 +681,180 @@ object FrustNativePresenter {
         }
     }
 
+    /**
+     * Show a Material [Snackbar] over [resumedActivity] — `android_toast.rs`'s
+     * `Host::show_toast`. `action` is the one action's label (`null` for
+     * none); `duration` is a length in milliseconds (never Material's
+     * `LENGTH_*` constants: from Android 10 its accessibility timeout turns
+     * `LENGTH_SHORT` into `LENGTH_LONG`). Hops to the main thread ([onMain]).
+     *
+     * Reports exactly once through [nativeOnOutcome] ([resolveToast]): no
+     * resumed Activity → [OUTCOME_NO_HOST]; an exception building it →
+     * [OUTCOME_FAILED]; otherwise its callback later reports
+     * [OUTCOME_TIMED_OUT], [OUTCOME_ACTION] (index 0), [OUTCOME_CANCELLED]
+     * (swiped away) or [OUTCOME_DISMISSED] ([dismissToast], or replaced —
+     * which the Rust side has already resolved, so that report is dropped).
+     */
+    @JvmStatic
+    fun showToast(generation: Long, message: String, action: String?, duration: Int) {
+        onMain { showToastNow(generation, message, action, duration) }
+    }
+
+    /**
+     * Take toast [generation] down → [OUTCOME_DISMISSED] —
+     * `android_toast.rs`'s `Host::dismiss`, on the main thread. A stale
+     * `generation` is ignored.
+     */
+    @JvmStatic
+    fun dismissToast(generation: Long) {
+        onMain {
+            val live = liveToast?.takeIf { it.generation == generation } ?: return@onMain
+            try {
+                live.snackbar.dismiss()
+            } catch (t: Throwable) {
+                resolveToast(live, OUTCOME_DISMISSED)
+                removeLayer(live.layer)
+            }
+        }
+    }
+
+    private fun showToastNow(generation: Long, message: String, action: String?, duration: Int) {
+        val activity = resumedActivity()
+        val content = activity?.window?.peekDecorView()?.findViewById<View?>(android.R.id.content) as? ViewGroup
+        if (activity == null || content == null) {
+            nativeOnOutcome(generation, OUTCOME_NO_HOST, -1)
+            return
+        }
+        var layer: ToastLayer? = null
+        try {
+            val context = FrustNativeChrome.toastContext(activity) ?: toastThemeContext(activity)
+            val match = ViewGroup.LayoutParams.MATCH_PARENT
+            val added = ToastLayer(context)
+            layer = added
+            content.addView(added, ViewGroup.LayoutParams(match, match))
+            val snackbar = Snackbar.make(context, added, message, duration)
+            // The layer applies every bottom inset itself (placeToast).
+            snackbar.setGestureInsetBottomIgnored(true)
+            snackbar.setAnchorViewLayoutListenerEnabled(true)
+            // Reported by the callback below (DISMISS_EVENT_ACTION).
+            if (action != null) snackbar.setAction(action) {}
+            val live = LiveToast(generation, snackbar, added, activity)
+            snackbar.addCallback(
+                object : BaseTransientBottomBar.BaseCallback<Snackbar>() {
+                    override fun onShown(transientBottomBar: Snackbar) {
+                        // The frust SurfaceView sits below the window, which
+                        // keeps a transparent region over it, gathered at
+                        // layout: the Snackbar was still slid out of place
+                        // then, so without a fresh layout the window can
+                        // leave its final rect transparent (seen with the
+                        // keyboard up).
+                        added.requestLayout()
+                    }
+
+                    override fun onDismissed(transientBottomBar: Snackbar, event: Int) {
+                        removeLayer(added)
+                        resolveToast(live, toastCode(event))
+                    }
+                },
+            )
+            ViewCompat.setOnApplyWindowInsetsListener(added) { _, insets ->
+                placeToast(live, insets)
+                WindowInsetsCompat.CONSUMED
+            }
+            ViewCompat.getRootWindowInsets(content)?.let { placeToast(live, it) }
+            liveToast = live
+            snackbar.show()
+            ViewCompat.requestApplyInsets(added)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Frust: native toast failed to show (the app theme must derive from Theme.Material3.*): $t")
+            layer?.let(::removeLayer)
+            if (liveToast?.generation == generation) liveToast = null
+            nativeOnOutcome(generation, OUTCOME_FAILED, -1)
+        }
+    }
+
+    /**
+     * Keep [live]'s Snackbar above the chrome's toolbar or bottom navigation
+     * while one shows ([FrustNativeChrome.toastAnchor] — Material measures
+     * the anchor itself), else above the larger of the keyboard and the
+     * navigation bar, and inside the side insets.
+     */
+    private fun placeToast(live: LiveToast, insets: WindowInsetsCompat) {
+        val anchor = FrustNativeChrome.toastAnchor(live.activity)
+        if (live.snackbar.anchorView !== anchor) live.snackbar.setAnchorView(anchor)
+        val sides = insets.getInsets(WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout())
+        val bottom =
+            if (anchor != null) {
+                0
+            } else {
+                max(insets.getInsets(WindowInsetsCompat.Type.ime()).bottom, sides.bottom)
+            }
+        val layer = live.layer
+        if (layer.paddingLeft != sides.left || layer.paddingRight != sides.right || layer.paddingBottom != bottom) {
+            layer.setPadding(sides.left, 0, sides.right, bottom)
+        }
+    }
+
+    /** The Snackbar's dismiss event → this object's outcome code. */
+    private fun toastCode(event: Int): Int =
+        when (event) {
+            BaseTransientBottomBar.BaseCallback.DISMISS_EVENT_TIMEOUT -> OUTCOME_TIMED_OUT
+            BaseTransientBottomBar.BaseCallback.DISMISS_EVENT_ACTION -> OUTCOME_ACTION
+            BaseTransientBottomBar.BaseCallback.DISMISS_EVENT_SWIPE -> OUTCOME_CANCELLED
+            else -> OUTCOME_DISMISSED
+        }
+
+    /** The Activity's manifest theme (Material's theme check needs it), else the Activity itself. */
+    private fun toastThemeContext(activity: Activity): Context =
+        try {
+            FrustMaterialContext.wrap(activity)
+        } catch (e: PackageManager.NameNotFoundException) {
+            activity
+        } catch (e: IllegalStateException) {
+            activity
+        }
+
+    /** Resolve toast [live] exactly once, while it is still [liveToast]. */
+    private fun resolveToast(live: LiveToast, code: Int) {
+        if (liveToast !== live) return
+        liveToast = null
+        nativeOnOutcome(live.generation, code, if (code == OUTCOME_ACTION) 0 else -1)
+    }
+
+    /** Remove a toast's layer from its content view, after the current callback returns. */
+    private fun removeLayer(layer: View) {
+        mainHandler.post { (layer.parent as? ViewGroup)?.removeView(layer) }
+    }
+
+    /**
+     * The live toast: its generation, Snackbar, layer and Activity.
+     */
+    private class LiveToast(
+        val generation: Long,
+        val snackbar: Snackbar,
+        val layer: ToastLayer,
+        val activity: Activity,
+    )
+
+    /**
+     * A toast's full-screen [CoordinatorLayout] (the parent that gives a
+     * Snackbar its swipe-to-dismiss). It takes a touch only when it starts on
+     * the Snackbar: everything else goes on to the frust surface and the bars
+     * beneath it, even after the swipe behaviour has seen a touch.
+     */
+    private class ToastLayer(context: Context) : CoordinatorLayout(context) {
+        override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+            if (ev.actionMasked == MotionEvent.ACTION_DOWN && !startsOnChild(ev)) return false
+            return super.dispatchTouchEvent(ev)
+        }
+
+        private fun startsOnChild(ev: MotionEvent): Boolean =
+            (0 until childCount).any { index ->
+                val child = getChildAt(index)
+                child.visibility == View.VISIBLE && isPointInChildBounds(child, ev.x.toInt(), ev.y.toInt())
+            }
+    }
+
     /** Run [block] on the main thread: inline when already there, else posted. */
     private fun onMain(block: () -> Unit) {
         if (Looper.myLooper() == Looper.getMainLooper()) block() else mainHandler.post { block() }
@@ -847,6 +1050,16 @@ object FrustNativePresenter {
                 liveAlert?.takeIf { it.activity === activity }?.let {
                     resolveAlert(it.generation, OUTCOME_HOST_LOST, -1)
                     closeQuietly(it.dialog)
+                }
+                // The toast goes with its Activity's views; reported on its own.
+                liveToast?.takeIf { it.activity === activity }?.let {
+                    resolveToast(it, OUTCOME_HOST_LOST)
+                    removeLayer(it.layer)
+                    try {
+                        it.snackbar.dismiss()
+                    } catch (t: Throwable) {
+                        // Its window is already going away.
+                    }
                 }
             }
         }
