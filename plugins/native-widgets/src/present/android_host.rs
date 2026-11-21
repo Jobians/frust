@@ -33,10 +33,10 @@
 //! An arm parks a resolver for its presentation in [`LIVE`], tagged with the
 //! generation it also hands the Kotlin side and its [`LiveKind`] — at most
 //! one entry per kind, so an alert's entry sits beside the sheet it is shown
-//! over; [`nativeOnOutcome`] takes the entry back **by generation** and runs
-//! it once. A callback for any other generation — a duplicate, or one from a
-//! presentation the caller already abandoned and a newer one replaced —
-//! finds nothing and is dropped. The resolver maps `(code, actionIndex)` into
+//! over, and a toast's beside both; [`nativeOnOutcome`] takes the entry
+//! back **by generation** and runs it once. A callback for any other
+//! generation — a duplicate, or one from a presentation the caller already
+//! abandoned and a newer one replaced — finds nothing and is dropped. The resolver maps `(code, actionIndex)` into
 //! its own outcome type, so the one callback serves every presentation kind.
 //!
 //! A sheet parks a [`Stream`] beside its resolver: a
@@ -197,6 +197,9 @@ pub(crate) type Stream = Arc<dyn Fn(i32, i32) + Send + Sync>;
 pub(crate) enum LiveKind {
     Alert,
     Sheet,
+    /// A toast (`super::android_toast`): its entry only forwards the report
+    /// to `super::toast`, which holds the toast's sender.
+    Toast,
 }
 
 /// One parked presentation, tagged with its generation and kind.

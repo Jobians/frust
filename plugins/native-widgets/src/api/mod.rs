@@ -54,9 +54,10 @@
 //!
 //! # Native presentations — not a slot
 //!
-//! [`show_native_alert`] / [`show_native_alert_into`] and
-//! [`show_native_sheet`] / [`show_native_sheet_into`] are the app-facing
-//! front door to `crate::present`: an alert or a sheet is an imperative
+//! [`show_native_alert`] / [`show_native_alert_into`],
+//! [`show_native_sheet`] / [`show_native_sheet_into`] and
+//! [`show_native_toast`] / [`show_native_toast_into`] are the app-facing
+//! front door to `crate::present`: an alert, a sheet or a toast is an imperative
 //! request answered by one outcome, never a `platform_view` slot (nor does a
 //! sheet host one — its content is a constrained native schema). The `_into`
 //! forms write that outcome into an `RwSignal`, the same events-as-signals
@@ -99,10 +100,11 @@ pub use builders::{
 };
 pub use mount::{NativeComponentView, native_component};
 /// The app-facing native-presentation entry points over `crate::present`:
-/// for an alert and for a sheet, an awaitable form and an events-as-signals
-/// form — see the `present` submodule doc.
+/// for an alert, a sheet and a toast, an awaitable form and an
+/// events-as-signals form — see the `present` submodule doc.
 pub use present::{
     show_native_alert, show_native_alert_into, show_native_sheet, show_native_sheet_into,
+    show_native_toast, show_native_toast_into,
 };
 pub use scaffold::{EdgeFade, NativeScaffoldView, native_scaffold};
 

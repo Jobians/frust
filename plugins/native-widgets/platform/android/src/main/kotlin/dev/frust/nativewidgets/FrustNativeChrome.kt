@@ -531,6 +531,25 @@ object FrustNativeChrome {
         applyCollapse(installed)
     }
 
+    /**
+     * The view [FrustNativePresenter]'s toast sits above in `activity`: the
+     * toolbar while it shows, else the bottom navigation while it shows, else
+     * `null` (no chrome there, no bottom bar, or the keyboard hid them).
+     * Asked again on every insets pass while a toast is up.
+     */
+    internal fun toastAnchor(activity: Activity): View? {
+        val installed = live?.takeIf { it.activity === activity } ?: return null
+        val bars = installed.bars
+        return when {
+            bars.fabs.isShown && bars.fabs.childCount > 0 -> bars.fabs
+            bars.bottom.isShown -> bars.bottom
+            else -> null
+        }
+    }
+
+    /** The chrome's themed context in `activity` (the app's brightness), `null` without a chrome there. */
+    internal fun toastContext(activity: Activity): Context? = live?.takeIf { it.activity === activity }?.bars?.context
+
     /** [FrustNativePresenter]'s lifecycle hook: the host Activity is going away. */
     internal fun onActivityDestroyed(activity: Activity) {
         val installed = live ?: return

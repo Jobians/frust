@@ -45,8 +45,9 @@
 //! parks everything the presentation needs (its controller, its blocks, its
 //! delegate, its sender) in [`LIVE`], one entry tagged with the
 //! presentation's generation, until the terminal outcome. `LIVE` holds at
-//! most one entry per kind ([`LivePresentation::is_sheet`]): an alert
-//! presented over a sheet is parked beside it. Every later touch
+//! most one entry per kind ([`LivePresentation::is_sheet`],
+//! [`LivePresentation::is_toast`]): an alert presented over a sheet is
+//! parked beside it, and a toast beside both. Every later touch
 //! — a handler firing, [`AlertHost::dismiss`](super::AlertHost::dismiss),
 //! the host going away — takes the entry back **by generation**: a stale
 //! callback for a finished presentation finds nothing and does nothing, and
@@ -67,7 +68,12 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+#[cfg(target_os = "ios")]
+use std::time::Duration;
+
 use dispatch2::DispatchQueue;
+#[cfg(target_os = "ios")]
+use dispatch2::DispatchTime;
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 
@@ -86,6 +92,27 @@ pub(crate) type PresentingAnchor = UIViewController;
 /// iOS, a window (for a window-modal sheet) on macOS.
 #[cfg(target_os = "macos")]
 pub(crate) type PresentingAnchor = NSWindow;
+
+/// Run `f` on the main thread once `delay` has passed — [`on_main`]'s hop,
+/// deferred (a toast's timeout). A delay too large for the dispatch clock
+/// waits forever, which no caller passes (toast durations are clamped).
+#[cfg(target_os = "ios")]
+pub(crate) fn on_main_after(delay: Duration, f: impl FnOnce(MainThreadMarker) + Send + 'static) {
+    let when = DispatchTime::try_from(delay).unwrap_or(DispatchTime::FOREVER);
+    let queued = DispatchQueue::main().after(when, move || {
+        // SAFETY: as in `on_main` — a block submitted to the main queue runs
+        // on the process's main thread.
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        if catch_unwind(AssertUnwindSafe(|| f(mtm))).is_err() {
+            log::error!(
+                "frust-native-widgets: a deferred presentation step panicked on the main queue"
+            );
+        }
+    });
+    if queued.is_err() {
+        log::error!("frust-native-widgets: could not schedule a deferred presentation step");
+    }
+}
 
 /// Run `f` on the main thread, on a later main-queue turn — see the module
 /// doc's *Main-thread dispatch*.
@@ -185,7 +212,7 @@ enum SheetResolution {
 /// falling back to any window scene's window. `None` — no window scene, or
 /// none with a window — means the app has no UI to present over yet.
 #[cfg(target_os = "ios")]
-fn anchor_window(mtm: MainThreadMarker) -> Option<Retained<UIWindow>> {
+pub(crate) fn anchor_window(mtm: MainThreadMarker) -> Option<Retained<UIWindow>> {
     let scenes = UIApplication::sharedApplication(mtm).connectedScenes();
 
     let mut fallback = None;
@@ -246,6 +273,19 @@ pub(crate) trait LivePresentation: Any {
     fn is_sheet(&self) -> bool {
         false
     }
+
+    /// Whether this is a toast (`super::apple_toast`) — the third kind,
+    /// parked beside an alert and a sheet and never displaced or taken as
+    /// stale by either. Alerts and sheets keep the default.
+    fn is_toast(&self) -> bool {
+        false
+    }
+}
+
+/// The kind `presentation` is, for [`LIVE`]'s one-entry-per-kind rule:
+/// (sheet, toast).
+fn kind_of(presentation: &dyn LivePresentation) -> (bool, bool) {
+    (presentation.is_sheet(), presentation.is_toast())
 }
 
 /// Take each of `displaced` down in order — through
@@ -350,8 +390,8 @@ pub(crate) fn install_live(
     generation: u64,
     presentation: Box<dyn LivePresentation>,
 ) -> Option<Box<dyn LivePresentation>> {
-    let sheet = presentation.is_sheet();
-    let displaced = take_where(|entry| entry.presentation.is_sheet() == sheet);
+    let kind = kind_of(&*presentation);
+    let displaced = take_where(|entry| kind_of(&*entry.presentation) == kind);
     LIVE.with(|live| {
         live.borrow_mut().push(LiveEntry {
             generation,
@@ -371,7 +411,9 @@ pub(crate) fn take_stale(
     sheet: bool,
     keep: Option<u64>,
 ) -> Option<Box<dyn LivePresentation>> {
-    take_where(|entry| entry.presentation.is_sheet() == sheet && Some(entry.generation) != keep)
+    take_where(|entry| {
+        kind_of(&*entry.presentation) == (sheet, false) && Some(entry.generation) != keep
+    })
 }
 
 /// Whether `generation` is parked right now — the iOS alert arm's check
