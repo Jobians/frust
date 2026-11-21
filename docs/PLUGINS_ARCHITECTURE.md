@@ -406,8 +406,8 @@ host ignores the back press.
   always wins over a discovered one, and a broken or ambiguous manifest skips that package with a
   warning, never a failure. A manifest declares the same kinds an out-of-tree plugin needs on
   mobile: Gradle module, permissions, Maven repositories, Swift package, frameworks, plist keys,
-  entitlements, optional features. It cannot contribute a desktop-lane entry, an app-crate macro
-  or a scaffold file, and trust rules bound its data ([PLUGINS_CODE_STANDARDS.md](PLUGINS_CODE_STANDARDS.md)).
+  entitlements, optional features. It cannot contribute a desktop-lane entry, an app-crate macro,
+  a scaffold file or an Android theme parent, and trust rules bound its data ([PLUGINS_CODE_STANDARDS.md](PLUGINS_CODE_STANDARDS.md)).
   The schema is the `frust-drive` `plugin::manifest` module rustdoc; the worked example is
   `crates/frust-drive/tests/fixtures/external-plugin` ([README](../crates/frust-drive/tests/fixtures/external-plugin/README.md)).
 - A plugin's native modules (Gradle module, Swift package) ship inside its own crate and are located
@@ -512,12 +512,15 @@ host ignores the back press.
   (Gradle module, Swift package, Info.plist key, manifest permission, Cargo dependency) onto a
   scaffolded app, driven by the `frust` TUI's Add Plugin dialog or manually per plugin README (see
   [CLI_ARCHITECTURE.md](CLI_ARCHITECTURE.md) and [TUI_ARCHITECTURE.md](TUI_ARCHITECTURE.md)).
-  Three further kinds, each idempotent: `PlistArrayEntry` inserts a key with an `<array>` of strings into
+  Four further kinds, each idempotent: `PlistArrayEntry` inserts a key with an `<array>` of strings into
   `Info.plist` (a present key is never merged into); `IosEntitlement` (`Bool`/`String`/`StringArray`) writes a
   key into `ios/Runner/Runner.entitlements`, created when absent, and sets `CODE_SIGN_ENTITLEMENTS` in every
   build configuration of the Runner target (one that already names another file keeps it and the key goes
   there); `MavenRepository` writes a group-filtered `exclusiveContent` block at the
-  `// frust:plugin-repositories` marker of `android/settings.gradle.kts`, idempotent by url. A
+  `// frust:plugin-repositories` marker of `android/settings.gradle.kts`, idempotent by url;
+  `AndroidThemeParent` (built-in only; `native-widgets`' Material 3 parent) sets the parent of the
+  app-owned `FrustAppTheme` style unless it already leads to a Material theme, and refuses an app
+  whose activity uses neither a defined `FrustAppTheme` nor a Material theme ([CLI_ARCHITECTURE.md](CLI_ARCHITECTURE.md)). A
   `PluginSpec`/`FeatureSpec` may state `min_ios`/`min_android_sdk`; the add checks the app's lowest
   `IPHONEOS_DEPLOYMENT_TARGET` and its `minSdk` against them and refuses rather than raising either.
 - `clean-signals-frust` wires a `clean_signals` controller into a Frust `Component`'s reactive

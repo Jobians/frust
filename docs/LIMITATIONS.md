@@ -566,6 +566,51 @@ and Profile. `crates/frust-drive/src/plugin/apply.rs`'s `apply_ios_entitlement`.
 
 ---
 
+### `plugin-theme-parent-built-in-only` — only a built-in plugin can set the app's Android theme parent
+
+**Observed**: `Contribution::AndroidThemeParent` (the `FrustAppTheme` parent that
+`frust plugin add native-widgets` writes) takes a `&'static str` parent, so only an entry of the
+built-in registry can carry it. The `[package.metadata.frust.plugin]` schema has no key for it, and
+an unknown key skips the whole plugin with a warning. A manifest-declared plugin whose Android views
+need a Material theme cannot ask for one.
+
+**Applies to**: a plugin outside the frust repository whose Android views need a theme family the
+platform theme is not.
+
+**Why accepted**: one plugin needs it today, and it is built in. The app author of an out-of-tree
+plugin sets the `FrustAppTheme` parent in `android/app/src/main/res/values/themes.xml` by hand,
+following that plugin's documentation.
+
+**Evidence**: `crates/frust-drive/src/plugin/mod.rs`'s `Contribution::AndroidThemeParent` doc
+("Built-in plugins only"); `crates/frust-drive/src/plugin/manifest.rs`'s `AndroidTable`
+(`deny_unknown_fields`) and its `unknown_keys_are_refused_at_every_level` test.
+
+---
+
+### `plugin-theme-parent-unresolved-trusted` — a theme parent the add cannot resolve is trusted, not verified
+
+**Observed**: when the app's `FrustAppTheme` already has a parent, `frust plugin add` follows it
+through the styles defined in `android/app/src/main/res/values/themes.xml` until it reaches an
+accepted Material theme (`Theme.Material3`, `Theme.Material3Expressive` or
+`Theme.MaterialComponents`, or a style below one) or a platform theme (`android:…`,
+`@android:style/…`). Only a missing parent or a platform ending is rewritten. A parent the file does not define (a style
+in another resource file or a library), a cycle, or a chain longer than the walk's limit is treated
+as app-owned and left alone, so the add reports the theme edit as present and `frust doctor` reports
+nothing. If that style is not Material after all, the Material views fail at run time as
+`native-chrome-android-material3-theme-required` describes.
+
+**Applies to**: Android apps using native-widgets whose `FrustAppTheme` parent is a style defined
+outside `themes.xml`.
+
+**Why accepted**: the add reads one resource file and never rewrites a style the app owns; resolving
+styles across every resource file and library would need the Android resource merger.
+
+**Evidence**: `crates/frust-drive/src/plugin/apply.rs`'s `Ancestry::Unresolved`, `style_ancestry`
+and `STYLE_CHAIN_LIMIT`; `crates/frust-drive/src/plugin/mod.rs`'s `Contribution::AndroidThemeParent`
+doc ("one the file cannot resolve is left to the app").
+
+---
+
 ### `ime-ios-content-type-unverified` — iOS secure-entry IME path is device-unverified
 
 **Observed**: `FrustViewController.swift`'s IME reconcile path — the
@@ -2738,8 +2783,10 @@ The Android sheet has one draggable half ratio: `BottomSheetBehavior` holds a si
 ratio, so of several half detents the user drags between the selected (else smallest) one and the
 full height (`SheetHandle::select_detent` reaches the others); `largest_undimmed` and
 `scrolling_expands` are ignored (the dialog dims at every height, the scroll view always hands
-nested scrolls to the behavior). One live presentation supersedes the previous: showing a sheet or
-alert takes down any alert or sheet on screen and resolves its abandoned resolver.
+nested scrolls to the behavior). The presentation slots are the same as on iOS: one sheet and one
+alert above it, with a second sheet, a second alert or a sheet while an alert is live refused
+`PresentError::Busy`. Only a presentation whose caller dropped its future is displaced: a new
+request takes that abandoned dialog down first and resolves its abandoned resolver.
 
 **Why accepted**: the stepper composite is follow-up work, and no Linux/Windows/web arm exists for
 the segmented control or the sheet (a macOS `NSPopover` arm is also follow-up); the compile-time
@@ -2756,27 +2803,40 @@ and `present/android_sheet.rs`; `plugins/native-widgets/README.md`'s controls ta
 
 ---
 
-### `native-chrome-android-material3-theme-required` — Android chrome, sheet, segmented and the toolbar FABs need a Material3-derived Activity theme
+### `native-chrome-android-material3-theme-required` — Android chrome, sheet, segmented and the toolbar FABs need a Material3-derived Activity theme, which an older or reverted app lacks
 
 **Observed**: the Material views are built under the Activity's manifest theme
 (the Kotlin-internal `FrustMaterialContext.wrap`), because `create_control`'s night-qualified context
-carries the framework default theme. A stock theme (e.g. `Theme.Material.NoActionBar`, the scaffold
-default) makes Material's theme enforcement throw: the chrome install answers `INSTALL_REFUSED` →
-`ChromeError::Refused`, the slot pins the generation to the frust-drawn fallback bars and logs the
-fix once; a segmented control logs and takes the host's dead-slot path; the sheet fails with
-`PresentError::Platform`. Never a crash.
+carries the framework default theme. `frust plugin add native-widgets` gives a generated app that
+theme: the template's manifest names the app-owned `@style/FrustAppTheme` and the add sets that
+style's parent to `Theme.Material3.DayNight.NoActionBar` (`Contribution::AndroidThemeParent`). An
+app with a stock theme still reaches the run-time path: one generated before the template defined
+`FrustAppTheme` (the add refuses it with `PluginAddError::AndroidAppThemeMissing`, naming the two
+manual edits, and writes nothing), or one whose theme was put back to a platform parent afterwards
+(by hand, or by `frust create --overwrite`). There, Material's theme enforcement throws: the
+chrome install answers `INSTALL_REFUSED` → `ChromeError::Refused`, the slot pins the generation to
+the frust-drawn fallback bars and logs the fix once; a segmented control logs and takes the host's
+dead-slot path; the sheet fails with `PresentError::Platform`. Never a crash. `frust doctor`'s
+`Plugins` block and `frust plugin list` report the pending theme edit, and the doctor row cites
+this id.
 
 The Material chrome also costs a landscape phone roughly half its height to the top bar and
 `BottomNavigationView`; there is no `NavigationRail` arm yet.
 
-**Applies to**: Android apps whose Activity theme derives from neither `Theme.Material3.*` nor
-`Theme.MaterialComponents.*`.
+**Applies to**: Android apps using native-widgets whose activity theme is in none of the
+`Theme.Material3`, `Theme.Material3Expressive` and `Theme.MaterialComponents` families: apps
+generated before the theme contribution existed, and apps that revert it. An activity on an app
+style of its own that descends from one of those families works at run time, but the add refuses it
+and the doctor row stays (both read the activity theme by name).
 
 **Why accepted**: Material's own enforcement is the only reliable signal, and the fallback keeps
-the app usable; the fix is one theme parent in the app.
+the app usable; the fix is one theme parent in the app, which a re-run of
+`frust plugin add native-widgets` writes when the app has `FrustAppTheme`.
 
 **Evidence**: `plugins/native-widgets/src/android/chrome.rs`'s *Install, refusal and the theme
-requirement*; `controls/segmented.rs`'s Android arm; `platform/android/build.gradle.kts` (THEME
+requirement*; `crates/frust-drive/src/plugin/mod.rs`'s `Contribution::AndroidThemeParent` and
+`PluginAddError::AndroidAppThemeMissing`; `crates/frust-drive/src/doctor/plugins.rs`
+(`THEME_LIMITATION`) and its tests; `controls/segmented.rs`'s Android arm; `platform/android/build.gradle.kts` (THEME
 REQUIREMENT); device gates on iPhone SE (iOS 26.7.1), Xiaomi 12 (Android 16), Pixel 5 (Android 14)
 and macOS; release APK cost: the Material pin alone is +116,211 B (the figure in
 `platform/android/build.gradle.kts`); the whole gate app (Material plus chrome code, demo code and
@@ -2785,20 +2845,25 @@ arm64 .so +141 KB), and R8 binds.
 
 ---
 
-### `native-chrome-android-bitmap-icons` — Android chrome icons are bitmaps; SF Symbols and menu-item icons are not drawn
+### `native-chrome-android-bitmap-icons` — Android chrome icons are bitmaps; symbol-only icons and menu-item icons are not drawn
 
-**Observed**: Android tab and action icons travel as PNG bytes (`setIcon`); an Apple SF Symbol has
-no Android rendering, so a symbol tab or action shows its title alone and `Leading::Symbol` shows
-no leading item (encoded `"none"`). A bottom item has one icon (a tab's selected-state icon is
-unused) and a menu item's icon is not shown.
+**Observed**: Android tab, action and leading icons travel as PNG bytes (`setIcon`). A
+`TabIcon::Bytes`, or the bytes half of a `TabIcon::AppleSymbolWithBytes`, draws on Android, in a
+tab, an action, a toolbar entry or `Leading::Icon`. An Apple SF Symbol alone has no Android
+rendering, so a `TabIcon::AppleSymbol` tab or action shows its title alone and `Leading::Symbol`
+(or `Leading::Icon` with a symbol-only icon) shows no leading item (encoded `"none"`). A bottom item
+has one icon (a tab's selected-state icon is unused) and a menu item's icon is not shown.
 
-**Applies to**: `native_scaffold` on Android.
+**Applies to**: `native_scaffold` on Android, for symbol-only icons and menu items.
 
-**Why accepted**: there is no cross-platform symbol vocabulary to map; apps supply bitmaps for
-Android, and the title keeps every item reachable.
+**Why accepted**: there is no cross-platform symbol vocabulary to map; apps give a symbol plus
+bytes (`TabIcon::apple_symbol_with_bytes`) or bytes alone for Android, and the title keeps every
+item reachable.
 
-**Evidence**: `plugins/native-widgets/src/android/chrome.rs`'s *Icons* and
-`chrome/mod.rs`'s `Leading::Symbol` doc.
+**Evidence**: `plugins/native-widgets/src/android/chrome.rs`'s *Icons*;
+`chrome/mod.rs`'s `Leading::Symbol` and `Leading::Icon` docs; `api/builders.rs`'s
+`TabIcon::AppleSymbolWithBytes`; the OnePlus 9 (Android 15) chrome-additions row of
+`examples/native-widgets-demo/README.md` (the symbol-plus-bytes icons draw).
 
 ---
 
@@ -2961,9 +3026,9 @@ class doc, `armed`, and `disarm()`.
 
 ---
 
-### `native-widgets-alert-busy-slot-unobserved-host-teardown` — a presenting host torn down through a path the arm cannot observe leaves the Busy slot held indefinitely
+### `native-widgets-alert-busy-slot-unobserved-host-teardown` — a presenting host torn down through a path the arm cannot observe leaves the alert's Busy slot held indefinitely
 
-**Observed**: both Apple alert arms document a teardown path their resolution mechanism cannot see: macOS's `NSWindowWillCloseNotification` fires only on a real window close, not `orderOut:` (hidden, not closed — `appkit_alert.rs`'s *Not observed*); on iOS the app replacing the presenting controller chain outside UIKit's own dismissal path removes the alert with no callback the arm can see (`apple_alert.rs`'s *Not observed*). In both cases the presentation stays pending in `present::ACTIVE` (the process-wide Busy slot) until `present::dismiss` resolves it `Dismissed` or the caller drops the `Presentation` future; every later `show_native_alert`/`show_native_alert_into` answers `PresentError::Busy` until then (a Busy refusal is logged at warn with the live presentation's generation and age).
+**Observed**: both Apple alert arms document a teardown path their resolution mechanism cannot see: macOS's `NSWindowWillCloseNotification` fires only on a real window close, not `orderOut:` (hidden, not closed — `appkit_alert.rs`'s *Not observed*); on iOS the app replacing the presenting controller chain outside UIKit's own dismissal path removes the alert with no callback the arm can see (`apple_alert.rs`'s *Not observed*). In both cases the presentation stays pending in its slot of `present::ACTIVE` (the process-wide Busy slots: one sheet, one alert above it) until `present::dismiss` resolves it `Dismissed` or the caller drops the `Presentation` future. With the alert slot held, every later `show_native_alert`/`show_native_alert_into` and every `show_native_sheet`/`show_native_sheet_into` answers `PresentError::Busy` until then (a Busy refusal is logged at warn with the live presentation's generation and age); toasts take no slot and are unaffected.
 
 **Applies to**: `show_native_alert`/`show_native_alert_into` on macOS and iOS/iPadOS — an app that hides rather than closes its presenting window (macOS `orderOut:`) or replaces a presenting controller chain outside UIKit's dismissal path (iOS) while an alert is live.
 
@@ -2987,17 +3052,17 @@ class doc, `armed`, and `disarm()`.
 
 ---
 
-### `native-widgets-alert-drop-leaves-platform-ui` — dropping a `Presentation` frees the Busy slot but leaves the platform alert or sheet on screen
+### `native-widgets-alert-drop-leaves-platform-ui` — dropping a `Presentation` frees its Busy slot but leaves the platform alert or sheet on screen
 
-**Observed**: dropping `Presentation<T>` releases the process-wide Busy slot (a new request — alert or sheet — may present at once) but does not dismiss the live platform UI. An alert stays on screen until the next request displaces it (the displacing arm takes it down first) or the user answers it, and that answer is discarded because nothing is listening. A sheet behaves the same way: dropping its future frees the slot, not the sheet, so a newer request (of either kind) can find the older sheet still live; whatever its kind, a displaced presentation goes down through the shared `LivePresentation::dismiss` seam and the successor presents from that dismissal's completion (`apple_host.rs`'s *The live-presentation guard*; `apple_sheet.rs`'s *A displaced presentation*).
+**Observed**: dropping `Presentation<T>` releases the Busy slot it held (the alert slot or the sheet slot; a new request for it may present at once) but does not dismiss the live platform UI. An abandoned alert stays on screen until a later request displaces it (a new alert, or a new sheet, which is accepted only with both slots free; the displacing arm takes it down first) or the user answers it, and that answer is discarded because nothing is listening. A sheet behaves the same way: dropping its future frees the sheet slot, not the sheet, so a newer sheet can find the older one still live, and a new alert takes an abandoned sheet down too (an alert stays above a sheet only while that sheet's request is live). Whatever its kind, a displaced presentation on iOS goes down through the shared `LivePresentation::dismiss` seam, the alert above first, and the successor presents from that dismissal's completion (`apple_host.rs`'s *The live-presentation guard*; `apple_sheet.rs`'s *A displaced presentation*); on Android the presenter takes the stale dialogs down before it builds the new one (`android_alert.rs`'s and `android_sheet.rs`'s *A displaced presentation*).
 
 A mid-interactive-dismissal race is accepted rather than closed: a successor request arriving while the user's swipe is still animating a displaced sheet away resolves it at once (`DisplacedAction::ResolveAndContinue`, `apple_host.rs`) without waiting for that animation, so the successor's own presentation attempt can find UIKit still mid-transition and resolve `PresentError::NoHost` instead of showing; and if the user's swipe is then cancelled, the old sheet is back on screen with no live entry to answer it — removable only by another swipe, not by a further programmatic `dismiss`.
 
-**Applies to**: any caller that drops the future returned by `show_native_alert` (or the request behind `show_native_alert_into`) without calling `dismiss`, on all three alert arms; the same holds for `show_native_sheet` (or `show_native_sheet_into`) on its one arm, iOS/iPadOS.
+**Applies to**: any caller that drops the future returned by `show_native_alert` (or the request behind `show_native_alert_into`) without calling `dismiss`, on all three alert arms; the same holds for `show_native_sheet` (or `show_native_sheet_into`) on its two arms, iOS/iPadOS and Android.
 
 **Why accepted**: documented module contract (`present/mod.rs`: dropping the future frees only this module's bookkeeping); tearing down live platform UI from a dropped future would need arm-specific plumbing for a case the API already covers with `dismiss`.
 
-**Evidence**: `plugins/native-widgets/src/present/mod.rs` module doc; `apple_alert.rs` / `appkit_alert.rs` / `android_alert.rs` and `apple_sheet.rs`'s *A displaced presentation* sections.
+**Evidence**: `plugins/native-widgets/src/present/mod.rs` module doc; `apple_alert.rs` / `appkit_alert.rs` / `android_alert.rs`, `apple_sheet.rs` and `android_sheet.rs`'s *A displaced presentation* sections.
 
 ---
 
@@ -3012,6 +3077,176 @@ A mid-interactive-dismissal race is accepted rather than closed: a successor req
 **Evidence**: `plugins/native-widgets/src/present/apple_sheet.rs`'s module doc, *iPad in regular width ignores detents*; `plugins/native-widgets/src/present/mod.rs`'s `Detent` doc.
 
 **Workaround**: none — design sheet content to read well at both a compact edge-attached presentation and a regular-width centered form sheet; never rely on detent changes firing on an iPad in regular width.
+
+---
+
+### `native-toast-android-behind-dialog` — an Android toast shown while a sheet or alert is up draws behind it, and its timer keeps running
+
+**Observed**: `show_native_toast` on Android shows a Material `Snackbar` in a layer added to the
+Activity's content view. A sheet (`BottomSheetDialog`) or an alert (`AlertDialog`) is its own
+window above that view, so a toast shown while one is up draws behind the dialog window: under its
+dim, hidden where the dialog covers it, and out of reach of a tap until the dialog goes. The toast takes no slot and its duration is not paused: it can time out (resolving
+`ToastOutcome::TimedOut`) while hidden.
+
+**Applies to**: `show_native_toast`/`show_native_toast_into` on Android while a native sheet or
+alert is live. iOS draws its capsule in the key window; that arm has not yet been run on a device.
+
+**Why accepted**: the toast is deliberately independent of both slots (never `Busy`, never waiting),
+and a toast above a dialog would need a window of its own.
+
+**Workaround**: show the toast after the sheet or alert resolves, or put the message in the
+dialog.
+
+**Evidence**: `plugins/native-widgets/platform/android/src/main/kotlin/dev/frust/nativewidgets/FrustNativePresenter.kt`'s
+*The toast* ("a toast shown while one is up draws behind it"); `plugins/native-widgets/src/present/toast.rs`'s
+*The contract*; the OnePlus 9 (Android 15) chrome-additions row of `examples/native-widgets-demo/README.md` ("a toast draws behind a sheet or alert dialog").
+
+---
+
+### `native-toast-phones-only` — `show_native_toast` is unsupported on macOS and every desktop and web target
+
+**Observed**: the toast has two arms, Android (`android_toast`, a Material `Snackbar`) and
+iOS/iPadOS (`apple_toast`, a plugin-owned capsule). Every other target, macOS included, answers
+`PresentError::Unsupported` at once, from both `show_native_toast` and `show_native_toast_into`.
+
+**Applies to**: `show_native_toast`/`show_native_toast_into` on macOS, Linux, Windows and web.
+
+**Why accepted**: macOS has no system toast idiom to wrap; a frust-drawn toast serves those targets.
+
+**Evidence**: `plugins/native-widgets/src/present/toast.rs`'s *Platform arms*;
+`plugins/native-widgets/src/present/unsupported.rs`; the host test
+`the_toast_forms_are_unsupported_off_android_and_ios_and_never_busy` in
+`plugins/native-widgets/src/api/present.rs`.
+
+---
+
+### `native-chrome-ios-badge-navigation-bar-only` — iOS shows action badges only on top-bar actions, and only on iOS 26 and later
+
+**Observed**: `ActionItem::badge` on iOS sets `UIBarButtonItem.badge`, which UIKit draws in
+navigation bars only and which exists from iOS 26. The arm looks the API up at run time
+(`respondsToSelector`) and shows no badge where it is missing, logging that once at debug level. A
+badge on a toolbar entry is therefore not shown on iOS. Android (a Material badge on the top-bar
+item or the toolbar button) and the frust-drawn bars show both. This is read from the code and
+UIKit's documentation: the iOS arm has not yet been run on a device.
+
+**Applies to**: `native_scaffold` on iOS/iPadOS: toolbar badges on every version, and every badge
+before iOS 26.
+
+**Why accepted**: the badge is UIKit's own; drawing one over a bar item by hand would fight the
+system bar's layout.
+
+**Evidence**: `plugins/native-widgets/src/apple/chrome.rs`'s *Badges, prominence and icons*;
+`plugins/native-widgets/src/chrome/mod.rs`'s `ActionItem::badge` doc.
+
+---
+
+### `native-search-placement-limited` — no bottom search placement, and the placement hint has no effect on Android
+
+**Observed**: `SearchPlacement` has two values, `Automatic` and `NavigationBar`, both in the top
+bar; there is no bottom (toolbar) placement. iOS maps `NavigationBar` onto the integrated
+navigation-bar placement (iOS 16 and later); the Android arm (a collapsible search action in the
+top bar) and the frust-drawn bars have one presentation each and ignore the hint. On Android, with
+other actions in the bar, a long placeholder is cut short.
+
+**Applies to**: `native_scaffold(..).search(..)`, every platform for the missing bottom placement,
+Android and the frust-drawn bars for the ignored hint.
+
+**Why accepted**: the top-bar field is the one presentation every arm has; a bottom search field
+would need a toolbar arm on each platform.
+
+**Evidence**: `plugins/native-widgets/src/chrome/mod.rs`'s `SearchPlacement` doc;
+`plugins/native-widgets/src/android/chrome.rs`'s *Search*; the OnePlus 9 (Android 15) chrome-additions row of `examples/native-widgets-demo/README.md` ("a long search placeholder is cut
+short").
+
+---
+
+### `native-chrome-android-floating-toolbar-overflow` — the Android floating toolbar has no overflow, so several text items run past a narrow phone
+
+**Observed**: with `ToolbarStyle::Floating`, the Android arm lays every secondary entry out in one
+horizontal row inside a Material 3 `FloatingToolbarLayout`, a text button per titled entry and an
+icon button per icon, each at its natural width, with no overflow menu and no scrolling. Several
+text items plus the primary beside the pill can be wider than a narrow phone, and nothing in the
+layout keeps the row inside the screen. This is read from the layout code, not observed: the demo's
+detail page (one item and a labelled primary) fits, and a wider set has not been run on a device.
+
+**Applies to**: `ToolbarSpec::style(ToolbarStyle::Floating)` on Android with several titled items.
+
+**Why accepted**: the floating toolbar is meant for a few actions; an overflow would duplicate the
+top bar's own.
+
+**Workaround**: give the items icons (`ActionItem::icon`), keep to a few, or use the default
+`ToolbarStyle::Buttons`.
+
+**Evidence**: `plugins/native-widgets/platform/android/src/main/kotlin/dev/frust/nativewidgets/FrustNativeChrome.kt`'s
+`addFloatingToolbar`; the OnePlus 9 (Android 15) chrome-additions row of `examples/native-widgets-demo/README.md` (the floating toolbar with the labelled primary).
+
+---
+
+### `native-segmented-android-expressive-pills` — under a Material 3 Expressive theme, Android `native_segmented` draws separate pills with clipped labels
+
+**Observed**: `native_segmented` on Android is a `MaterialButtonToggleGroup` of equal-width,
+single-line segments, styled by the activity theme. Under a `Theme.Material3Expressive` theme the
+group draws its buttons as separate pills, and the segment labels are clipped.
+
+**Applies to**: Android apps using `native_segmented` whose activity theme is in the
+`Theme.Material3Expressive` family (accepted by `frust plugin add`, which then leaves the theme
+alone).
+
+**Why accepted**: the theme the add writes, `Theme.Material3.DayNight.NoActionBar`, draws the
+connected segments; the plugin does not override an app's chosen theme.
+
+**Workaround**: use a `Theme.Material3` activity theme, or a frust-drawn segmented control.
+
+**Evidence**: the OnePlus 9 (Android 15) chrome-additions row of `examples/native-widgets-demo/README.md` ("under a Material 3 Expressive theme `native_segmented` draws separate pills
+with clipped labels"); `plugins/native-widgets/src/controls/segmented.rs`'s Android arm.
+
+---
+
+### `native-chrome-android-large-title-snaps` — the Android large title snaps between its heights instead of following the finger
+
+**Observed**: `.large_title(true)` on Android is Material 3's medium collapsing top bar. The arm
+collapses and expands it from the scroll state the scaffold mirrors (`.scroll(controller)`):
+`setScroll` derives a lifted state, and a change of that state animates the bar to the other height.
+It does not track the scroll offset, so the bar snaps rather than following the finger, and without
+`.scroll(..)` it stays expanded.
+
+**Applies to**: `native_scaffold(..).large_title(true)` on Android. iOS's large title is the
+navigation bar's own; it has not yet been run on a device.
+
+**Why accepted**: the frust body is not an Android scrolling view, so the `CoordinatorLayout`
+scroll behaviour that tracks the finger has nothing to follow; the mirrored state is what the arm
+has.
+
+**Evidence**: `plugins/native-widgets/src/android/chrome.rs`'s *Large title*; the OnePlus 9 (Android 15) chrome-additions row of `examples/native-widgets-demo/README.md` ("the bar
+collapses on scroll").
+
+---
+
+### `android-thread-local-key-limit` — every Rust `thread_local!` takes one of the process's 128 pthread keys on Android, and running out aborts
+
+**Observed**: on Android, Rust's standard library keeps each `thread_local!` static in a pthread key
+(`pthread_key_create`), taken the first time a thread touches the static and never freed. bionic
+allows `PTHREAD_KEYS_MAX` (128) keys per process, shared with the Java runtime, the C libraries and
+every other native library. A process that has used them all aborts (SIGABRT) on the first use of
+the next thread-local static, with no Rust panic in logcat: for example when a text field first
+takes focus and reaches a static nothing touched before. The framework itself links several dozen
+thread-local statics, so an app's own share of the budget is smaller than 128.
+
+**Applies to**: Android apps, in proportion to the thread-local statics they link and use; the
+native-widgets demo hit it when each page signal had its own `thread_local!`.
+
+**Why accepted**: the key budget is bionic's and the keyed storage is the standard library's choice
+on this target; frust cannot raise either.
+
+**Workaround**: keep per-thread state in one structure (one `thread_local!` holding a struct or a
+map) rather than many `thread_local!` statics. Count what a library links with
+`scripts/ci/tls-key-count.sh <unstripped .so> [budget]`: it prints the distinct thread-local statics
+and a per-crate breakdown, and with a budget exits 1 when the count is over it. The count is an
+upper bound for that library and ignores keys taken by non-Rust code.
+
+**Evidence**: `scripts/ci/tls-key-count.sh`'s header; `examples/native-widgets-demo/src/pages/common.rs`'s
+`local_sig!` and `LOCAL_SLOTS` (the demo's page signals moved into one type-keyed map, after which
+the demo no longer aborted on text-field focus); the OnePlus 9 (Android 15) chrome-additions row of `examples/native-widgets-demo/README.md` (the final pass on a clean launch).
 
 ---
 

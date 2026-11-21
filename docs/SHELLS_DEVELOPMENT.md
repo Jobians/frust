@@ -93,7 +93,7 @@ regardless of the app's theme).
 
 **Fix:** change `android:theme` on both the `<application>` and `<activity>` elements in
 `android/app/src/main/AndroidManifest.xml` from the legacy `@android:style/Theme.NoTitleBar` to
-`@android:style/Theme.Material.NoActionBar` (the current scaffold template's theme).
+`@android:style/Theme.Material.NoActionBar` (the parent of the scaffold's `@style/FrustAppTheme`).
 
 Rebuilding against the current embedding already fixes the bars and the insets even on the legacy
 theme — `FrustActivity.onCreate` adds `FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS` itself on API < 35 (see

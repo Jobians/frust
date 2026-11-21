@@ -129,6 +129,12 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   than the per-frame cap) now fails, panicking at the call that painted it; before, the test passed
   and only a device showed a blank frame. Migration: fix the view, or opt out for a test that paints
   one on purpose with `TesterOptions::allow_refused_frames(true)` and read `Tester::refused_frames()`.
+- `frust-native-widgets`: three public enums that are not `#[non_exhaustive]` gained variants:
+  `TabIcon::AppleSymbolWithBytes { symbol, bytes }`, `Leading::Icon(TabIcon)` and
+  `ChromeEvent::Search(SearchEvent)`. Migration: an exhaustive `match` on any of them adds the new
+  arm; a `ChromeEvent` handler that ignores search adds `ChromeEvent::Search(_) => {}`.
+- `frust-drive`: `Contribution` gained the variant `AndroidThemeParent` and `PluginAddError` the
+  variant `AndroidAppThemeMissing`, so an exhaustive `match` on either needs the new arm.
 
 ### Added
 
@@ -442,6 +448,62 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   the Kotlin result class gained a field.
 - `frust-drive`: `ProcessRunner::run_streaming_with_stderr`, which hands stderr lines to a second sink
   as they arrive.
+- `frust-native-widgets` chrome items: `ActionItem::badge` (a count, `"new"` or `""` for a dot; a
+  change of badge alone updates the shown item in place) and `ActionItem::prominent`;
+  `TabIcon::apple_symbol_with_bytes`, an SF Symbol on iOS and encoded image bytes on Android and in
+  the frust-drawn bars, accepted by tabs, actions, toolbar entries and the new `Leading::Icon` (a
+  plain, untappable leading icon). On Android `native_scaffold(..).large_title(true)` is now Material
+  3's medium collapsing top bar with the title and subtitle, collapsing on the `.scroll(..)` state.
+  iOS draws a badge on top-bar actions only, from iOS 26 (`native-chrome-ios-badge-navigation-bar-only`
+  in docs/LIMITATIONS.md).
+- `frust-native-widgets`: `ToolbarSpec::style(ToolbarStyle)` and `ToolbarSpec::primary_label(bool)`.
+  `ToolbarStyle::Floating` gathers the toolbar items into a Material 3 floating toolbar on Android,
+  centred above the bottom navigation with the primary beside it and hidden while the keyboard
+  shows, and into one pill in the frust-drawn bars. `primary_label(true)` makes an icon primary an
+  extended floating action button showing its title. iOS ignores both.
+- `frust-native-widgets`: `native_button(..).style(NativeButtonStyle)` with `Plain` (the default),
+  `Prominent`, `Destructive`, `Glass` and `ProminentGlass`, mapped to Material button styles on
+  Android, `UIButtonConfiguration`s on iOS (the glass ones on iOS 26, a fallback before, looked up at
+  run time) and push-button bezels on macOS. A style change restyles a live button in place, and the
+  result matches a fresh button of that style.
+- `frust-native-widgets` search: `native_scaffold(..).search(SearchSpec)` and `.on_search(..)` with
+  `SearchEvent` (`Began`, `Changed`, `Submitted`, `Ended`), also delivered as `ChromeEvent::Search`;
+  `SearchSpec` has `placeholder`, `text`, `active` and `placement` (`SearchPlacement::Automatic` or
+  `NavigationBar`). The app owns the query and the open state and feeds them back; the plugin never
+  echoes them into the field. iOS puts a `UISearchController` on each page's navigation item with the
+  frust body showing the results, Android a collapsible search field in the top bar, and the
+  frust-drawn bars a text-field row with a close button (`Ended` means closed and empty: Escape or
+  the close button, not a blur). The placement has no effect on Android and there is no bottom
+  placement (`native-search-placement-limited`). Focusing the native field ends a frust text field's
+  focus, and the reverse.
+- `frust-native-widgets` presentations: `SheetSpec::on_row_tap(id, listener)` makes a sheet row an
+  event that keeps the sheet up, so a row can open a confirmation alert above the sheet.
+- `frust-native-widgets` toasts: `show_native_toast` and `show_native_toast_into` with `ToastSpec`
+  (message, optional action, `with_duration`, `with_glass`), `ToastDuration` (`Short` 1.5 s, `Long`
+  2.75 s, `Custom` clamped to 1-10 s) and `ToastOutcome` (`TimedOut`, `Dismissed`, `Action`). A toast
+  takes no presentation slot, is never refused `Busy`, and a new one replaces the current one. Android
+  shows a Material `Snackbar` above the plugin's bottom bars and the keyboard (behind a sheet or alert
+  dialog that is up, `native-toast-android-behind-dialog`); iOS a plugin-owned capsule, with Liquid
+  Glass on request; every other target answers `PresentError::Unsupported`. The iOS arm has not yet
+  been run on a device.
+- `frust plugin add native-widgets` sets the parent of the app's `FrustAppTheme` style to
+  `Theme.Material3.DayNight.NoActionBar` (`Contribution::AndroidThemeParent`), so the plugin's
+  Material views work in a newly generated app. An activity theme already in the `Theme.Material3`,
+  `Theme.Material3Expressive` or `Theme.MaterialComponents` family needs nothing, and neither does a
+  `FrustAppTheme` whose parent is in one of them or is an app style leading to one. A parent that is
+  an app style ending in a platform theme is replaced, which takes that style out of the activity
+  theme. An activity on any other theme, including an app style of its own, is refused before
+  anything is written, with the two manual edits named (`PluginAddError::AndroidAppThemeMissing`).
+- `frust doctor` prints an informational `Plugins` block inside a project, listing each built-in plugin
+  the app depends on whose project edits are still pending (such as a missing Gradle include or a
+  stock activity theme), with the fix and the limitation id where one applies. It never changes the
+  exit code. `frust_drive::doctor::plugin_findings` and `PluginFinding` serve it.
+- `scripts/ci/kotlin-compile.sh` and a `kotlin-compile` CI job compile the Kotlin of every built-in
+  plugin's Android module and of the embedding in a throwaway app, without building Rust. The job
+  runs when a change touches those paths and is not part of the `ci-ok` merge gate.
+- `scripts/ci/tls-key-count.sh <unstripped .so> [budget]` counts the thread-local statics linked into
+  an Android library, with a per-crate breakdown, and exits 1 when a given budget is exceeded
+  (`android-thread-local-key-limit`).
 
 ### Changed
 
@@ -477,6 +539,22 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   non-browser client, are unaffected.
 - The pinned toolchain (`rust-toolchain.toml`) is now Rust 1.100.0 (was 1.98.1); rustup installs it
   on first use in a checkout. The minimum supported Rust version is not changed by this.
+- A generated Android app's manifest names the app-owned `@style/FrustAppTheme` on both the
+  `<application>` and the `<activity>` element, defined in the new
+  `android/app/src/main/res/values/themes.xml` with the platform parent the manifest used before
+  (`android:Theme.Material.NoActionBar`), so an app without plugins looks the same. Migration for an
+  existing app that adds native-widgets: add `<style name="FrustAppTheme"
+  parent="Theme.Material3.DayNight.NoActionBar" />` inside `<resources>` in that file (create it if it
+  is missing), set `android:theme="@style/FrustAppTheme"` on both elements, then run
+  `frust plugin add native-widgets`; an activity theme named directly from the `Theme.Material3`,
+  `Theme.Material3Expressive` or `Theme.MaterialComponents` family works as it is.
+- `frust-native-widgets`: an alert requested while a native sheet is up is now shown above the sheet,
+  where it was refused `PresentError::Busy`. When the sheet ends first, its alert resolves `Cancelled`
+  before the sheet's own outcome. A second alert, a second sheet and a sheet while an alert is up are
+  still refused `Busy`.
+- `frust-native-widgets`: on Android the themed `Plain` `native_button` keeps the Material ripple; the
+  theme fill and corner radius now go into the button's own Material background instead of replacing
+  it.
 
 ### Fixed
 
@@ -510,6 +588,10 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   parallel tests no longer see each other's presses.
 - `frust run` on a physical iPhone prints the app's stderr as it arrives, where it used to appear only
   once the launch command exited.
+- The native-widgets demo no longer aborts on Android when a text field first takes focus. Each page
+  signal had its own `thread_local!`, and the process ran out of pthread keys; the page signals now
+  share one thread-local map. An app with many `thread_local!` statics can hit the same abort
+  (`android-thread-local-key-limit` in docs/LIMITATIONS.md).
 
 ### Security
 

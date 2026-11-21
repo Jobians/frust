@@ -10,12 +10,12 @@
 //! retained-handle [`registry`] every control's create/update/dispose path is
 //! built over, the `runtime` those paths dispatch through, the `controls` —
 //! eight shared (`Button`, `Label`, `Switch`, `Slider`, `ProgressBar`, `Image`,
-//! `Spinner`, `DatePicker`), the two iOS/macOS-only ones (`Segmented`,
-//! `Stepper`) and the iOS-only `TabBar` —
+//! `Spinner`, `DatePicker`), `Segmented` (iOS, macOS and Android's Material
+//! arm), the iOS/macOS-only `Stepper` and the iOS-only `TabBar` —
 //! that runtime serves, the typed `events` vocabulary their listeners decode
 //! into, the app-facing `api` builders, and the three platform arms' factory
-//! glue. Each shared control carries one platform half per arm (`Segmented`/
-//! `Stepper` have no Android half and `TabBar` has only the iOS one — their
+//! glue. Each shared control carries one platform half per arm (`Stepper`
+//! has no Android half and `TabBar` has only the iOS one — their
 //! builders render a refusal banner elsewhere) — a
 //! `#[cfg(target_os = "android")] mod platform`, a
 //! `#[cfg(target_os = "ios")] mod platform` and a
@@ -79,14 +79,15 @@
 //!
 //! # Native presentations
 //!
-//! Modal platform UI — an alert today — is not a `platform_view` slot: the
+//! Modal platform UI — an alert or a sheet — is not a `platform_view` slot: the
 //! differ owns a slot's lifetime and knows no modal stacking, while a modal
 //! belongs to the host (the resumed Android `Activity`, the topmost iOS view
 //! controller, the macOS key window). The [`present`] module therefore serves
 //! it imperatively: [`present::show_alert`] answers a [`Presentation`] future
-//! resolving exactly one [`AlertOutcome`], one presentation is live per
-//! process (a second request resolves [`PresentError::Busy`]), and
-//! [`present::dismiss`] takes one down. It needs no `frust-api` feature — a
+//! resolving exactly one [`AlertOutcome`], and [`present::dismiss`] takes one
+//! down. There are two process-wide slots, one sheet and one alert above it:
+//! a second alert, a second sheet or a sheet while an alert is live resolves
+//! [`PresentError::Busy`]. It needs no `frust-api` feature — a
 //! plain [`core::future::Future`] pollable from any executor. All three arms
 //! are built: iOS/iPadOS presents a `UIAlertController` (an iPad action
 //! sheet anchored as a popover on [`AnchorRect`]); macOS presents an
@@ -98,10 +99,11 @@
 //! ([`present::show_sheet`]: a [`SheetSpec`]'s constrained native content —
 //! title, message, image, up to three action rows — resolving one
 //! [`SheetOutcome`], with detent changes streamed to a callback) is built
-//! on iOS/iPadOS only, a page sheet under `UISheetPresentationController`
-//! (an iPad in regular width shows a form sheet and ignores detents); every
-//! other target answers [`PresentError::Unsupported`]. Alerts and sheets
-//! share the one-at-a-time slot. A **toast** ([`present::show_toast`]: a
+//! on iOS/iPadOS (a page sheet under `UISheetPresentationController`; an
+//! iPad in regular width shows a form sheet and ignores detents) and Android
+//! (a Material `BottomSheetDialog`); every other target answers
+//! [`PresentError::Unsupported`]. An alert requested while a sheet is live
+//! is shown above it and resolves `Cancelled` if the sheet ends first. A **toast** ([`present::show_toast`]: a
 //! [`ToastSpec`]'s message and optional action, resolving one
 //! [`ToastOutcome`]) takes no slot — a newer toast replaces the current one
 //! — and is built on Android (a Material `Snackbar` above the plugin's bottom
@@ -232,8 +234,8 @@ mod appkit;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 #[cfg_attr(not(feature = "frust-api"), allow(dead_code))]
 mod coretext;
-// The v1 controls (eight shared, the two Apple-only ones, `Segmented` and
-// `Stepper`, and the iOS-only `TabBar`). Compiled on every target on
+// The v1 controls (eight shared, `Segmented` on all three arms, the
+// Apple-only `Stepper` and the iOS-only `TabBar`). Compiled on every target on
 // purpose: each control's
 // props/decode/diff half is platform-agnostic and host-tested, and only its
 // `NativeWidget` impls (one per platform arm) are `#[cfg(target_os = ...)]`

@@ -394,10 +394,10 @@ aarch64-apple-ios-sim -p <crate> [--lib | --test <name>]` — `frust-iap` (`--li
 Simulator gate (`-p frust-testing --test ios_sim`) use it.
 
 **Neither compile gate above touches Kotlin or Swift.** `cargo check --target
-aarch64-linux-android`/`aarch64-apple-ios*` type-checks the Rust `frust-*` graph only, so a Kotlin
-error in the embedding or a plugin's Gradle module ships through a green cargo gate undetected. Only
-a real Gradle build (`frust build apk --debug`, or the ignored `build_e2e`/scaffold tests above)
-compiles Kotlin; compiling Swift needs an Xcode build (macOS only).
+aarch64-linux-android`/`aarch64-apple-ios*` type-checks the Rust `frust-*` graph only. Kotlin compiles
+in a real Gradle build (`frust build apk --debug`, the ignored `build_e2e`/scaffold tests above) and in
+`scripts/ci/kotlin-compile.sh` (the embedding plus every built-in plugin's Android module; CI's
+`kotlin-compile` job, outside `ci-ok`); compiling Swift needs an Xcode build (macOS only).
 
 ### Per-unit device gates
 

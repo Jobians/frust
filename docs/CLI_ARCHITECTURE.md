@@ -49,7 +49,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for how CLI relates to the other units.
 | `frust-drive::packages` | `PackageLocator` — the one answer to "which directory holds this frust package for this project", by `cargo metadata` of the project (`CargoLocator`, `AllowUpdate` by default so it resolves as the next `cargo build` would, or `Locked`; `CachedLocator` runs cargo once per answer; `StubLocator` under the `test-util` feature). `locate`/`locate_many` return a `PackagesError` (`NoManifest`, `CargoUnavailable`, `MetadataFailed`/`MetadataUnreadable` carrying cargo's own text, `PackageAbsent`, `Ambiguous` when two versions are reachable and the project root's dependency closure cannot pick one). Every consumer needing a frust package directory goes through it, in registry and path mode alike: `web_build`'s host page/embedder, plugin apply, `platform_wiring`, and `frust doctor`'s web row |
 | `frust-drive::platform_wiring` | `sync`/`sync_with(&dyn PackageLocator)`/`resolve` and its `Report`: writes every machine-local native location into untracked files — `frust.embedding.dir` (the Android embedding inside `frust-shell-android`) and `frust.plugin.<module>.dir` per plugin Gradle module the manifest depends on into the gitignored `android/local.properties` (`android_build::local_properties`, which the generated `settings.gradle.kts` reads through `frustLocalDir(key)`; a legacy `gradle.properties` key is refreshed if present, never added), and one gitignored `ios/<Package>` symlink (`ios/FrustEmbedding`, one per plugin package) that `project.pbxproj` references as `relativePath = "<Package>"`. No tracked file of a generated project carries a machine path. `frust run`/`frust build` write only machine-local, untracked files — these, the app identity keys in `android/local.properties` and the iOS identity passed to `xcodebuild` (see [CLI_DEVELOPMENT.md](CLI_DEVELOPMENT.md) § Identifiers and flavors) — and never edit `Cargo.toml`, `settings.gradle.kts`, `Info.plist`, the entitlements file or the Xcode project; tracked edits happen only in `frust plugin add` and `frust plugin sync`, as anchor insertions, so app-owned edits outside the frust markers survive (for a manifest plugin's Swift package they also append `/ios/<Package>` to the root `.gitignore`, and that line counts as a pending edit). Before any build process they stop (`prepare_native_build`) when a discovered manifest plugin still has tracked edits pending, pointing at `frust plugin sync`. Idempotent; a platform directory the project lacks is skipped |
 | `frust-drive::host_path` | Windows verbatim-path (`\\?\`) simplification and portable (forward-slash) path rendering, shared by the scaffold pipeline above and, for `same_path`/`is_under`, the TUI's recent-projects and launch-guard identity checks (see [TUI_ARCHITECTURE.md](TUI_ARCHITECTURE.md)). `home_dir_from` is the single pure `HOME` → `USERPROFILE` → `HOMEDRIVE`+`HOMEPATH` resolver, delegated to by `frust-tui`'s persisted-config path, `frust-dap`'s VS Code workspace detection, and this crate's own Android Gradle-home note, so the three no longer hand-roll the same fallback chain |
-| `frust-drive::doctor` | Pluggable environment validators plus a structured, non-blocking toolchain report; `CargoPackagerValidator` checks the pinned `cargo-packager` version and is non-fatal (`Partial` at worst — only `frust build --installer` needs it). `WasmTargetValidator` ("wasm32 target"), `WasmBindgenCliValidator` ("wasm-bindgen CLI"), and `WasmOptValidator` ("wasm-opt") check the browser toolchain the same non-fatal way — never worse than `Partial`, since a host that will never build for the browser is not a broken host. `default_validators_for_host` registers `XcodeValidator` only on a macOS host, matching `build_report`'s own iOS-area gate, so the flat validator list carries no permanent `Xcode` row on Linux/Windows. The component-level `build_report` groups these into a non-core "Web" area alongside Prerequisites/Android/iOS/Desktop, with runnable fixes for the target (`rustup target add`) and the CLI (`cargo install -f wasm-bindgen-cli`) and install guidance for `wasm-opt` (binaryen ships as a platform package, not one invocation) |
+| `frust-drive::doctor` | Pluggable environment validators plus a structured, non-blocking toolchain report; `CargoPackagerValidator` checks the pinned `cargo-packager` version and is non-fatal (`Partial` at worst — only `frust build --installer` needs it). `WasmTargetValidator` ("wasm32 target"), `WasmBindgenCliValidator` ("wasm-bindgen CLI"), and `WasmOptValidator` ("wasm-opt") check the browser toolchain the same non-fatal way — never worse than `Partial`, since a host that will never build for the browser is not a broken host. `default_validators_for_host` registers `XcodeValidator` only on a macOS host, matching `build_report`'s own iOS-area gate, so the flat validator list carries no permanent `Xcode` row on Linux/Windows. The component-level `build_report` groups these into a non-core "Web" area alongside Prerequisites/Android/iOS/Desktop, with runnable fixes for the target (`rustup target add`) and the CLI (`cargo install -f wasm-bindgen-cli`) and install guidance for `wasm-opt` (binaryen ships as a platform package, not one invocation). `plugin_findings` → `PluginFinding` is the project-aware half: the built-in plugins an app depends on whose edits are still pending, judged by `plugin::pending_contributions` (no Gradle or XML parsing of its own) |
 | `frust-drive::devices` | Pluggable per-platform device discovery, aggregated non-fatally |
 | `frust-drive::facade_key` | Resolves the app's dependency key for the `frust-ui` package (`FacadeKey`), since cargo resolves `--features <dep>/<feature>` against the key, not the package name: `cargo metadata --no-deps` through the existing `CargoLocator` seam, falling back to the manifest's `[dependencies]`/`[target.*.dependencies]` tables (which cannot see a workspace-inherited rename), default `frust`; two keys is an error (`FacadeKeyError::Ambiguous`). `map` rewrites a canonical `frust/<feat>` to `<key>/<feat>` at the argv boundary; `FacadeKey::hint()` is the line front-ends append to a cargo feature error |
 | `frust-drive::build_info` | The debug/profile/release + flavor funnel shared by run and build; `BuildMode::cargo_features()` also selects the canonical `frust/perf-trace`+`frust/devtools` cargo-feature pair for Debug/Profile, and `session_cargo_features(hot)` adds `frust/hotpatch` (`HOTPATCH_FEATURE`) for a Debug hot session only — never Profile or Release (see [DEVTOOLS_ARCHITECTURE.md](DEVTOOLS_ARCHITECTURE.md)). Canonical names stay `frust/..` inside `BuildMode`; `cargo_features_for` / `session_cargo_features_for` are the command-line mapping of that list through a `FacadeKey` |
@@ -181,12 +181,19 @@ child output can't garble a caller's raw-mode terminal (relevant to `frust-tui`)
   `.cargo/config.toml` (a verbatim `template_manifest.json` entry) holding the Android link flags,
   byte-identical to the repository root's copy and kept so by `profile_sync` — a generated project sits
   outside any checkout, and with it beyond the reach of the root file Cargo would otherwise have merged in (see
-  [DEVELOPMENT.md](DEVELOPMENT.md) § Build).
+  [DEVELOPMENT.md](DEVELOPMENT.md) § Build). The Android template's manifest names the app-owned
+  `@style/FrustAppTheme` on both the application and the activity; `res/values/themes.xml` defines it
+  over the platform `android:Theme.Material.NoActionBar`, and it is the one style a plugin's
+  theme-parent edit touches.
 - `doctor`/`devices`: `dispatch` runs `frust-drive`'s independent, non-fatal `Validator`/
   `DeviceDiscovery` sets through the injected runner; the CLI renders the resulting report.
   `doctor` also prints a "Platform packages" section: the directory the project resolves for
   android, ios, and web through one `PackageLocator`, or the resolution error. The Android area reads
-  the NDK's `Pkg.Revision`: ok at r28 or later, a warning below it (not 16 KB aligned).
+  the NDK's `Pkg.Revision`: ok at r28 or later, a warning below it (not 16 KB aligned). A last
+  "Plugins" heading, printed only inside a project with something to report, lists each
+  `PluginFinding`: a plugin's pending edits, the limitation explaining one, and the add command —
+  preceded by the hand edits (`PendingContribution::manual_edits`) when the add would refuse — or a
+  note on a check that could not be made. Informational: it never moves `doctor`'s exit code.
 - `run`/`build`: CLI args become a `BuildInfo`, which drives `frust-drive`'s Android/iOS pipelines
   (compile → install → launch/stream) through the same `ProcessRunner`; desktop falls back to a
   `cargo run` passthrough (via `desktop_run`) with an optional `--watch` loop (below). `-d android|ios`
@@ -312,7 +319,7 @@ child output can't garble a caller's raw-mode terminal (relevant to `frust-tui`)
   [PLUGINS_ARCHITECTURE.md](PLUGINS_ARCHITECTURE.md) for the plugins this distributes); a plugin's
   native module location is written through `platform_wiring` (`frust.plugin.<module>.dir`,
   `ios/<Package>`). Before the first write it checks the requested features, the platform floors, the
-  native-path rule, an iOS entitlement plan and a Maven repository's marker, url and groups; a floor below
+  native-path rule, an iOS entitlement plan, a Maven repository's marker, url and groups, and the Android app theme; a floor below
   the plugin's is `PlatformFloorTooLow` (never raised) and a registry value that can never apply is
   `InvalidContribution`. The
   built-in registry's top-level entries include the five design-system plugins (`glyph`/
@@ -333,7 +340,15 @@ child output can't garble a caller's raw-mode terminal (relevant to `frust-tui`)
   code depends on the file it creates. `Contribution::IosFramework` (first used by `auth-session`)
   appends `-framework <name>` to every `OTHER_LDFLAGS` list of the Runner's pbxproj: a pure-`objc2`
   Apple arm's own `#[link(kind = "framework")]` never reaches Xcode's link of the iOS staticlib, so
-  a framework symbol it references must be linked by the app. A plugin's three desktop-lane `Contribution`s
+  a framework symbol it references must be linked by the app. `Contribution::AndroidThemeParent`
+  (built-in only; `native-widgets`, whose three contributions are it, the Cargo dependency and its
+  Gradle module, asks for `Theme.Material3.DayNight.NoActionBar`) is decided by the manifest's
+  activity theme first: a `Theme.Material3`, `Theme.Material3Expressive` or `Theme.MaterialComponents`
+  style is already satisfied; under `@style/FrustAppTheme` the parent is followed through the app's
+  styles and rewritten when it is missing or ends in a platform theme, else (Material, unresolved) kept;
+  any other manifest theme, or `FrustAppTheme` with no style defined, is refused with
+  `PluginAddError::AndroidAppThemeMissing` before any write.
+  A plugin's three desktop-lane `Contribution`s
   (`MacosPlistEntry`/`MacosEntitlement`/`LinuxDesktopEntry`) are the one family `add_plugin` never
   writes into a project file at all — `macos/Info.plist`, `macos/app.entitlements`, and
   `linux/app.desktop` are user-owned, hand-editable files a pre-desktop-shells project may not even
