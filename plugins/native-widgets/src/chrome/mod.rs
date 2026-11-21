@@ -39,6 +39,15 @@
 //!   shows ([`resolve_tap`]) and hands the id-based event to [`deliver_event`],
 //!   which re-encodes it against the live spec, so a reorder in between cannot
 //!   retarget it and an item that is gone or disabled by then is dropped.
+//! - **The search field echoes nothing.** The app owns the search text and
+//!   whether the field is expanded ([`SearchSpec`]), but the field changes
+//!   them itself as the user types, so the slot keeps what the field holds
+//!   (`FieldState`): an arm's search report updates it ([`deliver_search`]),
+//!   a report repeating it is dropped, and a publish sends
+//!   [`ChromeField::SearchText`]/[`ChromeField::SearchActive`] only for a
+//!   value the app changed that the field does not already hold — an app
+//!   writing the typed text back is never applied, so it cannot move the
+//!   caret or break an IME composition. A collapse empties the field.
 //! - **Failures reported late.** An arm that installs on a later turn reports
 //!   a failure it finds there through [`ChromeHost::take_failure`]; the slot
 //!   takes it at the top of the generation's next publish (or withdraw),
@@ -78,8 +87,10 @@ use std::sync::{Arc, Mutex, MutexGuard, Once};
 use crate::api::{TabIcon, TabId, TabItem};
 use crate::events::{
     EVENT_KIND_CHROME_ACTION, EVENT_KIND_CHROME_BACK, EVENT_KIND_CHROME_MENU,
-    EVENT_KIND_CHROME_TAB, pack_chrome_menu, pack_chrome_tab, pack_index, unpack_chrome_menu,
-    unpack_chrome_tab, unpack_index,
+    EVENT_KIND_CHROME_SEARCH_BEGAN, EVENT_KIND_CHROME_SEARCH_CHANGED,
+    EVENT_KIND_CHROME_SEARCH_ENDED, EVENT_KIND_CHROME_SEARCH_SUBMITTED, EVENT_KIND_CHROME_TAB,
+    pack_chrome_menu, pack_chrome_tab, pack_index, unpack_chrome_menu, unpack_chrome_tab,
+    unpack_index,
 };
 use host::ChromeField;
 
@@ -156,6 +167,93 @@ pub(crate) struct ChromeSpec {
     /// The app theme's brightness (`crate::api::theme::is_dark`), which an
     /// arm styles its bars with; the fallback bars read the theme directly.
     pub(crate) dark: bool,
+    /// The search item; `None` shows none.
+    pub(crate) search: Option<SearchSpec>,
+}
+
+/// The scaffold's search item: a field that reports
+/// [`ChromeEvent::Search`] as it is typed into, submitted, expanded and
+/// collapsed — iOS's `UISearchController` on the navigation item, a
+/// search action that expands into a field in the Android top bar, a
+/// frust text field row under the frust-drawn top bar. The results are the
+/// app's to show, in the body.
+///
+/// Controlled, but echo-free: [`Self::text`] and [`Self::active`] are the
+/// app's values, applied to the field only when the app changes them and
+/// the field does not already hold them, so writing the typed text back
+/// (the usual pattern) never touches the field.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SearchSpec {
+    pub(crate) placeholder: String,
+    pub(crate) text: String,
+    pub(crate) active: bool,
+    pub(crate) placement: SearchPlacement,
+}
+
+impl SearchSpec {
+    /// A collapsed, empty search item with no placeholder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The hint the empty field shows (and the item's accessibility label).
+    pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.placeholder = placeholder.into();
+        self
+    }
+
+    /// The app's query: the field's text. Applied only when it changes and
+    /// differs from what the field holds (the type doc). Default empty.
+    pub fn text(mut self, text: impl Into<String>) -> Self {
+        self.text = text.into();
+        self
+    }
+
+    /// Whether the field is expanded and focused, keyboard up. Default
+    /// `false`. Applied like [`Self::text`]: confirm a
+    /// [`SearchEvent::Began`]/[`SearchEvent::Ended`] by writing it back, and
+    /// flip it to open or close the field from the app. Collapsing empties
+    /// the field.
+    pub fn active(mut self, active: bool) -> Self {
+        self.active = active;
+        self
+    }
+
+    /// Where the field sits, a hint the platform may not honour. Default
+    /// [`SearchPlacement::Automatic`].
+    pub fn placement(mut self, placement: SearchPlacement) -> Self {
+        self.placement = placement;
+        self
+    }
+}
+
+/// Where the search field sits ([`SearchSpec::placement`]). iOS maps it onto
+/// the navigation item's search-bar placement (iOS 16+); Android and the
+/// frust-drawn chrome have one presentation and ignore it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SearchPlacement {
+    /// The platform's choice: on iOS the field below the title, revealed
+    /// with the large title.
+    #[default]
+    Automatic,
+    /// Inside the navigation bar itself: iOS's integrated placement.
+    NavigationBar,
+}
+
+/// One search-field interaction ([`ChromeEvent::Search`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SearchEvent {
+    /// The field's whole text, after an edit (IME composing text included).
+    Changed(String),
+    /// The keyboard's search key, with the field's text.
+    Submitted(String),
+    /// The field expanded (the user opened search).
+    Began,
+    /// The field collapsed (cancel or back); a non-empty field reports
+    /// `Changed("")` first.
+    Ended,
 }
 
 /// The top bar: title, optional subtitle, leading item and trailing actions.
@@ -507,6 +605,9 @@ fn declaration_rank(field: ChromeField) -> u8 {
         ChromeField::Scroll => 8,
         ChromeField::Brightness => 9,
         ChromeField::ActionBadges => 10,
+        ChromeField::Search => 11,
+        ChromeField::SearchText => 12,
+        ChromeField::SearchActive => 13,
     }
 }
 
@@ -587,10 +688,38 @@ pub enum ChromeEvent {
     MenuItemChosen(ActionId, MenuItemId),
     /// The leading back item was tapped.
     BackPressed,
+    /// The search item reported (`SearchSpec`).
+    Search(SearchEvent),
+}
+
+/// A search report's `kind` and `text` as the [`SearchEvent`] it names (the
+/// text read only for a change or a submit); `None` for any other kind.
+pub(crate) fn decode_search(kind: i32, text: &str) -> Option<SearchEvent> {
+    match kind {
+        EVENT_KIND_CHROME_SEARCH_CHANGED => Some(SearchEvent::Changed(text.to_owned())),
+        EVENT_KIND_CHROME_SEARCH_SUBMITTED => Some(SearchEvent::Submitted(text.to_owned())),
+        EVENT_KIND_CHROME_SEARCH_BEGAN => Some(SearchEvent::Began),
+        EVENT_KIND_CHROME_SEARCH_ENDED => Some(SearchEvent::Ended),
+        _ => None,
+    }
+}
+
+/// [`decode_search`]'s inverse: `event`'s kind and the text beside it (`""`
+/// for a payload-free event).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn encode_search(event: &SearchEvent) -> (i32, &str) {
+    match event {
+        SearchEvent::Changed(text) => (EVENT_KIND_CHROME_SEARCH_CHANGED, text),
+        SearchEvent::Submitted(text) => (EVENT_KIND_CHROME_SEARCH_SUBMITTED, text),
+        SearchEvent::Began => (EVENT_KIND_CHROME_SEARCH_BEGAN, ""),
+        SearchEvent::Ended => (EVENT_KIND_CHROME_SEARCH_ENDED, ""),
+    }
 }
 
 /// `event` as the `(kind, detail)` an arm reports, resolving ids to the
-/// first item carrying them in `spec`. `None` when `spec` has no such item.
+/// first item carrying them in `spec`. `None` when `spec` has no such item,
+/// and for a search event, whose text no `detail` carries
+/// ([`encode_search`]).
 pub(crate) fn encode_event(spec: &ChromeSpec, event: &ChromeEvent) -> Option<(i32, i64)> {
     let tab_index = |id: &TabId| spec.tabs.iter().position(|tab| tab.id() == id);
     let action_index = |id: &ActionId| chrome_actions(spec).position(|action| &action.id == id);
@@ -614,6 +743,7 @@ pub(crate) fn encode_event(spec: &ChromeSpec, event: &ChromeEvent) -> Option<(i3
             Some((EVENT_KIND_CHROME_MENU, pack_chrome_menu(a, m)?))
         }
         ChromeEvent::BackPressed => Some((EVENT_KIND_CHROME_BACK, 0)),
+        ChromeEvent::Search(_) => None,
     }
 }
 
@@ -744,6 +874,93 @@ struct Live {
     installed: Result<(), ChromeError>,
     sink: Option<ChromeSink>,
     busy_logged: bool,
+    /// What the search field holds (module doc, "The search field echoes
+    /// nothing").
+    field: FieldState,
+}
+
+/// What the search field holds, as its reports and the slot's own applies
+/// left it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FieldState {
+    pub(crate) text: String,
+    pub(crate) active: bool,
+}
+
+impl FieldState {
+    /// The field a fresh install of `search` builds.
+    fn of(search: Option<&SearchSpec>) -> Self {
+        search.map_or_else(Self::default, |search| Self {
+            text: search.text.clone(),
+            active: search.active,
+        })
+    }
+
+    /// Adopt what `event` says the field now holds; `false` when it says
+    /// nothing new (a repeated text, a second begin or end), which is then
+    /// not delivered. A submit always is.
+    fn adopt(&mut self, event: &SearchEvent) -> bool {
+        match event {
+            SearchEvent::Changed(text) if *text == self.text => false,
+            SearchEvent::Changed(text) => {
+                self.text.clone_from(text);
+                true
+            }
+            SearchEvent::Submitted(text) => {
+                self.text.clone_from(text);
+                true
+            }
+            SearchEvent::Began if self.active => false,
+            SearchEvent::Began => {
+                self.active = true;
+                true
+            }
+            SearchEvent::Ended if !self.active => false,
+            SearchEvent::Ended => {
+                self.active = false;
+                true
+            }
+        }
+    }
+}
+
+/// Bring `field` up to what the app changed from `old` to `new`, answering
+/// whether the text and the active state must reach the field: only a value
+/// the app changed that the field does not already hold, so an app writing
+/// back what the field reported sends nothing. A search item appearing or
+/// going away starts the field fresh (empty, collapsed); collapsing it
+/// empties it.
+pub(crate) fn track_search(
+    field: &mut FieldState,
+    old: Option<&SearchSpec>,
+    new: Option<&SearchSpec>,
+) -> (bool, bool) {
+    let blank = SearchSpec::default();
+    let Some(new) = new else {
+        *field = FieldState::default();
+        return (false, false);
+    };
+    let old = match old {
+        Some(old) => old,
+        None => {
+            *field = FieldState::default();
+            &blank
+        }
+    };
+    let mut active = false;
+    if new.active != old.active && new.active != field.active {
+        field.active = new.active;
+        if !new.active {
+            field.text.clear();
+        }
+        active = true;
+    }
+    let mut text = false;
+    if new.text != old.text && new.text != field.text {
+        field.text.clone_from(&new.text);
+        text = true;
+    }
+    (text, active)
 }
 
 /// The slot over one host. The process-wide instance is behind [`publish`]
@@ -787,6 +1004,7 @@ impl<H: ChromeHost> ChromeSlot<H> {
             };
             self.live = Some(Live {
                 generation,
+                field: FieldState::of(spec.search.as_ref()),
                 spec,
                 installed,
                 sink: None,
@@ -811,12 +1029,27 @@ impl<H: ChromeHost> ChromeSlot<H> {
         {
             // Fresh from the arm: fall back now, retry (NoHost) on the next publish.
             let error = error.clone();
+            track_search(
+                &mut live.field,
+                live.spec.search.as_ref(),
+                spec.search.as_ref(),
+            );
             live.spec = spec;
             return PublishOutcome::Fallback(generation, error);
         }
         if live.installed == Err(ChromeError::NoHost) {
             // NoHost is transient: retry; a success switches to the arm.
             live.installed = self.host.install(generation, &spec);
+            if live.installed.is_ok() {
+                live.field = FieldState::of(spec.search.as_ref());
+            } else {
+                // The fallback's field carries on.
+                track_search(
+                    &mut live.field,
+                    live.spec.search.as_ref(),
+                    spec.search.as_ref(),
+                );
+            }
             live.spec = spec;
             return match &live.installed {
                 Ok(()) => PublishOutcome::Installed(generation),
@@ -830,11 +1063,30 @@ impl<H: ChromeHost> ChromeSlot<H> {
         }
         if let Err(error) = &live.installed {
             let error = error.clone();
+            track_search(
+                &mut live.field,
+                live.spec.search.as_ref(),
+                spec.search.as_ref(),
+            );
             live.spec = spec;
             return PublishOutcome::Fallback(generation, error);
         }
-        let diff = diff_specs(&live.spec, &spec);
+        let mut diff = diff_specs(&live.spec, &spec);
+        let (text, active) = track_search(
+            &mut live.field,
+            live.spec.search.as_ref(),
+            spec.search.as_ref(),
+        );
+        // An echo of what the field holds never reaches it.
+        diff.changed.retain(|field| match field {
+            ChromeField::SearchText => text,
+            ChromeField::SearchActive => active,
+            _ => true,
+        });
         if diff.is_empty() {
+            // The retained spec still adopts the app's values, so the next
+            // diff compares against what the app last said.
+            live.spec = spec;
             return PublishOutcome::Unchanged(generation);
         }
         self.host.apply(&diff);
@@ -907,18 +1159,49 @@ impl<H: ChromeHost> ChromeSlot<H> {
     /// [`Self::route`] for an id-based `event` an arm resolved against the
     /// spec it shows: re-encoded against the live spec first, so it reaches
     /// the sink only while that spec still carries the same, enabled item.
-    #[cfg_attr(not(any(test, target_os = "ios")), allow(dead_code))]
+    /// A search event goes to [`Self::route_search`].
     pub(crate) fn route_event(
-        &self,
+        &mut self,
         generation: u64,
         event: &ChromeEvent,
     ) -> Option<(ChromeEvent, ChromeSink)> {
+        if let ChromeEvent::Search(search) = event {
+            return self.route_search(generation, search.clone());
+        }
         let live = self
             .live
             .as_ref()
             .filter(|live| live.generation.0 == generation)?;
         let (kind, detail) = encode_event(&live.spec, event)?;
         self.route(generation, kind, detail)
+    }
+
+    /// A search report stamped `generation`: adopted into what the field
+    /// holds, then handed back with the sink — unless the live spec has no
+    /// search item, the report repeats the field's state
+    /// ([`FieldState::adopt`]) or there is no sink.
+    pub(crate) fn route_search(
+        &mut self,
+        generation: u64,
+        event: SearchEvent,
+    ) -> Option<(ChromeEvent, ChromeSink)> {
+        let live = self
+            .live
+            .as_mut()
+            .filter(|live| live.generation.0 == generation && live.spec.search.is_some())?;
+        if !live.field.adopt(&event) {
+            return None;
+        }
+        Some((ChromeEvent::Search(event), Arc::clone(live.sink.as_ref()?)))
+    }
+
+    /// What the search field of `generation` holds, if it is live and shows
+    /// one.
+    pub(crate) fn field(&self, generation: ChromeGeneration) -> Option<&FieldState> {
+        self.live
+            .as_ref()
+            .filter(|live| live.generation == generation && live.spec.search.is_some())
+            .map(|live| &live.field)
     }
 
     /// The live generation, if any.
@@ -1047,10 +1330,45 @@ pub(crate) fn deliver(generation: u64, kind: i32, detail: i64) -> bool {
 
 /// An arm's already-resolved report — see [`ChromeSlot::route_event`].
 /// Answers whether it was delivered.
-#[cfg_attr(not(any(test, target_os = "ios")), allow(dead_code))]
 pub(crate) fn deliver_event(generation: u64, event: &ChromeEvent) -> bool {
     let routed = lock_slot().route_event(generation, event);
     hand_over(routed)
+}
+
+/// An arm's search report, `kind` one of the search kinds and `text` beside
+/// it ([`decode_search`]) — see [`ChromeSlot::route_search`]. Answers
+/// whether it was delivered.
+#[cfg_attr(not(any(test, target_os = "android")), allow(dead_code))]
+pub(crate) fn deliver_search(generation: u64, kind: i32, text: &str) -> bool {
+    let Some(event) = decode_search(kind, text) else {
+        return false;
+    };
+    let routed = lock_slot().route_search(generation, event);
+    hand_over(routed)
+}
+
+/// The live generation, when its spec shows a search item.
+#[cfg_attr(not(any(test, target_os = "android")), allow(dead_code))]
+pub(crate) fn live_search_generation() -> Option<u64> {
+    let slot = lock_slot();
+    let live = slot.live.as_ref()?;
+    live.spec.search.is_some().then_some(live.generation.0)
+}
+
+/// What generation `generation`'s search field holds, when it is live and
+/// shows one: the frust-drawn fallback field shows this text.
+pub(crate) fn search_field(generation: ChromeGeneration) -> Option<FieldState> {
+    lock_slot().field(generation).cloned()
+}
+
+/// The native search field took the platform's input focus: end frust's
+/// own focus session (a focused text input blurs and gives up its IME) at
+/// the next rebuild, and owe the frame that runs it. Main (UI) thread only;
+/// never with the slot locked.
+#[cfg_attr(not(any(target_os = "ios", target_os = "android")), allow(dead_code))]
+pub(crate) fn release_frust_focus() {
+    frust_core::mark_focus_orphaned();
+    frust::texture::request_frame();
 }
 
 /// Call the sink with the routed event; the slot lock is already released.
@@ -1115,6 +1433,17 @@ fn hand_over(routed: Option<(ChromeEvent, ChromeSink)>) -> bool {
 /// than [`ToolbarStyle::Buttons`] and `toolbarPrimaryLabel` only when `true`;
 /// Kotlin reads them absent as `"buttons"`/`false`.
 ///
+/// # Search
+///
+/// [`SEARCH_FIELDS`] ride an install only when the spec has a search item:
+/// `hasSearch` and `searchPlaceholder` ([`ChromeField::Search`]),
+/// `searchText` and `searchActive`; Kotlin reads them absent as no search.
+/// An apply carries `hasSearch` (`false` when the item went away) for a
+/// [`ChromeField::Search`] change and `searchText`/`searchActive` only for
+/// the changes the slot did not drop as echoes. The placement hint is not
+/// sent: Android has one presentation. The field reports through
+/// `nativeOnChromeSearch(generation, kind, text)` with the search kinds.
+///
 /// # The toolbar
 ///
 /// It rides [`ChromeField::Actions`] (the parent module's "One action index
@@ -1154,6 +1483,14 @@ pub(crate) mod android_wire {
         ChromeField::Brightness,
     ];
 
+    /// The search item's fields, appended to an install only when the spec
+    /// has one (module doc, *Search*).
+    pub(crate) const SEARCH_FIELDS: [ChromeField; 3] = [
+        ChromeField::Search,
+        ChromeField::SearchText,
+        ChromeField::SearchActive,
+    ];
+
     /// `field`'s spelling in an apply's `changed` array — its Rust name.
     pub(crate) fn field_name(field: ChromeField) -> &'static str {
         match field {
@@ -1168,6 +1505,9 @@ pub(crate) mod android_wire {
             ChromeField::Scroll => "Scroll",
             ChromeField::Brightness => "Brightness",
             ChromeField::ActionBadges => "ActionBadges",
+            ChromeField::Search => "Search",
+            ChromeField::SearchText => "SearchText",
+            ChromeField::SearchActive => "SearchActive",
         }
     }
 
@@ -1184,9 +1524,13 @@ pub(crate) mod android_wire {
     /// The flat object's entries, in encoding order.
     pub(crate) type Fields = Vec<(String, Value)>;
 
-    /// The `install` payload: every key, no `changed` array.
+    /// The `install` payload: every key, no `changed` array; the search keys
+    /// only for a spec with a search item, so one without encodes exactly as
+    /// before they existed.
     pub(crate) fn install_json(spec: &ChromeSpec, icons: &IconTable) -> String {
-        to_json(&fields(spec, &INSTALL_FIELDS, icons), None)
+        let search = spec.search.as_ref().map_or(&[][..], |_| &SEARCH_FIELDS[..]);
+        let all: Vec<ChromeField> = INSTALL_FIELDS.iter().chain(search).copied().collect();
+        to_json(&fields(spec, &all, icons), None)
     }
 
     /// The `apply` payload for a diff whose changed fields are `changed`, or
@@ -1214,6 +1558,7 @@ pub(crate) mod android_wire {
         INSTALL_FIELDS
             .into_iter()
             .chain([ChromeField::ActionBadges])
+            .chain(SEARCH_FIELDS)
             .filter(|field| match field {
                 ChromeField::Selected => tabs || changed.contains(field),
                 ChromeField::ActionBadges => !actions && changed.contains(field),
@@ -1304,6 +1649,23 @@ pub(crate) mod android_wire {
                             Value::OptStr(entry.badge.clone()),
                         );
                     }
+                }
+                ChromeField::Search => {
+                    put("hasSearch".into(), Value::Bool(spec.search.is_some()));
+                    if let Some(search) = &spec.search {
+                        put(
+                            "searchPlaceholder".into(),
+                            Value::Str(search.placeholder.clone()),
+                        );
+                    }
+                }
+                ChromeField::SearchText => {
+                    let text = spec.search.as_ref().map(|search| search.text.clone());
+                    put("searchText".into(), Value::Str(text.unwrap_or_default()));
+                }
+                ChromeField::SearchActive => {
+                    let active = spec.search.as_ref().is_some_and(|search| search.active);
+                    put("searchActive".into(), Value::Bool(active));
                 }
             }
         }
@@ -1567,7 +1929,7 @@ pub(crate) mod android_wire {
 
         use super::*;
         use crate::api::{TabId, TabItem};
-        use crate::chrome::{ActionItem, MenuItem};
+        use crate::chrome::{ActionItem, MenuItem, SearchSpec};
 
         /// `FrustNativeChrome.kt`'s key table, copied verbatim from its file
         /// header (`tests/kotlin_conformance.rs` fails if the two drift).
@@ -1587,10 +1949,12 @@ pub(crate) mod android_wire {
 //   Brightness: dark
 //   ActionBadges (apply only, never beside Actions): action<i>Badge and toolbar<i>Badge
 //             for every entry (null = none); the counts are unchanged
+//   Search:   hasSearch (absent = false), searchPlaceholder   SearchText: searchText
+//   SearchActive: searchActive (true = expanded and focused); install sends these three only with a search
 "#;
 
         /// Every key template [`KOTLIN_KEY_HEADER`] names.
-        const KEY_TEMPLATES: [&str; 34] = [
+        const KEY_TEMPLATES: [&str; 38] = [
             "tabCount",
             "tab<i>Title",
             "tab<i>Enabled",
@@ -1624,6 +1988,10 @@ pub(crate) mod android_wire {
             "toolbarStyle",
             "toolbarPrimaryLabel",
             "dark",
+            "hasSearch",
+            "searchPlaceholder",
+            "searchText",
+            "searchActive",
             // Not a spec key: an apply's field list.
             "changed",
         ];
@@ -1670,14 +2038,22 @@ pub(crate) mod android_wire {
                 ),
                 scroll: None,
                 dark: true,
+                search: None,
             }
         }
 
         /// A spec exercising every key: [`old_shape_spec`] with a badged,
         /// prominent top-bar action, a prominent toolbar item, a dot-badged
-        /// primary, the floating style and a labelled primary.
+        /// primary, the floating style, a labelled primary and an active
+        /// search item.
         fn full_spec() -> ChromeSpec {
             let mut spec = old_shape_spec();
+            spec.search = Some(
+                SearchSpec::new()
+                    .placeholder("Find \"it\"")
+                    .text("iss")
+                    .active(true),
+            );
             let top = spec.top.as_mut().unwrap();
             top.actions[0] = top.actions[0].clone().badge("4").prominent(true);
             let toolbar = spec.toolbar.take().unwrap();
@@ -1973,6 +2349,10 @@ pub(crate) mod android_wire {
                 [
                     "action0Badge",
                     "action0Prominent",
+                    "hasSearch",
+                    "searchActive",
+                    "searchPlaceholder",
+                    "searchText",
                     "toolbar0Prominent",
                     "toolbar1Badge",
                     "toolbarPrimaryLabel",
@@ -1980,6 +2360,57 @@ pub(crate) mod android_wire {
                 ]
             );
             assert!(old.is_subset(&new));
+        }
+
+        #[test]
+        fn a_search_item_appends_its_keys_after_every_other_one() {
+            let icons = IconTable::new();
+            let json = install_json(&full_spec(), &icons);
+            assert!(
+                json.ends_with(concat!(
+                    r#""dark":true,"hasSearch":true,"searchPlaceholder":"Find \"it\"","#,
+                    r#""searchText":"iss","searchActive":true}"#
+                )),
+                "{json}"
+            );
+            // Without one, none of its keys: the old payload exactly.
+            let mut icons = IconTable::new();
+            icons.sync(&old_shape_spec());
+            let bare = install_json(&old_shape_spec(), &icons);
+            assert_eq!(bare, OLD_SHAPE_INSTALL);
+            assert!(!bare.contains("Search") && !bare.contains("search"));
+        }
+
+        #[test]
+        fn a_search_apply_carries_only_the_changed_search_keys() {
+            let icons = IconTable::new();
+            let spec = full_spec();
+            let text = apply_json(&spec, &[ChromeField::SearchText], &icons).unwrap();
+            assert_eq!(text, r#"{"searchText":"iss","changed":["SearchText"]}"#);
+            let active = apply_json(&spec, &[ChromeField::SearchActive], &icons).unwrap();
+            assert_eq!(
+                active,
+                r#"{"searchActive":true,"changed":["SearchActive"]}"#
+            );
+            let both = apply_json(
+                &spec,
+                &[ChromeField::Search, ChromeField::SearchActive],
+                &icons,
+            )
+            .unwrap();
+            assert_eq!(
+                both,
+                concat!(
+                    r#"{"hasSearch":true,"searchPlaceholder":"Find \"it\"","#,
+                    r#""searchActive":true,"changed":["Search","SearchActive"]}"#
+                )
+            );
+            // The item going away says so, with nothing else.
+            let gone = apply_json(&old_shape_spec(), &[ChromeField::Search], &icons).unwrap();
+            assert_eq!(gone, r#"{"hasSearch":false,"changed":["Search"]}"#);
+            for field in SEARCH_FIELDS {
+                assert_eq!(field_name(field), format!("{field:?}"));
+            }
         }
 
         #[test]
@@ -2134,7 +2565,352 @@ mod tests {
             toolbar: None,
             scroll: None,
             dark: false,
+            search: None,
         }
+    }
+
+    /// [`spec`] with a search item showing `text`, expanded when `active`.
+    fn searching(text: &str, active: bool) -> ChromeSpec {
+        ChromeSpec {
+            search: Some(
+                SearchSpec::new()
+                    .placeholder("Search")
+                    .text(text)
+                    .active(active),
+            ),
+            ..spec()
+        }
+    }
+
+    /// A slot installed with [`searching`]`("", false)` and a sink recording
+    /// every event.
+    fn search_slot() -> (
+        ChromeSlot<RecordingChromeHost>,
+        ChromeGeneration,
+        Arc<StdMutex<Vec<ChromeEvent>>>,
+    ) {
+        let mut slot = slot();
+        let generation = slot
+            .publish(None, searching("", false))
+            .generation()
+            .unwrap();
+        slot.host_mut().take_calls();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        assert!(slot.set_sink(
+            generation,
+            Arc::new(move |event| sink_seen.lock().unwrap().push(event))
+        ));
+        (slot, generation, seen)
+    }
+
+    /// Route `event` from the field and hand it to the sink, as `deliver` does.
+    fn report_search(
+        slot: &mut ChromeSlot<RecordingChromeHost>,
+        generation: ChromeGeneration,
+        event: SearchEvent,
+    ) -> bool {
+        match slot.route_search(generation.get(), event) {
+            Some((event, sink)) => {
+                sink(event);
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[test]
+    fn every_search_event_round_trips_its_kind_and_text() {
+        for event in [
+            SearchEvent::Changed("issues".into()),
+            SearchEvent::Changed(String::new()),
+            SearchEvent::Submitted("pull \u{65e5}".into()),
+            SearchEvent::Began,
+            SearchEvent::Ended,
+        ] {
+            let (kind, text) = encode_search(&event);
+            assert!((14..=17).contains(&kind), "{event:?} kind {kind}");
+            assert_eq!(decode_search(kind, text), Some(event.clone()));
+        }
+        // Began/Ended ignore any text; other kinds are no search report.
+        assert_eq!(
+            decode_search(EVENT_KIND_CHROME_SEARCH_BEGAN, "x"),
+            Some(SearchEvent::Began)
+        );
+        for kind in [EVENT_KIND_CHROME_BACK, 13, 18, 0] {
+            assert_eq!(decode_search(kind, "x"), None, "{kind}");
+        }
+        // A search event has no (kind, detail) form, and the int path never
+        // decodes a search kind.
+        let spec = searching("", false);
+        let began = ChromeEvent::Search(SearchEvent::Began);
+        assert_eq!(encode_event(&spec, &began), None);
+        assert_eq!(decode_event(&spec, EVENT_KIND_CHROME_SEARCH_BEGAN, 0), None);
+    }
+
+    #[test]
+    fn the_search_fields_are_reported_on_their_own() {
+        let base = searching("is", false);
+        let cases: [(ChromeField, ChromeSpec); 5] = [
+            (ChromeField::Search, spec()),
+            (ChromeField::Search, {
+                let mut next = base.clone();
+                next.search.as_mut().unwrap().placeholder = "Find".into();
+                next
+            }),
+            (ChromeField::Search, {
+                let mut next = base.clone();
+                next.search.as_mut().unwrap().placement = SearchPlacement::NavigationBar;
+                next
+            }),
+            (ChromeField::SearchText, searching("iss", false)),
+            (ChromeField::SearchActive, searching("is", true)),
+        ];
+        for (field, next) in cases {
+            let diff = diff_specs(&base, &next);
+            if next.search.is_none() {
+                // Going away also resets the text it showed.
+                assert_eq!(diff.changed, [ChromeField::Search, ChromeField::SearchText]);
+            } else {
+                assert_eq!(diff.changed, [field], "{field:?}");
+            }
+        }
+        // A search item appearing beside a title change, in declaration order.
+        let mut both = searching("", true);
+        both.top.as_mut().unwrap().title.push('!');
+        assert_eq!(
+            diff_specs(&spec(), &both).changed,
+            [
+                ChromeField::Title,
+                ChromeField::Search,
+                ChromeField::SearchActive
+            ]
+        );
+    }
+
+    #[test]
+    fn writing_back_the_typed_text_reaches_the_field_never() {
+        let (mut slot, generation, seen) = search_slot();
+        for typed in ["i", "is", "iss"] {
+            assert!(report_search(
+                &mut slot,
+                generation,
+                SearchEvent::Changed(typed.into())
+            ));
+            // The app confirms what it was told: an echo, no host call.
+            assert_eq!(
+                slot.publish(Some(generation), searching(typed, false)),
+                PublishOutcome::Unchanged(generation),
+                "{typed}"
+            );
+        }
+        assert_eq!(slot.host().calls().count(), 0, "no wire update for an echo");
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        // The field repeating itself is not delivered again.
+        assert!(!report_search(
+            &mut slot,
+            generation,
+            SearchEvent::Changed("iss".into())
+        ));
+        assert_eq!(seen.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn an_app_change_of_the_text_is_applied_once() {
+        let (mut slot, generation, _) = search_slot();
+        assert!(report_search(
+            &mut slot,
+            generation,
+            SearchEvent::Changed("iss".into())
+        ));
+        slot.publish(Some(generation), searching("iss", false));
+        // The app clears it: applied, and the field now holds it.
+        let cleared = searching("", false);
+        assert_eq!(
+            slot.publish(Some(generation), cleared.clone()),
+            PublishOutcome::Applied(generation)
+        );
+        assert_eq!(
+            slot.host_mut().take_calls(),
+            [HostCall::Apply {
+                changed: vec![ChromeField::SearchText],
+                spec: cleared.clone(),
+            }]
+        );
+        assert_eq!(
+            slot.publish(Some(generation), cleared),
+            PublishOutcome::Unchanged(generation)
+        );
+        // An app that never writes the text back leaves the typing alone.
+        assert!(report_search(
+            &mut slot,
+            generation,
+            SearchEvent::Changed("pu".into())
+        ));
+        assert_eq!(
+            slot.publish(Some(generation), searching("", false)),
+            PublishOutcome::Unchanged(generation),
+            "its value did not change, so nothing is pushed over the typing"
+        );
+        assert_eq!(
+            slot.field(generation).map(|field| field.text.as_str()),
+            Some("pu")
+        );
+    }
+
+    #[test]
+    fn begin_and_end_are_confirmed_without_an_echo_and_applied_from_the_app() {
+        let (mut slot, generation, seen) = search_slot();
+        assert!(report_search(&mut slot, generation, SearchEvent::Began));
+        assert!(
+            !report_search(&mut slot, generation, SearchEvent::Began),
+            "a second begin says nothing new"
+        );
+        assert_eq!(
+            slot.publish(Some(generation), searching("", true)),
+            PublishOutcome::Unchanged(generation)
+        );
+        assert!(report_search(
+            &mut slot,
+            generation,
+            SearchEvent::Changed("is".into())
+        ));
+        assert!(report_search(
+            &mut slot,
+            generation,
+            SearchEvent::Submitted("is".into())
+        ));
+        assert!(
+            report_search(&mut slot, generation, SearchEvent::Submitted("is".into())),
+            "a submit is always delivered"
+        );
+        assert_eq!(
+            slot.publish(Some(generation), searching("is", true)),
+            PublishOutcome::Unchanged(generation)
+        );
+        // The app ends the search (a tab switch): applied, and it empties the field.
+        let ended = searching("", false);
+        assert_eq!(
+            slot.publish(Some(generation), ended.clone()),
+            PublishOutcome::Applied(generation)
+        );
+        assert_eq!(
+            slot.host_mut().take_calls(),
+            [HostCall::Apply {
+                changed: vec![ChromeField::SearchActive],
+                spec: ended,
+            }],
+            "the text it cleared is not sent again"
+        );
+        assert_eq!(slot.field(generation), Some(&FieldState::default()));
+        assert!(
+            !report_search(&mut slot, generation, SearchEvent::Ended),
+            "the field's own end after the app's collapse is an echo"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                ChromeEvent::Search(SearchEvent::Began),
+                ChromeEvent::Search(SearchEvent::Changed("is".into())),
+                ChromeEvent::Search(SearchEvent::Submitted("is".into())),
+                ChromeEvent::Search(SearchEvent::Submitted("is".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_search_report_needs_a_live_search_item() {
+        let (mut slot, generation, seen) = search_slot();
+        slot.publish(Some(generation), spec());
+        assert_eq!(slot.field(generation), None);
+        assert!(!report_search(&mut slot, generation, SearchEvent::Began));
+        assert!(
+            slot.route_search(generation.get() + 1, SearchEvent::Began)
+                .is_none()
+        );
+        // Coming back starts the field fresh.
+        slot.publish(Some(generation), searching("", false));
+        assert_eq!(slot.field(generation), Some(&FieldState::default()));
+        assert!(report_search(&mut slot, generation, SearchEvent::Began));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        // The id-based path routes a search event the same way.
+        let event = ChromeEvent::Search(SearchEvent::Changed("x".into()));
+        let routed = slot
+            .route_event(generation.get(), &event)
+            .map(|(event, _)| event);
+        assert_eq!(routed, Some(event));
+    }
+
+    #[test]
+    fn the_process_wide_slot_delivers_a_search_report_by_kind_and_text() {
+        let _guard = slot_test_guard();
+        let generation = publish(None, searching("", false))
+            .generation()
+            .expect("installed");
+        assert_eq!(live_search_generation(), Some(generation.get()));
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        assert!(set_sink(
+            generation,
+            Arc::new(move |event| sink_seen.lock().unwrap().push(event))
+        ));
+        assert!(deliver_search(
+            generation.get(),
+            EVENT_KIND_CHROME_SEARCH_CHANGED,
+            "\u{65e5}\u{672c}"
+        ));
+        assert!(
+            !deliver_search(generation.get(), EVENT_KIND_CHROME_SEARCH_ENDED, ""),
+            "not begun"
+        );
+        assert!(!deliver_search(
+            generation.get(),
+            EVENT_KIND_CHROME_BACK,
+            ""
+        ));
+        assert_eq!(
+            search_field(generation).map(|field| field.text),
+            Some("\u{65e5}\u{672c}".to_string())
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [ChromeEvent::Search(SearchEvent::Changed(
+                "\u{65e5}\u{672c}".into()
+            ))]
+        );
+        assert!(withdraw(generation));
+        assert!(!deliver_search(
+            generation.get(),
+            EVENT_KIND_CHROME_SEARCH_BEGAN,
+            ""
+        ));
+    }
+
+    #[test]
+    fn a_fallback_generation_tracks_its_field_too() {
+        let mut slot = ChromeSlot::new(RecordingChromeHost::refusing(ChromeError::Refused(
+            "theme".into(),
+        )));
+        let generation = slot
+            .publish(None, searching("", false))
+            .generation()
+            .unwrap();
+        assert!(slot.set_sink(generation, Arc::new(|_| {})));
+        assert!(
+            slot.route_search(generation.get(), SearchEvent::Changed("ab".into()))
+                .is_some()
+        );
+        slot.publish(Some(generation), searching("", false));
+        assert_eq!(
+            slot.field(generation).map(|field| field.text.clone()),
+            Some("ab".to_string()),
+            "the frust-drawn field keeps the typing an app does not write back"
+        );
+        slot.publish(Some(generation), searching("preset", false));
+        assert_eq!(
+            slot.field(generation).map(|field| field.text.clone()),
+            Some("preset".to_string())
+        );
     }
 
     /// [`spec`] with a toolbar: a plain item, a menu item and a primary.

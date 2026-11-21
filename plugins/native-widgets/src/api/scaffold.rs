@@ -29,6 +29,20 @@
 //! entry repeating an earlier id is dropped from the published spec, logged
 //! once per change and named by a one-line banner above the body.
 //!
+//! # Search
+//!
+//! `.search(SearchSpec)` adds a search item to the top bar (none without
+//! one): iOS's `UISearchController` on the navigation item, a search action
+//! on Android that expands into a field across the top bar (small or
+//! collapsing), a frust text field row under the fallback top bar.
+//! `.on_search` hears `SearchEvent::Changed` (the whole text, each edit),
+//! `Submitted`, `Began` and `Ended`; the results are the app's to show in the
+//! body, which stays visible and scrollable under the field. The app owns the
+//! text and the expanded state and writes them back; the slot never sends a
+//! field its own echo (`crate::chrome`'s module doc). When the native field
+//! takes the keyboard, a focused frust text field blurs; focusing a frust
+//! field takes the keyboard back and leaves the search open.
+//!
 //! # Insets
 //!
 //! On a target with a chrome arm the host already reports the bars through the
@@ -57,7 +71,10 @@ use frust::authoring::{
     build_child, event_child_reporting_claim, rebuild_child, retire_stale_focus_links,
     route_event_single, teardown_child,
 };
-use frust::{RwSignal, ScrollController, ScrollInfo, ScrollSubscription, Set, Theme, use_context};
+use frust::{
+    FocusHandle, RwSignal, ScrollController, ScrollInfo, ScrollSubscription, Set, Theme,
+    use_context,
+};
 use frust_core::{
     AnyView, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, EventCtx, EventResult, InputEvent,
     LayoutCtx, PaintCtx, PaintScene, SemanticsCtx, View, Widget, WindowInsets,
@@ -69,12 +86,13 @@ use super::builders::{TabId, TabItem, banner_placeholder};
 use super::signals::{ChromeHandlers, on_chrome};
 use super::theme;
 use crate::chrome::fallback::{
-    fallback_tab_row, fallback_toolbar_row, fallback_top_bar, teardown_tab_row,
-    teardown_toolbar_row, teardown_top_bar,
+    fallback_search_row, fallback_tab_row, fallback_toolbar_row, fallback_top_bar,
+    teardown_search_row, teardown_tab_row, teardown_toolbar_row, teardown_top_bar,
 };
 use crate::chrome::{
     self, ActionId, ActionItem, BARS_FLOAT_OVER_BODY, ChromeEvent, ChromeGeneration, ChromeSpec,
-    Leading, MenuItemId, PublishOutcome, ScrollState, ToolbarSpec, TopBarSpec, shown_toolbar,
+    Leading, MenuItemId, PublishOutcome, ScrollState, SearchEvent, SearchSpec, ToolbarSpec,
+    TopBarSpec, shown_toolbar,
 };
 
 /// How far past a bar's inset line the edge fade reaches into the body, in
@@ -252,6 +270,7 @@ pub fn native_scaffold<V>(body: V) -> NativeScaffoldView<V> {
         fade: Some(EdgeFade::default().resolve()),
         resize_to_avoid_keyboard: true,
         handlers: ChromeHandlers::default(),
+        search: None,
     }
 }
 
@@ -263,6 +282,7 @@ pub struct NativeScaffoldView<V> {
     selected: Option<TabId>,
     top: Option<TopBarSpec>,
     toolbar: Option<ToolbarSpec>,
+    search: Option<SearchSpec>,
     scroll: Option<ScrollController>,
     fade: Option<ResolvedFade>,
     resize_to_avoid_keyboard: bool,
@@ -317,6 +337,24 @@ impl<V> NativeScaffoldView<V> {
     /// repeat an action's.
     pub fn toolbar(mut self, toolbar: ToolbarSpec) -> Self {
         self.toolbar = Some(toolbar);
+        self
+    }
+
+    /// A search item in the top bar (see the [module docs](self)): iOS's
+    /// `UISearchController`, an expanding field in the Android top bar, a
+    /// frust text field row under the frust-drawn top bar. Shown only with a
+    /// top bar. Feed the reported text and active state back through
+    /// [`SearchSpec::text`]/[`SearchSpec::active`]; the field is never
+    /// rewritten by its own echo.
+    pub fn search(mut self, search: SearchSpec) -> Self {
+        self.search = Some(search);
+        self
+    }
+
+    /// Fires for every search-field interaction: text changes (the whole
+    /// text, each time), submit, begin and end.
+    pub fn on_search(mut self, handler: impl Fn(SearchEvent) + Send + Sync + 'static) -> Self {
+        self.handlers.on_search = Some(Arc::new(handler));
         self
     }
 
@@ -420,6 +458,8 @@ impl<V> NativeScaffoldView<V> {
             toolbar,
             scroll: self.scroll.as_ref().and_then(controller_state),
             dark: ambient_dark(),
+            // A search item lives in the top bar.
+            search: self.search.clone().filter(|_| self.top.is_some()),
         };
         (spec, repeats)
     }
@@ -656,6 +696,12 @@ pub struct ScaffoldWidget {
     /// The toolbar ids the last sync dropped, so a repeat is logged once.
     repeats: Vec<ActionId>,
     top: Option<ChildPod>,
+    /// The fallback search row, between the top bar and the body.
+    search: Option<ChildPod>,
+    /// Opens and closes the fallback search field for the app's `active`.
+    search_focus: FocusHandle,
+    /// The `active` the last sync saw, so only an app change moves focus.
+    search_active: Option<bool>,
     /// The fallback toolbar row, between the body and the tab row.
     toolbar: Option<ChildPod>,
     bottom: Option<ChildPod>,
@@ -790,7 +836,16 @@ impl<V> NativeScaffoldView<V> {
         let toolbar = drawn
             .filter(|_| shown_toolbar(&spec).is_some())
             .map(|generation| fallback_toolbar_row::<Outer>(&spec, generation));
+        let search = drawn.zip(spec.search.as_ref()).map(|(generation, search)| {
+            // The field shows what it holds: the typing, unless the app changed it.
+            let text = chrome::search_field(generation)
+                .map_or_else(|| search.text.clone(), |field| field.text);
+            fallback_search_row::<Outer>(&spec, generation, text, element.search_focus.clone())
+        });
+        self.sync_search_focus(element, search.is_some());
         flags |= sync_bar(&mut element.top, top, teardown_top_bar::<Outer>, ctx);
+        let teardown_search = teardown_search_row::<Outer>;
+        flags |= sync_bar(&mut element.search, search, teardown_search, ctx);
         flags |= sync_bar(&mut element.bottom, tabs, teardown_tab_row::<Outer>, ctx);
         let teardown_toolbar = teardown_toolbar_row::<Outer>;
         flags |= sync_bar(&mut element.toolbar, toolbar, teardown_toolbar, ctx);
@@ -806,6 +861,25 @@ impl<V> NativeScaffoldView<V> {
         element.fade = self.fade;
         self.sync_scroll(element, generation, spec);
         (flags, outcome)
+    }
+
+    /// Open or close the fallback search field when the app changed its
+    /// `active` since the last sync (`shown`: the row is drawn); the field's
+    /// own focus changes reach the app as `Began`/`Ended` instead.
+    fn sync_search_focus(&self, element: &mut ScaffoldWidget, shown: bool) {
+        let active = self.search.as_ref().map(|search| search.active);
+        if shown
+            && active != element.search_active
+            && let Some(active) = active
+        {
+            let focus = &element.search_focus;
+            if active && !focus.is_focused() {
+                focus.request();
+            } else if !active && focus.is_focused() {
+                focus.release();
+            }
+        }
+        element.search_active = active;
     }
 
     /// (Re)subscribe to the scroll controller, if any, seeding the publisher
@@ -866,6 +940,9 @@ impl<V> NativeScaffoldView<V> {
             banner: None,
             repeats: Vec::new(),
             top: None,
+            search: None,
+            search_focus: FocusHandle::new(),
+            search_active: None,
             toolbar: None,
             bottom: None,
             generation: None,
@@ -917,6 +994,9 @@ impl<Outer: 'static, V: View<Outer>> View<Outer> for NativeScaffoldView<V> {
         if let Some(mut top) = element.top.take() {
             teardown_top_bar::<Outer>(&mut top, ctx);
         }
+        if let Some(mut search) = element.search.take() {
+            teardown_search_row::<Outer>(&mut search, ctx);
+        }
         if let Some(mut toolbar) = element.toolbar.take() {
             teardown_toolbar_row::<Outer>(&mut toolbar, ctx);
         }
@@ -951,7 +1031,10 @@ impl Drop for ScaffoldWidget {
 
 impl ScaffoldWidget {
     fn has_bars(&self) -> bool {
-        self.top.is_some() || self.toolbar.is_some() || self.bottom.is_some()
+        self.top.is_some()
+            || self.search.is_some()
+            || self.toolbar.is_some()
+            || self.bottom.is_some()
     }
 
     /// Fill the edge fade bands over the body for bar insets `top`/`bottom`,
@@ -1097,6 +1180,7 @@ impl Widget for ScaffoldWidget {
                 .map_or(0.0, |bar| bar.layout_child(ctx, &bar_bc).height)
         };
         let top_height = bar_height(&mut self.top);
+        let search_height = bar_height(&mut self.search);
         let bottom_height = if self.bottom_hidden {
             0.0
         } else {
@@ -1114,7 +1198,7 @@ impl Widget for ScaffoldWidget {
             }),
             None => 0.0,
         };
-        let used = banner_height + top_height + toolbar_height + bottom_height;
+        let used = banner_height + top_height + search_height + toolbar_height + bottom_height;
         let body_bc = if bc.max().height.is_finite() {
             let height = (bc.max().height - used - ime).max(0.0);
             BoxConstraints::new(
@@ -1130,10 +1214,13 @@ impl Widget for ScaffoldWidget {
         let insets = self.body_insets(window);
         let body = &mut self.body;
         let body_size = ctx.with_window_insets(insets, |ctx| body.layout_child(ctx, &body_bc));
-        let body_y = banner_height + top_height;
+        let body_y = banner_height + top_height + search_height;
         self.body.set_origin(Point::new(0.0, body_y));
         if let Some(top) = &mut self.top {
             top.set_origin(Point::new(0.0, banner_height));
+        }
+        if let Some(search) = &mut self.search {
+            search.set_origin(Point::new(0.0, banner_height + top_height));
         }
         let below_body = body_y + body_size.height;
         if let Some(toolbar) = &mut self.toolbar {
@@ -1168,6 +1255,7 @@ impl Widget for ScaffoldWidget {
         };
         for pod in [
             self.top.as_mut(),
+            self.search.as_mut(),
             self.toolbar.as_mut(),
             bottom,
             self.banner.as_mut().map(|(_, pod)| pod),
@@ -1185,6 +1273,7 @@ impl Widget for ScaffoldWidget {
         }
         let mut pods: Vec<&mut ChildPod> = std::iter::once(&mut self.body)
             .chain(self.top.as_mut())
+            .chain(self.search.as_mut())
             .chain(self.toolbar.as_mut())
             .chain(self.bottom.as_mut().filter(|_| !self.bottom_hidden))
             .collect();
@@ -1192,9 +1281,13 @@ impl Widget for ScaffoldWidget {
     }
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
-        for pod in [self.top.as_ref(), self.banner.as_ref().map(|(_, pod)| pod)]
-            .into_iter()
-            .flatten()
+        for pod in [
+            self.top.as_ref(),
+            self.search.as_ref(),
+            self.banner.as_ref().map(|(_, pod)| pod),
+        ]
+        .into_iter()
+        .flatten()
         {
             pod.semantics_child(ctx);
         }
@@ -1214,6 +1307,7 @@ impl Widget for ScaffoldWidget {
             pod.visit_pods(visitor);
         }
         self.top.visit_pods(visitor);
+        self.search.visit_pods(visitor);
         self.toolbar.visit_pods(visitor);
         self.bottom.visit_pods(visitor);
     }
@@ -1557,6 +1651,34 @@ mod tests {
         }
         assert_eq!(*log.lock().unwrap(), ["action:comment", "menu:sort/new"]);
         teardown(&view, &mut element);
+    }
+
+    #[test]
+    fn a_search_item_is_published_with_its_top_bar_and_reaches_on_search() {
+        let _guard = chrome::slot_test_guard();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let (searches, all) = (Arc::clone(&log), Arc::clone(&log));
+        let last: RwSignal<Option<ChromeEvent>> = RwSignal::new(None);
+        let search = SearchSpec::new().placeholder("Search").text("is");
+        let view = scaffold()
+            .search(search.clone())
+            .on_search(move |event| searches.lock().unwrap().push(format!("{event:?}")))
+            .on_action(move |id| all.lock().unwrap().push(format!("action:{id}")))
+            .events_into(last);
+        assert_eq!(view.spec().search.as_ref(), Some(&search));
+        let (mut element, _) = build(&view);
+        let generation = element.generation.expect("installed").get();
+        let event = ChromeEvent::Search(SearchEvent::Submitted("is".into()));
+        assert!(chrome::deliver_event(generation, &event));
+        assert_eq!(
+            frust::GetUntracked::get_untracked(&last).as_ref(),
+            Some(&event)
+        );
+        assert_eq!(*log.lock().unwrap(), ["Submitted(\"is\")"]);
+        teardown(&view, &mut element);
+        // No top bar, no search item.
+        let bare = native_scaffold(text("body")).search(search);
+        assert_eq!(bare.spec().search, None);
     }
 
     #[test]

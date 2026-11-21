@@ -27,7 +27,7 @@
 use std::sync::Arc;
 
 use super::builders::TabId;
-use crate::chrome::{ActionId, ChromeEvent, ChromeSink, MenuItemId};
+use crate::chrome::{ActionId, ChromeEvent, ChromeSink, MenuItemId, SearchEvent};
 use crate::controls::date_picker::CivilDate;
 use crate::events::EventPayload;
 
@@ -139,6 +139,7 @@ pub(super) struct ChromeHandlers {
     pub(super) on_action: ActionHandler,
     pub(super) on_menu: Option<Arc<dyn Fn(ActionId, MenuItemId) + Send + Sync>>,
     pub(super) on_back: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(super) on_search: Option<Arc<dyn Fn(SearchEvent) + Send + Sync>>,
     pub(super) on_event: Option<Arc<dyn Fn(ChromeEvent) + Send + Sync>>,
 }
 
@@ -175,6 +176,11 @@ pub(super) fn on_chrome(handlers: ChromeHandlers) -> ChromeSink {
             ChromeEvent::BackPressed => {
                 if let Some(handler) = &handlers.on_back {
                     handler();
+                }
+            }
+            ChromeEvent::Search(event) => {
+                if let Some(handler) = &handlers.on_search {
+                    handler(event);
                 }
             }
         }
@@ -227,12 +233,13 @@ mod tests {
             let log = Arc::clone(&log);
             move |detail: String| log.lock().unwrap().push(format!("{tag}:{detail}"))
         };
-        let (select, reselect, action, menu, back, all) = (
+        let (select, reselect, action, menu, back, search, all) = (
             push("select"),
             push("reselect"),
             push("action"),
             push("menu"),
             push("back"),
+            push("search"),
             push("all"),
         );
         let sink = on_chrome(ChromeHandlers {
@@ -241,6 +248,7 @@ mod tests {
             on_action: Some(Arc::new(move |id| action(id.to_string()))),
             on_menu: Some(Arc::new(move |a, m| menu(format!("{a}/{m}")))),
             on_back: Some(Arc::new(move || back(String::new()))),
+            on_search: Some(Arc::new(move |event| search(format!("{event:?}")))),
             on_event: Some(Arc::new(move |event| all(format!("{event:?}")))),
         });
         sink(ChromeEvent::TabSelected(TabId::new("a")));
@@ -248,6 +256,7 @@ mod tests {
         sink(ChromeEvent::ActionTapped("add".into()));
         sink(ChromeEvent::MenuItemChosen("more".into(), "share".into()));
         sink(ChromeEvent::BackPressed);
+        sink(ChromeEvent::Search(SearchEvent::Changed("is".into())));
         let log = log.lock().unwrap();
         for expected in [
             "select:a",
@@ -255,10 +264,11 @@ mod tests {
             "action:add",
             "menu:more/share",
             "back:",
+            "search:Changed(\"is\")",
         ] {
             assert!(log.iter().any(|line| line == expected), "{expected}");
         }
-        assert_eq!(log.iter().filter(|l| l.starts_with("all:")).count(), 5);
+        assert_eq!(log.iter().filter(|l| l.starts_with("all:")).count(), 6);
     }
 
     #[test]

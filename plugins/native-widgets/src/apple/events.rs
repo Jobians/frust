@@ -68,6 +68,19 @@
 //! Menu items are `UIAction`s whose handler blocks report `MenuItemChosen`
 //! themselves; the bare tab bar's `UITabBarDelegate` path is unchanged.
 //!
+//! The chrome's search item is not this class's: its `UISearchController`s
+//! report through `crate::apple::chrome`'s own `FrustChromeSearchDelegate`
+//! (one per installed chrome, retained by it), each event a
+//! `ChromeEvent::Search` handed to the same slot by id:
+//!
+//! | Selector | Sender | Reports |
+//! |---|---|---|
+//! | `updateSearchResultsForSearchController:` | the search controller | `Search(Changed(text))`, only for a text the slot does not hold |
+//! | `searchBarSearchButtonClicked:` | its search bar | `Search(Submitted(text))`, then the keyboard lowers |
+//! | `willPresentSearchController:` | the search controller | `Search(Began)` |
+//! | `willDismissSearchController:` | the search controller | `Search(Changed(""))` for a non-empty field, then `Search(Ended)` |
+//! | `searchBarTextDidBeginEditing:` | its search bar | nothing: ends frust's focus session (a focused frust field blurs) |
+//!
 //! A public `NativeComponent` reaches the same class through
 //! `FrustNativeControlTarget::attach_component` (called by
 //! `crate::component::ComponentCtx::attach_listener`), which wires the same
