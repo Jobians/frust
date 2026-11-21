@@ -15,10 +15,13 @@
 //!   callback after the first is dropped by the presentation's generation
 //!   guard. A sheet's detent changes are intermediate events
 //!   ([`SheetSpec::on_detent`]), not outcomes.
-//! - **One at a time, across kinds.** A request while another presentation
-//!   of any kind is live is refused [`PresentError::Busy`] at once — never
-//!   queued, never replacing the live one; an alert and a sheet share the
-//!   one slot.
+//! - **One sheet, and one alert above it.** An alert requested while a sheet
+//!   is live is presented above that sheet — a sheet's confirmation, opened
+//!   from a row [`SheetSpec::on_row_tap`] keeps open — and resolves
+//!   `Cancelled` if the sheet ends first. Every other overlap is refused
+//!   [`PresentError::Busy`] at once — a second alert, a second sheet, a
+//!   sheet while an alert is live — never queued, never replacing the live
+//!   one.
 //! - **Nothing blocks.** Both forms return immediately; the outcome arrives
 //!   when the user answers, driven by the platform's main thread.
 //!
@@ -48,9 +51,11 @@ use crate::present::{
 /// Present a native alert and await its one outcome.
 ///
 /// Resolves `Ok(outcome)` once the user (or [`crate::present::dismiss`], or
-/// the host going away) ends the alert, or `Err`: an invalid spec, `Busy`,
-/// no host to present over, or `Unsupported` on a platform without a native
-/// alert arm. The returned [`Presentation`] is a plain [`Future`] — await it
+/// the host going away, or the sheet it is presented over ending) ends the
+/// alert, or `Err`: an invalid spec, `Busy` (another alert is live), no host
+/// to present over, or `Unsupported` on a platform without a native alert
+/// arm. While a sheet is live the alert is presented above it. The returned
+/// [`Presentation`] is a plain [`Future`] — await it
 /// from `frust::spawn_local` or any executor — and its
 /// [`Presentation::handle`] is what [`crate::present::dismiss`] takes.
 /// Dropping it frees the one-at-a-time slot but leaves the platform alert on
@@ -119,7 +124,7 @@ pub fn show_native_alert_into(
 ///
 /// Resolves `Ok(outcome)` once the user (an action row, a swipe-down on a
 /// dismissible sheet), [`SheetHandle::dismiss`] or the host going away ends
-/// the sheet, or `Err`: an invalid spec, `Busy` (any other presentation is
+/// the sheet, or `Err`: an invalid spec, `Busy` (a sheet or an alert is
 /// live), no host to present over, or `Unsupported` — every platform but
 /// iOS/iPadOS today (macOS and Android sheet arms are follow-up work). Take
 /// [`Presentation::sheet_handle`] before awaiting to move or dismiss it.
@@ -241,7 +246,7 @@ mod tests {
     use frust::GetUntracked;
 
     use super::*;
-    use crate::present::test_support::{pending_pair, with_slot_held};
+    use crate::present::test_support::{pending_pair, with_sheet_held, with_slot_held};
     use crate::present::{ActionRole, AlertStyle, DismissReason, SheetContent};
 
     fn spec() -> AlertSpec {
@@ -392,6 +397,27 @@ mod tests {
                 Err(PresentError::Busy)
             );
             assert_eq!(signal.get_untracked(), None);
+        });
+    }
+
+    /// A live sheet refuses a second sheet, but not an alert above it: the
+    /// alert reaches the platform arm (which, on a host without one, refuses
+    /// it `Unsupported` rather than `Busy`).
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
+    #[test]
+    fn a_live_sheet_refuses_a_sheet_but_not_an_alert() {
+        with_sheet_held(|| {
+            let signal: RwSignal<Option<SheetOutcome>> = RwSignal::new(None);
+            assert_eq!(
+                show_native_sheet_into(sheet(), signal),
+                Err(PresentError::Busy)
+            );
+            let alert: RwSignal<Option<AlertOutcome>> = RwSignal::new(None);
+            assert_eq!(
+                show_native_alert_into(spec(), alert),
+                Err(PresentError::Unsupported)
+            );
+            assert_eq!(alert.get_untracked(), None);
         });
     }
 

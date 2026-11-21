@@ -60,8 +60,8 @@
 //! **by generation** (`apple_host::take_live_as`) — the first path to get
 //! there wins, and every later one finds nothing:
 //!
-//! - **An action row** — the controller's `frustSheetAction:` reads the
-//!   button's tag → the sheet dismisses itself
+//! - **An action row** (not an event row) — the controller's
+//!   `frustSheetAction:` reads the button's tag → the sheet dismisses itself
 //!   (`dismissViewControllerAnimated:completion:`) and resolves
 //!   [`SheetOutcome::Action`] from the completion, so the caller's
 //!   continuation never races a sheet still sliding away.
@@ -110,14 +110,27 @@
 //!
 //! # A displaced presentation
 //!
-//! As in the alert arm: a caller dropping its future frees the Busy slot,
-//! not the presentation, so a newer request (of either kind) can find an
-//! older alert or sheet still live. Whatever its kind, it goes down through
-//! the shared [`super::apple_host::LivePresentation::dismiss`] seam and this
-//! sheet presents from that dismissal's completion, from a freshly
-//! discovered anchor — a displaced entry already mid-dismissal for some
-//! other reason resolves and hands over from that same completion, never
-//! re-parked under its own generation ([`super::apple_host::displaced_action`]).
+//! As in the alert arm: a caller dropping its future frees its Busy slot,
+//! not the presentation, so a newer sheet can find an older alert or sheet
+//! still live — both abandoned, since a sheet is accepted only with neither
+//! slot taken. Each goes down through the shared
+//! [`super::apple_host::LivePresentation::dismiss`] seam, the alert first
+//! ([`super::apple_host::dismiss_all_then`]), and this sheet presents from
+//! the last dismissal's completion, from a freshly discovered anchor — a
+//! displaced entry already mid-dismissal for some other reason resolves and
+//! hands over from that same completion, never re-parked under its own
+//! generation ([`super::apple_host::displaced_action`]).
+//!
+//! # An alert over the sheet
+//!
+//! An alert requested while this sheet is live is presented from this
+//! sheet's controller (the topmost one), above it; the sheet stays live and
+//! is not "covered" for `viewDidDisappear:` purposes (it keeps its
+//! presenter). When the sheet ends by any path, UIKit removes that alert
+//! with it, and the [`SheetSender`] the sheet resolves through has the alert
+//! arm resolve it `Cancelled` first (`apple_alert`'s *Over a sheet*). An
+//! event row ([`SheetSpec::on_row_tap`]) is how a row opens one: its tap
+//! calls the row's listener and leaves the sheet up.
 //!
 //! # `unsafe`
 //!
@@ -162,11 +175,12 @@ use objc2_ui_kit::{
 };
 
 use super::apple_host::{
-    AfterDismiss, DisplacedAction, LivePresentation, dismiss_live, displaced_action, install_live,
-    on_main, presenting_anchor, take_live_as,
+    AfterDismiss, DisplacedAction, LivePresentation, dismiss_all_then, dismiss_live,
+    displaced_action, install_live, on_main, presenting_anchor, take_live_as, take_stale,
 };
 use super::{
-    ActionRole, Detent, DismissReason, PresentError, Sender, SheetHost, SheetOutcome, SheetSpec,
+    ActionRole, Detent, DismissReason, PresentError, RowListener, SheetHost, SheetOutcome,
+    SheetSender, SheetSpec,
 };
 use crate::controls::platform::{set_label_font, set_label_text_color, ui_color};
 
@@ -195,11 +209,7 @@ type DetentResolver = RcBlock<
 pub(crate) struct Host;
 
 impl SheetHost for Host {
-    fn show_sheet(
-        spec: SheetSpec,
-        tx: Sender<SheetOutcome>,
-        generation: u64,
-    ) -> Result<(), PresentError> {
+    fn show_sheet(spec: SheetSpec, tx: SheetSender, generation: u64) -> Result<(), PresentError> {
         on_main(move |mtm| start(mtm, spec, tx, generation));
         Ok(())
     }
@@ -300,19 +310,19 @@ fn detent_object(
 }
 
 /// The main-queue half of a request: build the sheet, park it as the live
-/// entry, then present it (after taking down a displaced one, if any).
-fn start(mtm: MainThreadMarker, spec: SheetSpec, tx: Sender<SheetOutcome>, generation: u64) {
+/// entry, then present it (after taking down displaced ones, if any).
+fn start(mtm: MainThreadMarker, spec: SheetSpec, tx: SheetSender, generation: u64) {
     let live = LiveSheet::build(mtm, &spec, tx, generation);
-    match install_live(mtm, generation, Box::new(live)) {
-        None => present_live(mtm, generation),
-        Some(displaced) => {
-            let then: AfterDismiss = Box::new(move |mtm| present_live(mtm, generation));
-            // Whatever kind `displaced` is, its own `dismiss` takes it down
-            // and runs `then` from that dismissal's completion (module
-            // doc's *A displaced presentation*).
-            displaced.dismiss(mtm, Some(then));
-        }
-    }
+    // An abandoned alert first (it is above an abandoned sheet), then the
+    // sheet this one displaces; each runs the next from its dismissal's
+    // completion (module doc's *A displaced presentation*).
+    let stale_alert = take_stale(mtm, false, None);
+    let displaced: Vec<_> = stale_alert
+        .into_iter()
+        .chain(install_live(mtm, generation, Box::new(live)))
+        .collect();
+    let then: AfterDismiss = Box::new(move |mtm| present_live(mtm, generation));
+    dismiss_all_then(mtm, displaced, then);
 }
 
 /// Present the live entry for `generation` from a freshly discovered anchor.
@@ -386,7 +396,7 @@ fn resolve(generation: u64, outcome: Result<SheetOutcome, PresentError>) {
 /// Everything one presented sheet keeps alive until its outcome.
 struct LiveSheet {
     generation: u64,
-    tx: Sender<SheetOutcome>,
+    tx: SheetSender,
     controller: Retained<FrustNativeSheetController>,
     /// Retained by their custom detents too; held here so the entry owns
     /// everything the presentation built.
@@ -397,12 +407,7 @@ struct LiveSheet {
 }
 
 impl LiveSheet {
-    fn build(
-        mtm: MainThreadMarker,
-        spec: &SheetSpec,
-        tx: Sender<SheetOutcome>,
-        generation: u64,
-    ) -> Self {
+    fn build(mtm: MainThreadMarker, spec: &SheetSpec, tx: SheetSender, generation: u64) -> Self {
         let custom_available = custom_detents_available();
         let mut detents: Vec<Detent> = Vec::with_capacity(spec.detents.len());
         for detent in &spec.detents {
@@ -418,6 +423,9 @@ impl LiveSheet {
                 generation,
                 dismissible: spec.dismissible,
                 action_ids: spec.content.actions.iter().map(|a| a.id.clone()).collect(),
+                row_listeners: (0..spec.content.actions.len())
+                    .map(|index| spec.row_listener(index))
+                    .collect(),
                 detents: detents
                     .iter()
                     .map(|detent| (*detent, identifier(*detent).to_string()))
@@ -573,6 +581,10 @@ impl LiveSheet {
 impl LivePresentation for LiveSheet {
     fn dismiss(self: Box<Self>, mtm: MainThreadMarker, then: Option<AfterDismiss>) {
         self.take_down(mtm, then);
+    }
+
+    fn is_sheet(&self) -> bool {
+        true
     }
 }
 
@@ -742,6 +754,9 @@ struct SheetIvars {
     dismissible: bool,
     /// The spec's action ids, indexed by each button's tag.
     action_ids: Vec<String>,
+    /// Each action row's [`SheetSpec::on_row_tap`] listener, indexed by tag:
+    /// `Some` makes the row an event that leaves the sheet up.
+    row_listeners: Vec<Option<RowListener>>,
     /// Every detent the sheet was given (after availability mapping) with
     /// the identifier UIKit reports it by.
     detents: Vec<(Detent, String)>,
@@ -814,12 +829,20 @@ define_class!(
     }
 
     impl FrustNativeSheetController {
-        /// An action row's `TouchUpInside` → dismiss, then `Action(id)`.
+        /// An action row's `TouchUpInside` → dismiss, then `Action(id)`; an
+        /// event row's → its listener, the sheet left up.
         #[unsafe(method(frustSheetAction:))]
         fn sheet_action(&self, sender: &UIButton) {
             let generation = self.ivars().generation;
-            let id = usize::try_from(sender.tag())
-                .ok()
+            let index = usize::try_from(sender.tag()).ok();
+            if let Some(listener) = index
+                .and_then(|index| self.ivars().row_listeners.get(index))
+                .and_then(Option::clone)
+            {
+                guarded("row tap", || listener());
+                return;
+            }
+            let id = index
                 .and_then(|index| self.ivars().action_ids.get(index))
                 .cloned();
             guarded("action", || {

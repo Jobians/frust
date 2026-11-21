@@ -39,7 +39,7 @@
 //! # Resolution
 //!
 //! Every terminal path reports through `nativeOnOutcome`, exactly once
-//! under the presenter's own live-dialog guard (shared with the alert) and
+//! under the presenter's own live-sheet guard (beside the alert's) and
 //! `android_host`'s generation-keyed entry:
 //!
 //! - **An action row** → the dialog dismisses, and its dismiss listener
@@ -60,13 +60,23 @@
 //! settles the sheet at a different detent, streamed to
 //! [`SheetSpec::on_detent`] with the presentation left live. The detent
 //! applied at show and a [`select_detent`](SheetHost::select_detent) move are
-//! not echoed back.
+//! not echoed back. Neither is a tap on an event row
+//! ([`SheetSpec::on_row_tap`], `action{i}Event` in the payload): the button
+//! reports `OUTCOME_ROW` with its spec index, streamed to that row's
+//! listener, and the sheet stays up — an alert the listener presents is
+//! shown above it (`android_alert`'s *Over a sheet*).
+//!
+//! Every terminal path above takes an alert still shown over the sheet down
+//! first, reported `OUTCOME_CANCELLED` before the sheet's own outcome (the
+//! presenter's `cancelAlertOver`; the [`SheetSender`] this arm resolves
+//! through asks the same of the alert arm, as a backstop).
 //!
 //! # A displaced presentation
 //!
 //! As in the alert arm: an abandoned presentation's resolver is resolved
-//! (and discarded) as [`install_live_streaming`] displaces it, and
-//! `showSheet` takes its dialog — an alert's or a sheet's — down first.
+//! (and discarded) as [`install_live`] displaces it — a sheet is accepted
+//! only with neither slot live, so a parked alert is abandoned too and goes
+//! the same way — and `showSheet` takes their dialogs down first.
 //!
 //! # `unsafe`
 //!
@@ -84,10 +94,10 @@ use jni::sys::jlong;
 use jni::{Env, jni_sig, jni_str};
 
 use super::android_host::{
-    Stream, has_resumed_activity, install_live_streaming, jni_call, sheet_resolver, take_live,
-    with_presenter,
+    LiveKind, Stream, has_resumed_activity, install_live, jni_call, sheet_resolver, take_live,
+    take_stale, with_presenter,
 };
-use super::{Detent, PresentError, Sender, SheetHost, SheetOutcome, SheetSpec, wire};
+use super::{Detent, PresentError, SheetHost, SheetSender, SheetSpec, wire};
 
 /// The live sheet's generation and detents — what
 /// [`select_detent`](SheetHost::select_detent) turns a [`Detent`] into a
@@ -120,30 +130,22 @@ fn clear_detents(generation: u64) {
 pub(crate) struct Host;
 
 impl SheetHost for Host {
-    fn show_sheet(
-        spec: SheetSpec,
-        tx: Sender<SheetOutcome>,
-        generation: u64,
-    ) -> Result<(), PresentError> {
+    fn show_sheet(spec: SheetSpec, tx: SheetSender, generation: u64) -> Result<(), PresentError> {
         if !with_presenter(has_resumed_activity)? {
             return Err(PresentError::NoHost);
         }
         let action_ids = spec.content.actions.iter().map(|a| a.id.clone()).collect();
         *DETENTS.lock().unwrap_or_else(|p| p.into_inner()) =
             Some((generation, spec.detents.clone()));
-        let stream = spec.detent_listener().map(|listener| {
-            let detents = spec.detents.clone();
-            Arc::new(move |index: i32| match wire::detent_at(index, &detents) {
-                Some(detent) => listener(detent),
-                None => log::warn!(
-                    "frust-native-widgets: sheet detent report {index} is out of range — dropped"
-                ),
-            }) as Stream
-        });
+        let stream = sheet_stream(&spec);
         let resolve = sheet_resolver(tx, action_ids);
-        if let Some(displaced) = install_live_streaming(generation, resolve, stream) {
-            // Discarded on arrival: its receiver is already gone.
-            displaced(wire::OUTCOME_DISMISSED, -1);
+        let displaced = install_live(LiveKind::Sheet, generation, resolve, stream);
+        // Discarded on arrival: their receivers are already gone.
+        for stale in take_stale(LiveKind::Alert, None)
+            .into_iter()
+            .chain(displaced)
+        {
+            stale(wire::OUTCOME_DISMISSED, -1);
         }
         let json = wire::sheet_json(&spec);
         let image = spec.content.image.as_deref();
@@ -203,6 +205,42 @@ impl SheetHost for Host {
             );
         }
     }
+}
+
+/// The [`Stream`] a sheet's non-terminal reports go to: `OUTCOME_DETENT` to
+/// its [`SheetSpec::on_detent`] listener, `OUTCOME_ROW` to the tapped row's
+/// [`SheetSpec::on_row_tap`] listener. `None` when the spec has neither.
+fn sheet_stream(spec: &SheetSpec) -> Option<Stream> {
+    let on_detent = spec.detent_listener();
+    let rows: Vec<_> = (0..spec.content.actions.len())
+        .map(|index| spec.row_listener(index))
+        .collect();
+    if on_detent.is_none() && rows.iter().all(Option::is_none) {
+        return None;
+    }
+    let detents = spec.detents.clone();
+    Some(Arc::new(move |code: i32, index: i32| {
+        if code == wire::OUTCOME_ROW {
+            let listener = usize::try_from(index)
+                .ok()
+                .and_then(|index| rows.get(index))
+                .and_then(Option::as_ref);
+            match listener {
+                Some(listener) => listener(),
+                None => log::warn!(
+                    "frust-native-widgets: sheet row report {index} names no event row — dropped"
+                ),
+            }
+            return;
+        }
+        match (wire::detent_at(index, &detents), on_detent.as_ref()) {
+            (Some(detent), Some(listener)) => listener(detent),
+            (Some(_), None) => {}
+            (None, _) => log::warn!(
+                "frust-native-widgets: sheet detent report {index} is out of range — dropped"
+            ),
+        }
+    }))
 }
 
 /// `FrustNativePresenter.showSheet(generation, specJson, image)` — see the

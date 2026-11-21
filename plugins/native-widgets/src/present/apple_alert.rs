@@ -75,14 +75,29 @@
 //! resolving call is usually running *inside* one of them (a handler the
 //! controller invokes, a delegate method) and must not free its own caller.
 //!
+//! # Over a sheet
+//!
+//! An alert accepted while a sheet is live ([`super::sheet_under`]) is
+//! presented from the topmost controller — that sheet's own controller — so
+//! it shows above the sheet, which stays up. When the sheet ends, UIKit
+//! removes the alert with the controller it was presented from, and the
+//! sheet's sender asks this arm to resolve it ([`AlertHost::cancel`]):
+//! [`AlertOutcome::Cancelled`], before the sheet's own outcome. Such an
+//! alert does not observe the scene itself — the sheet's own disconnect
+//! takes it down the same way. A sheet that is already gone by the time the
+//! alert's main-queue step runs resolves the alert `Cancelled` without
+//! presenting it.
+//!
 //! # A displaced presentation
 //!
-//! A caller that drops its [`super::Presentation`] frees the Busy slot but
-//! not the presentation on screen, so a newer request (of either kind) can
-//! find an older alert or sheet still live. Whatever its kind, it goes down
-//! through the shared [`super::apple_host::LivePresentation::dismiss`]
-//! seam — its own `Dismissed`/`Dismissed(Programmatic)` outcome goes to the
-//! dropped receiver and is discarded — and this alert presents from that
+//! A caller that drops its [`super::Presentation`] frees its Busy slot but
+//! not the presentation on screen, so a newer alert can find an older alert
+//! still live — and a sheet that is not the one it goes over (an abandoned
+//! one). Each goes down through the shared
+//! [`super::apple_host::LivePresentation::dismiss`] seam, the alert above
+//! first ([`super::apple_host::dismiss_all_then`]) — its own
+//! `Dismissed`/`Dismissed(Programmatic)` outcome goes to the dropped
+//! receiver and is discarded — and this alert presents from the last
 //! dismissal's completion, from a freshly discovered anchor. A displaced
 //! entry already mid-dismissal for some other reason resolves and hands
 //! over from that same completion, never re-parked under its own
@@ -124,8 +139,9 @@ use objc2_ui_kit::{
 };
 
 use super::apple_host::{
-    AfterDismiss, DisplacedAction, LivePresentation, dismiss_live, displaced_action, install_live,
-    on_main, presenting_anchor, take_live_as,
+    AfterDismiss, DisplacedAction, LivePresentation, dismiss_all_then, dismiss_live,
+    displaced_action, install_live, is_parked, on_main, presenting_anchor, take_live_as,
+    take_stale,
 };
 use super::{
     ActionRole, AlertHost, AlertOutcome, AlertSpec, AlertStyle, AnchorRect, PresentError, Sender,
@@ -155,6 +171,31 @@ impl AlertHost for Host {
     fn dismiss(generation: u64) {
         dismiss_live(generation);
     }
+
+    /// Module doc's *Over a sheet*: synchronous on the main thread (where a
+    /// sheet's sender always resolves), so the alert resolves first.
+    fn cancel(generation: u64) {
+        match MainThreadMarker::new() {
+            Some(mtm) => cancel_now(mtm, generation),
+            None => on_main(move |mtm| cancel_now(mtm, generation)),
+        }
+    }
+}
+
+/// Take alert `generation` down without waiting for an animation and
+/// resolve it `Cancelled` — a no-op when it is no longer the live entry.
+fn cancel_now(mtm: MainThreadMarker, generation: u64) {
+    let Some(live) = take_live_as::<LiveAlert>(mtm, generation) else {
+        return;
+    };
+    // Normally already gone, removed by UIKit with the sheet it was
+    // presented from.
+    if let Some(presenter) = live.controller.presentingViewController()
+        && !live.controller.isBeingDismissed()
+    {
+        presenter.dismissViewControllerAnimated_completion(false, None);
+    }
+    live.finish(Ok(AlertOutcome::Cancelled));
 }
 
 /// The iPad anchor rule — see the module doc.
@@ -173,33 +214,47 @@ fn check_anchor_rule(mtm: MainThreadMarker, spec: &AlertSpec) -> Result<(), Pres
 }
 
 /// The main-queue half of a request: build the alert, park it as the live
-/// entry, then present it (after taking down a displaced one, if any).
+/// entry, then present it (after taking down displaced ones, if any).
 fn start(mtm: MainThreadMarker, spec: AlertSpec, tx: Sender<AlertOutcome>, generation: u64) {
     if let Err(err) = check_anchor_rule(mtm, &spec) {
         tx.send(Err(err));
         return;
     }
     let anchor = spec.anchor;
+    let over_sheet = super::sheet_under(generation);
     let live = LiveAlert::build(mtm, &spec, tx, generation);
-    match install_live(mtm, generation, Box::new(live)) {
-        None => present_live(mtm, generation, anchor),
-        Some(displaced) => {
-            let then: AfterDismiss = Box::new(move |mtm| present_live(mtm, generation, anchor));
-            // Whatever kind `displaced` is, its own `dismiss` takes it down
-            // and runs `then` from that dismissal's completion (module
-            // doc's *A displaced presentation*).
-            displaced.dismiss(mtm, Some(then));
-        }
-    }
+    // The stale alert first (it is above any sheet), then a sheet that is
+    // not the one this alert goes over (module doc's *A displaced
+    // presentation*); each runs the next from its dismissal's completion.
+    let displaced: Vec<_> = install_live(mtm, generation, Box::new(live))
+        .into_iter()
+        .chain(take_stale(mtm, true, over_sheet))
+        .collect();
+    let then: AfterDismiss = Box::new(move |mtm| present_live(mtm, generation, anchor, over_sheet));
+    dismiss_all_then(mtm, displaced, then);
 }
 
-/// Present the live entry for `generation` from a freshly discovered anchor.
-/// A no-op when the entry is gone (resolved while a displaced alert was
-/// being taken down).
-fn present_live(mtm: MainThreadMarker, generation: u64, anchor: Option<AnchorRect>) {
+/// Present the live entry for `generation` from a freshly discovered anchor
+/// — above `over_sheet`, when given (module doc's *Over a sheet*). A no-op
+/// when the entry is gone (resolved while a displaced alert was being taken
+/// down).
+fn present_live(
+    mtm: MainThreadMarker,
+    generation: u64,
+    anchor: Option<AnchorRect>,
+    over_sheet: Option<u64>,
+) {
     let Some(live) = take_live_as::<LiveAlert>(mtm, generation) else {
         return;
     };
+    if let Some(sheet) = over_sheet
+        && !is_parked(mtm, sheet)
+    {
+        // The sheet it was accepted over already ended (or is ending): it
+        // would have taken this alert with it.
+        live.finish(Ok(AlertOutcome::Cancelled));
+        return;
+    }
     let Some(presenter) = presenting_anchor(mtm) else {
         live.finish(Err(PresentError::NoHost));
         return;
@@ -241,9 +296,11 @@ fn present_live(mtm: MainThreadMarker, generation: u64, anchor: Option<AnchorRec
         .view()
         .and_then(|view| view.window())
         .and_then(|window| window.windowScene());
-    if let Some(scene) = scene {
+    // Over a sheet, the sheet observes the scene and takes this alert down
+    // first (module doc's *Over a sheet*).
+    if let Some(scene) = scene.filter(|_| over_sheet.is_none()) {
         live.delegate.observe_disconnect(&scene);
-    } else {
+    } else if over_sheet.is_none() {
         log::debug!(
             "frust-native-widgets: the presenting controller has no window scene; the alert's \
              HostLost is not observed"
