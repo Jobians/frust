@@ -26,6 +26,7 @@ use crate::layout::BoxConstraints;
 use crate::semantics::SemanticsCtx;
 use crate::shortcuts::ShortcutId;
 use crate::sliver::{SliverConstraints, SliverGeometry, SliverWidget};
+use crate::thread_state;
 use crate::tree::InspectDetail;
 
 /// The renderer-agnostic paint target a widget draws into; `SceneBuilder`
@@ -1571,25 +1572,6 @@ pub struct ChildPod {
     sliver_geometry: Option<SliverGeometry>,
 }
 
-thread_local! {
-    /// The next tooling id [`ChildPod::inspect_id`] hands out (UI-thread only).
-    static NEXT_INSPECT_ID: Cell<u64> = const { Cell::new(ChildPod::INSPECT_ID_BASE) };
-
-    /// The inspect id of the pod that recorded this dispatch's hover claim.
-    static HOVER_CLAIMANT: Cell<Option<u64>> = const { Cell::new(None) };
-
-    /// Whether the first pod to record this dispatch's focus claim already held a live link.
-    static FOCUS_REQ_FROM_LIVE: Cell<Option<bool>> = const { Cell::new(None) };
-
-    /// The thread's focus session as `(root, live epoch, claim epoch)`; the
-    /// claim epoch is a dispatch's candidate session. `(0, 0, 0)` until a root
-    /// publishes, which a real root never does.
-    static LIVE_FOCUS_SESSION: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
-
-    /// The open root→pod focus grant as `(carrier, target inspect id, landed)`; lands once.
-    static FOCUS_GRANT: Cell<Option<(ShortcutId, u64, bool)>> = const { Cell::new(None) };
-}
-
 /// A root→pod focus grant ([`RenderRoot`](crate::app::RenderRoot)'s Tab traversal), open for one
 /// delivery of `InputEvent::Shortcut(carrier)`: the pod whose [`ChildPod::inspect_id`] is the
 /// target turns it into the state [`EventCtx::request_focus`] produces, so its own pod and every
@@ -1598,33 +1580,33 @@ pub(crate) struct FocusGrant;
 
 impl FocusGrant {
     pub(crate) fn enter(carrier: ShortcutId, target: u64) -> Self {
-        FOCUS_GRANT.with(|grant| grant.set(Some((carrier, target, false))));
+        thread_state::with(|t| t.focus_grant.set(Some((carrier, target, false))));
         FocusGrant
     }
 }
 
 impl Drop for FocusGrant {
     fn drop(&mut self) {
-        FOCUS_GRANT.with(|grant| grant.set(None));
+        thread_state::with(|t| t.focus_grant.set(None));
     }
 }
 
 /// Publish the focus session standing on this thread: `live` is the session a
 /// link must name to count, `claim` the one a link recorded now takes. A
-/// thread-local because pod destructors run with no context.
+/// per-thread slot because pod destructors run with no context.
 pub(crate) fn set_live_focus_session(root: u64, live: u64, claim: u64) {
-    LIVE_FOCUS_SESSION.with(|slot| slot.set((root, live, claim)));
+    thread_state::with(|t| t.live_focus_session.set((root, live, claim)));
 }
 
 /// The `(root, epoch)` a link recorded now is stamped with.
 fn focus_claim_stamp() -> (u64, u64) {
-    let (root, _live, claim) = LIVE_FOCUS_SESSION.with(|slot| slot.get());
+    let (root, _live, claim) = thread_state::with(|t| t.live_focus_session.get());
     (root, claim)
 }
 
 /// Whether `(root, epoch)` names the live session or the open candidate.
 fn names_live_focus_session(root: u64, epoch: u64) -> bool {
-    let (live_root, live, claim) = LIVE_FOCUS_SESSION.with(|slot| slot.get());
+    let (live_root, live, claim) = thread_state::with(|t| t.live_focus_session.get());
     root == live_root && (epoch == live || epoch == claim)
 }
 
@@ -1632,6 +1614,10 @@ impl Drop for ChildPod {
     /// Report a live hover link severed by this pod's removal, so
     /// [`RenderRoot::rebuild`](crate::app::RenderRoot::rebuild) ends the hover.
     fn drop(&mut self) {
+        // A pod a registry field holds drops with the thread's state: no root is left to owe.
+        if thread_state::try_with(|_| ()).is_none() {
+            return;
+        }
         if crate::event::live_hover_link_is(self.hover_root, self.hover_epoch) {
             crate::event::mark_hover_orphaned(self.hover_root);
         }
@@ -1648,22 +1634,22 @@ impl Drop for ChildPod {
 
 /// Forget the recorded hover claimant (called before a dispatch).
 pub(crate) fn clear_hover_claimant() {
-    HOVER_CLAIMANT.with(|claimant| claimant.set(None));
+    thread_state::with(|t| t.hover_claimant.set(None));
 }
 
 /// Take the inspect id of the pod that recorded the last hover claim.
 pub(crate) fn take_hover_claimant() -> Option<u64> {
-    HOVER_CLAIMANT.with(Cell::take)
+    thread_state::with(|t| t.hover_claimant.take())
 }
 
 /// Forget the recorded claimant liveness (called before a dispatch).
 pub(crate) fn clear_focus_req_from_live() {
-    FOCUS_REQ_FROM_LIVE.with(|c| c.set(None));
+    thread_state::with(|t| t.focus_req_from_live.set(None));
 }
 
 /// Take whether the claim's first pod already held a live link (`None`: no pod claimed).
 pub(crate) fn take_focus_req_from_live() -> Option<bool> {
-    FOCUS_REQ_FROM_LIVE.with(Cell::take)
+    thread_state::with(|t| t.focus_req_from_live.take())
 }
 
 impl ChildPod {
@@ -1732,9 +1718,9 @@ impl ChildPod {
         let id = match self.inspect_id.get() {
             Some(id) => id,
             None => {
-                let id = NEXT_INSPECT_ID.with(|next| {
-                    let id = next.get();
-                    next.set(id + 1);
+                let id = thread_state::with(|t| {
+                    let id = t.next_inspect_id.get();
+                    t.next_inspect_id.set(id + 1);
                     NonZeroU64::new(id).expect("the allocator starts at 2^48, never zero")
                 });
                 self.inspect_id.set(Some(id));
@@ -2248,9 +2234,9 @@ impl ChildPod {
             self.hover_epoch = claim_epoch;
             self.hover_root = ctx.hover_root();
             // Stamps land bottom-up, so the first is the claimant's own pod.
-            if HOVER_CLAIMANT.with(Cell::get).is_none() {
+            if thread_state::with(|t| t.hover_claimant.get()).is_none() {
                 let id = self.inspect_id().0;
-                HOVER_CLAIMANT.with(|claimant| claimant.set(Some(id)));
+                thread_state::with(|t| t.hover_claimant.set(Some(id)));
             }
         }
         // A focus request wins over a release in one dispatch.
@@ -2259,9 +2245,9 @@ impl ChildPod {
         }
         if focus_req {
             // Bottom-up: the first pod here is the claimant's own.
-            if FOCUS_REQ_FROM_LIVE.with(Cell::get).is_none() {
+            if thread_state::with(|t| t.focus_req_from_live.get()).is_none() {
                 let live = self.holds_live_focus();
-                FOCUS_REQ_FROM_LIVE.with(|c| c.set(Some(live)));
+                thread_state::with(|t| t.focus_req_from_live.set(Some(live)));
             }
             self.set_focused(true);
         }
@@ -2274,9 +2260,9 @@ impl ChildPod {
         let Some(id) = self.inspect_id.get() else {
             return false;
         };
-        FOCUS_GRANT.with(|grant| match grant.get() {
+        thread_state::with(|t| match t.focus_grant.get() {
             Some((open, target, false)) if open == carrier && target == id.get() => {
-                grant.set(Some((open, target, true)));
+                t.focus_grant.set(Some((open, target, true)));
                 true
             }
             _ => false,
@@ -2310,7 +2296,7 @@ mod focus_link_tests {
 
     impl Session {
         fn enter(root: u64, live: u64, claim: u64) -> Self {
-            let previous = LIVE_FOCUS_SESSION.with(|slot| slot.get());
+            let previous = thread_state::with(|t| t.live_focus_session.get());
             set_live_focus_session(root, live, claim);
             Session(previous.0, previous.1, previous.2)
         }

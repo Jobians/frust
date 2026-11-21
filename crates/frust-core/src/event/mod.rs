@@ -33,9 +33,9 @@ mod pointer;
 mod tests;
 
 pub(crate) use contact::{
-    ContactFrame, ContactPass, current_pointer_id, in_secondary_contact_pass,
-    note_secondary_delivered, run_secondary_walk, secondary_walk_carrier, secondary_walk_event,
-    without_secondary_walk,
+    ContactFrame, ContactFrameState, ContactPass, ContactPassState, SecondaryWalkFrame,
+    current_pointer_id, in_secondary_contact_pass, note_secondary_delivered, run_secondary_walk,
+    secondary_walk_carrier, secondary_walk_event, without_secondary_walk,
 };
 pub use ctx::{EventCtx, EventOutcome, EventResult};
 pub use flags::{
