@@ -1,0 +1,9 @@
+budget android 6
+crates/frust-widgets/src/authoring.rs TEXT test
+crates/frust-widgets/src/nav/ambient.rs PAGE_REACH android
+crates/frust-widgets/src/nav/ambient.rs SWIPE_CLAIM android
+crates/frust-widgets/src/scroll.rs MULTI_CONTACT_VETO android
+crates/frust-widgets/src/scroll.rs SCROLL_CLAIM android
+crates/frust-widgets/src/scroll.rs TEXT test
+crates/frust-widgets/src/slivers/keep_alive.rs ROW_SCOPES android
+crates/frust-widgets/src/viewport.rs VIEWPORT_FRAMES android
