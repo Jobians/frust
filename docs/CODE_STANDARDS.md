@@ -497,7 +497,7 @@ Conventions for `Widget::semantics` (see `docs/CORE_ARCHITECTURE.md`'s `semantic
 
 - **No new `thread_local!` static in a framework crate** (each takes a pthread key on Android). Per-thread state is
   a field of the crate's one per-thread struct, keeping its own `Cell`/`RefCell` (no outer `RefCell`); a `Drop` that
-  can run at thread exit uses `try_with`. A new static joins the list in `crates/frust/tests/thread_local_budget.rs`.
+  can run at thread exit uses `try_with`. Any new static is listed under `crates/frust/tests/thread_local_budget/`, within budget.
 - **Local state lives in the retained `Component` element, not signals, unless it needs
   cross-tree reactivity.** `Component::State` is plain data `ComponentWidget` retains across
   rebuilds — reach for an `RwSignal` field only when something outside the component's own
