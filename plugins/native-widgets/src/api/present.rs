@@ -296,7 +296,9 @@ mod tests {
     use frust::GetUntracked;
 
     use super::*;
-    use crate::present::test_support::{pending_pair, with_sheet_held, with_slot_held};
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_os = "macos")))]
+    use crate::present::test_support::with_sheet_held;
+    use crate::present::test_support::{pending_pair, with_slot_held};
     use crate::present::{ActionRole, AlertStyle, DismissReason, SheetContent, ToastSpec};
 
     fn spec() -> AlertSpec {

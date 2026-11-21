@@ -21,9 +21,9 @@
 //! it (an alert or a sheet covers a toast, as on Android). Horizontally it
 //! hugs its content, centred, at most 560 pt wide and 16 pt inside the safe
 //! area. Vertically its bottom sits 12 pt above the highest of: the window's
-//! safe area, the keyboard (the root view's — else the window's —
-//! `keyboardLayoutGuide`, iOS 15+, which tracks the docked keyboard and
-//! otherwise stands at the safe area),
+//! safe area, the keyboard (the `keyboardLayoutGuide`, iOS 15+, of the root
+//! controller's view when that view is in the window, else the window's;
+//! it tracks the docked keyboard and otherwise stands at the safe area),
 //! and the safe area of the selected page's view (the root walked through
 //! `UITabBarController.selectedViewController` and
 //! `UINavigationController.topViewController`), whose bottom inset includes
@@ -411,9 +411,17 @@ fn activate_placement(
     resting.setPriority(UILayoutPriorityDefaultLow);
     constraints.push(resting);
 
-    // The root view's guide (a full-window view controller's view, the usual
-    // owner of a keyboard guide), else the window's own.
-    let keyboard_owner: &UIView = root_view.unwrap_or(window);
+    // The root controller's view owns the keyboard guide whenever it is in
+    // this window, direct subview or not (UIKit may wrap it in a transition
+    // view): the window's own guide does not follow the keyboard there. Only
+    // a window with no such view falls back to its own guide.
+    let root_controller_view = window
+        .rootViewController()
+        .and_then(|root| root.viewIfLoaded())
+        .filter(|view| view.window().is_some_and(|w| same(&w, window)));
+    let keyboard_owner: &UIView = root_view
+        .or(root_controller_view.as_deref())
+        .unwrap_or(window);
     if keyboard_owner.respondsToSelector(sel!(keyboardLayoutGuide)) {
         constraints.push(
             keyboard_owner
