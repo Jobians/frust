@@ -6,68 +6,46 @@
 //! inside a `LocalSet` — and the UI thread has none. This module is the fix:
 //! `spawn` hands `Send` futures to the
 //! background runtime, while `spawn_local` pushes `!Send` futures onto a
-//! `thread_local!` [`LocalPool`] that the shell drains via
+//! per-thread [`LocalPool`](futures::executor::LocalPool) that the shell drains via
 //! [`ReactiveRuntime::pump_local`](crate::ReactiveRuntime::pump_local).
 
-use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 
 use any_spawner::{CustomExecutor, PinnedFuture, PinnedLocalFuture};
-use futures::executor::{LocalPool, LocalSpawner};
 use futures::task::LocalSpawnExt;
 use tokio::runtime::Handle;
 
-// The thread-locals live in an allow-scoped module: on the mobile targets
-// (no `#[thread_local]` fast path) std's macro expands through the `os_local`
-// path, where clippy's `missing_const_for_thread_local` misfires — it flags
-// even the already-const `IS_UI_THREAD`, and a per-static `#[allow]` does not
-// survive that expansion. `LOCAL_POOL`/`LOCAL_SPAWNER` genuinely cannot be
-// `const` (`LocalPool::new()`/`spawner()` are not const fns).
-#[allow(clippy::missing_const_for_thread_local)]
-mod tls {
-    use super::*;
-
-    thread_local! {
-        /// The UI thread's local task queue for `!Send` futures. Empty on every
-        /// other thread (each thread has its own, so pumping off the UI thread
-        /// is a harmless no-op rather than a panic).
-        pub(super) static LOCAL_POOL: RefCell<LocalPool> = RefCell::new(LocalPool::new());
-        /// Spawner into `LOCAL_POOL`, cached to avoid re-deriving it per spawn.
-        pub(super) static LOCAL_SPAWNER: LocalSpawner =
-            LOCAL_POOL.with(|pool| pool.borrow().spawner());
-        /// Set on the thread that called [`init_ui_thread`]; gates `spawn_local`.
-        pub(super) static IS_UI_THREAD: Cell<bool> = const { Cell::new(false) };
-    }
-}
-use tls::{IS_UI_THREAD, LOCAL_POOL, LOCAL_SPAWNER};
+use crate::thread_state;
 
 /// Marks the calling thread as the UI thread — the one that owns the local task
 /// queue and drains it via `pump_local`. Called from `ReactiveRuntime::init`,
 /// which is documented to run on the UI thread.
 pub(crate) fn init_ui_thread() {
-    IS_UI_THREAD.with(|flag| flag.set(true));
+    thread_state::with(|t| t.is_ui_thread.set(true));
 }
 
-/// Whether the calling thread is the UI thread.
+/// Whether the calling thread is the UI thread; `false` once the thread's teardown has destroyed
+/// its state, since it no longer owns a local task queue then.
 pub(crate) fn is_ui_thread() -> bool {
-    IS_UI_THREAD.with(Cell::get)
+    thread_state::try_with(|t| t.is_ui_thread.get()).unwrap_or(false)
 }
 
 /// Runs the calling thread's local task queue until it stalls. The caller is
 /// responsible for establishing a tokio runtime context first (so that
 /// `tokio::time::sleep` inside a local task can register with the background
-/// runtime's timer driver) — see [`ReactiveRuntime::pump_local`].
+/// runtime's timer driver) — see [`ReactiveRuntime::pump_local`]. A no-op once the
+/// thread's teardown has destroyed the queue, since a pending task dropping then may pump.
 ///
 /// [`ReactiveRuntime::pump_local`]: crate::ReactiveRuntime::pump_local
 pub(crate) fn run_until_stalled() {
-    LOCAL_POOL.with(|pool| {
+    thread_state::try_with(|t| {
         // `try_borrow_mut` guards against a re-entrant pump (a task that itself
         // triggers a pump): if the pool is already borrowed we are nested, so
         // do nothing rather than double-borrow-panic.
-        if let Ok(mut pool) = pool.try_borrow_mut() {
+        if let Ok(mut pool) = t.local_pool().try_borrow_mut() {
             pool.run_until_stalled();
         }
     });
@@ -208,8 +186,8 @@ impl CustomExecutor for ForgeExecutor {
         // Without this, only the spawn-time `wake()` below ever nudges the
         // shell, so a parked desktop loop never pumps the completion.
         let fut = WakeBridge { inner: fut };
-        LOCAL_SPAWNER.with(|spawner| {
-            spawner
+        thread_state::with(|t| {
+            t.local_spawner()
                 .spawn_local(fut)
                 .expect("frust-reactive: UI-thread local task queue rejected a future");
         });
