@@ -240,6 +240,10 @@ fn surface_alpha_request() -> frust_render::SurfaceAlphaRequest {
 #[unsafe(no_mangle)]
 pub extern "system" fn JNI_OnLoad(vm: *mut c_void, _reserved: *mut c_void) -> jint {
     init_logger_once();
+    // Earliest point with logging up: the startup key count (a slot scan that holds at
+    // most one key, for an instant; see `tls_keys` for the one-free-key edge).
+    #[cfg(debug_assertions)]
+    crate::tls_keys::log_at_startup();
     // Retain the VM pointer for `nativeInitPlatform`; a plain pointer store,
     // never dereferenced here. `Release` pairs with the `Acquire` load there.
     JAVA_VM.store(vm, Ordering::Release);

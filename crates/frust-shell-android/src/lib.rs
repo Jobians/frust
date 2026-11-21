@@ -95,6 +95,9 @@ mod log_level;
 mod app;
 #[cfg(target_os = "android")]
 pub mod jni_glue;
+// Debug-only pthread key count; see the module comment for how it is taken.
+#[cfg(all(target_os = "android", debug_assertions))]
+mod tls_keys;
 
 // Re-exports the macro-generated `extern "system" fn`s reach for, so a generated
 // app only needs to depend on `frust` (which re-exports `android_app!`), never
