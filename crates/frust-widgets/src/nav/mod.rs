@@ -53,5 +53,5 @@ mod view;
 
 // The page-reach seam (R23) is shared with `IndexedStack`, the second installer
 // of reach cells. Crate-visible only: nothing outside this crate may install a
-// reach scope (see `ambient`'s `PAGE_REACH` docs).
+// reach scope (see `WidgetLocals::page_reach` docs).
 pub(crate) use ambient::{ambient_page_reach, with_page_reach};
