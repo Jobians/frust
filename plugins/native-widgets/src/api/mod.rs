@@ -82,8 +82,8 @@ mod theme;
 /// The app-chrome builder and the vocabulary it speaks, re-exported from the
 /// crate-private `chrome` module — see [`native_scaffold`].
 pub use crate::chrome::{
-    ActionId, ActionItem, ChromeEvent, Leading, MenuItem, MenuItemId, ScrollState, ToolbarSpec,
-    ToolbarStyle,
+    ActionId, ActionItem, ChromeEvent, Leading, MenuItem, MenuItemId, ScrollState, SearchEvent,
+    SearchPlacement, SearchSpec, ToolbarSpec, ToolbarStyle,
 };
 /// The date value `native_date_picker` shows and reports — defined beside the
 /// control (`crate::controls::date_picker`) because the platform-agnostic

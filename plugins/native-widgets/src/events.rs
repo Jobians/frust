@@ -19,7 +19,7 @@
 //! [`EventPayload`] straight into a signal write, which is what wakes
 //! exactly one frust frame.
 //!
-//! # One listener, twelve kinds, no JSON
+//! # One listener, one kind table, no JSON
 //!
 //! Kinds 1-5 are emitted on Android; the sixth,
 //! [`EVENT_KIND_SELECTION`], is appended for the segmented control and is
@@ -39,7 +39,11 @@
 //! with these kinds and `FrustNativeListener`'s `KIND_CHROME_*` twins. Its
 //! `CHROME_MENU_STRIDE` and `CHROME_TAB_RESELECT_SHIFT` twin
 //! [`CHROME_MENU_STRIDE`] and [`pack_chrome_tab`]'s reselect bit
-//! (`tests/kotlin_conformance.rs` pins both).
+//! (`tests/kotlin_conformance.rs` pins both). Kind 13 is reserved; kinds
+//! 14-17 ([`EVENT_KIND_CHROME_SEARCH_CHANGED`] ..
+//! [`EVENT_KIND_CHROME_SEARCH_ENDED`]) are the chrome search field's, whose
+//! text travels beside the kind rather than in `detail` (Android's
+//! `nativeOnChromeSearch` takes it as a string).
 //!
 //! `FrustNativeListener` implements every listener interface
 //! a v1 control needs — `View.OnClickListener`,
@@ -137,6 +141,18 @@ pub(crate) const EVENT_KIND_CHROME_ACTION: i32 = 10;
 pub(crate) const EVENT_KIND_CHROME_MENU: i32 = 11;
 /// The app-chrome back item — `detail` unused (`0`).
 pub(crate) const EVENT_KIND_CHROME_BACK: i32 = 12;
+/// The chrome search field's text changed — `detail` unused (`0`); the text
+/// rides beside the kind (Android: `nativeOnChromeSearch`'s string argument),
+/// never in `detail`. Kind 13 is reserved, so the search kinds start at 14.
+pub(crate) const EVENT_KIND_CHROME_SEARCH_CHANGED: i32 = 14;
+/// The chrome search field was submitted (the keyboard's search key) —
+/// `detail` unused, the text beside it as for
+/// [`EVENT_KIND_CHROME_SEARCH_CHANGED`].
+pub(crate) const EVENT_KIND_CHROME_SEARCH_SUBMITTED: i32 = 15;
+/// The chrome search field expanded (search began) — no payload.
+pub(crate) const EVENT_KIND_CHROME_SEARCH_BEGAN: i32 = 16;
+/// The chrome search field collapsed (search ended) — no payload.
+pub(crate) const EVENT_KIND_CHROME_SEARCH_ENDED: i32 = 17;
 
 // --- the typed vocabulary the app-facing api wraps into a signal -----------
 
@@ -430,8 +446,17 @@ mod tests {
     #[test]
     fn the_kind_table_is_append_only() {
         // Kinds 1-5 are shipped wire values; SELECTION, DATE, RESELECTED and
-        // the four chrome kinds are appended after them, never renumbered
-        // into the middle.
+        // the chrome kinds are appended after them, never renumbered into
+        // the middle. 13 is reserved; the search kinds follow it.
+        assert_eq!(
+            [
+                EVENT_KIND_CHROME_SEARCH_CHANGED,
+                EVENT_KIND_CHROME_SEARCH_SUBMITTED,
+                EVENT_KIND_CHROME_SEARCH_BEGAN,
+                EVENT_KIND_CHROME_SEARCH_ENDED,
+            ],
+            [14, 15, 16, 17]
+        );
         assert_eq!(
             [
                 EVENT_KIND_CLICK,

@@ -189,5 +189,18 @@ class FrustNativeListener(private val slotId: Long) :
         const val KIND_CHROME_ACTION = 10
         const val KIND_CHROME_MENU = 11
         const val KIND_CHROME_BACK = 12
+
+        /**
+         * The chrome search field (the Rust side's `EVENT_KIND_CHROME_SEARCH_*`):
+         * its text changed, it was submitted, it expanded, it collapsed. The
+         * text travels as the string argument of
+         * `FrustNativeChrome.nativeOnChromeSearch`, never in a `detail`.
+         * Emitted by [FrustNativeChrome] only. 13 is reserved, so these
+         * start at 14 — appended, never renumbered.
+         */
+        const val KIND_CHROME_SEARCH_CHANGED = 14
+        const val KIND_CHROME_SEARCH_SUBMITTED = 15
+        const val KIND_CHROME_SEARCH_BEGAN = 16
+        const val KIND_CHROME_SEARCH_ENDED = 17
     }
 }

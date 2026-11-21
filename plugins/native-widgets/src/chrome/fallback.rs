@@ -31,13 +31,18 @@
 //!   a prominent action sits on a `primary` pill, as the toolbar's primary
 //!   does.
 //! - No keyboard focus: each target publishes a clickable semantics node,
-//!   which assistive technology activates as a tap.
+//!   which assistive technology activates as a tap. The one exception is the
+//!   search row under the top bar, a frust text field reporting the search
+//!   events beside a close button ([`fallback_search_row`]).
 
 use std::sync::{Arc, OnceLock};
 
 use frust::authoring::text::{FontWeight, TextContext, TextLayout, TextStyle};
 use frust::authoring::{Brush, ImageSource, teardown_child};
-use frust::{Color, ColorScheme, IconData, Theme, icons};
+use frust::{
+    Color, ColorScheme, EdgeInsets, FocusHandle, IconData, Padding, Theme, container, icon_button,
+    icons, row, shortcuts, text_input, use_context,
+};
 use frust_core::accesskit::{Action, Node, Rect as AccessRect, Role};
 use frust_core::{
     AnyView, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, EventCtx, EventResult, InputEvent,
@@ -46,8 +51,8 @@ use frust_core::{
 use kurbo::{Affine, BezPath, Point, Rect, Size};
 
 use super::{
-    ActionItem, ChromeEvent, ChromeGeneration, ChromeSpec, Leading, ToolbarSpec, ToolbarStyle,
-    TopBarSpec, deliver, deliver_event, encode_event,
+    ActionItem, ChromeEvent, ChromeGeneration, ChromeSpec, Leading, SearchEvent, ToolbarSpec,
+    ToolbarStyle, TopBarSpec, deliver, deliver_event, encode_event, search_field,
 };
 use crate::api::{TabIcon, TabItem};
 
@@ -460,6 +465,99 @@ fn pressed_layer(rect: Rect, scheme: &ColorScheme, scene: &mut dyn PaintScene) {
         rect.height().min(rect.width()) / 2.0,
         with_alpha(scheme.on_surface, PRESSED_ALPHA),
     );
+}
+
+// --- the search row ----------------------------------------------------------
+
+/// The search row's padding around its field.
+const SEARCH_PAD: (f64, f64) = (16.0, 8.0);
+
+/// The fallback search row for `spec`'s search item, under the top bar: a
+/// frust text field showing `text` (what the field holds, the slot's
+/// `FieldState`) that reports exactly as an arm's field does, under
+/// `generation` — each edit a `Changed` with the whole text, the Enter key
+/// a `Submitted`, gaining focus `Began` — and a trailing close button. A
+/// blur alone ends nothing, as a native field's keyboard going away does
+/// not; the close button, and Escape while the search is open, end it the
+/// native way ([`close_search`]): `Changed("")` for a non-empty field, then
+/// `Ended`, the field emptied. `focus` lets the scaffold open and close it
+/// for the app's `active`; the app's close empties it quietly (the slot's
+/// collapse).
+pub(crate) fn fallback_search_row<Outer: 'static>(
+    spec: &ChromeSpec,
+    generation: ChromeGeneration,
+    text: String,
+    focus: FocusHandle,
+) -> AnyView<Outer> {
+    let placeholder = spec
+        .search
+        .as_ref()
+        .map(|search| search.placeholder.clone())
+        .unwrap_or_default();
+    let open = !text.is_empty() || search_field(generation).is_some_and(|field| field.active);
+    let field = text_input(text, move |_: &mut Outer, text: String| {
+        report_search(generation, SearchEvent::Changed(text));
+    })
+    .placeholder(placeholder.clone())
+    .label(placeholder)
+    .on_submit(move |_: &mut Outer, text: String| {
+        report_search(generation, SearchEvent::Submitted(text));
+    })
+    .on_focus_change(move |_: &mut Outer, focused: bool| {
+        if focused {
+            report_search(generation, SearchEvent::Began);
+        }
+    })
+    .focus_handle(focus.clone());
+    let close_focus = focus.clone();
+    let close = icon_button(icons::CLOSE, "Close search", move |_: &mut Outer| {
+        close_search(generation, &close_focus);
+    });
+    let row = row().flex(1, field).child(close);
+    // Escape ends an open search; a closed one leaves the key to the app.
+    let row = if open {
+        shortcuts(row).on("Escape", "Close search", move |_: &mut Outer| {
+            close_search(generation, &focus);
+        })
+    } else {
+        shortcuts(row)
+    };
+    let fill = theme_or_neutral(use_context::<Theme>().as_ref())
+        .scheme()
+        .surface;
+    any(container(Padding(
+        EdgeInsets::symmetric(SEARCH_PAD.0, SEARCH_PAD.1),
+        row,
+    ))
+    .fill(fill))
+}
+
+/// The user closed the fallback search (its close button, Escape): report
+/// what a native field's collapse does — `Changed("")` when it held text,
+/// then `Ended` — and give the focus up. The slot drops whichever says
+/// nothing new, and the field shows the emptied text on the next build.
+fn close_search(generation: ChromeGeneration, focus: &FocusHandle) {
+    if search_field(generation).is_some_and(|field| !field.text.is_empty()) {
+        report_search(generation, SearchEvent::Changed(String::new()));
+    }
+    report_search(generation, SearchEvent::Ended);
+    focus.release();
+}
+
+/// Tear down a pod [`fallback_search_row`] built.
+pub(crate) fn teardown_search_row<Outer: 'static>(pod: &mut ChildPod, ctx: &mut BuildCtx<'_>) {
+    let inert = fallback_search_row::<Outer>(
+        &ChromeSpec::default(),
+        ChromeGeneration(0),
+        String::new(),
+        FocusHandle::new(),
+    );
+    teardown_child(&inert, pod, ctx);
+}
+
+/// Report a search `event` from the fallback field, as an arm's field does.
+fn report_search(generation: ChromeGeneration, event: SearchEvent) {
+    deliver_event(generation.get(), &ChromeEvent::Search(event));
 }
 
 // --- the top bar -------------------------------------------------------------
@@ -1810,6 +1908,7 @@ mod tests {
         size: Size,
         toolbar: Option<ToolbarSpec>,
         tabs: bool,
+        search: Option<crate::chrome::SearchSpec>,
     }
 
     impl App {
@@ -1828,7 +1927,14 @@ mod tests {
                 size: Size::new(size.0, size.1),
                 toolbar: None,
                 tabs: true,
+                search: None,
             }
+        }
+
+        /// This app with a search item, its events logged as `search:<event>`.
+        fn with_search(mut self, search: crate::chrome::SearchSpec) -> Self {
+            self.search = Some(search);
+            self
         }
 
         /// This app with `toolbar`, and without tabs unless `tabs`.
@@ -1841,12 +1947,22 @@ mod tests {
         fn frame(&mut self) -> Rec {
             let (seen, log) = (Rc::clone(&self.seen), Arc::clone(&self.log));
             let (toolbar, tabs) = (self.toolbar.clone(), self.tabs);
+            let search = self.search.clone();
             let mut build = move |_: &mut ()| {
                 let view = scaffold(&seen, &log);
                 let view = if tabs {
                     view
                 } else {
                     view.tabs(Vec::new(), "")
+                };
+                let view = match &search {
+                    Some(search) => {
+                        let log = Arc::clone(&log);
+                        view.search(search.clone()).on_search(move |event| {
+                            log.lock().unwrap().push(format!("search:{event:?}"));
+                        })
+                    }
+                    None => view,
                 };
                 match &toolbar {
                     Some(toolbar) => view.toolbar(toolbar.clone()),
@@ -1895,6 +2011,104 @@ mod tests {
             WindowEdgeInsets::new(left, top, 0.0, bottom),
             WindowEdgeInsets::ZERO,
         )
+    }
+
+    #[test]
+    fn the_search_row_sits_under_the_top_bar_and_reports_like_a_native_field() {
+        use frust_core::{ImeEvent, Key, KeyEvent, Modifiers, NamedKey};
+
+        let _guard = slot_test_guard();
+        let search = crate::chrome::SearchSpec::new().placeholder("Search issues");
+        let mut app = App::new(SIZES[0], Brightness::Light, WindowInsets::default())
+            .with_search(search.clone());
+        app.frame();
+        let seen = app.seen();
+        let row = seen.origin.y - TOP_BAR_HEIGHT;
+        assert!(row > 0.0, "the row takes height above the body: {row}");
+        assert_eq!(
+            seen.size.height,
+            SIZES[0].1 - TOP_BAR_HEIGHT - row - TAB_ROW_HEIGHT
+        );
+        // Focusing the field begins the search; each edit reports the whole
+        // text, the Enter key submits it.
+        app.tap(100.0, TOP_BAR_HEIGHT + row / 2.0);
+        app.root
+            .event(&mut (), &InputEvent::Ime(ImeEvent::Commit("is".into())));
+        app.frame();
+        app.root
+            .event(&mut (), &InputEvent::Ime(ImeEvent::Commit("s".into())));
+        app.frame();
+        let enter = InputEvent::Key(KeyEvent {
+            key: Key::Named(NamedKey::Enter),
+            modifiers: Modifiers::default(),
+            repeat: false,
+        });
+        app.root.event(&mut (), &enter);
+        app.frame();
+        let log: Vec<String> = app
+            .take_log()
+            .into_iter()
+            .filter(|line| line.starts_with("search:"))
+            .collect();
+        assert_eq!(
+            log,
+            [
+                "search:Began",
+                "search:Changed(\"is\")",
+                "search:Changed(\"iss\")",
+                "search:Submitted(\"iss\")",
+            ]
+        );
+        // The typing stays in the field although this app never writes it
+        // back; a tap on the body blurs it, which ends nothing.
+        app.tap(100.0, seen.origin.y + 200.0);
+        assert_eq!(app.take_log(), Vec::<String>::new());
+        // The slot holds what the field shows.
+        let generation = crate::chrome::live_generation().expect("live");
+        let shown = crate::chrome::search_field(generation).expect("a field");
+        assert_eq!((shown.text.as_str(), shown.active), ("iss", true));
+        // The close button ends it as a native collapse does: the emptying,
+        // then the end, and the field shows the empty text.
+        let close = (
+            SIZES[0].0 - SEARCH_PAD.0 - SLOT / 2.0,
+            TOP_BAR_HEIGHT + row / 2.0,
+        );
+        app.tap(close.0, close.1);
+        assert_eq!(app.take_log(), ["search:Changed(\"\")", "search:Ended"]);
+        assert_eq!(
+            crate::chrome::search_field(generation),
+            Some(crate::chrome::FieldState::default())
+        );
+        app.frame();
+        assert!(
+            app.take_log().is_empty(),
+            "the emptied field reports nothing"
+        );
+        // Escape does the same from the focused field.
+        app.tap(100.0, TOP_BAR_HEIGHT + row / 2.0);
+        app.root
+            .event(&mut (), &InputEvent::Ime(ImeEvent::Commit("x".into())));
+        app.frame();
+        let escape = InputEvent::Key(KeyEvent {
+            key: Key::Named(NamedKey::Escape),
+            modifiers: Modifiers::default(),
+            repeat: false,
+        });
+        app.root.event(&mut (), &escape);
+        app.frame();
+        assert_eq!(
+            app.take_log(),
+            [
+                "search:Began",
+                "search:Changed(\"x\")",
+                "search:Changed(\"\")",
+                "search:Ended",
+            ]
+        );
+        // A closed, empty search leaves Escape alone.
+        app.root.event(&mut (), &escape);
+        app.frame();
+        assert!(app.take_log().is_empty());
     }
 
     #[test]

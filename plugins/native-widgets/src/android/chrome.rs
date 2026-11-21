@@ -22,8 +22,10 @@
 //! | Rust → Kotlin | `@JvmStatic dispose()` | Idempotent; never calls back into Rust |
 //! | Kotlin → Rust | [`Java_dev_frust_nativewidgets_FrustNativeChrome_nativeOnChromeEvent`]`(env, class, generation: jlong, kind: jint, detail: jlong)` | A tap, `FrustNativeListener`'s `KIND_CHROME_*` kinds → [`chrome::deliver`] |
 //! | Kotlin → Rust | [`Java_dev_frust_nativewidgets_FrustNativeChrome_nativeOnChromeLost`]`(env, class, generation: jlong)` | The Activity or content root went away under the installed chrome |
+//! | Kotlin → Rust | [`Java_dev_frust_nativewidgets_FrustNativeChrome_nativeOnChromeSearch`]`(env, class, generation: jlong, kind: jint, text: jstring)` | A search report, `KIND_CHROME_SEARCH_*` with the field's text → [`chrome::deliver_search`] |
+//! | Kotlin → Rust | [`Java_dev_frust_nativewidgets_FrustNativeChrome_nativeOnChromeSearchFocus`]`(env, class, generation: jlong)` | The search field took the input focus → [`chrome::release_frust_focus`] |
 //!
-//! Both natives are `@JvmStatic external` members of a Kotlin `object`, so
+//! The natives are `@JvmStatic external` members of a Kotlin `object`, so
 //! the exports take the class, not an instance. They live here, beside the
 //! host they serve, rather than in `crate::android`'s module root: that
 //! module's exports are pinned to the factory and listener classes, the
@@ -106,6 +108,31 @@
 //! flag change swaps only the top bar, in the same main-thread turn. Nothing
 //! on this side changes for it but [`APPLY_ORDER`].
 //!
+//! # Search
+//!
+//! The spec's search item is a toolbar action (AppCompat's
+//! `SearchView` as a collapsible action view), so it lives in the top bar
+//! whichever shape it has — the small bar or the collapsing one, whose
+//! pinned toolbar carries it. Tapping it expands the field across the
+//! toolbar and raises the keyboard; the frust body stays where it is, under
+//! the bar, and shows the results. Its text changes, the keyboard's search
+//! key, the expansion and the collapse report through `nativeOnChromeSearch`
+//! with the field's text as a Java string, never in `detail`; Kotlin drops
+//! the reports its own applies cause, and the slot drops any echo that gets
+//! through. The field gaining the input focus calls
+//! `nativeOnChromeSearchFocus`, which ends frust's focus session so a
+//! focused frust text field blurs; frust's shell then lowers the keyboard
+//! for the field it lost, which Kotlin raises again for the search field a
+//! frame later. A frust text field taking focus back needs nothing here: its
+//! surface takes the Android focus from the search field, which stays
+//! expanded. While expanded, back collapses the field (an
+//! `OnBackPressedCallback` on the host Activity's dispatcher). Kotlin's
+//! model follows the field's own reports, and a rebuilt menu or bar never
+//! opens the field from it: a menu rebuild keeps the search item as it is,
+//! and a new bar re-opens only a field the old one showed expanded, without
+//! taking the focus unless that field had it — so the slot's `FieldState`
+//! and the field never part.
+//!
 //! # No unwind across FFI
 //!
 //! Both export bodies run inside [`jni::EnvUnowned::with_env`] (a
@@ -119,7 +146,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use jni::errors::LogErrorAndDefault;
-use jni::objects::{JClass, JObject, JValue};
+use jni::objects::{JClass, JObject, JString, JValue};
 use jni::refs::Global;
 use jni::sys::{jint, jlong};
 use jni::{Env, EnvUnowned, jni_sig, jni_str};
@@ -587,6 +614,73 @@ pub extern "system" fn Java_dev_frust_nativewidgets_FrustNativeChrome_nativeOnCh
                 "frust-native-widgets: chrome event {kind}/{detail} for generation \
                  {generation} dropped"
             );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>();
+}
+
+/// `FrustNativeChrome.nativeOnChromeSearch` — the search field reported
+/// `kind` (one of `FrustNativeListener`'s `KIND_CHROME_SEARCH_*`) with the
+/// field's `text` beside it, decoded and routed by [`chrome::deliver_search`]
+/// (module doc's *Search*). Dropped like a tap for a withdrawn generation, or
+/// when it repeats what the field already holds.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_frust_nativewidgets_FrustNativeChrome_nativeOnChromeSearch<
+    'local,
+>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    generation: jlong,
+    kind: jint,
+    text: JString<'local>,
+) {
+    env.with_env(|env| -> Result<(), jni::errors::Error> {
+        debug_assert_main_thread(env, "nativeOnChromeSearch");
+        if IN_HOST_CALL.load(Ordering::Acquire) {
+            log::debug!(
+                "frust-native-widgets: chrome search report {kind} from inside a chrome host \
+                 call — dropped (the slot applied it)"
+            );
+            return Ok(());
+        }
+        let text = if text.is_null() {
+            String::new()
+        } else {
+            text.try_to_string(env)?
+        };
+        if !chrome::deliver_search(generation as u64, kind, &text) {
+            log::debug!(
+                "frust-native-widgets: chrome search report {kind} for generation {generation} \
+                 dropped"
+            );
+        }
+        Ok(())
+    })
+    .resolve::<LogErrorAndDefault>();
+}
+
+/// `FrustNativeChrome.nativeOnChromeSearchFocus` — the native search field
+/// took the input focus: end frust's own focus session so a focused frust
+/// text field blurs and gives the keyboard up ([`chrome::release_frust_focus`];
+/// module doc's *Search*). Generation-stamped like every report; a stale one
+/// does nothing.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_frust_nativewidgets_FrustNativeChrome_nativeOnChromeSearchFocus<
+    'local,
+>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    generation: jlong,
+) {
+    env.with_env(|env| -> Result<(), jni::errors::Error> {
+        debug_assert_main_thread(env, "nativeOnChromeSearchFocus");
+        // Inside a host call (an app-driven expand) the slot is locked and
+        // the generation is the one being applied: no lookup needed.
+        let current = IN_HOST_CALL.load(Ordering::Acquire)
+            || chrome::live_search_generation() == Some(generation as u64);
+        if current {
+            chrome::release_frust_focus();
         }
         Ok(())
     })
