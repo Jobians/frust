@@ -99,3 +99,33 @@ fn is_accessibility_element_is_not_overridden_in_swift() {
         );
     }
 }
+
+const CONTROLLER: &str =
+    "platform/ios/FrustEmbedding/Sources/FrustEmbedding/FrustViewController.swift";
+const HEADER: &str = "platform/ios/FrustEmbedding/Sources/CFrustFFI/include/frust_ffi.h";
+
+#[test]
+fn insert_text_routes_a_lone_return_before_touching_the_mirror() {
+    let input = code(&read(INPUT));
+    let b = body(&input, "func insertText(_ text: String)");
+    let action = b.find("imeAction").expect("insertText calls imeAction");
+    let write = b
+        .find("mirror.replaceCharacters")
+        .expect("insertText writes the mirror");
+    assert!(
+        action < write,
+        "imeAction must come before the mirror write"
+    );
+}
+
+#[test]
+fn header_declares_ime_action() {
+    assert!(read(HEADER).contains("frust_ime_action("));
+}
+
+#[test]
+fn controller_wires_ime_action_to_the_export() {
+    let controller = code(&read(CONTROLLER));
+    assert!(controller.contains("forgeView.imeAction"));
+    assert!(controller.contains("frust_ime_action("));
+}
