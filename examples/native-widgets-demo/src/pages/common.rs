@@ -10,7 +10,6 @@
 //! Every color resolves from the live [`Theme`] (Glyph baseline fallback), so
 //! each page follows the brightness toggle.
 
-use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -38,55 +37,34 @@ pub type S = NativeWidgetsDemoState;
 // ---------------------------------------------------------------------------
 
 /// Defines a `fn $name() -> RwSignal<$ty>` returning a page-local signal
-/// cached in the one shared slot map ([`local_slot`]), self-healing across a
+/// cached in a per-call-site [`frust::thread_slot!`], self-healing across a
 /// disposed owner (a headless test tears its owner down between runs; the next
 /// read mints a fresh signal instead of touching a disposed one). Page state no
 /// other page reads lives here rather than in [`NativeWidgetsDemoState`], which
 /// holds only what the shell itself needs.
 ///
-/// Every slot shares a single `thread_local!` rather than declaring its own,
-/// because on Android each thread-local static costs one pthread key and the
-/// per-process key limit is small and never refilled.
+/// A thread slot rather than a `thread_local!` per signal, because on Android
+/// each thread-local static costs one pthread key and the per-process key
+/// limit is small and never refilled; every slot shares the facade's one map.
+/// `$init` runs with no borrow of that map held, so it may itself call another
+/// slot.
 macro_rules! local_sig {
     ($name:ident, $ty:ty, $init:expr) => {
         fn $name() -> frust::RwSignal<$ty> {
-            // A type unique to this invocation: its `TypeId` keys the slot.
-            struct Slot;
-            $crate::pages::common::local_slot::<$ty>(std::any::TypeId::of::<Slot>(), || $init)
+            frust::thread_slot! {
+                static SLOT: frust::RwSignal<$ty> = frust::RwSignal::new($init);
+            }
+            let sig = SLOT.get();
+            if frust::GetUntracked::try_get_untracked(&sig).is_some() {
+                return sig;
+            }
+            let sig = frust::RwSignal::new($init);
+            SLOT.set(sig);
+            sig
         }
     };
 }
 pub(crate) use local_sig;
-
-thread_local! {
-    /// Every [`local_sig!`] slot, type-erased, keyed by the invoking slot's
-    /// marker type. One thread-local for all of them.
-    static LOCAL_SLOTS: RefCell<HashMap<TypeId, Box<dyn Any>>> = RefCell::new(HashMap::new());
-}
-
-/// The signal cached under `key`: the same one on every call, re-minted with
-/// `init` when its owner was disposed. `init` runs only when minting and with
-/// no borrow of the slot map held, so it may itself call another slot.
-pub(crate) fn local_slot<T: Clone + Send + Sync + 'static>(
-    key: TypeId,
-    init: impl FnOnce() -> T,
-) -> frust::RwSignal<T> {
-    let cached = LOCAL_SLOTS.with(|slots| {
-        slots
-            .borrow()
-            .get(&key)
-            .and_then(|any| any.downcast_ref::<frust::RwSignal<T>>())
-            .copied()
-    });
-    if let Some(sig) = cached
-        && sig.try_get_untracked().is_some()
-    {
-        return sig;
-    }
-    let sig = frust::RwSignal::new(init());
-    LOCAL_SLOTS.with(|slots| slots.borrow_mut().insert(key, Box::new(sig)));
-    sig
-}
 
 /// Bump a `u32` counter signal by one — from an event handler only (a native
 /// listener or a frust `on_*` callback), never from `build`.

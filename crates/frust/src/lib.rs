@@ -1502,6 +1502,13 @@ mod back_glue;
 mod repaint_glue;
 mod route_state;
 mod router_glue;
+mod thread_slot;
+
+/// Per-thread, lazily initialised values that spend no pthread key of their own: declare them
+/// with [`thread_slot!`] (the `thread_local!` syntax) and read them through [`ThreadSlot`]. Every
+/// slot shares one per-thread map, so app and plugin state on Android does not run the process
+/// out of keys (limitation `android-thread-local-key-limit`). See `thread_slot`'s module docs.
+pub use thread_slot::ThreadSlot;
 
 /// Repaint on a signal change without a rebuild: [`repaint_on`] tracks the signals its closure
 /// reads and calls [`request_repaint`] on every change until its [`RepaintBinding`] drops. See
