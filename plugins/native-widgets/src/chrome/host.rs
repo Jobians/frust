@@ -8,7 +8,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{ActionsChange, ChromeGeneration, ChromeSpec, TopBarSpec};
+use super::{ActionsChange, ChromeGeneration, ChromeSpec, SearchSpec, TopBarSpec};
 
 /// Why the chrome slot or a host refused a publish.
 #[derive(thiserror::Error, Clone, Debug, PartialEq, Eq)]
@@ -49,6 +49,15 @@ pub(crate) enum ChromeField {
     /// rebuilding them. Never reported beside [`Self::Actions`], whose
     /// rebuild carries the badges too.
     ActionBadges,
+    /// The search item appeared, went away, or changed its placeholder or
+    /// placement.
+    Search,
+    /// The app changed the search text (the slot drops an echo of what the
+    /// field already holds, `super::ChromeSlot::publish`).
+    SearchText,
+    /// The app expanded or collapsed the search field (an echo of the
+    /// field's own state is dropped likewise).
+    SearchActive,
 }
 
 /// What changed between the retained spec and a newly published one. A
@@ -73,6 +82,11 @@ impl<'a> ChromeDiff<'a> {
         let old_top = old.top.as_ref().unwrap_or(&empty);
         let new_top = new.top.as_ref().unwrap_or(&empty);
         let actions = ActionsChange::between(old_top.actions.iter(), new_top.actions.iter());
+        let blank = SearchSpec::default();
+        let (old_search, new_search) = (
+            old.search.as_ref().unwrap_or(&blank),
+            new.search.as_ref().unwrap_or(&blank),
+        );
         let checks = [
             (ChromeField::Tabs, old.tabs != new.tabs),
             (ChromeField::Selected, old.selected != new.selected),
@@ -88,6 +102,17 @@ impl<'a> ChromeDiff<'a> {
             (ChromeField::Scroll, old.scroll != new.scroll),
             (ChromeField::Brightness, old.dark != new.dark),
             (ChromeField::ActionBadges, actions == ActionsChange::Badges),
+            (
+                ChromeField::Search,
+                old.search.is_some() != new.search.is_some()
+                    || old_search.placeholder != new_search.placeholder
+                    || old_search.placement != new_search.placement,
+            ),
+            (ChromeField::SearchText, old_search.text != new_search.text),
+            (
+                ChromeField::SearchActive,
+                old_search.active != new_search.active,
+            ),
         ];
         let changed = checks
             .into_iter()

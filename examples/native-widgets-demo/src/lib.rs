@@ -41,8 +41,8 @@ use frust::{
 };
 use frust_glyph::{baseline, toast_host};
 use frust_native_widgets::{
-    ActionId, ActionItem, ChromeEvent, Leading, MenuItem, MenuItemId, NativeScaffoldView, TabIcon,
-    TabId, TabItem, ToolbarSpec, ToolbarStyle, native_scaffold,
+    ActionId, ActionItem, ChromeEvent, Leading, MenuItem, MenuItemId, NativeScaffoldView,
+    SearchEvent, SearchSpec, TabIcon, TabId, TabItem, ToolbarSpec, ToolbarStyle, native_scaffold,
 };
 
 // ---------------------------------------------------------------------------
@@ -151,12 +151,6 @@ fn published_png(cell: &'static OnceLock<Arc<[u8]>>, bytes: &'static [u8]) -> Ar
 fn plus_png() -> Arc<[u8]> {
     static PLUS_PNG: OnceLock<Arc<[u8]>> = OnceLock::new();
     published_png(&PLUS_PNG, include_bytes!("../assets/icons/plus.png"))
-}
-
-/// The Search action's `search.png`.
-fn search_png() -> Arc<[u8]> {
-    static SEARCH_PNG: OnceLock<Arc<[u8]>> = OnceLock::new();
-    published_png(&SEARCH_PNG, include_bytes!("../assets/icons/search.png"))
 }
 
 /// The More actions' `more.png`.
@@ -581,6 +575,12 @@ pub struct NativeWidgetsDemoState {
     /// Unread notifications: the Home bar's bell badge while non-zero; the
     /// Home page's Notify and Clear buttons write it.
     pub notifications: RwSignal<u32>,
+    /// The Home bar's search query: the field's text, written back from its
+    /// `Changed` reports; the Home list filters by it.
+    pub search_query: RwSignal<String>,
+    /// Whether Home's search field is expanded, written back from `Began`
+    /// and `Ended`; leaving Home's root ends the search.
+    pub search_active: RwSignal<bool>,
     /// Navigator changes chrome handlers asked for, append-only.
     pub chrome_requests: RwSignal<Vec<ChromeRequest>>,
     /// Back at a tab's root returns to Home; at Home's root it exits.
@@ -625,6 +625,8 @@ impl NativeWidgetsDemoState {
             chrome_event: RwSignal::new(None),
             unseen_outcomes: RwSignal::new(0),
             notifications: RwSignal::new(0),
+            search_query: RwSignal::new(String::new()),
+            search_active: RwSignal::new(false),
             chrome_requests: RwSignal::new(Vec::new()),
             home_fallback,
             applied_requests: Cell::new(0),
@@ -652,6 +654,9 @@ impl NativeWidgetsDemoState {
     /// Select `destination`'s tab and, with an anchor, ask its body to scroll
     /// there. Event-handler or router writes only.
     pub fn go(&self, destination: Destination) {
+        if destination.tab != self.tab.get_untracked() {
+            self.end_search();
+        }
         show_tab(self.tab, self.unseen_outcomes, destination.tab);
         if let Some(anchor) = destination.anchor {
             let sequence = self.anchor_sequence.get() + 1;
@@ -659,6 +664,25 @@ impl NativeWidgetsDemoState {
             self.pending_anchor
                 .set(Some(AnchorRequest { anchor, sequence }));
         }
+    }
+}
+
+impl NativeWidgetsDemoState {
+    /// Close Home's search and clear its query: leaving Home's root (another
+    /// tab, a pushed page) ends the search. Event-handler writes only.
+    pub fn end_search(&self) {
+        end_search(self.search_query, self.search_active);
+    }
+}
+
+/// [`NativeWidgetsDemoState::end_search`] over the two signals, for handlers
+/// that hold only those.
+fn end_search(query: RwSignal<String>, active: RwSignal<bool>) {
+    if active.get_untracked() {
+        active.set(false);
+    }
+    if !query.get_untracked().is_empty() {
+        query.set(String::new());
     }
 }
 
@@ -697,8 +721,8 @@ fn flipped(brightness: Brightness) -> Brightness {
 
 /// Home's '+' pull-down.
 const ADD: &str = "add";
-/// Home's search action.
-const SEARCH: &str = "search";
+/// The Home search field's placeholder.
+const SEARCH_PLACEHOLDER: &str = "Search your work";
 /// Home's notifications bell, badged with the unread count.
 const BELL: &str = "bell";
 /// Every tab root's overflow pull-down.
@@ -710,16 +734,26 @@ const COMMENT: &str = "comment";
 /// The detail toolbar's secondary action.
 const INFO: &str = "info";
 
-/// `native_scaffold` takes a subtitle unconditionally; this skips an absent one.
-trait SubtitleIf {
+/// `native_scaffold` takes a subtitle and a search item unconditionally;
+/// these skip an absent one.
+trait OptionalChrome {
     /// Set `subtitle` when it is `Some`.
     fn subtitle_if(self, subtitle: Option<String>) -> Self;
+    /// Add `search` when it is `Some`.
+    fn search_if(self, search: Option<SearchSpec>) -> Self;
 }
 
-impl<V> SubtitleIf for NativeScaffoldView<V> {
+impl<V> OptionalChrome for NativeScaffoldView<V> {
     fn subtitle_if(self, subtitle: Option<String>) -> Self {
         match subtitle {
             Some(subtitle) => self.subtitle(subtitle),
+            None => self,
+        }
+    }
+
+    fn search_if(self, search: Option<SearchSpec>) -> Self {
+        match search {
+            Some(search) => self.search(search),
             None => self,
         }
     }
@@ -767,6 +801,7 @@ impl Component for NativeWidgetsDemoApp {
                 state.notifications.get(),
             ))
             .toolbar(Self::toolbar(tab, detail.as_ref(), composer_open))
+            .search_if(Self::search(state, tab))
             .scroll(Self::scroll(state, tab))
             .events_into(state.chrome_event)
             .on_tab_select(Self::on_tab_select(state))
@@ -774,6 +809,7 @@ impl Component for NativeWidgetsDemoApp {
             .on_action(Self::on_action(state))
             .on_menu(Self::on_menu(state))
             .on_back(Self::on_back(state))
+            .on_search(Self::on_search(state))
     }
 }
 
@@ -888,9 +924,48 @@ impl NativeWidgetsDemoApp {
         }
     }
 
+    /// Home's search item, at Home's root only: the query and the expanded
+    /// state are the app's, written back from the field's reports.
+    fn search(state: &NativeWidgetsDemoState, tab: Tab) -> Option<SearchSpec> {
+        let at_root = tab == Tab::Home && state.route(tab).depth() <= 1;
+        at_root.then(|| Self::search_item(state.search_query.get(), state.search_active.get()))
+    }
+
+    /// The search item showing `query`, expanded when `active`.
+    fn search_item(query: String, active: bool) -> SearchSpec {
+        SearchSpec::new()
+            .placeholder(SEARCH_PLACEHOLDER)
+            .text(query)
+            .active(active)
+    }
+
+    /// The search field's reports: the text and the expanded state written
+    /// back, a submit toasted.
+    fn on_search(state: &NativeWidgetsDemoState) -> impl Fn(SearchEvent) + Send + Sync + 'static {
+        Self::search_reports(state.search_query, state.search_active, state.toasts)
+    }
+
+    /// [`Self::on_search`] over the signals it writes.
+    fn search_reports(
+        query: RwSignal<String>,
+        active: RwSignal<bool>,
+        toasts: RwSignal<Vec<String>>,
+    ) -> impl Fn(SearchEvent) + Send + Sync + 'static {
+        move |event: SearchEvent| match event {
+            SearchEvent::Changed(text) => query.set(text),
+            SearchEvent::Submitted(text) => {
+                push_toast(toasts, format!("Searched for '{text}'"));
+                query.set(text);
+            }
+            SearchEvent::Began => active.set(true),
+            SearchEvent::Ended => active.set(false),
+            _ => {}
+        }
+    }
+
     /// Above a root: the page's Share/Copy link menu. At a root: Home's
-    /// prominent '+' menu, the bell (badged with `unread`) and search, then
-    /// every tab's overflow menu.
+    /// prominent '+' menu and the bell (badged with `unread`), then every
+    /// tab's overflow menu. Home's search is its search item, not an action.
     fn actions(tab: Tab, pushed: bool, unread: u32) -> Vec<ActionItem> {
         if pushed {
             return vec![
@@ -909,7 +984,6 @@ impl NativeWidgetsDemoApp {
                         MenuItem::new("new-repository", "New repository"),
                     ]),
                 Self::bell(unread),
-                Self::action(SEARCH, "Search", "magnifyingglass", search_png()),
             ]
         });
         home.into_iter()
@@ -952,11 +1026,16 @@ impl NativeWidgetsDemoApp {
         }
     }
 
-    /// Select the tapped tab synchronously — never vetoed.
+    /// Select the tapped tab synchronously — never vetoed. Leaving Home ends
+    /// its search.
     fn on_tab_select(state: &NativeWidgetsDemoState) -> impl Fn(TabId) + Send + Sync + 'static {
         let (tab, unseen) = (state.tab, state.unseen_outcomes);
+        let (query, active) = (state.search_query, state.search_active);
         move |id: TabId| {
             if let Some(next) = Tab::from_slug(id.as_str()) {
+                if next != tab.get_untracked() {
+                    end_search(query, active);
+                }
                 show_tab(tab, unseen, next);
             }
         }
@@ -981,13 +1060,12 @@ impl NativeWidgetsDemoApp {
         }
     }
 
-    /// Plain actions: search, and the detail toolbar's Comment and Info. The
-    /// bell's tap shows only in the Home page's chrome-event readout.
+    /// Plain actions: the detail toolbar's Comment and Info. The bell's tap
+    /// shows only in the Home page's chrome-event readout.
     fn on_action(state: &NativeWidgetsDemoState) -> impl Fn(ActionId) + Send + Sync + 'static {
         let (toasts, composer_open) = (state.toasts, state.composer_open);
         move |id: ActionId| match id.as_str() {
             BELL => {}
-            SEARCH => push_toast(toasts, "Search".to_string()),
             COMMENT => composer_open.update(|open| *open = !*open),
             INFO => push_toast(toasts, "Pull request info".to_string()),
             _ => {}
@@ -1587,10 +1665,10 @@ mod chrome_action_tests {
     }
 
     #[test]
-    fn home_shows_a_prominent_new_the_bell_search_and_more() {
+    fn home_shows_a_prominent_new_the_bell_and_more() {
         let actions = NativeWidgetsDemoApp::actions(Tab::Home, false, 2);
         let ids: Vec<&str> = actions.iter().map(|a| a.id().as_str()).collect();
-        assert_eq!(ids, [ADD, BELL, SEARCH, MORE]);
+        assert_eq!(ids, [ADD, BELL, MORE]);
         assert_ne!(
             actions[0],
             actions[0].clone().prominent(false),
@@ -1600,6 +1678,35 @@ mod chrome_action_tests {
         let others = NativeWidgetsDemoApp::actions(Tab::Lab, false, 2);
         let ids: Vec<&str> = others.iter().map(|a| a.id().as_str()).collect();
         assert_eq!(ids, [MORE], "the bell is Home's alone");
+    }
+
+    #[test]
+    fn the_search_reports_are_written_back_and_ending_clears_them() {
+        let (query, active) = (RwSignal::new(String::new()), RwSignal::new(false));
+        let toasts: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
+        assert_eq!(
+            NativeWidgetsDemoApp::search_item(String::new(), false),
+            SearchSpec::new().placeholder(SEARCH_PLACEHOLDER)
+        );
+        let report = NativeWidgetsDemoApp::search_reports(query, active, toasts);
+        report(SearchEvent::Began);
+        report(SearchEvent::Changed("pull".into()));
+        assert!(active.get_untracked());
+        assert_eq!(query.get_untracked(), "pull");
+        assert_eq!(
+            NativeWidgetsDemoApp::search_item(query.get_untracked(), active.get_untracked()),
+            SearchSpec::new()
+                .placeholder(SEARCH_PLACEHOLDER)
+                .text("pull")
+                .active(true)
+        );
+        report(SearchEvent::Submitted("pull".into()));
+        assert_eq!(toasts.get_untracked(), ["Searched for 'pull'"]);
+        end_search(query, active);
+        assert!(!active.get_untracked());
+        assert_eq!(query.get_untracked(), "");
+        report(SearchEvent::Ended);
+        assert!(!active.get_untracked());
     }
 
     #[test]

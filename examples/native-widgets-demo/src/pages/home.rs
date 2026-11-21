@@ -1,18 +1,22 @@
 //! The Home tab's root page, after the GitHub app's home: a "My Work" card of
-//! icon-tile rows that each push a [`detail`](super::detail) page, a
-//! "Favorites" card whose one control is a real native button, a
-//! "Notifications" card driving the bar's bell badge, and a "Shortcuts" note.
-//! The body is frust, the bars are the shell's native chrome, and the button
-//! that stays put is native.
+//! icon-tile rows that each push a [`detail`](super::detail) page, filtered
+//! live by the bar's search field, a "Favorites" card whose one control is a
+//! real native button, a "Notifications" card driving the bar's bell badge, a
+//! "Search" card that drives the search field from the app and holds a frust
+//! text field, and a "Shortcuts" note. The body is frust, the bars are the
+//! shell's native chrome, and the button that stays put is native.
 
 use frust::authoring::text::FontWeight;
 use frust::{
     AnyView, Axis, Color, EdgeInsets, FlexChild, FlexView, GestureDetector, Get, IconSource,
     Padding, Set, Theme, Update, View, container, divider, flexible, icon, icons, inflexible, text,
+    text_input,
 };
 use frust_native_widgets::{ChromeEvent, native_button};
 
-use super::common::{S, caption, chip, gap, gap_h, page_column, readout, row, tab_body, theme};
+use super::common::{
+    S, caption, chip, gap, gap_h, local_sig, page_column, readout, row, tab_body, theme,
+};
 use super::detail;
 use crate::{DetailRoute, Tab, push_toast};
 
@@ -83,12 +87,16 @@ const WORK_ROWS: [WorkRow; 7] = [
     },
 ];
 
+// The Search card's frust text field, for moving the keyboard between it and
+// the bar's native search field.
+local_sig!(note_field, String, String::new());
+
 /// See the page-fn contract in [`crate::pages`].
 pub fn page(state: &S) -> AnyView<S> {
     let sections = vec![
         section_title("My Work", Some("...")),
         gap(8.0),
-        inflexible(card(work_rows(state))),
+        inflexible(card(work_rows(state, &state.search_query.get()))),
         gap(20.0),
         section_title("Favorites", None),
         gap(8.0),
@@ -97,6 +105,10 @@ pub fn page(state: &S) -> AnyView<S> {
         section_title("Notifications", None),
         gap(8.0),
         inflexible(card(notifications_body(state))),
+        gap(20.0),
+        section_title("Search", None),
+        gap(8.0),
+        inflexible(card(search_body(state))),
         gap(20.0),
         section_title("Shortcuts", None),
         gap(8.0),
@@ -132,16 +144,31 @@ fn card(children: Vec<FlexChild<S>>) -> impl View<S> {
     .radius(12.0)
 }
 
-/// The "My Work" rows, a divider between each pair.
-fn work_rows(state: &S) -> Vec<FlexChild<S>> {
+/// Whether `label` matches the search `query`: every row for an empty one,
+/// else a case-insensitive substring match.
+fn matches(label: &str, query: &str) -> bool {
+    let query = query.trim();
+    query.is_empty() || label.to_lowercase().contains(&query.to_lowercase())
+}
+
+/// The "My Work" rows matching the search `query`, a divider between each
+/// pair, or a line saying none does.
+fn work_rows(state: &S, query: &str) -> Vec<FlexChild<S>> {
     let mut children = Vec::new();
-    for (index, work) in WORK_ROWS.iter().enumerate() {
+    let shown = WORK_ROWS.iter().filter(|work| matches(work.label, query));
+    for (index, work) in shown.enumerate() {
         if index > 0 {
             children.push(gap(8.0));
             children.push(inflexible(divider(theme().scheme().outline_variant)));
             children.push(gap(8.0));
         }
         children.push(inflexible(work_row(state, work)));
+    }
+    if children.is_empty() {
+        children.push(inflexible(caption(format!(
+            "No work matches '{}'.",
+            query.trim()
+        ))));
     }
     children
 }
@@ -183,6 +210,7 @@ fn detail_title(label: &str) -> String {
 /// Push a detail page titled `title` onto the Home navigator. Runs in a tap
 /// handler, never in `build`. The page opens with its composer closed.
 fn open_detail(state: &mut S, handles: &S, title: &str) {
+    state.end_search();
     state.composer_open.set(false);
     let route = DetailRoute::new(title, REPOSITORY);
     let (handles, shown) = (handles.clone(), route.clone());
@@ -236,6 +264,51 @@ fn notifications_body(state: &S) -> Vec<FlexChild<S>> {
     ]
 }
 
+/// The Search card: the bar field's state, chips that drive it from the app
+/// (a preset query that opens it, a clear), and a frust text field to move the
+/// keyboard to and from.
+fn search_body(state: &S) -> Vec<FlexChild<S>> {
+    let (query, active) = (state.search_query.get(), state.search_active.get());
+    let note = note_field();
+    vec![
+        inflexible(readout(describe_search(&query, active))),
+        gap(4.0),
+        inflexible(caption(
+            "The bar's search field is native; the My Work rows above filter as it is typed into.",
+        )),
+        gap(12.0),
+        inflexible(row(vec![
+            inflexible(chip("Find 'pull'", |state: &mut S| {
+                state.search_active.set(true);
+                state.search_query.set("pull".to_string());
+            })),
+            gap_h(8.0),
+            inflexible(chip("Clear query", |state: &mut S| {
+                state.search_query.set(String::new());
+            })),
+        ])),
+        gap(12.0),
+        inflexible(
+            text_input(note.get(), move |_: &mut S, value: String| note.set(value))
+                .placeholder("A frust field: tap it while searching"),
+        ),
+    ]
+}
+
+/// The Search readout: the query and whether the field is open, and how many
+/// work rows match.
+fn describe_search(query: &str, active: bool) -> String {
+    let shown = WORK_ROWS
+        .iter()
+        .filter(|work| matches(work.label, query))
+        .count();
+    let state = if active { "open" } else { "closed" };
+    format!(
+        "Search {state} \u{b7} query '{query}' \u{b7} {shown} of {} rows",
+        WORK_ROWS.len()
+    )
+}
+
 /// The Notifications readout: `unread` and the last chrome event.
 fn describe_bell(unread: u32, event: Option<&ChromeEvent>) -> String {
     let last = event.map_or_else(|| "(none yet)".to_string(), |event| format!("{event:?}"));
@@ -247,6 +320,23 @@ mod tests {
     use frust_native_widgets::ActionId;
 
     use super::*;
+
+    #[test]
+    fn the_search_filters_rows_case_insensitively_and_the_readout_counts_them() {
+        assert!(matches("Pull Requests", ""));
+        assert!(matches("Pull Requests", "  "));
+        assert!(matches("Pull Requests", "pull"));
+        assert!(matches("Pull Requests", "REQ"));
+        assert!(!matches("Issues", "pull"));
+        assert_eq!(
+            describe_search("pull", true),
+            "Search open \u{b7} query 'pull' \u{b7} 1 of 7 rows"
+        );
+        assert_eq!(
+            describe_search("", false),
+            "Search closed \u{b7} query '' \u{b7} 7 of 7 rows"
+        );
+    }
 
     #[test]
     fn the_readout_names_the_count_and_the_last_event() {

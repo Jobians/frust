@@ -93,15 +93,17 @@
 //! `src/events.rs`'s `CHROME_MENU_STRIDE` and `pack_chrome_tab`'s reselect
 //! bit; [`chrome_codes_match_between_kotlin_and_rust`] the `INSTALL_*` and
 //! `ICON_SLOT_*` codes; [`chrome_class_and_exports_match_the_kotlin_object`]
-//! the class name and the two `external fun` exports, which live in
+//! the class name and the four `external fun` exports, which live in
 //! `src/android/chrome.rs` beside the host rather than in `android/mod.rs`;
 //! [`chrome_json_key_table_copy_matches_the_kotlin_header`] that the
 //! copy of the header's JSON key table `src/chrome/mod.rs`'s encoder tests
 //! round-trip against is still verbatim; and
 //! [`chrome_changed_field_spellings_match_between_kotlin_and_rust`] that
-//! Kotlin's `FIELD_*` constants spell the eleven `ChromeField`s exactly as
+//! Kotlin's `FIELD_*` constants spell the fourteen `ChromeField`s exactly as
 //! `android_wire::field_name` does, are the only place Kotlin spells them, and
-//! that Kotlin's `INSTALL_FIELDS` names `android_wire::INSTALL_FIELDS`; and
+//! that Kotlin's `INSTALL_FIELDS` and `SEARCH_FIELDS` name `android_wire`'s;
+//! [`chrome_search_keys_are_read_under_the_spelling_rust_writes`] the search
+//! keys; and
 //! [`chrome_leading_spellings_match_between_kotlin_and_rust`] that Kotlin's
 //! `LEADING_*` constants are exactly the `leading` values
 //! `android_wire::leading_name` writes; and
@@ -274,6 +276,15 @@ fn the_appended_kinds_keep_their_codes_on_both_sides() {
         ("SELECTION", 6),
         ("DATE", 7),
         ("RESELECTED", 8),
+        ("CHROME_TAB", 9),
+        ("CHROME_ACTION", 10),
+        ("CHROME_MENU", 11),
+        ("CHROME_BACK", 12),
+        // 13 is reserved; the search kinds follow it.
+        ("CHROME_SEARCH_CHANGED", 14),
+        ("CHROME_SEARCH_SUBMITTED", 15),
+        ("CHROME_SEARCH_BEGAN", 16),
+        ("CHROME_SEARCH_ENDED", 17),
     ] {
         assert_eq!(
             kotlin_kinds.get(name),
@@ -886,9 +897,14 @@ fn chrome_class_and_exports_match_the_kotlin_object() {
          fun`s, mangled — a mismatch is an `UnsatisfiedLinkError` at the first tap"
     );
     assert_eq!(
-        natives.len(),
-        2,
-        "nativeOnChromeEvent and nativeOnChromeLost"
+        natives,
+        [
+            "nativeOnChromeEvent",
+            "nativeOnChromeLost",
+            "nativeOnChromeSearch",
+            "nativeOnChromeSearchFocus"
+        ],
+        "the chrome object's natives, in declaration order"
     );
 }
 
@@ -987,8 +1003,8 @@ fn chrome_changed_field_spellings_match_between_kotlin_and_rust() {
     let arms = rust_field_name_arms(&rust);
     assert_eq!(
         arms.len(),
-        11,
-        "{RUST_CHROME_MOD_PATH}'s field_name should spell all eleven ChromeFields: {arms:?}"
+        14,
+        "{RUST_CHROME_MOD_PATH}'s field_name should spell all fourteen ChromeFields: {arms:?}"
     );
     for (variant, spelling) in &arms {
         assert_eq!(
@@ -1051,6 +1067,71 @@ fn chrome_changed_field_spellings_match_between_kotlin_and_rust() {
         kotlin_install, rust_install,
         "{KOTLIN_CHROME_PATH}'s INSTALL_FIELDS drifted from {RUST_CHROME_MOD_PATH}'s"
     );
+
+    // Kotlin's SEARCH_FIELDS names exactly Rust's.
+    let kotlin_search = kotlin
+        .split_once("val SEARCH_FIELDS = setOf(")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(body, _)| body)
+        .unwrap_or_else(|| panic!("no `val SEARCH_FIELDS = setOf(` in {KOTLIN_CHROME_PATH}"));
+    let mut kotlin_search: Vec<&str> = kotlin_search
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let name = entry.strip_prefix("FIELD_").unwrap_or_else(|| {
+                panic!("{KOTLIN_CHROME_PATH}'s SEARCH_FIELDS entry `{entry}` is not a FIELD_*")
+            });
+            *by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("{KOTLIN_CHROME_PATH} declares no FIELD_{name}"))
+        })
+        .collect();
+    let opener = "pub(crate) const SEARCH_FIELDS: [ChromeField; ";
+    let start = rust
+        .find(opener)
+        .unwrap_or_else(|| panic!("no `{opener}` found in {RUST_CHROME_MOD_PATH}"));
+    let rest = &rust[start..];
+    let end = rest
+        .find("];")
+        .unwrap_or_else(|| panic!("no closing `];` for SEARCH_FIELDS in {RUST_CHROME_MOD_PATH}"));
+    let mut rust_search: Vec<String> = rest[..end]
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("ChromeField::"))
+        .map(|variant| arms[variant.trim_end_matches(',')].clone())
+        .collect();
+    kotlin_search.sort_unstable();
+    rust_search.sort();
+    assert_eq!(
+        kotlin_search,
+        ["Search", "SearchActive", "SearchText"],
+        "{KOTLIN_CHROME_PATH}'s SEARCH_FIELDS"
+    );
+    assert_eq!(
+        kotlin_search, rust_search,
+        "{KOTLIN_CHROME_PATH}'s SEARCH_FIELDS drifted from {RUST_CHROME_MOD_PATH}'s"
+    );
+}
+
+#[test]
+fn chrome_search_keys_are_read_under_the_spelling_rust_writes() {
+    let kotlin = read(KOTLIN_CHROME_PATH);
+    let rust = read(RUST_CHROME_MOD_PATH);
+    for (reader, key) in [
+        ("json.optBoolean(", "\"hasSearch\""),
+        ("json.optString(", "\"searchPlaceholder\""),
+        ("json.optString(", "\"searchText\""),
+        ("json.optBoolean(", "\"searchActive\""),
+    ] {
+        assert!(
+            kotlin.contains(&format!("{reader}{key}")),
+            "{KOTLIN_CHROME_PATH} never reads {key} with {reader}"
+        );
+        assert!(
+            rust.contains(&format!("{key}.into()")),
+            "{RUST_CHROME_MOD_PATH} never writes {key}"
+        );
+    }
 }
 
 /// Every string literal in `text`, in order (no escapes in these bodies).
