@@ -17,7 +17,7 @@ after lab 2 and before lab 3.
 | A container's child | `crates/frust-core/src/widget.rs` | `ChildPod` ≈2163, `holds_live_focus` ≈2561, `layout_child` ≈2624, `paint_child` ≈2637, `event_child` ≈2807 |
 | The arena | `crates/frust-core/src/tree.rs` | `WidgetPod` ≈52, `new_typed` ≈90, `WidgetTree` ≈214, `inspect` ≈300 |
 | The driver | `crates/frust-core/src/app/` | `RenderRoot` (`mod.rs`), `RenderRoot::rebuild` and `rebuild_view` (`rebuild.rs`), `layout_with_text` (`layout.rs`), `paint` (`paint.rs`), `event` (`dispatch.rs`) |
-| Focus-orphan side channel | `crates/frust-core/src/event/flags.rs` | `FOCUS_ORPHANED`, `mark_focus_orphaned` |
+| Focus-orphan side channel | `crates/frust-core/src/event/flags.rs` | `mark_focus_orphaned`, `take_focus_orphaned` (flag: `CoreLocals::focus_orphaned`, `crates/frust-core/src/thread_state.rs`) |
 | Reconcilers | `crates/frust-widgets/src/authoring.rs` | `build_child` ≈278, `rebuild_child` ≈308, `teardown_child` ≈393, `rebuild_children_positional` ≈635 |
 | Routing + introspection | `crates/frust-widgets/src/authoring.rs` | `route_event` ≈978, `route_event_single` ≈1039, `VisitPods` ≈803, `macro_rules! visit_children` ≈870 |
 | A real container | `crates/frust-widgets/src/flex.rs` | `FlexView` (its `rebuild` ≈271) |
@@ -119,7 +119,7 @@ after lab 2 and before lab 3.
 5. **Reconciliation keeps identity; components add a state boundary.** `rebuild_child` wraps
    `rebuild_child_tracked`, which rebuilds under `with_focus_link(pod flag)` and detects a swap by
    `TypeId`. On a swap it drops `active`/`focused` and calls `mark_orphan_if_live` (≈432). That sets
-   the thread-local `Cell<bool>` behind `frust_core::mark_focus_orphaned`, but **only if** the link
+   the `focus_orphaned` `Cell<bool>` of the per-thread `CoreLocals` behind `frust_core::mark_focus_orphaned`, but **only if** the link
    was focused *and* the chain above it was live. `teardown_child` first sends a synthetic `Cancel`
    to a captured pod. The positional reconciler computes the **stable prefix** `k`: the first
    type-swap index, or the common length if there is none. Pods before `k` keep their paths, and

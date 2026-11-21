@@ -177,7 +177,7 @@ there. The facade's dependency on `frust-widgets`/`frust-theme` (WIDGETS) and th
   unhandled goes on to the declined-key chain (see Keyboard Shortcuts and Traversal). Per pointer event, `ChildPod` records the
   smallest hit-testing pod (`Widget::hit_test_self`; layout wrappers opt out) for `EventCtx::track_pointer_hits`, a pass-scoped
   side channel.
-- `RenderRoot::rebuild` dispatches a `Housekeeping` broadcast when a thread-local flag
+- `RenderRoot::rebuild` dispatches a `Housekeeping` broadcast when a per-thread flag
   (`mark_pending_result_flush`/`take_pending_result_flush`) is set — the seam a widget uses to run a deferred callback that needs
   `&mut State` but was queued during the state-free view diff (a navigator's pop-result and `frust-widgets`' gesture long-press
   latch are the shipped producers; see WIDGETS_ARCHITECTURE.md). It then re-runs the root component's `build` + the view diff so
@@ -188,6 +188,11 @@ there. The facade's dependency on `frust-widgets`/`frust-theme` (WIDGETS) and th
   the mobile frame gate and the desktop `Wait` loop. A non-draining peek, `has_pending_result_flush`, lets the mobile frame gate's
   `deferred_callbacks_pending` input force a run before a skipped frame ever reaches the `rebuild` that would otherwise drain the
   mark.
+- Every per-thread mark, registry and id counter in this crate is a field of one private `CoreLocals` struct behind a single
+  `thread_local!` static (`thread_state.rs`; the reactive, widgets, facade, shell-common and native-widgets crates each keep
+  one such struct): on Android each static takes one of the process's 128 pthread keys. Once a thread's teardown starts
+  destroying the struct no field is reachable (`with` panics, `try_with` returns `None`), so a `Drop` path uses `try_with`.
+  App and plugin code that needs per-thread state without a key declares `frust::thread_slot!` statics of `frust::ThreadSlot<T>`.
 - A tracked signal write wakes the shell via the process-wide `FrameWaker`, triggering the next rebuild.
 - `request_repaint()` asks for paint only: no build, no layout, no frame loop of its own. `RenderRoot::repaint_pending` peeks it; when the generation moved, `RenderRoot::paint` advances the paint epoch (every retained boundary re-records for that frame) and the semantics generation (semantics republish without a rebuild). It is not per-widget: every live root repaints its whole tree once. The facade's `repaint_on(read)` bridges signals to it — an owned `RepaintBinding` over a `RepaintScope` requests a repaint on every write to a signal `read` read, until dropped.
 - `Component::init`/`teardown` creates/disposes a per-instance reactive `Owner` nested under its parent's.
@@ -207,7 +212,7 @@ there. The facade's dependency on `frust-widgets`/`frust-theme` (WIDGETS) and th
   intervening container is handed an inert `InputEvent::Overlay` broadcast instead of running its own pointer handling, while the
   real event rides alongside, re-based into each pod's space (`ChildPod::event_child`/`walk_secondary`/`dispatch_local`); where a
   container does not forward broadcasts to its children (an overlay owner whose captured pod is a floated surface), the real event
-  falls back to ordinary delivery to that child alone. Only the claimant's `Up`/`Cancel` releases the capture. A thread-local
+  falls back to ordinary delivery to that child alone. Only the claimant's `Up`/`Cancel` releases the capture. A per-thread
   `ContactPass` guard brackets each root dispatch with the contact identity and opt-in flag so both survive a `ComponentWidget`
   boundary's fresh `EventCtx`. A container that takes a gesture over from a captured child releases it through
   `EventCtx::release_captured_child`, not `ChildPod::set_active(false)` directly: the claimant keeps the capture until its own
@@ -335,7 +340,7 @@ A structural rebuild that tears down, type-swaps, or clears the `focused` flag o
 live focus chain* — runs inside a state-free view diff with no `RenderRoot` handle to release the session itself. Liveness is
 tracked through the rebuild pass by a `BuildCtx` effective-focus AND-chain (`has_focus`/`with_focus_link`), seeded at the root
 from the session mirror (`focus_active || ime_state.is_some()`) and ANDed with each pod's live link (`holds_live_focus`, never the
-raw flag), so a link the session already stranded marks nothing. A live loss instead raises a thread-local `mark_focus_orphaned`
+raw flag), so a link the session already stranded marks nothing. A live loss instead raises a per-thread `mark_focus_orphaned`
 flag — mirroring `mark_pending_result_flush` above, including the same idempotent, thread-affine, data-free shape — and
 `RenderRoot::rebuild` drains it (`take_focus_orphaned`) after its deferred-callback loop and releases the session, so the root's
 cached focus/IME state can never outlive the widget it described.
@@ -432,7 +437,7 @@ uncaptured `Move` (which may record a claim) or the `Down`/`Up`/`Cancel` that en
 — which strands the previous claimant's stamp with no leave event or explicit clearing required. A
 structural rebuild that drops the pod holding the *live* claim (not merely a stale, already-stranded
 one) has no hover pass to strand it with — `RenderRoot::rebuild` releases it explicitly instead, via
-the same thread-local mark/drain shape (`mark_hover_orphaned`/`take_hover_orphaned`) as the
+the same per-thread mark/drain shape (`mark_hover_orphaned`/`take_hover_orphaned`) as the
 focus-orphan release above, so an unmounted claimant can never leave the root's hover mirror standing
 on a widget that no longer exists.
 
@@ -448,7 +453,7 @@ Interaction Semantics for the consumer contract. For retained pages a hover repa
 claimant change bumps the paint epoch (see Data Flow's paint-dirtiness bullet).
 
 The cursor is hover's sibling channel and deliberately not derived from it: `EventCtx::set_cursor`
-writes a per-pass, thread-local request that `RenderRoot::event` resolves into the cached `cursor`
+writes a per-pass, per-thread request that `RenderRoot::event` resolves into the cached `cursor`
 field on any pointer `Move` (captured included, so a drag keeps its own shape), last writer wins,
 and absence resolves to `CursorIcon::Default`. Every other pass leaves `cursor` standing. The request
 slot is bracketed per pass by the shared `RequestPass` guard rather than a bare clear/take pair, so a

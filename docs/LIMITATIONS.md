@@ -3229,24 +3229,41 @@ collapses on scroll").
 allows `PTHREAD_KEYS_MAX` (128) keys per process, shared with the Java runtime, the C libraries and
 every other native library. A process that has used them all aborts (SIGABRT) on the first use of
 the next thread-local static, with no Rust panic in logcat: for example when a text field first
-takes focus and reaches a static nothing touched before. The framework itself links several dozen
-thread-local statics, so an app's own share of the budget is smaller than 128.
+takes focus and reaches a static nothing touched before. The abort message goes to stderr and does
+not reach logcat, so the only sign is the crash itself. What takes keys in an app: the platform's
+own share (the Java runtime and the C libraries), `std` and third-party crates, the framework's
+crates, and the app's own statics. The framework keeps each crate's per-thread state in one struct
+behind one static, so it links 7 thread-local statics. On the measured phone (OnePlus 9, Android 15,
+debug build of the native-widgets demo) the platform holds 19 keys at library load, leaving 111
+free, and 47 keys are in use after the first frame (83 free). After a full walk of the demo (all
+four tabs, an alert, an action sheet, a sheet and a toast, the Issues detail, typing in the
+composer, search, rotation, background and foreground) 82 keys are free. A throwaway build with 60
+extra `thread_local!` statics, all touched at startup, ran the same walk without aborting and ended
+with 22 free, so an app can add at least 60 statics of its own on that phone. The demo library links
+33 thread-local statics in all (84 before the framework's state moved into structs, of which the
+framework's own were 57), and the same 60 extra statics aborted the app on the earlier build.
 
 **Applies to**: Android apps, in proportion to the thread-local statics they link and use; the
-native-widgets demo hit it when each page signal had its own `thread_local!`.
+native-widgets demo hit it when each page signal had its own `thread_local!`. The figures above are
+one phone and one Android version: the platform's own share of the keys, and so the headroom,
+differs by device and Android version, so treat 60 as a measurement, not a guarantee.
 
 **Why accepted**: the key budget is bionic's and the keyed storage is the standard library's choice
 on this target; frust cannot raise either.
 
-**Workaround**: keep per-thread state in one structure (one `thread_local!` holding a struct or a
-map) rather than many `thread_local!` statics. Count what a library links with
+**Workaround**: declare per-thread state in app and plugin code with `frust::thread_slot!`, which
+declares `frust::ThreadSlot<T>` statics (`with`, `get`, `set`, `try_with`) that take no pthread key;
+otherwise keep it in one structure (one `thread_local!` holding a struct or a map) rather than many
+`thread_local!` statics. Count what a library links with
 `scripts/ci/tls-key-count.sh <unstripped .so> [budget]`: it prints the distinct thread-local statics
 and a per-crate breakdown, and with a budget exits 1 when the count is over it. The count is an
-upper bound for that library and ignores keys taken by non-Rust code.
+upper bound for that library and ignores keys taken by non-Rust code. A debug Android build also logs
+`frust: pthread keys` lines with the keys in use and free at library load and after the first frame,
+and warns when fewer than 24 are free.
 
 **Evidence**: `scripts/ci/tls-key-count.sh`'s header; `examples/native-widgets-demo/src/pages/common.rs`'s
-`local_sig!` and `LOCAL_SLOTS` (the demo's page signals moved into one type-keyed map, after which
-the demo no longer aborted on text-field focus); the OnePlus 9 (Android 15) chrome-additions row of `examples/native-widgets-demo/README.md` (the final pass on a clean launch).
+`local_sig!` (the demo's page signals share one type-keyed map, now `frust::thread_slot!`'s, after which
+the demo no longer aborted on text-field focus); the OnePlus 9 (Android 15) chrome-additions row and the `Android (pthread keys)` row (2026-11-22) of `examples/native-widgets-demo/README.md` (every number above); `crates/frust/src/thread_slot.rs`; `crates/frust-shell-android/src/tls_keys.rs`.
 
 ---
 
@@ -5748,11 +5765,11 @@ newly-eligible inner, and vice versa.
 arbitration; a single stationary `Down`-time state decides the whole gesture.
 
 **Why accepted**: the same Down-time-snapshot tradeoff the navigator's own edge-swipe arming already
-lives with (`nav::ambient`'s `SWIPE_CLAIM`) — arbitrating once at `Down` is what
+lives with (the `swipe_claim` stack of `WidgetLocals`) — arbitrating once at `Down` is what
 keeps the takeover decision a single read rather than a per-`Move` re-evaluation; the fix is a
 strictly larger seam (a live-updating claim), not a bug in the one shipped.
 
-**Evidence**: `crates/frust-widgets/src/scroll.rs`'s `SCROLL_CLAIM`/`InnerScrollState` module docs
+**Evidence**: `crates/frust-widgets/src/thread_state.rs`'s `scroll_claim` field of `WidgetLocals` and `scroll.rs`'s `InnerScrollState` module docs
 (*Nested scrolling: innermost wins*); the `deferring`/`inner_at_down` fields of `ScrollSurfaceCore`
 in `scroll_core.rs`.
 
