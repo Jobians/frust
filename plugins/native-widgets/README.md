@@ -744,11 +744,17 @@ idempotently. By hand:
 
 The theme step leaves an app alone when it is already fine: an activity theme
 in the `Theme.Material3`, `Theme.Material3Expressive` or
-`Theme.MaterialComponents` family needs nothing, and a `FrustAppTheme` whose
-parent is already one of those, or another style of the app's own, is never
-rewritten. A parent style the add cannot follow (one defined outside
+`Theme.MaterialComponents` family needs nothing, and neither does a
+`FrustAppTheme` whose parent is one of those or an app style in `themes.xml`
+that leads to one. A parent style the add cannot follow (one defined outside
 `themes.xml`) is trusted, not checked; if it is not Material after all, the
 chrome falls back to the frust-drawn bars at run time.
+
+A `FrustAppTheme` whose parent is an app style that ends in a platform theme
+(`FrustAppTheme` → `Brand` → `android:Theme.Material.Light`) **is** rewritten:
+its `parent` becomes `Theme.Material3.DayNight.NoActionBar`, which takes
+`Brand` and its items out of the activity theme. Re-parent `Brand` onto a
+Material 3 theme first to keep them.
 
 **An app generated before the template defined `FrustAppTheme`** (its
 activity names neither that style nor a Material theme) is refused before
@@ -758,8 +764,11 @@ inside `<resources>` in `android/app/src/main/res/values/themes.xml` (create
 the file if it is missing), set `android:theme="@style/FrustAppTheme"` on both
 the `<application>` and the `<activity>` element of
 `android/app/src/main/AndroidManifest.xml`, then re-run
-`frust plugin add native-widgets`. Pointing the activity at a Material theme of
-your own works too.
+`frust plugin add native-widgets`. The add reads the activity theme by name: a
+style of your own on the activity (`@style/MyTheme`) is refused the same way
+even when it descends from Material 3, and `frust doctor` keeps reporting the
+theme edit as pending, although the Material views work at run time. Keep the
+activity on `@style/FrustAppTheme` and make your style its parent.
 
 **Checking the wiring.** `frust plugin list` marks the plugin `<n> pending`
 while an edit is missing, and inside the project `frust doctor` prints a

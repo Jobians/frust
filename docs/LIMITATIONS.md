@@ -2825,7 +2825,9 @@ The Material chrome also costs a landscape phone roughly half its height to the 
 
 **Applies to**: Android apps using native-widgets whose activity theme is in none of the
 `Theme.Material3`, `Theme.Material3Expressive` and `Theme.MaterialComponents` families: apps
-generated before the theme contribution existed, and apps that revert it.
+generated before the theme contribution existed, and apps that revert it. An activity on an app
+style of its own that descends from one of those families works at run time, but the add refuses it
+and the doctor row stays (both read the activity theme by name).
 
 **Why accepted**: Material's own enforcement is the only reliable signal, and the fallback keeps
 the app usable; the fix is one theme parent in the app, which a re-run of
@@ -3124,8 +3126,8 @@ iOS/iPadOS (`apple_toast`, a plugin-owned capsule). Every other target, macOS in
 navigation bars only and which exists from iOS 26. The arm looks the API up at run time
 (`respondsToSelector`) and shows no badge where it is missing, logging that once at debug level. A
 badge on a toolbar entry is therefore not shown on iOS. Android (a Material badge on the top-bar
-item or the toolbar button) and the frust-drawn bars show both. The iOS arm has not yet been run on
-a device.
+item or the toolbar button) and the frust-drawn bars show both. This is read from the code and
+UIKit's documentation: the iOS arm has not yet been run on a device.
 
 **Applies to**: `native_scaffold` on iOS/iPadOS: toolbar badges on every version, and every badge
 before iOS 26.
@@ -3163,9 +3165,9 @@ short").
 **Observed**: with `ToolbarStyle::Floating`, the Android arm lays every secondary entry out in one
 horizontal row inside a Material 3 `FloatingToolbarLayout`, a text button per titled entry and an
 icon button per icon, each at its natural width, with no overflow menu and no scrolling. Several
-text items plus the primary beside the pill can be wider than a narrow phone, and the row then runs
-past the screen edge. The demo's detail page (one item and a labelled primary) fits; a wider set has
-not been measured on a device.
+text items plus the primary beside the pill can be wider than a narrow phone, and nothing in the
+layout keeps the row inside the screen. This is read from the layout code, not observed: the demo's
+detail page (one item and a labelled primary) fits, and a wider set has not been run on a device.
 
 **Applies to**: `ToolbarSpec::style(ToolbarStyle::Floating)` on Android with several titled items.
 

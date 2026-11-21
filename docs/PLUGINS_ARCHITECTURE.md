@@ -519,7 +519,7 @@ host ignores the back press.
   there); `MavenRepository` writes a group-filtered `exclusiveContent` block at the
   `// frust:plugin-repositories` marker of `android/settings.gradle.kts`, idempotent by url;
   `AndroidThemeParent` (built-in only; `native-widgets`' Material 3 parent) sets the parent of the
-  app-owned `FrustAppTheme` style, never replacing a Material or app-owned one, and refuses an app
+  app-owned `FrustAppTheme` style unless it already leads to a Material theme, and refuses an app
   whose activity uses neither a defined `FrustAppTheme` nor a Material theme ([CLI_ARCHITECTURE.md](CLI_ARCHITECTURE.md)). A
   `PluginSpec`/`FeatureSpec` may state `min_ios`/`min_android_sdk`; the add checks the app's lowest
   `IPHONEOS_DEPLOYMENT_TARGET` and its `minSdk` against them and refuses rather than raising either.

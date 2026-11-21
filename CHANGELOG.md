@@ -489,9 +489,11 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 - `frust plugin add native-widgets` sets the parent of the app's `FrustAppTheme` style to
   `Theme.Material3.DayNight.NoActionBar` (`Contribution::AndroidThemeParent`), so the plugin's
   Material views work in a newly generated app. An activity theme already in the `Theme.Material3`,
-  `Theme.Material3Expressive` or `Theme.MaterialComponents` family needs nothing, and an accepted or
-  app-owned parent is never rewritten. An app with neither the style nor such a theme is refused
-  before anything is written, with the two manual edits named (`PluginAddError::AndroidAppThemeMissing`).
+  `Theme.Material3Expressive` or `Theme.MaterialComponents` family needs nothing, and neither does a
+  `FrustAppTheme` whose parent is in one of them or is an app style leading to one. A parent that is
+  an app style ending in a platform theme is replaced, which takes that style out of the activity
+  theme. An activity on any other theme, including an app style of its own, is refused before
+  anything is written, with the two manual edits named (`PluginAddError::AndroidAppThemeMissing`).
 - `frust doctor` prints an informational `Plugins` block inside a project, listing each built-in plugin
   the app depends on whose project edits are still pending (such as a missing Gradle include or a
   stock activity theme), with the fix and the limitation id where one applies. It never changes the
@@ -544,8 +546,8 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   existing app that adds native-widgets: add `<style name="FrustAppTheme"
   parent="Theme.Material3.DayNight.NoActionBar" />` inside `<resources>` in that file (create it if it
   is missing), set `android:theme="@style/FrustAppTheme"` on both elements, then run
-  `frust plugin add native-widgets`; an activity theme that already names a Material 3 or Material
-  Components style works as it is.
+  `frust plugin add native-widgets`; an activity theme named directly from the `Theme.Material3`,
+  `Theme.Material3Expressive` or `Theme.MaterialComponents` family works as it is.
 - `frust-native-widgets`: an alert requested while a native sheet is up is now shown above the sheet,
   where it was refused `PresentError::Busy`. When the sheet ends first, its alert resolves `Cancelled`
   before the sheet's own outcome. A second alert, a second sheet and a sheet while an alert is up are

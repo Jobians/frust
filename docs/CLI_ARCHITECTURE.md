@@ -344,8 +344,8 @@ child output can't garble a caller's raw-mode terminal (relevant to `frust-tui`)
   (built-in only; `native-widgets`, whose three contributions are it, the Cargo dependency and its
   Gradle module, asks for `Theme.Material3.DayNight.NoActionBar`) is decided by the manifest's
   activity theme first: a `Theme.Material3`, `Theme.Material3Expressive` or `Theme.MaterialComponents`
-  style is already satisfied; under `@style/FrustAppTheme` an accepted or app-owned parent is never
-  rewritten, and only a missing or platform parent has `FrustAppTheme`'s parent attribute rewritten;
+  style is already satisfied; under `@style/FrustAppTheme` the parent is followed through the app's
+  styles and rewritten when it is missing or ends in a platform theme, else (Material, unresolved) kept;
   any other manifest theme, or `FrustAppTheme` with no style defined, is refused with
   `PluginAddError::AndroidAppThemeMissing` before any write.
   A plugin's three desktop-lane `Contribution`s
