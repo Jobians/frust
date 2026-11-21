@@ -73,7 +73,7 @@
 //! to the decode side by construction — which is the intended failure mode,
 //! not a race.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -81,6 +81,7 @@ use super::{CONTENT_DESCRIPTION, FIT, Plan, Setter, TINT, color, owned_text, slo
 use crate::NativeWidgetError;
 use crate::registry::SlotId;
 use crate::runtime::Params;
+use crate::thread_state::{self, PluginLocals};
 
 /// The registered kind string the api layer injects as `__frustControl`.
 pub(crate) const KIND: &str = "image";
@@ -240,7 +241,7 @@ impl std::fmt::Debug for ImageBytes {
 }
 
 /// One slot's published payload.
-struct Published {
+pub(crate) struct Published {
     /// The revision handed back to the publisher.
     rev: u64,
     /// The payload itself, kept alive by this table for as long as the slot
@@ -257,27 +258,36 @@ struct Published {
     holders: u32,
 }
 
-// `missing_const_for_thread_local` fires on the table below and is wrong
-// here: `HashMap::new` is not a `const fn` (it builds a `RandomState`), so a
-// `const` block around it does not compile. The counter beside it *is* const.
-#[allow(clippy::missing_const_for_thread_local)]
-mod tables {
-    use super::{Cell, HashMap, Published, RefCell, SlotId};
-
-    thread_local! {
-        /// The publish table (module doc). Bounded by the number of live
-        /// image slots: publishing replaces a slot's entry, and the last
-        /// holder's `dispose` removes it.
-        pub(super) static PUBLISHED: RefCell<HashMap<SlotId, Published>> =
-            RefCell::new(HashMap::new());
-
-        /// The revision counter. Process-wide (not per slot) so a revision is
-        /// never re-used after a slot id is recycled.
-        pub(super) static NEXT_REV: Cell<u64> = const { Cell::new(1) };
-    }
+/// Run `f` against the calling thread's publish table (module doc), built
+/// empty on first touch. Bounded by the number of live image slots:
+/// publishing replaces a slot's entry, and the last holder's `dispose`
+/// removes it.
+fn with_table<T>(f: impl FnOnce(&RefCell<HashMap<SlotId, Published>>) -> T) -> T {
+    thread_state::with(|state| f(table_of(state)))
 }
 
-use tables::{NEXT_REV, PUBLISHED};
+/// [`with_table`] for the removal paths, which a teardown-time cleanup can
+/// reach: a no-op once the thread's state is gone, since its table went with
+/// it.
+fn try_with_table(f: impl FnOnce(&RefCell<HashMap<SlotId, Published>>)) {
+    let _ = thread_state::try_with(|state| f(table_of(state)));
+}
+
+fn table_of(state: &PluginLocals) -> &RefCell<HashMap<SlotId, Published>> {
+    state
+        .image_bytes
+        .get_or_init(|| RefCell::new(HashMap::new()))
+}
+
+/// The next publish revision. Process-wide (not per slot) so a revision is
+/// never re-used after a slot id is recycled.
+fn next_rev() -> u64 {
+    thread_state::with(|state| {
+        let rev = state.image_next_rev.get();
+        state.image_next_rev.set(rev.wrapping_add(1));
+        rev
+    })
+}
 
 /// Publish the bytes `slot` should show, returning the revision to write into
 /// that slot's params as [`REV`].
@@ -288,18 +298,14 @@ use tables::{NEXT_REV, PUBLISHED};
 /// payload keeps whatever [`claim_bytes`] count it already had — the holder
 /// is the *slot's control*, not the individual payload.
 pub(crate) fn publish_bytes(slot: SlotId, bytes: Arc<[u8]>) -> u64 {
-    PUBLISHED.with(|table| {
+    with_table(|table| {
         let mut table = table.borrow_mut();
         let holders = match table.get(&slot) {
             Some(existing) if Arc::ptr_eq(&existing.bytes, &bytes) => return existing.rev,
             Some(existing) => existing.holders,
             None => 0,
         };
-        let rev = NEXT_REV.with(|next| {
-            let rev = next.get();
-            next.set(rev.wrapping_add(1));
-            rev
-        });
+        let rev = next_rev();
         table.insert(
             slot,
             Published {
@@ -321,7 +327,7 @@ pub(crate) fn publish_bytes(slot: SlotId, bytes: Arc<[u8]>) -> u64 {
 /// [`retire`] (the module doc's fix, above) reaps this case too, not only the
 /// counted holders-reach-zero path.
 pub(crate) fn claim_bytes(slot: SlotId) {
-    PUBLISHED.with(|table| {
+    with_table(|table| {
         if let Some(entry) = table.borrow_mut().get_mut(&slot) {
             entry.holders = entry.holders.saturating_add(1);
         }
@@ -331,7 +337,7 @@ pub(crate) fn claim_bytes(slot: SlotId) {
 /// Release a hold taken by [`claim_bytes`], dropping the payload once the last
 /// holder is gone — the control's `dispose`.
 pub(crate) fn release_bytes(slot: SlotId) {
-    PUBLISHED.with(|table| {
+    try_with_table(|table| {
         let mut table = table.borrow_mut();
         let Some(entry) = table.get_mut(&slot) else {
             return;
@@ -358,14 +364,14 @@ pub(crate) fn release_bytes(slot: SlotId) {
 /// `get_mut` on a missing entry, `crate::controls::image`'s existing
 /// contract). No ordering machinery needed between the two paths.
 pub(crate) fn retire(slot: SlotId) {
-    PUBLISHED.with(|table| {
+    try_with_table(|table| {
         table.borrow_mut().remove(&slot);
     });
 }
 
 /// The bytes currently published for `slot`, if any.
 fn published_bytes(slot: SlotId) -> ImageBytes {
-    PUBLISHED.with(|table| {
+    with_table(|table| {
         table
             .borrow()
             .get(&slot)

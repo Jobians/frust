@@ -164,7 +164,7 @@ thread_local! {
     /// (`crate::apple`'s whole arm is UIKit-confined there and
     /// `crate::appkit`'s is AppKit-confined there, and this crate never spins
     /// up a second one), the same main-thread-confinement
-    /// `crate::runtime`'s own `thread_local!` `RUNTIME` documents — so one
+    /// `crate::runtime`'s per-thread runtime (`crate::thread_state`) documents — so one
     /// cache per thread is, in practice, one cache, period.
     static MONO: RefCell<Option<CFRetained<CTFontDescriptor>>> = const { RefCell::new(None) };
     static PLEX: RefCell<Option<CFRetained<CTFontDescriptor>>> = const { RefCell::new(None) };

@@ -1359,9 +1359,9 @@ impl Drop for HostChild {
 thread_local! {
     /// How many host stand-in child handles are alive on this thread — the
     /// mirror of ART's live-global-ref count ("52 at peak → 0 after the
-    /// dispose cycle" on device). Thread-local for the same reason
-    /// [`STAGED`] is, which also keeps each `cargo test` thread's count its
-    /// own.
+    /// dispose cycle" on device). Thread-local for the same reason the
+    /// staging table ([`with_staged`]) is, which also keeps each `cargo test`
+    /// thread's count its own.
     static LIVE_CHILDREN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -1975,7 +1975,7 @@ fn on_platform_main_thread() -> Option<bool> {
 const RETRY_UPDATE_BUDGET: u32 = 3;
 
 /// One slot's staged component value and props, as [`publish`] left them.
-struct Staged {
+pub(crate) struct Staged {
     /// `Rc<C>` for the registered `C`, erased — cloned into the instance at
     /// create/update time.
     component: Rc<dyn Any>,
@@ -2007,29 +2007,29 @@ struct Staged {
     consecutive_update_failures: u32,
 }
 
-thread_local! {
-    /// Per-slot staged props, main-thread-confined exactly like the runtime
-    /// itself. A `thread_local!` rather than a `Mutex` global for the same
-    /// reason (`crate::runtime`'s *main-thread confinement*): a component value
-    /// may hold `!Send` platform handles, which a global would have to forbid.
-    static STAGED: RefCell<HashMap<SlotId, Staged>> = RefCell::new(HashMap::new());
-}
-
 /// Run `f` against the calling thread's staging table, reporting `None` when
 /// it is already borrowed on this thread — the same re-entrancy tolerance
 /// `crate::runtime::with_runtime` has, and for the same reason: dropping a
 /// pathological re-entrant call (a `Props: Clone` impl that itself publishes)
-/// beats panicking anywhere near an FFI boundary.
+/// beats panicking anywhere near an FFI boundary. Also `None` once the
+/// thread's teardown has destroyed its state.
+///
+/// The table is per-thread (`crate::thread_state`), main-thread-confined
+/// exactly like the runtime itself and for the same reason
+/// (`crate::runtime`'s *main-thread confinement*): a component value may hold
+/// `!Send` platform handles, which a `Mutex` global would have to forbid.
 fn with_staged<T>(f: impl FnOnce(&mut HashMap<SlotId, Staged>) -> T) -> Option<T> {
-    STAGED
-        .try_with(|cell| match cell.try_borrow_mut() {
+    crate::thread_state::try_with(|state| {
+        let cell = state.staged.get_or_init(|| RefCell::new(HashMap::new()));
+        match cell.try_borrow_mut() {
             Ok(mut staged) => Some(f(&mut staged)),
             Err(_) => {
                 log::warn!("frust-native-widgets: re-entrant component props publish ignored");
                 None
             }
-        })
-        .unwrap_or_default()
+        }
+    })
+    .unwrap_or_default()
 }
 
 /// Stage this rebuild's component value and props for `slot`, returning the
