@@ -2,7 +2,6 @@
 //! [`EventOutcome`] a dispatch reports.
 
 use std::any::Any;
-use std::cell::Cell;
 
 use kurbo::{Point, Size};
 
@@ -11,43 +10,34 @@ use super::contact::{
 };
 use super::ime::ImeState;
 use super::key::EditCommand;
-use super::pass::{CLIPBOARD_WRITE, CURSOR_REQUEST, EDIT_COMMAND_QUEUE, PASTE_REQUEST};
 use super::pointer::{CursorIcon, PointerId};
 use crate::overlay::OverlayKey;
-
-thread_local! {
-    /// The smallest area of any hit-testing pod
-    /// ([`Widget::hit_test_self`](crate::widget::Widget::hit_test_self)) a pointer event landed
-    /// inside during the open [`EventCtx::track_pointer_hits`] scope (`INFINITY` until one does);
-    /// `None` while no scope is open, so a pass nobody tracks records nothing. A pass-scoped slot
-    /// rather than a context field, so it crosses a component boundary's inner context with no
-    /// threading.
-    static POINTER_HIT_AREA: Cell<Option<f64>> = const { Cell::new(None) };
-}
+use crate::thread_state;
 
 /// Restores the enclosing [`EventCtx::track_pointer_hits`] scope on drop, folding the inner
-/// scope's smallest hit into it, so an unwinding handler cannot leave a scope open.
+/// scope's smallest hit into it, so an unwinding handler cannot leave a scope open. The scope's
+/// slot is per-thread rather than a context field, so it crosses a component boundary's inner
+/// context with no threading.
 struct PointerHitScope {
     outer: Option<f64>,
 }
 
 impl PointerHitScope {
     fn open() -> Self {
-        let outer = POINTER_HIT_AREA.with(|slot| slot.replace(Some(f64::INFINITY)));
+        let outer = thread_state::with(|t| t.pointer_hit_area.replace(Some(f64::INFINITY)));
         Self { outer }
     }
 
     /// The smallest area recorded since [`PointerHitScope::open`], if any.
     fn smallest(&self) -> Option<f64> {
-        POINTER_HIT_AREA
-            .with(Cell::get)
-            .filter(|area| area.is_finite())
+        thread_state::with(|t| t.pointer_hit_area.get()).filter(|area| area.is_finite())
     }
 }
 
 impl Drop for PointerHitScope {
     fn drop(&mut self) {
-        POINTER_HIT_AREA.with(|slot| {
+        thread_state::with(|t| {
+            let slot = &t.pointer_hit_area;
             let inner = slot.get().unwrap_or(f64::INFINITY);
             slot.set(self.outer.map(|outer| outer.min(inner)));
         });
@@ -331,14 +321,14 @@ impl<'a> EventCtx<'a> {
     /// it, so a drag re-asks on each captured `Move`, and a container overriding its child asks
     /// after routing (the reverse of `claim_hover`'s order). Requests no redraw.
     pub fn set_cursor(&mut self, icon: CursorIcon) {
-        CURSOR_REQUEST.with(|slot| slot.set(Some(icon)));
+        thread_state::with(|t| t.cursor_request.set(Some(icon)));
     }
 
     /// Ask the shell to put `text` on the host clipboard — a widget's answer to `EditCommand::Copy`
     /// or `Cut`. Per pass, last writer wins; drained by
     /// [`RenderRoot::take_clipboard_write`](crate::app::RenderRoot::take_clipboard_write).
     pub fn write_clipboard(&mut self, text: String) {
-        CLIPBOARD_WRITE.with(|slot| slot.set(Some(text)));
+        thread_state::with(|t| t.clipboard_write.set(Some(text)));
     }
 
     /// Ask the shell to read the host clipboard and dispatch it back as `EditCommand::Paste` on a
@@ -346,23 +336,23 @@ impl<'a> EventCtx<'a> {
     /// read binds it to [`RenderRoot::focus_epoch`](crate::app::RenderRoot::focus_epoch) and drops
     /// a mismatch (never `focus_ime_generation`, which edits also move).
     pub fn request_paste(&mut self) {
-        PASTE_REQUEST.with(|slot| slot.set(true));
+        thread_state::with(|t| t.paste_request.set(true));
     }
 
     /// Queue `cmd` for whichever widget drains [`EventCtx::take_edit_commands`] later in this pass
     /// — the route from a floated toolbar back to its field. A command nobody takes is dropped.
     pub fn dispatch_edit_command(&mut self, cmd: EditCommand) {
-        EDIT_COMMAND_QUEUE.with(|slot| {
-            let mut queue = slot.take();
+        thread_state::with(|t| {
+            let mut queue = t.edit_command_queue.take();
             queue.push(cmd);
-            slot.set(queue);
+            t.edit_command_queue.set(queue);
         });
     }
 
     /// Drain this pass's queued edit commands in dispatch order; an overlay owner calls it right
     /// after forwarding into its floated pod.
     pub fn take_edit_commands(&mut self) -> Vec<EditCommand> {
-        EDIT_COMMAND_QUEUE.with(|slot| slot.take())
+        thread_state::with(|t| t.edit_command_queue.take())
     }
 
     /// Publish this widget's IME surface after an editing change; it bubbles up the focus chain to
@@ -455,9 +445,9 @@ impl<'a> EventCtx<'a> {
     /// Record that a pointer event landed inside a hit-testing pod of `area`; a no-op outside a
     /// [`EventCtx::track_pointer_hits`] scope. Called by `ChildPod`'s dispatch.
     pub(crate) fn note_pointer_hit(&mut self, area: f64) {
-        POINTER_HIT_AREA.with(|slot| {
-            if let Some(smallest) = slot.get() {
-                slot.set(Some(smallest.min(area)));
+        thread_state::with(|t| {
+            if let Some(smallest) = t.pointer_hit_area.get() {
+                t.pointer_hit_area.set(Some(smallest.min(area)));
             }
         });
     }

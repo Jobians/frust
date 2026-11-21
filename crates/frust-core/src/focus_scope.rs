@@ -17,21 +17,9 @@
 //! an overlay scope (the claim's own surface); a widget scope reads it from its host's focus path
 //! at its last registered paint. See `docs/CORE_ARCHITECTURE.md`'s traversal notes.
 
-use std::cell::Cell;
-
 use crate::event::PassBracket;
 use crate::overlay::OverlayKey;
-
-thread_local! {
-    /// The next [`FocusScopeKey::new`] value; starts at `1` so `0` can mean "none".
-    static NEXT_FOCUS_SCOPE_KEY: Cell<u64> = const { Cell::new(1) };
-
-    /// Scopes registered so far in this thread's open paint pass, in order, each with whether
-    /// its host held the focus path.
-    static SCOPE_REGISTRY: Cell<Vec<(FocusScopeKey, bool)>> = const { Cell::new(Vec::new()) };
-
-    static SCOPE_PASS_OPEN: Cell<bool> = const { Cell::new(false) };
-}
+use crate::thread_state;
 
 /// A focus-return scope's identity: allocate one per widget instance, register it every paint the
 /// widget is open.
@@ -41,9 +29,9 @@ pub struct FocusScopeKey(u64);
 impl FocusScopeKey {
     /// Allocate a key unique on this thread. Call once when the scope's widget is built.
     pub fn new() -> Self {
-        FocusScopeKey(NEXT_FOCUS_SCOPE_KEY.with(|next| {
-            let id = next.get();
-            next.set(id.wrapping_add(1));
+        FocusScopeKey(thread_state::with(|t| {
+            let id = t.next_focus_scope_key.get();
+            t.next_focus_scope_key.set(id.wrapping_add(1));
             id
         }))
     }
@@ -66,7 +54,10 @@ pub(crate) struct FocusScopePass(PassBracket<Vec<(FocusScopeKey, bool)>>);
 
 impl FocusScopePass {
     pub(crate) fn enter() -> Self {
-        FocusScopePass(PassBracket::enter(&SCOPE_REGISTRY, &SCOPE_PASS_OPEN))
+        FocusScopePass(PassBracket::enter(
+            |t| &t.scope_registry,
+            |t| &t.scope_pass_open,
+        ))
     }
 
     pub(crate) fn take(&self) -> Vec<(FocusScopeKey, bool)> {
@@ -77,10 +68,10 @@ impl FocusScopePass {
 /// Record `key`, and whether its host `holds` the focus path, in this thread's open pass (behind
 /// `PaintCtx::register_focus_scope`).
 pub(crate) fn register(key: FocusScopeKey, holds: bool) {
-    SCOPE_REGISTRY.with(|registry| {
-        let mut keys = registry.take();
+    thread_state::with(|t| {
+        let mut keys = t.scope_registry.take();
         keys.push((key, holds));
-        registry.set(keys);
+        t.scope_registry.set(keys);
     });
 }
 

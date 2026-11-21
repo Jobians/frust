@@ -20,7 +20,7 @@
 //! * No nesting: a registration made from inside a floated pod's paint is dropped;
 //!   register a submenu from the same owner, in the main tree's paint.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
@@ -28,17 +28,8 @@ use kurbo::Rect;
 
 use crate::event::PassBracket;
 use crate::insets::WindowInsets;
+use crate::thread_state;
 use crate::widget::ChildPod;
-
-thread_local! {
-    /// The next [`OverlayKey::next`] value; starts at `1` so `0` can mean "none".
-    static NEXT_OVERLAY_KEY: Cell<u64> = const { Cell::new(1) };
-
-    /// Entries registered so far in this thread's open paint pass, in order.
-    static OVERLAY_REGISTRY: Cell<Vec<OverlayEntry>> = const { Cell::new(Vec::new()) };
-
-    static OVERLAY_PASS_OPEN: Cell<bool> = const { Cell::new(false) };
-}
 
 /// An overlay owner's identity, quoted back by every overlay event routed to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -47,9 +38,9 @@ pub struct OverlayKey(u64);
 impl OverlayKey {
     /// Allocate a key unique on this thread. Call once when the owner is built.
     pub fn next() -> Self {
-        OverlayKey(NEXT_OVERLAY_KEY.with(|next| {
-            let id = next.get();
-            next.set(id.wrapping_add(1));
+        OverlayKey(thread_state::with(|t| {
+            let id = t.next_overlay_key.get();
+            t.next_overlay_key.set(id.wrapping_add(1));
             id
         }))
     }
@@ -178,7 +169,10 @@ pub(crate) struct OverlayPaintPass(PassBracket<Vec<OverlayEntry>>);
 
 impl OverlayPaintPass {
     pub(crate) fn enter() -> Self {
-        OverlayPaintPass(PassBracket::enter(&OVERLAY_REGISTRY, &OVERLAY_PASS_OPEN))
+        OverlayPaintPass(PassBracket::enter(
+            |t| &t.overlay_registry,
+            |t| &t.overlay_pass_open,
+        ))
     }
 
     pub(crate) fn take(&self) -> Vec<OverlayEntry> {
@@ -188,10 +182,10 @@ impl OverlayPaintPass {
 
 /// Record `entry` in this thread's open pass (behind `PaintCtx::register_overlay`).
 pub(crate) fn register(entry: OverlayEntry) {
-    OVERLAY_REGISTRY.with(|registry| {
-        let mut entries = registry.take();
+    thread_state::with(|t| {
+        let mut entries = t.overlay_registry.take();
         entries.push(entry);
-        registry.set(entries);
+        t.overlay_registry.set(entries);
     });
 }
 

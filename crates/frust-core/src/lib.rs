@@ -42,6 +42,7 @@ pub mod selection_toolbar;
 pub mod semantics;
 pub mod shortcuts;
 pub mod sliver;
+mod thread_state;
 pub mod tree;
 pub mod view;
 pub mod widget;

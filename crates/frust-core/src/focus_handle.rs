@@ -21,10 +21,11 @@
 //! while [`EventCtx::focus_notice_open`](crate::event::EventCtx::focus_notice_open). A handle's
 //! stop holds the session only when it is the holder itself, not an ancestor of it.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use crate::event::PassBracket;
+use crate::thread_state;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Intent {
@@ -135,22 +136,14 @@ pub(crate) struct BoundHandle {
     pub(crate) stop: u64,
 }
 
-struct Binding {
+pub(crate) struct Binding {
     handle: FocusHandle,
     stop: Option<u64>,
 }
 
-thread_local! {
-    static BINDINGS: Cell<Vec<Binding>> = const { Cell::new(Vec::new()) };
-    static BIND_PASS_OPEN: Cell<bool> = const { Cell::new(false) };
-    /// The stops named by the open notification broadcast.
-    static NOTICE: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
-    static PRESS: Cell<Press> = const { Cell::new(Press::Idle) };
-}
-
 /// The keep-focus state of the pointer `Down` being dispatched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Press {
+pub(crate) enum Press {
     Idle,
     /// A pointer `Down` with a live session: a keep may land.
     Armed,
@@ -161,7 +154,7 @@ pub(crate) struct FocusBindPass(PassBracket<Vec<Binding>>);
 
 impl FocusBindPass {
     pub(crate) fn enter() -> Self {
-        FocusBindPass(PassBracket::enter(&BINDINGS, &BIND_PASS_OPEN))
+        FocusBindPass(PassBracket::enter(|t| &t.bindings, |t| &t.bind_pass_open))
     }
 
     pub(crate) fn take(&self) -> Vec<BoundHandle> {
@@ -179,21 +172,21 @@ impl FocusBindPass {
 }
 
 pub(crate) fn bind(handle: &FocusHandle) {
-    BINDINGS.with(|cell| {
-        let mut bindings = cell.take();
+    thread_state::with(|t| {
+        let mut bindings = t.bindings.take();
         bindings.push(Binding {
             handle: handle.clone(),
             stop: None,
         });
-        cell.set(bindings);
+        t.bindings.set(bindings);
     });
 }
 
 pub(crate) fn bind_mark() -> usize {
-    BINDINGS.with(|cell| {
-        let bindings = cell.take();
+    thread_state::with(|t| {
+        let bindings = t.bindings.take();
         let len = bindings.len();
-        cell.set(bindings);
+        t.bindings.set(bindings);
         len
     })
 }
@@ -201,8 +194,8 @@ pub(crate) fn bind_mark() -> usize {
 /// Give each unresolved binding made since `mark` the painting pod's stop; nested pods resolve
 /// their own first, and `stop` runs only if needed.
 pub(crate) fn resolve_binds(mark: usize, stop: impl FnOnce() -> u64) {
-    BINDINGS.with(|cell| {
-        let mut bindings = cell.take();
+    thread_state::with(|t| {
+        let mut bindings = t.bindings.take();
         if bindings.len() > mark {
             let mut stop = Some(stop);
             let mut id = None;
@@ -213,7 +206,7 @@ pub(crate) fn resolve_binds(mark: usize, stop: impl FnOnce() -> u64) {
                 }
             }
         }
-        cell.set(bindings);
+        t.bindings.set(bindings);
     });
 }
 
@@ -223,7 +216,8 @@ pub(crate) struct FocusNoticePass {
 
 impl FocusNoticePass {
     pub(crate) fn enter(stops: Vec<u64>) -> Self {
-        let previous = NOTICE.with(|slot| std::mem::replace(&mut *slot.borrow_mut(), stops));
+        let previous =
+            thread_state::with(|t| std::mem::replace(&mut *t.notice.borrow_mut(), stops));
         FocusNoticePass { previous }
     }
 }
@@ -231,12 +225,12 @@ impl FocusNoticePass {
 impl Drop for FocusNoticePass {
     fn drop(&mut self) {
         let previous = std::mem::take(&mut self.previous);
-        NOTICE.with(|slot| *slot.borrow_mut() = previous);
+        thread_state::with(|t| *t.notice.borrow_mut() = previous);
     }
 }
 
 pub(crate) fn notice_names(stop: u64) -> bool {
-    NOTICE.with(|slot| slot.borrow().contains(&stop))
+    thread_state::with(|t| t.notice.borrow().contains(&stop))
 }
 
 /// Brackets one root dispatch's press state; dropping it disarms the press.
@@ -244,7 +238,7 @@ pub(crate) struct PressPass(());
 
 impl PressPass {
     pub(crate) fn open(armed: bool) -> Self {
-        PRESS.with(|state| state.set(if armed { Press::Armed } else { Press::Idle }));
+        thread_state::with(|t| t.press.set(if armed { Press::Armed } else { Press::Idle }));
         PressPass(())
     }
 
@@ -256,26 +250,26 @@ impl PressPass {
 
 impl Drop for PressPass {
     fn drop(&mut self) {
-        PRESS.with(|state| state.set(Press::Idle));
+        thread_state::with(|t| t.press.set(Press::Idle));
     }
 }
 
 /// Behind `EventCtx::keep_focus`.
 pub(crate) fn note_keep_focus() {
-    PRESS.with(|state| {
-        if state.get() == Press::Armed {
-            state.set(Press::Kept);
+    thread_state::with(|t| {
+        if t.press.get() == Press::Armed {
+            t.press.set(Press::Kept);
         }
     });
 }
 
 pub(crate) fn press_kept() -> bool {
-    PRESS.with(|state| state.get() == Press::Kept)
+    thread_state::with(|t| t.press.get() == Press::Kept)
 }
 
 /// Whether a deferred focus notice is open (see `FocusNoticePass`).
 pub(crate) fn notice_open() -> bool {
-    NOTICE.with(|slot| !slot.borrow().is_empty())
+    thread_state::with(|t| !t.notice.borrow().is_empty())
 }
 
 #[cfg(test)]
