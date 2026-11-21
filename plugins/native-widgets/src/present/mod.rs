@@ -13,11 +13,18 @@
 //!
 //! # The contract
 //!
-//! - **One in flight, process-wide — across every kind.** A second request
-//!   while one is live resolves [`PresentError::Busy`] immediately — no
-//!   queueing, no replacing. The slot is shared by every presentation kind:
-//!   an alert and a sheet can never both be live, so a [`show_sheet`] while
-//!   an alert is up (or the reverse) is refused `Busy` too.
+//! - **At most one sheet and one alert above it, process-wide.** There are
+//!   two slots: one sheet, and one alert. An alert may be requested while a
+//!   sheet is live and is presented **above** it (iOS: from the sheet's
+//!   view controller; Android: an alert dialog over the bottom sheet dialog)
+//!   — the confirmation a sheet's row opens ([`SheetSpec::on_row_tap`]).
+//!   Everything else is refused [`PresentError::Busy`] immediately — no
+//!   queueing, no replacing: a second alert, a second sheet, and a sheet
+//!   while an alert is live.
+//! - **The sheet takes its alert with it.** When a sheet ends — by the user,
+//!   by the app, or by its host going away — while the alert presented over
+//!   it is still live, that alert is taken down first and resolves
+//!   [`AlertOutcome::Cancelled`], then the sheet resolves its own outcome.
 //! - **Exactly one terminal outcome.** Each accepted request is stamped with
 //!   a fresh, never-zero **generation**, and resolves through a one-shot
 //!   channel whose sending half is consumed by its first use: an action, a
@@ -25,8 +32,9 @@
 //!   ([`AlertOutcome::HostLost`], [`SheetOutcome::HostLost`]). A platform
 //!   callback arriving for any other generation finds no live entry and is
 //!   dropped. A sheet's detent changes are **not** outcomes: they stream
-//!   through [`SheetSpec::on_detent`] while the sheet stays live.
-//! - **The slot frees itself.** It is released when the outcome is sent
+//!   through [`SheetSpec::on_detent`] while the sheet stays live, and so do
+//!   taps on the rows [`SheetSpec::on_row_tap`] names.
+//! - **A slot frees itself.** It is released when the outcome is sent
 //!   (before the caller is woken, so the caller's continuation may present
 //!   again), when an arm drops its sender without sending (resolving
 //!   [`PresentError::Platform`]), or when the caller drops the
@@ -69,6 +77,18 @@
 //!
 //! `apple_host` holds what every Apple arm shares: host discovery, the
 //! main-queue hop and the live-presentation guard.
+//!
+//! # How an alert follows its sheet
+//!
+//! The alert slot records the sheet that was live when the alert was
+//! accepted ([`sheet_under`]); the arms read it to present over that sheet
+//! (and to take down a stale, abandoned sheet otherwise). A sheet arm
+//! resolves through a [`SheetSender`], which — before the sheet's own value
+//! is delivered, and also when it is dropped without one — asks the alert
+//! arm to cancel the alert recorded over it ([`AlertHost::cancel`]). The
+//! Android presenter also takes the alert down first itself, so there the
+//! request finds it already resolved; on iOS UIKit removes an alert with
+//! the controller it was presented from, and the request resolves it.
 
 mod oneshot;
 
@@ -488,6 +508,31 @@ impl PartialEq for DetentListener {
     }
 }
 
+/// What a tap on a row [`SheetSpec::on_row_tap`] names calls.
+pub(crate) type RowListener = Arc<dyn Fn() + Send + Sync>;
+
+/// One row [`SheetSpec::on_row_tap`] turned into an event: its action id and
+/// listener. Compared by id and listener identity, printed opaquely.
+#[derive(Clone)]
+struct RowTap {
+    id: String,
+    listener: RowListener,
+}
+
+impl fmt::Debug for RowTap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RowTap")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for RowTap {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && Arc::ptr_eq(&self.listener, &other.listener)
+    }
+}
+
 /// What a sheet asks: its [`SheetContent`], the detents it rests at and how
 /// its sheet chrome behaves.
 ///
@@ -527,6 +572,7 @@ pub struct SheetSpec {
     /// Pin the sheet's light/dark appearance; `None` follows the system.
     pub dark: Option<bool>,
     on_detent: Option<DetentListener>,
+    row_taps: Vec<RowTap>,
 }
 
 impl SheetSpec {
@@ -545,6 +591,7 @@ impl SheetSpec {
             tint: None,
             dark: None,
             on_detent: None,
+            row_taps: Vec::new(),
         }
     }
 
@@ -591,13 +638,53 @@ impl SheetSpec {
             .map(|listener| Arc::clone(&listener.0))
     }
 
+    /// Make the action row `id` an **event** instead of an outcome: a tap on
+    /// it calls `listener` on the platform's main thread (frust's UI thread)
+    /// and the sheet stays up. The sheet still resolves exactly once — through
+    /// another row, a swipe-down, a dismissal or its host going away.
+    ///
+    /// This is how a row asks for confirmation: `listener` may call
+    /// [`show_alert`], and the alert is presented above the sheet (module
+    /// doc's *The contract*). Naming the same `id` again replaces its
+    /// listener; an `id` that names no action row is refused when the sheet
+    /// is submitted ([`Self::validate`]).
+    #[must_use]
+    pub fn on_row_tap(
+        mut self,
+        id: impl Into<String>,
+        listener: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let id = id.into();
+        self.row_taps.retain(|tap| tap.id != id);
+        self.row_taps.push(RowTap {
+            id,
+            listener: Arc::new(listener),
+        });
+        self
+    }
+
+    /// The [`Self::on_row_tap`] listener of the action row at `index` (spec
+    /// order), if that row is an event.
+    #[cfg_attr(
+        not(any(test, target_os = "android", target_os = "ios")),
+        allow(dead_code)
+    )]
+    pub(crate) fn row_listener(&self, index: usize) -> Option<RowListener> {
+        let action = self.content.actions.get(index)?;
+        self.row_taps
+            .iter()
+            .find(|tap| tap.id == action.id)
+            .map(|tap| Arc::clone(&tap.listener))
+    }
+
     /// The submit-time validation: the content is not empty (a non-empty
     /// title or message, an image or an action) and any image is non-empty
     /// bytes; at most [`MAX_SHEET_ACTIONS`] actions, every action id
     /// non-empty and unique; at least one detent, no duplicates, every
     /// [`Detent::Custom`] fraction finite with `0 < f <= 1`; `selected` and
     /// `largest_undimmed`, when given, among `detents`; a `corner_radius`,
-    /// when given, finite and non-negative.
+    /// when given, finite and non-negative; every [`Self::on_row_tap`] id
+    /// one of the action rows.
     ///
     /// # Errors
     /// [`PresentError::InvalidSpec`] naming the first rule broken.
@@ -654,6 +741,16 @@ impl SheetSpec {
             && !(radius.is_finite() && radius >= 0.0)
         {
             return invalid("the corner radius must be finite and non-negative".to_string());
+        }
+        if let Some(tap) = self
+            .row_taps
+            .iter()
+            .find(|tap| !actions.iter().any(|action| action.id == tap.id))
+        {
+            return invalid(format!(
+                "on_row_tap({:?}) names no action row of this sheet",
+                tap.id
+            ));
         }
         Ok(())
     }
@@ -728,10 +825,12 @@ impl Presentation<SheetOutcome> {
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PresentError {
-    /// Another presentation is live — one at a time, process-wide. Recover
-    /// by resolving it: take it down through its [`PresentationHandle`] with
-    /// [`dismiss`], or drop its [`Presentation`] future — either frees the
-    /// slot. A refusal logs the live presentation's generation and how long
+    /// The slot this request needs is taken: an alert while an alert is live,
+    /// a sheet while a sheet or an alert is live (an alert *over* a live sheet
+    /// is accepted — module doc's *The contract*). Recover by resolving the
+    /// live presentation: take it down through its [`PresentationHandle`]
+    /// with [`dismiss`], or drop its [`Presentation`] future — either frees
+    /// its slot. A refusal logs the live presentation's generation and how long
     /// it has been held (where the target has a monotonic clock); see
     /// `docs/LIMITATIONS.md`'s `native-widgets-alert-busy-slot-unobserved-host-teardown`
     /// for the case where a live presentation outlives an unobserved host teardown.
@@ -767,7 +866,7 @@ pub struct PresentationHandle {
 /// Resolves once; every further poll answers [`Poll::Pending`] rather than
 /// panicking (a completion can be driven from a platform thread the polling
 /// executor knows nothing about, and a spurious re-poll must not take a
-/// process down). Dropping it releases the process-wide slot.
+/// process down). Dropping it releases its process-wide slot.
 #[must_use = "a presentation's outcome is only observed by polling it; dropping it abandons the outcome"]
 pub struct Presentation<T> {
     state: PresentationState<T>,
@@ -872,6 +971,19 @@ pub(crate) trait AlertHost {
     /// presenting: the live check [`dismiss`] makes first can race a
     /// platform callback resolving that very presentation.
     fn dismiss(generation: u64);
+
+    /// The sheet alert `generation` was presented over is ending: take the
+    /// alert down and resolve it [`AlertOutcome::Cancelled`] — synchronously
+    /// when called on the main thread, so it resolves before the sheet does
+    /// (module doc's *How an alert follows its sheet*). Must ignore a
+    /// generation it is not presenting, like [`Self::dismiss`].
+    ///
+    /// The default takes it down as [`Self::dismiss`] does: right only for an
+    /// arm that never presents over a sheet (macOS and the unsupported arm —
+    /// no sheet is ever live there), where it is never called.
+    fn cancel(generation: u64) {
+        Self::dismiss(generation);
+    }
 }
 
 /// A live presentation: its generation and when its slot was claimed — the
@@ -881,8 +993,65 @@ struct ActiveSlot {
     claimed_at: Option<Instant>,
 }
 
-/// The live presentation, if any — the process-wide Busy slot.
-static ACTIVE: Mutex<Option<ActiveSlot>> = Mutex::new(None);
+/// The live alert: its [`ActiveSlot`], the sheet that was live when it was
+/// accepted (the one it is presented over), and how its arm cancels it when
+/// that sheet ends ([`AlertHost::cancel`] of the arm it was submitted to).
+struct AlertSlot {
+    slot: ActiveSlot,
+    over_sheet: Option<u64>,
+    cancel: fn(u64),
+}
+
+/// The two process-wide Busy slots: at most one live sheet and at most one
+/// live alert (module doc's *The contract*).
+struct Slots {
+    sheet: Option<ActiveSlot>,
+    alert: Option<AlertSlot>,
+}
+
+impl Slots {
+    /// Which slot `generation` holds, if either.
+    fn kind_of(&self, generation: u64) -> Option<Kind> {
+        if self
+            .alert
+            .as_ref()
+            .is_some_and(|alert| alert.slot.generation == generation)
+        {
+            Some(Kind::Alert)
+        } else if self
+            .sheet
+            .as_ref()
+            .is_some_and(|sheet| sheet.generation == generation)
+        {
+            Some(Kind::Sheet)
+        } else {
+            None
+        }
+    }
+}
+
+/// The two presentation kinds, one slot each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Alert,
+    Sheet,
+}
+
+/// What a request claims in [`submit`].
+#[derive(Clone, Copy)]
+enum Claim {
+    /// The alert slot — accepted over a live sheet — cancelled through
+    /// `cancel` when that sheet ends.
+    Alert { cancel: fn(u64) },
+    /// The sheet slot — refused while either slot is taken.
+    Sheet,
+}
+
+/// The live presentations, if any — the process-wide Busy slots.
+static ACTIVE: Mutex<Slots> = Mutex::new(Slots {
+    sheet: None,
+    alert: None,
+});
 
 /// The counter behind [`next_generation`]. Starts at `1` so a generation is
 /// never `0` — a zero-initialized `jlong`/`u64` arriving from a host that
@@ -940,61 +1109,123 @@ fn busy_refusal_message(generation: u64, age: Option<std::time::Duration>) -> St
 
 /// Lock [`ACTIVE`], recovering from poisoning instead of panicking — a panic
 /// on either side (a polling caller, a platform callback) must not turn the
-/// other side's next call into a panic too. The guarded data is a plain
-/// `Option<ActiveSlot>`, coherent after any panic.
-fn lock_active() -> MutexGuard<'static, Option<ActiveSlot>> {
+/// other side's next call into a panic too. The guarded data is two plain
+/// `Option`s, coherent after any panic.
+fn lock_active() -> MutexGuard<'static, Slots> {
     ACTIVE
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Release the Busy slot if it still holds `generation` — the hook both
+/// Release whichever Busy slot still holds `generation` — the hook both
 /// channel halves call (`oneshot`'s module doc). A no-op when a newer
 /// presentation holds the slot or none does.
 pub(crate) fn release_if_live(generation: u64) {
-    let mut active = lock_active();
-    if active
-        .as_ref()
-        .is_some_and(|slot| slot.generation == generation)
-    {
-        *active = None;
+    let mut slots = lock_active();
+    match slots.kind_of(generation) {
+        Some(Kind::Alert) => slots.alert = None,
+        Some(Kind::Sheet) => slots.sheet = None,
+        None => {}
     }
 }
 
-/// The live presentation's generation and how long its slot has been held —
-/// the same claim a Busy refusal logs ([`submit`]), read directly by tests.
-/// `None` when the slot is free. The age is `None` on targets without a
-/// monotonic clock (wasm32-unknown-unknown). Test-only: production code reads
-/// the claim under the lock it already holds ([`submit`]), never through this
-/// second lock acquisition.
-#[cfg(test)]
-pub(crate) fn live_since() -> Option<(u64, Option<std::time::Duration>)> {
-    lock_active().as_ref().map(|slot| {
-        (
-            slot.generation,
-            slot.claimed_at.map(|instant| instant.elapsed()),
-        )
-    })
+/// The sheet the live alert `alert_generation` was accepted over — what an
+/// alert arm presents above (module doc's *How an alert follows its sheet*).
+/// `None` when that alert was accepted with no sheet live, or no longer
+/// holds the alert slot. Still answers after the sheet itself ended: an arm
+/// that finds no such sheet on screen resolves the alert `Cancelled` rather
+/// than presenting it.
+#[cfg_attr(
+    not(any(test, target_os = "android", target_os = "ios")),
+    allow(dead_code)
+)]
+pub(crate) fn sheet_under(alert_generation: u64) -> Option<u64> {
+    lock_active()
+        .alert
+        .as_ref()
+        .filter(|alert| alert.slot.generation == alert_generation)
+        .and_then(|alert| alert.over_sheet)
 }
 
-/// Claim the Busy slot for a fresh generation, then hand the sending half to
-/// `start`. The lock is released before `start` runs: a host that resolves
-/// synchronously releases the slot through the sender, which must not
-/// deadlock on a lock this function still holds.
-fn submit<T>(start: impl FnOnce(Sender<T>, u64) -> Result<(), PresentError>) -> Presentation<T> {
+/// The sheet `sheet_generation` is ending: ask the arm of the alert recorded
+/// over it to cancel that alert ([`AlertHost::cancel`]) — called with the
+/// lock released, since the arm resolves through the alert's sender, which
+/// re-enters [`release_if_live`]. A no-op when no live alert was accepted
+/// over this sheet.
+fn cancel_alert_over(sheet_generation: u64) {
+    let target = lock_active()
+        .alert
+        .as_ref()
+        .filter(|alert| alert.over_sheet == Some(sheet_generation))
+        .map(|alert| (alert.slot.generation, alert.cancel));
+    if let Some((generation, cancel)) = target {
+        cancel(generation);
+    }
+}
+
+/// The newest live presentation's generation and how long its slot has been
+/// held — the same claim a Busy refusal logs ([`submit`]), read directly by
+/// tests: the alert when one is live (it is always newer than a sheet it is
+/// over), else the sheet. `None` when both slots are free. The age is `None`
+/// on targets without a monotonic clock (wasm32-unknown-unknown). Test-only:
+/// production code reads the claim under the lock it already holds
+/// ([`submit`]), never through this second lock acquisition.
+#[cfg(test)]
+pub(crate) fn live_since() -> Option<(u64, Option<std::time::Duration>)> {
+    let slots = lock_active();
+    slots
+        .alert
+        .as_ref()
+        .map(|alert| &alert.slot)
+        .or(slots.sheet.as_ref())
+        .map(|slot| {
+            (
+                slot.generation,
+                slot.claimed_at.map(|instant| instant.elapsed()),
+            )
+        })
+}
+
+/// Claim the slot `claim` names for a fresh generation, then hand the sending
+/// half to `start`. The lock is released before `start` runs: a host that
+/// resolves synchronously releases the slot through the sender, which must
+/// not deadlock on a lock this function still holds.
+fn submit<T>(
+    claim: Claim,
+    start: impl FnOnce(Sender<T>, u64) -> Result<(), PresentError>,
+) -> Presentation<T> {
     let generation = {
-        let mut active = lock_active();
-        if let Some(live) = active.as_ref() {
+        let mut slots = lock_active();
+        let blocking = match claim {
+            Claim::Alert { .. } => slots.alert.as_ref().map(|alert| &alert.slot),
+            Claim::Sheet => slots
+                .alert
+                .as_ref()
+                .map(|alert| &alert.slot)
+                .or(slots.sheet.as_ref()),
+        };
+        if let Some(live) = blocking {
             let age = live.claimed_at.map(|instant| instant.elapsed());
             let message = busy_refusal_message(live.generation, age);
             log::warn!("{}", message);
             return Presentation::ready(Err(PresentError::Busy));
         }
         let generation = next_generation();
-        *active = Some(ActiveSlot {
+        let slot = ActiveSlot {
             generation,
             claimed_at: claim_clock(),
-        });
+        };
+        match claim {
+            Claim::Alert { cancel } => {
+                let over_sheet = slots.sheet.as_ref().map(|sheet| sheet.generation);
+                slots.alert = Some(AlertSlot {
+                    slot,
+                    over_sheet,
+                    cancel,
+                });
+            }
+            Claim::Sheet => slots.sheet = Some(slot),
+        }
         generation
     };
 
@@ -1015,15 +1246,28 @@ fn show_alert_on<H: AlertHost>(spec: AlertSpec) -> Presentation<AlertOutcome> {
     if let Err(err) = spec.validate() {
         return Presentation::ready(Err(err));
     }
-    submit(|tx, generation| H::show_alert(spec, tx, generation))
+    submit(Claim::Alert { cancel: H::cancel }, |tx, generation| {
+        H::show_alert(spec, tx, generation)
+    })
 }
 
+/// [`dismiss`] for an alert: reaches `H` only while `handle` holds the alert
+/// slot.
 fn dismiss_on<H: AlertHost>(handle: &PresentationHandle) {
     // Checked, then released, before calling into the host: the host may
     // resolve synchronously, which re-enters `release_if_live`.
-    if is_live(handle.generation) {
+    if live_kind(handle.generation) == Some(Kind::Alert) {
         H::dismiss(handle.generation);
     }
+}
+
+/// [`dismiss`]'s routing: the alert arm for a live alert, the sheet arm for a
+/// live sheet, nothing for a stale handle.
+fn dismiss_any_on<A: AlertHost, S: SheetHost>(handle: &PresentationHandle) {
+    dismiss_on::<A>(handle);
+    dismiss_sheet_on::<S>(&SheetHandle {
+        generation: handle.generation,
+    });
 }
 
 /// Present a native alert — see the module doc's *The contract*.
@@ -1033,7 +1277,9 @@ fn dismiss_on<H: AlertHost>(handle: &PresentationHandle) {
 /// [`PresentError`]: `InvalidSpec` / `Busy` / a synchronous host refusal
 /// (`NoHost`, `Unsupported`, `Platform`) on its first poll, or a later
 /// `NoHost`/`Platform` from an arm that discovered it only on the platform's
-/// main thread.
+/// main thread. `Busy` means another alert is live; while a sheet is live
+/// the alert is accepted and presented above it, and resolves `Cancelled` if
+/// that sheet ends first.
 pub fn show_alert(spec: AlertSpec) -> Presentation<AlertOutcome> {
     show_alert_on::<PlatformHost>(spec)
 }
@@ -1044,23 +1290,61 @@ pub fn show_alert(spec: AlertSpec) -> Presentation<AlertOutcome> {
 /// exactly once. A stale handle — its presentation already resolved, or
 /// superseded — is ignored.
 pub fn dismiss(handle: &PresentationHandle) {
-    dismiss_on::<PlatformHost>(handle);
+    dismiss_any_on::<PlatformHost, SheetPlatformHost>(handle);
+}
+
+/// The sending half a sheet arm resolves through: a [`Sender`] that first
+/// cancels the alert presented over its sheet, if one is still live — when
+/// the value is sent, and when it is dropped without one (module doc's *How
+/// an alert follows its sheet*). The alert therefore always resolves before
+/// the sheet, whatever ended the sheet.
+pub(crate) struct SheetSender {
+    tx: Option<Sender<SheetOutcome>>,
+}
+
+impl SheetSender {
+    fn new(tx: Sender<SheetOutcome>) -> Self {
+        Self { tx: Some(tx) }
+    }
+
+    /// Cancel the alert over this sheet, then resolve the sheet with `value`
+    /// — [`Sender::send`]'s contract otherwise, including its answer.
+    #[cfg_attr(
+        not(any(test, target_os = "android", target_os = "ios")),
+        allow(dead_code)
+    )]
+    pub(crate) fn send(mut self, value: Result<SheetOutcome, PresentError>) -> bool {
+        match self.tx.take() {
+            Some(tx) => {
+                cancel_alert_over(tx.generation());
+                tx.send(value)
+            }
+            None => false,
+        }
+    }
+}
+
+impl Drop for SheetSender {
+    /// Dropped unsent: the sheet ends without an outcome (the sender's
+    /// fallback), and still takes its alert with it first.
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            cancel_alert_over(tx.generation());
+            drop(tx);
+        }
+    }
 }
 
 /// The platform seam a sheet arm implements (selected by `cfg`, see the
-/// module doc's *Platform arms*). Shares the Busy slot, the generation guard
-/// and the `oneshot` channel with [`AlertHost`] — only the platform half
-/// differs.
+/// module doc's *Platform arms*). Shares the generation guard and the
+/// `oneshot` channel with [`AlertHost`] and has its own Busy slot; only the
+/// platform half differs.
 pub(crate) trait SheetHost {
     /// Present `spec` for presentation `generation`, resolving `tx` exactly
     /// once — later, from the platform's own callback — or return an error
     /// synchronously without having sent anything. Never blocks for the
     /// user's answer. `spec` has already passed [`SheetSpec::validate`].
-    fn show_sheet(
-        spec: SheetSpec,
-        tx: Sender<SheetOutcome>,
-        generation: u64,
-    ) -> Result<(), PresentError>;
+    fn show_sheet(spec: SheetSpec, tx: SheetSender, generation: u64) -> Result<(), PresentError>;
 
     /// Take presentation `generation` down programmatically, resolving it
     /// [`SheetOutcome::Dismissed`]`(`[`DismissReason::Programmatic`]`)`. Must
@@ -1084,7 +1368,7 @@ pub(crate) struct UnsupportedSheet;
 impl SheetHost for UnsupportedSheet {
     fn show_sheet(
         _spec: SheetSpec,
-        _tx: Sender<SheetOutcome>,
+        _tx: SheetSender,
         _generation: u64,
     ) -> Result<(), PresentError> {
         Err(PresentError::Unsupported)
@@ -1099,20 +1383,21 @@ fn show_sheet_on<H: SheetHost>(spec: SheetSpec) -> Presentation<SheetOutcome> {
     if let Err(err) = spec.validate() {
         return Presentation::ready(Err(err));
     }
-    submit(|tx, generation| H::show_sheet(spec, tx, generation))
+    submit(Claim::Sheet, |tx, generation| {
+        H::show_sheet(spec, SheetSender::new(tx), generation)
+    })
 }
 
-/// Whether `generation` holds the Busy slot — the stale-handle filter
-/// [`dismiss_on`] applies, shared by the sheet handle's calls. Released
-/// before the caller reaches the host, which may resolve synchronously.
-fn is_live(generation: u64) -> bool {
-    lock_active()
-        .as_ref()
-        .is_some_and(|slot| slot.generation == generation)
+/// Which Busy slot `generation` holds, if either — the stale-handle filter
+/// [`dismiss_on`] and [`dismiss_any_on`] apply, shared by the sheet handle's
+/// calls. Released before the caller reaches the host, which may resolve
+/// synchronously.
+fn live_kind(generation: u64) -> Option<Kind> {
+    lock_active().kind_of(generation)
 }
 
 fn dismiss_sheet_on<H: SheetHost>(handle: &SheetHandle) {
-    if is_live(handle.generation) {
+    if live_kind(handle.generation) == Some(Kind::Sheet) {
         H::dismiss(handle.generation);
     }
 }
@@ -1125,7 +1410,7 @@ fn select_detent_on<H: SheetHost>(handle: &SheetHandle, detent: Detent) {
         );
         return;
     }
-    if is_live(handle.generation) {
+    if live_kind(handle.generation) == Some(Kind::Sheet) {
         H::select_detent(handle.generation, detent);
     }
 }
@@ -1134,8 +1419,8 @@ fn select_detent_on<H: SheetHost>(handle: &SheetHandle, detent: Detent) {
 ///
 /// The returned [`Presentation`] resolves [`SheetOutcome`] once the user
 /// (an action row, a swipe-down), [`SheetHandle::dismiss`] or the host going
-/// away ends the sheet, or [`PresentError`]: `InvalidSpec` / `Busy` (another
-/// presentation of any kind is live) / `Unsupported` (every platform but
+/// away ends the sheet, or [`PresentError`]: `InvalidSpec` / `Busy` (a sheet
+/// or an alert is live) / `Unsupported` (every platform but
 /// iOS/iPadOS and Android) on its first poll, or a later `NoHost`/`Platform`
 /// from the arm. [`Presentation::sheet_handle`] names it for
 /// [`SheetHandle::select_detent`] and [`SheetHandle::dismiss`].
@@ -1180,6 +1465,10 @@ pub(crate) mod wire {
     /// `actionIndex` (spec order). `android_host` streams it to the sheet's
     /// [`SheetSpec::on_detent`] and leaves the presentation live.
     pub(crate) const OUTCOME_DETENT: i32 = 6;
+    /// **Not terminal**: the user tapped the [`SheetSpec::on_row_tap`] row
+    /// at `actionIndex` (spec order). `android_host` streams it to that row's
+    /// listener and leaves the presentation live.
+    pub(crate) const OUTCOME_ROW: i32 = 7;
 
     /// An action's [`ActionRole::Default`] wire code.
     pub(crate) const ROLE_DEFAULT: i32 = 0;
@@ -1238,8 +1527,8 @@ pub(crate) mod wire {
 
     /// Map one terminal `nativeOnOutcome` report onto a sheet's result: a
     /// cancel is the user's dismissal, a dismissal the programmatic one.
-    /// [`OUTCOME_DETENT`] is never terminal (`android_host` intercepts it),
-    /// so it decodes as unknown here.
+    /// [`OUTCOME_DETENT`] and [`OUTCOME_ROW`] are never terminal
+    /// (`android_host` intercepts them), so they decode as unknown here.
     pub(crate) fn sheet_outcome(
         code: i32,
         action_index: i32,
@@ -1321,8 +1610,10 @@ pub(crate) mod wire {
     }
 
     /// `showSheet`'s `specJson`: one flat object (the chrome wire's shape),
-    /// every key always present except `cornerRadius`, `tint` and `dark`,
-    /// which are omitted for `None`. The image travels beside it as bytes.
+    /// every key always present except `action{i}Event` (written `true` only
+    /// for an [`SheetSpec::on_row_tap`] row) and `cornerRadius`, `tint` and
+    /// `dark`, which are omitted for `None`. The image travels beside it as
+    /// bytes.
     pub(crate) fn sheet_json(spec: &SheetSpec) -> String {
         let content = &spec.content;
         let mut out = String::from("{");
@@ -1342,6 +1633,9 @@ pub(crate) mod wire {
                 &format!("action{i}Role"),
                 &role_code(action.role).to_string(),
             );
+            if spec.row_listener(i).is_some() {
+                put(&format!("action{i}Event"), "true");
+            }
         }
         put("detentCount", &spec.detents.len().to_string());
         for (i, detent) in spec.detents.iter().enumerate() {
@@ -1379,7 +1673,8 @@ pub(crate) mod test_support {
     use std::sync::{Mutex, MutexGuard};
 
     use super::{
-        ActiveSlot, Presentation, Sender, claim_clock, lock_active, next_generation, oneshot,
+        ActiveSlot, AlertSlot, Presentation, Sender, claim_clock, lock_active, next_generation,
+        oneshot,
     };
 
     /// Serializes every test that touches [`super::ACTIVE`] — one
@@ -1402,17 +1697,56 @@ pub(crate) mod test_support {
         (tx, Presentation::pending(rx, u64::MAX))
     }
 
-    /// Run `f` with the Busy slot held by some other presentation, freeing
-    /// it afterwards; serialized on [`TEST_LOCK`].
+    /// A fresh claim, as [`super::submit`] makes one.
+    fn claim() -> ActiveSlot {
+        ActiveSlot {
+            generation: next_generation(),
+            claimed_at: claim_clock(),
+        }
+    }
+
+    /// Free both Busy slots.
+    fn free_both() {
+        let mut slots = lock_active();
+        slots.alert = None;
+        slots.sheet = None;
+    }
+
+    /// Run `f` with the alert slot held by some other presentation — so
+    /// every request, alert or sheet, is refused `Busy` — freeing it
+    /// afterwards; serialized on [`TEST_LOCK`].
     #[cfg_attr(not(feature = "frust-api"), allow(dead_code))]
     pub(crate) fn with_slot_held<R>(f: impl FnOnce() -> R) -> R {
         let _guard = serialize();
-        *lock_active() = Some(ActiveSlot {
-            generation: next_generation(),
-            claimed_at: claim_clock(),
+        free_both();
+        lock_active().alert = Some(AlertSlot {
+            slot: claim(),
+            over_sheet: None,
+            cancel: |_| {},
         });
         let result = f();
-        *lock_active() = None;
+        free_both();
+        result
+    }
+
+    /// Run `f` with the sheet slot held by some other presentation — so a
+    /// sheet is refused `Busy` and an alert is accepted over it — freeing
+    /// both slots afterwards; serialized on [`TEST_LOCK`].
+    #[cfg_attr(
+        any(
+            not(feature = "frust-api"),
+            target_os = "android",
+            target_os = "ios",
+            target_os = "macos"
+        ),
+        allow(dead_code)
+    )]
+    pub(crate) fn with_sheet_held<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = serialize();
+        free_both();
+        lock_active().sheet = Some(claim());
+        let result = f();
+        free_both();
         result
     }
 }
@@ -1435,6 +1769,7 @@ mod tests {
         live: Option<(u64, Sender<AlertOutcome>)>,
         shown: Vec<AlertSpec>,
         dismissed: Vec<u64>,
+        cancelled: Vec<u64>,
     }
 
     thread_local! {
@@ -1475,6 +1810,20 @@ mod tests {
                 tx.send(Ok(AlertOutcome::Dismissed));
             }
         }
+
+        fn cancel(generation: u64) {
+            let taken = FAKE.with(|fake| {
+                let mut fake = fake.borrow_mut();
+                fake.cancelled.push(generation);
+                match &fake.live {
+                    Some((live, _)) if *live == generation => fake.live.take(),
+                    _ => None,
+                }
+            });
+            if let Some((_, tx)) = taken {
+                tx.send(Ok(AlertOutcome::Cancelled));
+            }
+        }
     }
 
     /// The platform delivering `outcome` for whatever is live on the fake —
@@ -1494,7 +1843,10 @@ mod tests {
     fn isolated<R>(f: impl FnOnce() -> R) -> R {
         let _guard = test_support::serialize();
         let reset = || {
-            *lock_active() = None;
+            let mut slots = lock_active();
+            slots.alert = None;
+            slots.sheet = None;
+            drop(slots);
             FAKE.with(|fake| *fake.borrow_mut() = FakeState::default());
         };
         reset();
@@ -2009,7 +2361,7 @@ mod tests {
     /// of every show / dismiss / detent move that reached the host.
     #[derive(Default)]
     struct FakeSheetState {
-        live: Option<(u64, Sender<SheetOutcome>)>,
+        live: Option<(u64, SheetSender)>,
         shown: usize,
         dismissed: Vec<u64>,
         moved: Vec<(u64, Detent)>,
@@ -2024,7 +2376,7 @@ mod tests {
     impl SheetHost for FakeSheetHost {
         fn show_sheet(
             _spec: SheetSpec,
-            tx: Sender<SheetOutcome>,
+            tx: SheetSender,
             generation: u64,
         ) -> Result<(), PresentError> {
             FAKE_SHEET.with(|fake| {
@@ -2331,7 +2683,7 @@ mod tests {
     }
 
     #[test]
-    fn alerts_and_sheets_share_the_one_busy_slot() {
+    fn a_sheet_is_refused_while_an_alert_is_live() {
         isolated_sheet(|| {
             let alert = show_alert_on::<FakeHost>(two_button_spec());
             let mut sheet = show_sheet_on::<FakeSheetHost>(sheet_spec());
@@ -2340,20 +2692,365 @@ mod tests {
             assert_eq!(FAKE_SHEET.with(|fake| fake.borrow().shown), 0);
             drop(alert);
 
-            let live_sheet = show_sheet_on::<FakeSheetHost>(sheet_spec());
-            assert!(live_sheet.sheet_handle().is_some());
-            let mut alert = show_alert_on::<FakeHost>(two_button_spec());
-            assert_eq!(poll_once(&mut alert), Poll::Ready(Err(PresentError::Busy)));
+            // Freeing the alert frees the sheet's way at once.
+            let mut next = show_sheet_on::<FakeSheetHost>(sheet_spec());
+            assert!(next.sheet_handle().is_some());
+            assert_eq!(poll_once(&mut next), Poll::Pending);
+        });
+    }
 
-            // Resolving the sheet frees the slot for the next kind at once.
+    /// Records the order presentations are woken in: each waker pushes its
+    /// tag into the shared log.
+    struct OrderWaker {
+        tag: &'static str,
+        log: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl std::task::Wake for OrderWaker {
+        fn wake(self: Arc<Self>) {
+            self.log.lock().expect("unpoisoned").push(self.tag);
+        }
+    }
+
+    fn order_waker(tag: &'static str, log: &Arc<Mutex<Vec<&'static str>>>) -> Waker {
+        Waker::from(Arc::new(OrderWaker {
+            tag,
+            log: Arc::clone(log),
+        }))
+    }
+
+    /// A live sheet with an alert accepted over it, both polled once with
+    /// [`order_waker`]s tagged `"alert"` and `"sheet"`.
+    struct OverSheet {
+        sheet: Presentation<SheetOutcome>,
+        alert: Presentation<AlertOutcome>,
+        sheet_waker: Waker,
+        alert_waker: Waker,
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    fn alert_over_sheet() -> OverSheet {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut sheet = show_sheet_on::<FakeSheetHost>(sheet_spec());
+        let mut alert = show_alert_on::<FakeHost>(two_button_spec());
+        let (sheet_waker, alert_waker) =
+            (order_waker("sheet", &order), order_waker("alert", &order));
+        assert_eq!(poll_with(&mut sheet, &sheet_waker), Poll::Pending);
+        assert_eq!(poll_with(&mut alert, &alert_waker), Poll::Pending);
+        OverSheet {
+            sheet,
+            alert,
+            sheet_waker,
+            alert_waker,
+            order,
+        }
+    }
+
+    #[test]
+    fn an_alert_over_a_live_sheet_is_accepted() {
+        isolated_sheet(|| {
+            let mut over = alert_over_sheet();
+            let sheet = over.sheet.sheet_handle().expect("accepted").generation;
+            let alert = over
+                .alert
+                .handle()
+                .expect("accepted over the sheet")
+                .generation;
+            assert_eq!(sheet_under(alert), Some(sheet));
+            assert_eq!(FAKE.with(|fake| fake.borrow().shown.len()), 1);
+            assert_eq!(live_since().map(|(generation, _)| generation), Some(alert));
+
+            // The alert answers on its own; the sheet stays live under it.
+            assert!(platform_resolves(Ok(AlertOutcome::Action("delete".into()))));
+            assert_eq!(
+                poll_with(&mut over.alert, &over.alert_waker),
+                Poll::Ready(Ok(AlertOutcome::Action("delete".into())))
+            );
+            assert_eq!(poll_with(&mut over.sheet, &over.sheet_waker), Poll::Pending);
+            assert_eq!(live_since().map(|(generation, _)| generation), Some(sheet));
+            assert!(FAKE.with(|fake| fake.borrow().cancelled.is_empty()));
+
+            // …and a second confirmation may follow over the same sheet.
+            let next = show_alert_on::<FakeHost>(two_button_spec());
+            let next = next
+                .handle()
+                .expect("accepted over the sheet again")
+                .generation;
+            assert_eq!(sheet_under(next), Some(sheet));
+        });
+    }
+
+    #[test]
+    fn an_alert_with_no_sheet_live_is_over_nothing() {
+        isolated_sheet(|| {
+            let alert = show_alert_on::<FakeHost>(two_button_spec());
+            assert_eq!(
+                sheet_under(alert.handle().expect("accepted").generation),
+                None
+            );
+            // A generation that holds no alert slot answers nothing either.
+            assert_eq!(sheet_under(u64::MAX), None);
+        });
+    }
+
+    #[test]
+    fn the_refused_combinations_are_busy() {
+        isolated_sheet(|| {
+            let sheet = show_sheet_on::<FakeSheetHost>(sheet_spec());
+            let mut second_sheet = show_sheet_on::<FakeSheetHost>(sheet_spec());
+            assert_eq!(second_sheet.sheet_handle(), None);
+            assert_eq!(
+                poll_once(&mut second_sheet),
+                Poll::Ready(Err(PresentError::Busy)),
+                "a second sheet"
+            );
+
+            let alert = show_alert_on::<FakeHost>(two_button_spec());
+            assert!(alert.handle().is_some());
+            let mut second_alert = show_alert_on::<FakeHost>(two_button_spec());
+            assert_eq!(
+                poll_once(&mut second_alert),
+                Poll::Ready(Err(PresentError::Busy)),
+                "a second alert, over the same sheet"
+            );
+            let mut sheet_over_alert = show_sheet_on::<FakeSheetHost>(sheet_spec());
+            assert_eq!(
+                poll_once(&mut sheet_over_alert),
+                Poll::Ready(Err(PresentError::Busy)),
+                "a sheet while an alert is live"
+            );
+
+            // No refused request ever reached a host.
+            assert_eq!(FAKE.with(|fake| fake.borrow().shown.len()), 1);
+            assert_eq!(FAKE_SHEET.with(|fake| fake.borrow().shown), 1);
+            drop((sheet, alert));
+        });
+    }
+
+    #[test]
+    fn dismissing_the_sheet_cancels_its_alert_first() {
+        isolated_sheet(|| {
+            let mut over = alert_over_sheet();
+            let sheet = over.sheet.sheet_handle().expect("accepted");
+            let alert = over.alert.handle().expect("accepted");
+
+            dismiss_sheet_on::<FakeSheetHost>(&sheet);
+
+            assert_eq!(*over.order.lock().expect("unpoisoned"), ["alert", "sheet"]);
+            assert_eq!(
+                poll_with(&mut over.alert, &over.alert_waker),
+                Poll::Ready(Ok(AlertOutcome::Cancelled))
+            );
+            assert_eq!(
+                poll_with(&mut over.sheet, &over.sheet_waker),
+                Poll::Ready(Ok(SheetOutcome::Dismissed(DismissReason::Programmatic)))
+            );
+            // Each exactly once: nothing is left to resolve, nothing re-wakes.
+            assert_eq!(poll_with(&mut over.alert, &over.alert_waker), Poll::Pending);
+            assert_eq!(poll_with(&mut over.sheet, &over.sheet_waker), Poll::Pending);
+            assert!(!platform_resolves(Ok(AlertOutcome::Action("keep".into()))));
+            assert!(!sheet_resolves(Ok(SheetOutcome::HostLost)));
+            assert_eq!(*over.order.lock().expect("unpoisoned"), ["alert", "sheet"]);
+            assert_eq!(
+                FAKE.with(|fake| fake.borrow().cancelled.clone()),
+                vec![alert.generation]
+            );
+            assert!(live_since().is_none(), "both slots are free");
+        });
+    }
+
+    #[test]
+    fn every_way_a_sheet_ends_cancels_its_alert_first() {
+        let endings = [
+            Ok(SheetOutcome::Dismissed(DismissReason::User)),
+            Ok(SheetOutcome::HostLost),
+            Ok(SheetOutcome::Action("copy".into())),
+            Err(PresentError::NoHost),
+        ];
+        for ending in endings {
+            isolated_sheet(|| {
+                let mut over = alert_over_sheet();
+                assert!(sheet_resolves(ending.clone()));
+                assert_eq!(*over.order.lock().expect("unpoisoned"), ["alert", "sheet"]);
+                assert_eq!(
+                    poll_with(&mut over.alert, &over.alert_waker),
+                    Poll::Ready(Ok(AlertOutcome::Cancelled)),
+                    "{ending:?}"
+                );
+                assert_eq!(
+                    poll_with(&mut over.sheet, &over.sheet_waker),
+                    Poll::Ready(ending.clone())
+                );
+                assert!(live_since().is_none());
+            });
+        }
+
+        // A sheet arm dropping its sender unsent takes the alert down too.
+        isolated_sheet(|| {
+            let mut over = alert_over_sheet();
+            drop(FAKE_SHEET.with(|fake| fake.borrow_mut().live.take()));
+            assert_eq!(*over.order.lock().expect("unpoisoned"), ["alert", "sheet"]);
+            assert_eq!(
+                poll_with(&mut over.alert, &over.alert_waker),
+                Poll::Ready(Ok(AlertOutcome::Cancelled))
+            );
+            assert_eq!(
+                poll_with(&mut over.sheet, &over.sheet_waker),
+                Poll::Ready(Err(PresentError::Platform(
+                    oneshot::DROPPED_WITHOUT_OUTCOME.to_string()
+                )))
+            );
+        });
+    }
+
+    #[test]
+    fn outcomes_never_cross_between_the_sheet_and_its_alert() {
+        isolated_sheet(|| {
+            let mut over = alert_over_sheet();
+            let alert = over.alert.handle().expect("accepted");
+
+            // Dismissing the alert touches only the alert.
+            dismiss_on::<FakeHost>(&alert);
+            assert_eq!(
+                poll_with(&mut over.alert, &over.alert_waker),
+                Poll::Ready(Ok(AlertOutcome::Dismissed))
+            );
+            assert_eq!(poll_with(&mut over.sheet, &over.sheet_waker), Poll::Pending);
+            assert!(FAKE_SHEET.with(|fake| fake.borrow().dismissed.is_empty()));
+
+            // A sheet handle never reaches the alert host, and an alert
+            // handle never reaches the sheet host — even with the same
+            // generation asked of the wrong arm.
+            let sheet = over.sheet.sheet_handle().expect("accepted");
+            dismiss_on::<FakeHost>(&sheet.presentation());
+            assert!(FAKE.with(|fake| fake.borrow().dismissed == vec![alert.generation]));
+            dismiss_sheet_on::<FakeSheetHost>(&SheetHandle {
+                generation: alert.generation,
+            });
+            assert!(FAKE_SHEET.with(|fake| fake.borrow().dismissed.is_empty()));
+
+            // The sheet resolves its own outcome, with no alert left to cancel.
+            assert!(sheet_resolves(Ok(SheetOutcome::Action("copy".into()))));
+            assert_eq!(
+                poll_with(&mut over.sheet, &over.sheet_waker),
+                Poll::Ready(Ok(SheetOutcome::Action("copy".into())))
+            );
+            assert!(FAKE.with(|fake| fake.borrow().cancelled.is_empty()));
+        });
+    }
+
+    #[test]
+    fn dismiss_routes_a_handle_to_its_own_arm() {
+        isolated_sheet(|| {
+            let mut over = alert_over_sheet();
+            let sheet = over.sheet.sheet_handle().expect("accepted");
+            let alert = over.alert.handle().expect("accepted");
+
+            dismiss_any_on::<FakeHost, FakeSheetHost>(&alert);
+            assert_eq!(
+                poll_with(&mut over.alert, &over.alert_waker),
+                Poll::Ready(Ok(AlertOutcome::Dismissed))
+            );
+            dismiss_any_on::<FakeHost, FakeSheetHost>(&sheet.presentation());
+            assert_eq!(
+                poll_with(&mut over.sheet, &over.sheet_waker),
+                Poll::Ready(Ok(SheetOutcome::Dismissed(DismissReason::Programmatic)))
+            );
+            // Both stale now: filtered before either host.
+            dismiss_any_on::<FakeHost, FakeSheetHost>(&alert);
+            dismiss_any_on::<FakeHost, FakeSheetHost>(&sheet.presentation());
+            assert_eq!(
+                FAKE.with(|fake| fake.borrow().dismissed.clone()),
+                vec![alert.generation]
+            );
+            assert_eq!(
+                FAKE_SHEET.with(|fake| fake.borrow().dismissed.clone()),
+                vec![sheet.generation]
+            );
+        });
+    }
+
+    #[test]
+    fn abandoning_the_sheet_leaves_its_alert_live() {
+        isolated_sheet(|| {
+            let mut over = alert_over_sheet();
+            let OverSheet { sheet, .. } = &mut over;
+            let sheet_generation = sheet.sheet_handle().expect("accepted").generation;
+            drop(std::mem::replace(
+                sheet,
+                Presentation::ready(Err(PresentError::Busy)),
+            ));
+
+            // The caller dropped only the sheet's future: the alert is still
+            // waiting for its user, and still holds its slot.
+            assert_eq!(poll_with(&mut over.alert, &over.alert_waker), Poll::Pending);
+            assert!(FAKE.with(|fake| fake.borrow().cancelled.is_empty()));
+            let mut refused = show_sheet_on::<FakeSheetHost>(sheet_spec());
+            assert_eq!(
+                poll_once(&mut refused),
+                Poll::Ready(Err(PresentError::Busy))
+            );
+
+            // The abandoned sheet's platform UI still ends later, and still
+            // takes the alert it carries with it.
             assert!(sheet_resolves(Ok(SheetOutcome::Dismissed(
                 DismissReason::User
             ))));
-            let mut next = show_alert_on::<FakeHost>(two_button_spec());
-            assert!(next.handle().is_some());
-            assert_eq!(poll_once(&mut next), Poll::Pending);
-            drop(live_sheet);
+            assert_eq!(
+                poll_with(&mut over.alert, &over.alert_waker),
+                Poll::Ready(Ok(AlertOutcome::Cancelled))
+            );
+            assert_eq!(
+                FAKE.with(|fake| fake.borrow().cancelled.len()),
+                1,
+                "sheet {sheet_generation}'s alert cancelled once"
+            );
         });
+    }
+
+    #[test]
+    fn a_row_tap_must_name_an_action_row() {
+        assert_eq!(sheet_spec().on_row_tap("delete", || {}).validate(), Ok(()));
+        assert_invalid_sheet(&sheet_spec().on_row_tap("nope", || {}));
+    }
+
+    #[test]
+    fn a_row_tap_listener_is_found_by_action_index_and_replaced_by_id() {
+        let taps = Arc::new(Mutex::new(Vec::new()));
+        let (first, second) = (Arc::clone(&taps), Arc::clone(&taps));
+        let spec = sheet_spec()
+            .on_row_tap("delete", move || first.lock().expect("unpoisoned").push(1))
+            .on_row_tap("delete", move || second.lock().expect("unpoisoned").push(2));
+        assert!(spec.row_listener(0).is_none(), "`copy` stays an outcome");
+        assert!(spec.row_listener(2).is_none(), "out of range");
+        spec.row_listener(1).expect("`delete` is an event")();
+        assert_eq!(*taps.lock().expect("unpoisoned"), [2]);
+        assert_eq!(spec.clone(), spec, "a clone shares the listener");
+        assert_ne!(sheet_spec().on_row_tap("delete", || {}), spec);
+    }
+
+    #[test]
+    fn only_an_event_row_carries_the_event_key() {
+        let plain = wire::sheet_json(&sheet_spec());
+        assert!(!plain.contains("Event"), "{plain}");
+        let json = wire::sheet_json(&sheet_spec().on_row_tap("delete", || {}));
+        assert!(
+            json.contains(",\"action1Role\":2,\"action1Event\":true,"),
+            "{json}"
+        );
+        assert!(!json.contains("action0Event"), "{json}");
+    }
+
+    #[test]
+    fn a_row_report_is_never_a_sheet_outcome() {
+        assert!(matches!(
+            wire::sheet_outcome(
+                wire::OUTCOME_ROW,
+                1,
+                &["copy".to_string(), "delete".to_string()]
+            ),
+            Err(PresentError::Platform(_))
+        ));
     }
 
     #[test]
@@ -2432,6 +3129,7 @@ mod tests {
             ("NO_HOST".to_string(), wire::OUTCOME_NO_HOST),
             ("FAILED".to_string(), wire::OUTCOME_FAILED),
             ("DETENT".to_string(), wire::OUTCOME_DETENT),
+            ("ROW".to_string(), wire::OUTCOME_ROW),
         ]);
         assert_eq!(
             kotlin, rust,
@@ -2475,6 +3173,19 @@ mod tests {
             assert!(
                 PRESENTER_KT.contains(member),
                 "FrustNativePresenter.kt must declare `{member}` (android_sheet.rs calls it)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_alert_over_sheet_members_exist_in_kotlin() {
+        for member in [
+            "fun cancelAlert(generation: Long)",
+            "cancelable: Boolean,\n        overSheet: Long,\n    )",
+        ] {
+            assert!(
+                PRESENTER_KT.contains(member),
+                "FrustNativePresenter.kt must declare `{member}` (android_alert.rs calls it)"
             );
         }
     }

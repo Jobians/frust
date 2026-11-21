@@ -3,7 +3,7 @@
 // `plugins/native-widgets/src/present/android_host.rs` (host discovery, the
 // `nativeOnOutcome` callback export) and
 // `plugins/native-widgets/src/present/android_alert.rs` (the `showAlert`/
-// `dismiss` calls below) and `plugins/native-widgets/src/present/android_sheet.rs`
+// `dismiss`/`cancelAlert` calls below) and `plugins/native-widgets/src/present/android_sheet.rs`
 // (`showSheet`/`dismissSheet`/`selectSheetDetent`) — see those modules'
 // contract tables. Native presentations (alerts, sheets) are not
 // platform-view slots: they are shown over the resumed Activity, which this
@@ -75,17 +75,20 @@ import java.lang.ref.WeakReference
  * [resumedActivity] additionally refuses an Activity that is finishing or
  * already destroyed.
  *
- * ## The live dialog: exactly-once, own guard
+ * ## The live dialogs: exactly-once, own guard
  *
- * [liveDialog]/[liveActivity]/[liveGeneration] track the one dialog
- * currently shown by [showAlert] or [showSheet] (alerts and sheets share one
- * Busy slot on the Rust side, so at most one is live), independently of (and in
- * addition to) `android_alert.rs`'s own generation-keyed parking on the Rust
- * side. [resolveOnce] is this object's own exactly-once guard: it nulls
- * [liveDialog] the moment any path reports an outcome, so a framework
- * callback firing again for the same dialog (a button tap always dismisses
- * the dialog too, invoking both its own listener and the dismiss listener)
- * finds nothing left to report. Every field here is touched only from the
+ * [liveAlert] and [liveSheet] track the dialogs currently shown by
+ * [showAlert] and [showSheet]: at most one of each, the alert shown above the
+ * sheet when the Rust side accepted it over that sheet (`overSheet`) —
+ * independently of (and in addition to) `android_host.rs`'s own
+ * generation-keyed parking on the Rust side. [resolveAlert]/[resolveSheet]
+ * are this object's own exactly-once guards: each nulls its record the moment
+ * any path reports an outcome, so a framework callback firing again for the
+ * same dialog (a button tap always dismisses the dialog too, invoking both
+ * its own listener and the dismiss listener) finds nothing left to report.
+ * A sheet ending by any path takes the alert above it down first, reporting
+ * [OUTCOME_CANCELLED] for that alert before the sheet's own outcome
+ * ([cancelAlertOver]). Every field here is touched only from the
  * main thread: `showAlert`/`dismiss` are called directly, synchronously, by
  * Rust (`android_alert.rs`'s module doc, *Main-thread dispatch* — the whole
  * frust Android runtime is thread-confined to the main `Looper`), the sheet
@@ -114,6 +117,9 @@ object FrustNativePresenter {
 
     /** Not terminal: the user settled the live sheet at the detent at `actionIndex`. */
     const val OUTCOME_DETENT = 6
+
+    /** Not terminal: the user tapped the live sheet's event row at `actionIndex`. */
+    const val OUTCOME_ROW = 7
 
     /** An ordinary action — [showAlert]'s `roles` wire code for `Default`. */
     private const val ROLE_DEFAULT = 0
@@ -155,21 +161,15 @@ object FrustNativePresenter {
     private val created = ArrayList<WeakReference<Activity>>()
 
     /**
-     * The dialog [showAlert] currently has up, or `null` between
-     * presentations — this object's own exactly-once guard (class doc's *The
-     * live dialog*). Main-thread only, unlike [resumed]: nothing here is ever
+     * The alert [showAlert] currently has up, or `null` between alerts —
+     * this object's own exactly-once guard for it (class doc's *The live
+     * dialogs*). Main-thread only, unlike [resumed]: nothing here is ever
      * read from a JNI worker thread.
      */
-    private var liveDialog: Dialog? = null
+    private var liveAlert: LiveAlert? = null
 
-    /** The sheet state beside [liveDialog] when it is a [showSheet] dialog. */
+    /** The sheet [showSheet] currently has up, or `null` between sheets. */
     private var liveSheet: LiveSheet? = null
-
-    /** The Activity [liveDialog] is attached to, alongside [liveDialog]. */
-    private var liveActivity: Activity? = null
-
-    /** The generation [liveDialog] belongs to, alongside [liveDialog]. */
-    private var liveGeneration: Long = 0L
 
     /**
      * Guards a single [Application.registerActivityLifecycleCallbacks] call.
@@ -234,15 +234,19 @@ object FrustNativePresenter {
      * `AlertSpec::validate`/`MAX_ALERT_ACTIONS`), so every action always
      * finds a free slot among `AlertDialog`'s three.
      *
-     * A dialog already up from an earlier, abandoned presentation (its
-     * caller dropped the Rust `Presentation` future without waiting —
+     * `overSheet` is the generation of the sheet the Rust side accepted this
+     * alert over (`0` for none): the alert is shown above that sheet, which
+     * stays up. An alert already up from an earlier, abandoned presentation
+     * (its caller dropped the Rust `Presentation` future without waiting —
      * `android_alert.rs`'s module doc, *A displaced presentation*) is taken
-     * down first ([dismissStale]), so two never show stacked.
+     * down first ([closeStaleAlert]), and so is a sheet that is not
+     * `overSheet`'s (an abandoned one), so two alerts never show stacked.
      *
-     * Reports exactly once through [nativeOnOutcome] ([resolveOnce]): no
-     * resumed Activity → [OUTCOME_NO_HOST]; an exception building or showing
-     * the dialog → [OUTCOME_FAILED]; otherwise the dialog's own listeners
-     * report later.
+     * Reports exactly once through [nativeOnOutcome] ([resolveAlert]): no
+     * resumed Activity → [OUTCOME_NO_HOST]; the `overSheet` sheet already
+     * gone → [OUTCOME_CANCELLED] (it would have taken the alert with it); an
+     * exception building or showing the dialog → [OUTCOME_FAILED]; otherwise
+     * the dialog's own listeners report later.
      */
     @JvmStatic
     fun showAlert(
@@ -252,9 +256,15 @@ object FrustNativePresenter {
         labels: Array<String>,
         roles: IntArray,
         cancelable: Boolean,
+        overSheet: Long,
     ) {
-        dismissStale()
-        val activity = resumedActivity()
+        closeStaleAlert()
+        if (liveSheet?.generation != overSheet) closeStaleSheet()
+        if (overSheet != 0L && liveSheet == null) {
+            nativeOnOutcome(generation, OUTCOME_CANCELLED, -1)
+            return
+        }
+        val activity = liveSheet?.activity ?: resumedActivity()
         if (activity == null) {
             nativeOnOutcome(generation, OUTCOME_NO_HOST, -1)
             return
@@ -266,13 +276,13 @@ object FrustNativePresenter {
             builder.setTitle(title)
             builder.setMessage(message)
             builder.setCancelable(cancelable)
-            builder.setOnCancelListener { resolveOnce(generation, OUTCOME_CANCELLED, -1) }
+            builder.setOnCancelListener { resolveAlert(generation, OUTCOME_CANCELLED, -1) }
 
             val slots = assignSlots(roles)
             for (index in labels.indices) {
                 val listener =
                     DialogInterface.OnClickListener { _, _ ->
-                        resolveOnce(generation, OUTCOME_ACTION, index)
+                        resolveAlert(generation, OUTCOME_ACTION, index)
                     }
                 when (slots[index]) {
                     ButtonSlot.POSITIVE -> builder.setPositiveButton(labels[index], listener)
@@ -285,31 +295,44 @@ object FrustNativePresenter {
             }
 
             val dialog = builder.create()
-            dialog.setOnDismissListener { resolveOnce(generation, OUTCOME_DISMISSED, -1) }
-            liveGeneration = generation
-            liveDialog = dialog
-            liveActivity = activity
+            dialog.setOnDismissListener { resolveAlert(generation, OUTCOME_DISMISSED, -1) }
+            liveAlert = LiveAlert(generation, dialog, activity, overSheet)
             dialog.show()
         } catch (t: Throwable) {
-            liveDialog = null
-            liveActivity = null
-            liveSheet = null
+            liveAlert = null
             nativeOnOutcome(generation, OUTCOME_FAILED, -1)
         }
     }
 
     /**
-     * Take presentation [generation] down programmatically —
+     * Take alert [generation] down programmatically → [OUTCOME_DISMISSED] —
      * `android_alert.rs`'s `Host::dismiss`. Ignores a `generation` that is
-     * not [liveGeneration]'s (a stale handle, or a race with the dialog
-     * resolving on its own): [resolveOnce]'s own guard already covers it, so
-     * this amounts to a no-op either way.
+     * not [liveAlert]'s (a stale handle, or a race with the dialog resolving
+     * on its own): [resolveAlert]'s own guard already covers it, so this
+     * amounts to a no-op either way.
      */
     @JvmStatic
     fun dismiss(generation: Long) {
-        val dialog = if (liveGeneration == generation) liveDialog else null
-        resolveOnce(generation, OUTCOME_DISMISSED, -1)
-        closeQuietly(dialog)
+        endAlert(generation, OUTCOME_DISMISSED)
+    }
+
+    /**
+     * Take alert [generation] down because the sheet it is shown over is
+     * ending → [OUTCOME_CANCELLED] — `android_alert.rs`'s `Host::cancel`, the
+     * Rust side's request when a sheet resolves with its alert still live.
+     * The sheet paths here already did it themselves ([cancelAlertOver]), so
+     * this normally finds nothing; a stale `generation` is ignored.
+     */
+    @JvmStatic
+    fun cancelAlert(generation: Long) {
+        endAlert(generation, OUTCOME_CANCELLED)
+    }
+
+    /** Report `code` for alert [generation] if it is still live, then close it. */
+    private fun endAlert(generation: Long, code: Int) {
+        val live = liveAlert?.takeIf { it.generation == generation }
+        resolveAlert(generation, code, -1)
+        closeQuietly(live?.dialog)
     }
 
     /**
@@ -318,22 +341,31 @@ object FrustNativePresenter {
      * flat `present::wire::sheet_json` object; `image` the encoded image row
      * (`null` for none). Hops to the main thread ([onMain]).
      *
-     * Takes an abandoned presentation's dialog down first ([dismissStale]),
-     * like [showAlert], and reports exactly once through [nativeOnOutcome]
-     * ([resolveOnce]): no resumed Activity → [OUTCOME_NO_HOST]; an exception
-     * building or showing the sheet → [OUTCOME_FAILED]; otherwise the
-     * sheet's own listeners report later. `android_sheet.rs`'s module doc
-     * maps every spec field.
+     * Takes abandoned presentations' dialogs down first ([closeStaleAlert],
+     * [closeStaleSheet]) — the Rust side accepts a sheet only with neither
+     * slot live, so whatever is still up is abandoned — and reports exactly
+     * once through [nativeOnOutcome] ([resolveSheet]): no resumed Activity →
+     * [OUTCOME_NO_HOST]; an exception building or showing the sheet →
+     * [OUTCOME_FAILED]; otherwise the sheet's own listeners report later.
+     * `android_sheet.rs`'s module doc maps every spec field.
      */
     @JvmStatic
     fun showSheet(generation: Long, specJson: String, image: ByteArray?) {
         onMain { showSheetNow(generation, specJson, image) }
     }
 
-    /** [dismiss] for a sheet — `android_sheet.rs`'s `Host::dismiss`, on the main thread. */
+    /**
+     * Take sheet [generation] down programmatically → [OUTCOME_DISMISSED],
+     * after the alert above it ([cancelAlertOver]) — `android_sheet.rs`'s
+     * `Host::dismiss`, on the main thread. A stale `generation` is ignored.
+     */
     @JvmStatic
     fun dismissSheet(generation: Long) {
-        onMain { dismiss(generation) }
+        onMain {
+            val live = liveSheet?.takeIf { it.generation == generation }
+            resolveSheet(generation, OUTCOME_DISMISSED, -1)
+            closeQuietly(live?.dialog)
+        }
     }
 
     /**
@@ -353,7 +385,8 @@ object FrustNativePresenter {
     }
 
     private fun showSheetNow(generation: Long, specJson: String, image: ByteArray?) {
-        dismissStale()
+        closeStaleAlert()
+        closeStaleSheet()
         val activity = resumedActivity()
         if (activity == null) {
             nativeOnOutcome(generation, OUTCOME_NO_HOST, -1)
@@ -377,7 +410,7 @@ object FrustNativePresenter {
             if (spec.has("cornerRadius")) applyCornerRadius(sheet, spec.getDouble("cornerRadius").toFloat())
 
             val behavior = dialog.behavior
-            val live = LiveSheet(generation, behavior, sheet, detents)
+            val live = LiveSheet(generation, dialog, activity, behavior, sheet, detents)
             dialog.setCancelable(dismissible)
             behavior.isFitToContents = false
             behavior.skipCollapsed = true
@@ -395,24 +428,19 @@ object FrustNativePresenter {
                     override fun onSlide(bottomSheet: View, slideOffset: Float) {}
                 },
             )
-            dialog.setOnCancelListener { resolveOnce(generation, OUTCOME_CANCELLED, -1) }
+            dialog.setOnCancelListener { resolveSheet(generation, OUTCOME_CANCELLED, -1) }
             dialog.setOnDismissListener {
                 val action = live.pendingAction
                 if (action >= 0) {
-                    resolveOnce(generation, OUTCOME_ACTION, action)
+                    resolveSheet(generation, OUTCOME_ACTION, action)
                 } else {
-                    resolveOnce(generation, OUTCOME_CANCELLED, -1)
+                    resolveSheet(generation, OUTCOME_CANCELLED, -1)
                 }
             }
-            liveGeneration = generation
-            liveDialog = dialog
-            liveActivity = activity
             liveSheet = live
             dialog.show()
         } catch (t: Throwable) {
             Log.w(TAG, "Frust: native sheet failed to show (the app theme must derive from Theme.Material3.*): $t")
-            liveDialog = null
-            liveActivity = null
             liveSheet = null
             nativeOnOutcome(generation, OUTCOME_FAILED, -1)
         }
@@ -501,12 +529,18 @@ object FrustNativePresenter {
         for (index in 0 until spec.optInt("actionCount")) {
             val button = actionButton(context, spec.optInt("action${index}Role"), tint)
             button.text = spec.optString("action${index}Label")
+            val event = spec.optBoolean("action${index}Event", false)
             button.setOnClickListener {
                 val live = liveSheet
                 if (live != null && live.generation == generation && live.pendingAction < 0) {
-                    // Resolved by the dismiss listener, once the sheet is gone.
-                    live.pendingAction = index
-                    dialog.dismiss()
+                    if (event) {
+                        // An event row: reported, and the sheet stays up.
+                        nativeOnOutcome(generation, OUTCOME_ROW, index)
+                    } else {
+                        // Resolved by the dismiss listener, once the sheet is gone.
+                        live.pendingAction = index
+                        dialog.dismiss()
+                    }
                 }
             }
             addRow(button)
@@ -627,13 +661,26 @@ object FrustNativePresenter {
     private class SheetDetent(val full: Boolean, val ratio: Float)
 
     /**
-     * The live sheet beside [liveDialog]: its behavior and detents, the
-     * detent indices the half/full states currently stand for, the last
-     * detent reported (or applied), and the tapped action awaiting the
-     * dismissal (`-1` for none).
+     * The live alert: its generation, dialog and Activity, and the sheet it
+     * is shown over (`0` for none).
+     */
+    private class LiveAlert(
+        val generation: Long,
+        val dialog: Dialog,
+        val activity: Activity,
+        val overSheet: Long,
+    )
+
+    /**
+     * The live sheet: its generation, dialog and Activity, its behavior and
+     * detents, the detent indices the half/full states currently stand for,
+     * the last detent reported (or applied), and the tapped action awaiting
+     * the dismissal (`-1` for none).
      */
     private class LiveSheet(
         val generation: Long,
+        val dialog: Dialog,
+        val activity: Activity,
         val behavior: BottomSheetBehavior<FrameLayout>,
         val sheet: FrameLayout,
         val detents: List<SheetDetent>,
@@ -645,41 +692,68 @@ object FrustNativePresenter {
     }
 
     /**
-     * Resolve `generation`'s presentation exactly once: a no-op once
-     * [liveDialog] is `null` or belongs to a different generation — this
-     * object's own guard (class doc's *The live dialog*), independent of
-     * `android_alert.rs`'s own generation-keyed parking on the Rust side.
-     * Never closes the dialog itself: every caller of [resolveOnce] other
-     * than [dismiss]/[onActivityDestroyed] is itself one of the dialog's own
-     * listeners, which the framework is already in the middle of tearing the
-     * dialog down for.
+     * Resolve alert `generation` exactly once: a no-op once [liveAlert] is
+     * `null` or belongs to a different generation — this object's own guard
+     * (class doc's *The live dialogs*), independent of `android_host.rs`'s
+     * own generation-keyed parking on the Rust side. Never closes the dialog
+     * itself: every caller other than [endAlert]/[cancelAlertOver]/
+     * [onActivityDestroyed] is itself one of the dialog's own listeners,
+     * which the framework is already in the middle of tearing the dialog
+     * down for.
      */
-    private fun resolveOnce(generation: Long, code: Int, actionIndex: Int) {
-        if (liveGeneration != generation || liveDialog == null) return
-        liveDialog = null
-        liveActivity = null
+    private fun resolveAlert(generation: Long, code: Int, actionIndex: Int) {
+        if (liveAlert?.generation != generation) return
+        liveAlert = null
+        nativeOnOutcome(generation, code, actionIndex)
+    }
+
+    /**
+     * Resolve sheet `generation` exactly once, like [resolveAlert] — after
+     * taking the alert shown over it down ([cancelAlertOver]), so that alert
+     * always reports before the sheet does.
+     */
+    private fun resolveSheet(generation: Long, code: Int, actionIndex: Int) {
+        val live = liveSheet ?: return
+        if (live.generation != generation) return
+        cancelAlertOver(live)
         liveSheet = null
         nativeOnOutcome(generation, code, actionIndex)
     }
 
     /**
-     * Take an abandoned presentation's dialog down without reporting an
-     * outcome for it — `android_alert.rs`'s `Host::show_alert` has already
-     * resolved its Rust-side resolver directly (discarded on arrival, its
-     * receiver already gone) by the time this runs, so nothing is listening
-     * for whatever this dialog might still report.
+     * The sheet [sheet] is ending: close the alert shown over it, if any,
+     * reporting [OUTCOME_CANCELLED] for it first.
      */
-    private fun dismissStale() {
-        val dialog = liveDialog ?: return
-        liveDialog = null
-        liveActivity = null
+    private fun cancelAlertOver(sheet: LiveSheet) {
+        val alert = liveAlert ?: return
+        if (alert.overSheet != sheet.generation) return
+        resolveAlert(alert.generation, OUTCOME_CANCELLED, -1)
+        closeQuietly(alert.dialog)
+    }
+
+    /**
+     * Take an abandoned alert's dialog down without reporting an outcome for
+     * it — `android_alert.rs`/`android_sheet.rs` have already resolved its
+     * Rust-side resolver directly (discarded on arrival, its receiver
+     * already gone) by the time this runs, so nothing is listening for
+     * whatever this dialog might still report.
+     */
+    private fun closeStaleAlert() {
+        val live = liveAlert ?: return
+        liveAlert = null
+        closeQuietly(live.dialog)
+    }
+
+    /** [closeStaleAlert] for an abandoned sheet's dialog. */
+    private fun closeStaleSheet() {
+        val live = liveSheet ?: return
         liveSheet = null
-        closeQuietly(dialog)
+        closeQuietly(live.dialog)
     }
 
     /**
      * `dialog.dismiss()`, detaching its dismiss listener first (so it cannot
-     * re-enter [resolveOnce]) and swallowing whatever it throws — its window
+     * re-enter [resolveAlert]/[resolveSheet]) and swallowing whatever it throws — its window
      * may already be gone by the time a caller here needs it closed.
      */
     private fun closeQuietly(dialog: Dialog?) {
@@ -760,15 +834,19 @@ object FrustNativePresenter {
                 }
                 created.removeAll { it.get().let { live -> live == null || live === activity } }
                 FrustNativeChrome.onActivityDestroyed(activity)
-                // The dialog [liveDialog] is attached to is going away with
-                // its Activity (a configuration change, e.g. rotation, or
-                // the user leaving the app) — report HostLost and take it
-                // down, rather than let it leak a destroyed window.
-                if (liveActivity === activity) {
-                    val generation = liveGeneration
-                    val dialog = liveDialog
-                    resolveOnce(generation, OUTCOME_HOST_LOST, -1)
-                    closeQuietly(dialog)
+                // The dialogs attached to it are going away with their
+                // Activity (a configuration change the Activity does not
+                // handle itself, or the user leaving the app) — report
+                // HostLost and take them down, rather than let them leak a
+                // destroyed window. The sheet goes first: it takes the alert
+                // shown over it with it, reported Cancelled before the sheet.
+                liveSheet?.takeIf { it.activity === activity }?.let {
+                    resolveSheet(it.generation, OUTCOME_HOST_LOST, -1)
+                    closeQuietly(it.dialog)
+                }
+                liveAlert?.takeIf { it.activity === activity }?.let {
+                    resolveAlert(it.generation, OUTCOME_HOST_LOST, -1)
+                    closeQuietly(it.dialog)
                 }
             }
         }

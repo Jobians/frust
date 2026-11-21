@@ -44,7 +44,9 @@
 //! is on screen, and its handlers are blocks this crate built — so the arm
 //! parks everything the presentation needs (its controller, its blocks, its
 //! delegate, its sender) in [`LIVE`], one entry tagged with the
-//! presentation's generation, until the terminal outcome. Every later touch
+//! presentation's generation, until the terminal outcome. `LIVE` holds at
+//! most one entry per kind ([`LivePresentation::is_sheet`]): an alert
+//! presented over a sheet is parked beside it. Every later touch
 //! — a handler firing, [`AlertHost::dismiss`](super::AlertHost::dismiss),
 //! the host going away — takes the entry back **by generation**: a stale
 //! callback for a finished presentation finds nothing and does nothing, and
@@ -238,6 +240,33 @@ pub(crate) trait LivePresentation: Any {
     /// `take_down` typically makes once its platform UI is confirmed on
     /// screen.
     fn dismiss(self: Box<Self>, mtm: MainThreadMarker, then: Option<AfterDismiss>);
+
+    /// Whether this is a sheet — the kind [`LIVE`] keeps one entry of beside
+    /// one alert. Alerts keep the default.
+    fn is_sheet(&self) -> bool {
+        false
+    }
+}
+
+/// Take each of `displaced` down in order — through
+/// [`LivePresentation::dismiss`], each from the previous one's completion —
+/// then run `then`: how an arm clears every abandoned presentation still on
+/// screen (an alert above its sheet goes first) before presenting its own.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+pub(crate) fn dismiss_all_then(
+    mtm: MainThreadMarker,
+    mut displaced: Vec<Box<dyn LivePresentation>>,
+    then: AfterDismiss,
+) {
+    if displaced.is_empty() {
+        then(mtm);
+        return;
+    }
+    let first = displaced.remove(0);
+    first.dismiss(
+        mtm,
+        Some(Box::new(move |mtm| dismiss_all_then(mtm, displaced, then))),
+    );
 }
 
 /// [`LivePresentation::dismiss`]'s three-way decision once a presentation is
@@ -295,43 +324,80 @@ struct LiveEntry {
 }
 
 thread_local! {
-    /// The one live presentation, if any. Main thread only.
-    static LIVE: RefCell<Option<LiveEntry>> = const { RefCell::new(None) };
+    /// The live presentations — at most one alert and one sheet. Main
+    /// thread only.
+    static LIVE: RefCell<Vec<LiveEntry>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Remove and answer the first entry matching `pick`.
+fn take_where(pick: impl Fn(&LiveEntry) -> bool) -> Option<Box<dyn LivePresentation>> {
+    LIVE.with(|live| {
+        let mut entries = live.borrow_mut();
+        let index = entries.iter().position(pick)?;
+        Some(entries.remove(index).presentation)
+    })
 }
 
 /// Park `presentation` as the live entry for `generation`, answering the
-/// entry it displaced, if any — one whose caller dropped the future (which
-/// frees the Busy slot, not the platform UI). The arm decides what to do
-/// with a displaced entry (typically [`LivePresentation::dismiss`] it, whose
-/// outcome then has no receiver and is discarded). Returned rather than
-/// dropped here so no arm code runs inside the `LIVE` borrow.
+/// entry **of the same kind** it displaced, if any — one whose caller dropped
+/// the future (which frees the Busy slot, not the platform UI). The arm
+/// decides what to do with a displaced entry (typically
+/// [`LivePresentation::dismiss`] it, whose outcome then has no receiver and
+/// is discarded). Returned rather than dropped here so no arm code runs
+/// inside the `LIVE` borrow.
 pub(crate) fn install_live(
     _mtm: MainThreadMarker,
     generation: u64,
     presentation: Box<dyn LivePresentation>,
 ) -> Option<Box<dyn LivePresentation>> {
+    let sheet = presentation.is_sheet();
+    let displaced = take_where(|entry| entry.presentation.is_sheet() == sheet);
     LIVE.with(|live| {
-        live.borrow_mut()
-            .replace(LiveEntry {
-                generation,
-                presentation,
-            })
-            .map(|displaced| displaced.presentation)
+        live.borrow_mut().push(LiveEntry {
+            generation,
+            presentation,
+        });
+    });
+    displaced
+}
+
+/// Take the parked entry of the kind `sheet` names out unless it is
+/// `keep`'s — an abandoned presentation a newer one replaces (the iOS alert
+/// arm takes a sheet that is not the one it presents over; the sheet arm
+/// takes any alert).
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+pub(crate) fn take_stale(
+    _mtm: MainThreadMarker,
+    sheet: bool,
+    keep: Option<u64>,
+) -> Option<Box<dyn LivePresentation>> {
+    take_where(|entry| entry.presentation.is_sheet() == sheet && Some(entry.generation) != keep)
+}
+
+/// Whether `generation` is parked right now — the iOS alert arm's check
+/// that the sheet it was accepted over is still on screen.
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+pub(crate) fn is_parked(_mtm: MainThreadMarker, generation: u64) -> bool {
+    LIVE.with(|live| {
+        live.borrow()
+            .iter()
+            .any(|entry| entry.generation == generation)
     })
 }
 
-/// Take the live entry out unconditionally, regardless of generation —
+/// Take a live entry out unconditionally, regardless of generation —
 /// unlike [`take_live`]/[`take_live_as`], which only ever take *their own*
 /// presentation. For an arm that must take a displaced presentation down
 /// **before** it can be mistaken for something else: macOS's `start` calls
 /// this ahead of [`presenting_anchor`], since an attached sheet becomes the
 /// key (and often main) window while it is up (module doc's *Host
-/// discovery*). Only the macOS arm needs this; the iOS arm re-discovers its
+/// discovery*). Only the macOS arm needs this — and macOS parks alerts only,
+/// so there is at most one entry to take; the iOS arm re-discovers its
 /// anchor from the displaced alert's own dismissal completion instead (see
 /// `apple_alert`'s module doc's *A displaced presentation*).
 #[cfg(target_os = "macos")]
 pub(crate) fn take_live_any(_mtm: MainThreadMarker) -> Option<Box<dyn LivePresentation>> {
-    LIVE.with(|live| live.borrow_mut().take().map(|entry| entry.presentation))
+    take_where(|_| true)
 }
 
 /// Take the live entry out, but only if it is still `generation`'s.
@@ -339,15 +405,7 @@ pub(crate) fn take_live(
     _mtm: MainThreadMarker,
     generation: u64,
 ) -> Option<Box<dyn LivePresentation>> {
-    LIVE.with(|live| {
-        let mut slot = live.borrow_mut();
-        match slot.as_ref() {
-            Some(entry) if entry.generation == generation => {
-                slot.take().map(|entry| entry.presentation)
-            }
-            _ => None,
-        }
-    })
+    take_where(|entry| entry.generation == generation)
 }
 
 /// [`take_live`] for an arm that needs its own concrete state back (to
@@ -357,17 +415,10 @@ pub(crate) fn take_live_as<P: LivePresentation>(
     _mtm: MainThreadMarker,
     generation: u64,
 ) -> Option<Box<P>> {
-    LIVE.with(|live| {
-        let mut slot = live.borrow_mut();
-        let matches = slot.as_ref().is_some_and(|entry| {
-            entry.generation == generation && (&*entry.presentation as &dyn Any).is::<P>()
-        });
-        if !matches {
-            return None;
-        }
-        let presentation: Box<dyn Any> = slot.take()?.presentation;
-        presentation.downcast::<P>().ok()
-    })
+    let presentation: Box<dyn Any> = take_where(|entry| {
+        entry.generation == generation && (&*entry.presentation as &dyn Any).is::<P>()
+    })?;
+    presentation.downcast::<P>().ok()
 }
 
 /// Programmatically dismiss presentation `generation` on the main thread: a
