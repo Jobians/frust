@@ -174,6 +174,27 @@
 //! backdrop colour, not a page override). The bars are restyled on install,
 //! for every new page, and on any apply whose spec flips it.
 //!
+//! # Search
+//!
+//! `ChromeSpec::search` is global, like the toolbar, so every page carries
+//! its own `UISearchController` on its navigation item (one controller can
+//! sit on one item only): no results controller, the frust body showing the
+//! results, `hidesNavigationBarDuringPresentation` and
+//! `obscuresBackgroundDuringPresentation` off, `hidesSearchBarWhenScrolling`
+//! off, the page defining the presentation context so the search presents
+//! inside it. `SearchPlacement::NavigationBar` asks for the integrated
+//! placement (iOS 16+, `respondsToSelector`-guarded); `Automatic` leaves it
+//! to UIKit. One `FrustChromeSearchDelegate` per install, retained by the
+//! chrome, is every controller's updater and delegate and its bar's
+//! delegate; it reports through `crate::chrome::deliver_event` and drops a
+//! repeat of the text the slot knows. The app's text and expanded state are
+//! applied quietly (no report), the expanded state on the shown page only,
+//! an expansion focusing the bar on the next main-queue turn and a collapse
+//! emptying it. The bar taking first responder ends frust's focus session,
+//! so a focused frust field blurs; a frust field taking the responder back
+//! leaves the search presented. A controller is unhooked
+//! (`detach_search`) before its page or the chrome goes.
+//!
 //! # Limitations
 //!
 //! `native-chrome-single-surface-containment`: one frust surface serves every
@@ -191,7 +212,7 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::{Retained, Weak};
-use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol};
+use objc2::runtime::{AnyClass, AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send, sel,
 };
@@ -199,10 +220,12 @@ use objc2_core_foundation::{CGFloat, CGRect};
 use objc2_foundation::{NSArray, NSData, NSString, ns_string};
 use objc2_ui_kit::{
     NSObjectUIAccessibility, UIAction, UIApplication, UIBarButtonItem, UIBarButtonItemStyle,
-    UIColor, UIImage, UIImageView, UIMenu, UIMenuElement, UIMenuElementAttributes,
-    UINavigationController, UINavigationItemLargeTitleDisplayMode, UIResponder,
-    UISceneActivationState, UITabBarController, UITraitCollection, UIUserInterfaceStyle, UIView,
-    UIViewAutoresizing, UIViewContentMode, UIViewController, UIWindow, UIWindowScene,
+    UIBarPositioningDelegate, UIColor, UIImage, UIImageView, UIMenu, UIMenuElement,
+    UIMenuElementAttributes, UINavigationController, UINavigationItemLargeTitleDisplayMode,
+    UINavigationItemSearchBarPlacement, UIResponder, UISceneActivationState, UISearchBar,
+    UISearchBarDelegate, UISearchController, UISearchControllerDelegate, UISearchResultsUpdating,
+    UITabBarController, UITraitCollection, UIUserInterfaceStyle, UIView, UIViewAutoresizing,
+    UIViewContentMode, UIViewController, UIWindow, UIWindowScene,
 };
 
 use super::FrustNativeControlTarget;
@@ -210,8 +233,9 @@ use super::theme::apply_user_interface_style;
 use crate::api::{TabIcon, TabId, TabItem};
 use crate::chrome::host::ChromeField;
 use crate::chrome::{
-    self, ActionItem, ChromeDiff, ChromeError, ChromeGeneration, ChromeHost, ChromeSpec, ChromeTap,
-    Leading, MenuItem, TopBarSpec, resolve_tap, shown_toolbar, toolbar_offset,
+    self, ActionItem, ChromeDiff, ChromeError, ChromeEvent, ChromeGeneration, ChromeHost,
+    ChromeSpec, ChromeTap, Leading, MenuItem, SearchEvent, SearchPlacement, SearchSpec, TopBarSpec,
+    resolve_tap, shown_toolbar, toolbar_offset,
 };
 use crate::controls::tab_bar::icon_decode_scale;
 
@@ -651,6 +675,8 @@ struct Page {
     id: Option<TabId>,
     nav: Retained<UINavigationController>,
     page: Retained<FrustChromePageController>,
+    /// The page's search controller while the spec has a search item.
+    search: Option<Retained<UISearchController>>,
 }
 
 /// Everything the installed chrome owns.
@@ -666,6 +692,10 @@ struct Chrome {
     spec: ChromeSpec,
     /// The delegate and bar-item target; both references to it are weak.
     target: Retained<FrustNativeControlTarget>,
+    /// Every page's search controller's updater and delegates (all weak
+    /// references): kept for exactly as long as the controllers, which
+    /// [`detach_search`] unhooks first.
+    search: Retained<FrustChromeSearchDelegate>,
     /// The native tab tap the app has not confirmed yet (module doc, Selection).
     pending: Option<NativeSelect>,
     /// Native tab taps so far: the last one's number.
@@ -699,6 +729,7 @@ impl Chrome {
             pages: Vec::new(),
             spec: spec.clone(),
             target: FrustNativeControlTarget::chrome_target(mtm),
+            search: FrustChromeSearchDelegate::new(mtm, generation),
             pending: None,
             taps: 0,
         };
@@ -762,6 +793,12 @@ impl Chrome {
                 rebadge_toolbar(page, &self.spec);
             }
         }
+        let (pages, search) = (&mut self.pages, &self.search);
+        for page in pages {
+            apply_search(mtm, page, spec.search.as_ref(), search, |field| {
+                diff.contains(field)
+            });
+        }
         // Animate only a push/pop inside the selected tab (module doc, Toolbar).
         let toolbar_changed = toolbar_was_shown != shown_toolbar(&self.spec).is_some();
         let animated = toolbar_changed && self.tabs.selectedIndex() == tab_before;
@@ -791,9 +828,11 @@ impl Chrome {
             let page = match old.iter().position(|page| page.id == id) {
                 Some(index) => old.remove(index),
                 None => {
-                    let page = Page::new(mtm, id);
+                    let mut page = Page::new(mtm, id);
                     apply_top(mtm, &page, self.spec.top.as_ref(), &self.target, |_| true);
                     apply_toolbar(mtm, &page, &self.spec, &self.target);
+                    let search = self.spec.search.as_ref();
+                    apply_search(mtm, &mut page, search, &self.search, |_| true);
                     apply_user_interface_style(&page.nav.navigationBar(), self.spec.dark);
                     paint_backdrop(page.page.view(), self.spec.dark);
                     page
@@ -810,6 +849,7 @@ impl Chrome {
             .then(|| self.snapshot_cover())
             .flatten();
         for page in old {
+            detach_search(&page, &self.search);
             page.page.release();
         }
         let navs: Vec<Retained<UIViewController>> = self
@@ -1001,6 +1041,7 @@ impl Chrome {
         self.target.detach_tab_bar_controller(&self.tabs);
         let stack: Vec<Retained<UIView>> = self.host.subviews().iter().collect();
         for page in &self.pages {
+            detach_search(page, &self.search);
             page.page.release();
         }
         detach_from_parent(&self.frust);
@@ -1264,7 +1305,12 @@ impl Page {
             UINavigationController::alloc(mtm),
             &page,
         );
-        Self { id, nav, page }
+        Self {
+            id,
+            nav,
+            page,
+            search: None,
+        }
     }
 
     /// Mirror `tab` onto the navigation controller's `tabBarItem`.
@@ -1624,6 +1670,278 @@ fn rebadge(
             .and_then(|tag| tag.checked_sub(offset));
         if let Some(action) = index.and_then(|index| actions.get(index)) {
             set_badge(&item, action.badge.as_deref());
+        }
+    }
+}
+
+/// Mirror the search item's `wants` fields onto `page` (module doc, Search):
+/// its `UISearchController` built or dropped, the placeholder and placement,
+/// the app's text and expanded state applied quietly. Expanding acts on the
+/// page holding the frust controller only (the one on screen).
+fn apply_search(
+    mtm: MainThreadMarker,
+    page: &mut Page,
+    search: Option<&SearchSpec>,
+    delegate: &FrustChromeSearchDelegate,
+    wants: impl Fn(ChromeField) -> bool,
+) {
+    let Some(search) = search else {
+        if wants(ChromeField::Search) {
+            detach_search(page, delegate);
+            page.search = None;
+        }
+        return;
+    };
+    if wants(ChromeField::Search) {
+        let controller = match &page.search {
+            Some(controller) => controller.clone(),
+            None => {
+                let controller = attach_search(mtm, page, delegate);
+                page.search = Some(controller.clone());
+                controller
+            }
+        };
+        let placeholder = NSString::from_str(&search.placeholder);
+        controller.searchBar().setPlaceholder(Some(&placeholder));
+        let item = page.page.navigationItem();
+        // `preferredSearchBarPlacement` is iOS 16+; earlier systems stack it.
+        if item.respondsToSelector(sel!(setPreferredSearchBarPlacement:)) {
+            item.setPreferredSearchBarPlacement(match search.placement {
+                SearchPlacement::NavigationBar => UINavigationItemSearchBarPlacement::Integrated,
+                _ => UINavigationItemSearchBarPlacement::Automatic,
+            });
+        }
+    }
+    let Some(controller) = page.search.clone() else {
+        return;
+    };
+    let bar = controller.searchBar();
+    if wants(ChromeField::SearchActive) && page.page.holds() {
+        let active = search.active;
+        if controller.isActive() != active {
+            delegate.quietly(|| controller.setActive(active));
+        }
+        if active {
+            delegate.note_active(true);
+            focus_search_bar(delegate.ivars().generation);
+        } else {
+            // Collapsing empties the field (the slot's model of it).
+            delegate.quietly(|| bar.setText(None));
+            delegate.note_active(false);
+            delegate.note_text("");
+        }
+    }
+    if wants(ChromeField::SearchText) {
+        let shown = bar.text().map(|text| text.to_string()).unwrap_or_default();
+        if shown != search.text {
+            delegate.quietly(|| bar.setText(Some(&NSString::from_str(&search.text))));
+        }
+        delegate.note_text(&search.text);
+    }
+}
+
+/// A fresh search controller on `page`'s navigation item, results shown by
+/// the frust body (no results controller), the navigation bar kept and the
+/// body left unobscured during the search, its updater and delegates
+/// `delegate`.
+fn attach_search(
+    mtm: MainThreadMarker,
+    page: &Page,
+    delegate: &FrustChromeSearchDelegate,
+) -> Retained<UISearchController> {
+    let controller =
+        UISearchController::initWithSearchResultsController(UISearchController::alloc(mtm), None);
+    controller.setSearchResultsUpdater(Some(ProtocolObject::from_ref(delegate)));
+    controller.setDelegate(Some(ProtocolObject::from_ref(delegate)));
+    controller
+        .searchBar()
+        .setDelegate(Some(ProtocolObject::from_ref(delegate)));
+    controller.setObscuresBackgroundDuringPresentation(false);
+    controller.setHidesNavigationBarDuringPresentation(false);
+    // The presentation stays inside this page, not over the tab bar controller.
+    page.page.setDefinesPresentationContext(true);
+    let item = page.page.navigationItem();
+    item.setSearchController(Some(&controller));
+    item.setHidesSearchBarWhenScrolling(false);
+    controller
+}
+
+/// Unhook and remove `page`'s search controller, if any: its weak updater
+/// and delegate references cleared before [`FrustChromeSearchDelegate`] can
+/// go, a shown search dismissed quietly.
+fn detach_search(page: &Page, delegate: &FrustChromeSearchDelegate) {
+    let Some(controller) = &page.search else {
+        return;
+    };
+    if controller.isActive() {
+        delegate.quietly(|| controller.setActive(false));
+    }
+    controller.setSearchResultsUpdater(None);
+    controller.setDelegate(None);
+    controller.searchBar().setDelegate(None);
+    page.page.navigationItem().setSearchController(None);
+}
+
+/// Make the shown page's search bar first responder on the next main-queue
+/// turn, once the activation just made has presented it; generation
+/// `generation`'s chrome only, and a bar out of the window is left alone.
+fn focus_search_bar(generation: u64) {
+    on_main(move |mtm| {
+        with_chrome(mtm, generation, |chrome| {
+            let shown = chrome.pages.iter().find(|page| page.page.holds());
+            let Some(controller) = shown.and_then(|page| page.search.as_ref()) else {
+                return;
+            };
+            let bar = controller.searchBar();
+            if bar.window().is_some() && !bar.isFirstResponder() {
+                bar.becomeFirstResponder();
+            }
+        });
+    });
+}
+
+/// [`FrustChromeSearchDelegate`]'s state.
+struct SearchIvars {
+    /// The chrome generation every report is stamped with.
+    generation: u64,
+    /// Set while the chrome changes a search controller itself.
+    applying: Cell<bool>,
+    /// The text the slot knows the field holds.
+    reported: RefCell<String>,
+    /// Whether the field was last reported (or applied) expanded.
+    active: Cell<bool>,
+}
+
+define_class!(
+    // SAFETY:
+    // - `NSObject` has no subclassing requirements.
+    // - The ivars are plain Rust values with no `Drop` beyond a `String`,
+    //   which the generated `dealloc` drops without touching the object.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = SearchIvars]
+    struct FrustChromeSearchDelegate;
+
+    unsafe impl NSObjectProtocol for FrustChromeSearchDelegate {}
+
+    unsafe impl UIBarPositioningDelegate for FrustChromeSearchDelegate {}
+
+    unsafe impl UISearchResultsUpdating for FrustChromeSearchDelegate {
+        /// Every text change (marked IME text included, as UIKit reports
+        /// it), and the presentation itself: a repeat is not reported.
+        #[unsafe(method(updateSearchResultsForSearchController:))]
+        fn update_search_results(&self, controller: &UISearchController) {
+            self.guarded("updateSearchResultsForSearchController:", || {
+                let text = controller
+                    .searchBar()
+                    .text()
+                    .map(|text| text.to_string())
+                    .unwrap_or_default();
+                self.text_changed(text);
+            });
+        }
+    }
+
+    unsafe impl UISearchBarDelegate for FrustChromeSearchDelegate {
+        /// The field took the keyboard: a focused frust text field blurs.
+        #[unsafe(method(searchBarTextDidBeginEditing:))]
+        fn text_did_begin_editing(&self, _bar: &UISearchBar) {
+            self.guarded("searchBarTextDidBeginEditing:", chrome::release_frust_focus);
+        }
+
+        /// The keyboard's search key: submit, then lower the keyboard.
+        #[unsafe(method(searchBarSearchButtonClicked:))]
+        fn search_button_clicked(&self, bar: &UISearchBar) {
+            self.guarded("searchBarSearchButtonClicked:", || {
+                let text = bar.text().map(|text| text.to_string()).unwrap_or_default();
+                self.ivars().reported.replace(text.clone());
+                self.report(SearchEvent::Submitted(text));
+                bar.resignFirstResponder();
+            });
+        }
+    }
+
+    unsafe impl UISearchControllerDelegate for FrustChromeSearchDelegate {
+        #[unsafe(method(willPresentSearchController:))]
+        fn will_present(&self, _controller: &UISearchController) {
+            self.guarded("willPresentSearchController:", || {
+                if !self.ivars().active.replace(true) {
+                    self.report(SearchEvent::Began);
+                }
+            });
+        }
+
+        /// Cancel: a non-empty field reports its emptying, then the end.
+        #[unsafe(method(willDismissSearchController:))]
+        fn will_dismiss(&self, _controller: &UISearchController) {
+            self.guarded("willDismissSearchController:", || {
+                self.text_changed(String::new());
+                if self.ivars().active.replace(false) {
+                    self.report(SearchEvent::Ended);
+                }
+            });
+        }
+    }
+);
+
+impl FrustChromeSearchDelegate {
+    fn new(mtm: MainThreadMarker, generation: u64) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(SearchIvars {
+            generation,
+            applying: Cell::new(false),
+            reported: RefCell::new(String::new()),
+            active: Cell::new(false),
+        });
+        // SAFETY: `NSObject`'s `init` on a freshly allocated instance whose
+        // ivars are set (the page controller's idiom).
+        unsafe { msg_send![super(this), init] }
+    }
+
+    /// Run `f` with every report suppressed: what it changes is the app's
+    /// doing, applied from the spec, not the user's.
+    fn quietly(&self, f: impl FnOnce()) {
+        let was = self.ivars().applying.replace(true);
+        f();
+        self.ivars().applying.set(was);
+    }
+
+    fn note_text(&self, text: &str) {
+        let mut reported = self.ivars().reported.borrow_mut();
+        reported.clear();
+        reported.push_str(text);
+    }
+
+    fn note_active(&self, active: bool) {
+        self.ivars().active.set(active);
+    }
+
+    /// Report `text` as the field's new text unless it is what the slot
+    /// already knows, or the chrome is applying.
+    fn text_changed(&self, text: String) {
+        if self.ivars().applying.get() || *self.ivars().reported.borrow() == text {
+            self.note_text(&text);
+            return;
+        }
+        self.note_text(&text);
+        self.report(SearchEvent::Changed(text));
+    }
+
+    /// Hand `event` to the slot, which re-checks it against the live spec;
+    /// nothing while the chrome is applying.
+    fn report(&self, event: SearchEvent) {
+        if self.ivars().applying.get() {
+            return;
+        }
+        let generation = self.ivars().generation;
+        if !chrome::deliver_event(generation, &ChromeEvent::Search(event)) {
+            log::debug!("frust-native-widgets: a chrome search report was dropped");
+        }
+    }
+
+    /// Run a UIKit callback's body under `catch_unwind`.
+    fn guarded(&self, which: &str, f: impl FnOnce()) {
+        if catch_unwind(AssertUnwindSafe(f)).is_err() {
+            log::warn!("frust-native-widgets: panic caught in {which} — search report dropped");
         }
     }
 }
