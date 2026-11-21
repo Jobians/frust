@@ -12,9 +12,9 @@
 //! The map is keyed by the `TypeId` of a zero-sized marker type the macro declares for each item,
 //! and holds each value behind an `Rc`. No borrow of the map is held while user code runs: an
 //! access looks the entry up and clones the `Rc`, and a miss releases the borrow before running the
-//! init expression, then inserts only if the entry is still absent. So an init expression, an
-//! accessor's closure or a value's `Drop` may use any slot, the same one included, without a
-//! `RefCell` panic.
+//! init expression, then inserts only if the entry is still absent. So an accessor's closure or a
+//! value's `Drop` may use any slot, the same one included, without a `RefCell` panic, and an init
+//! expression may use any other slot (one that reads its own slot recurses, as with `thread_local!`).
 //!
 //! # Teardown
 //!
@@ -77,7 +77,9 @@ impl SlotMap {
 /// It is for per-thread state in app or plugin code: on Android every `thread_local!` static
 /// takes one of the process's 128 pthread keys and running out aborts the app (limitation
 /// `android-thread-local-key-limit`), while every `ThreadSlot` in the process shares one per-thread
-/// map, so a slot spends none. Migrating a `thread_local!` block is a one-word change.
+/// map, so a slot spends none. The declaration reads like a `thread_local!` block, but the accessors
+/// differ from `LocalKey`'s: `get` clones the whole value and `set` replaces it (for a `Cell` or
+/// `RefCell` slot, reach the inner value through [`with`](Self::with)).
 ///
 /// ```
 /// use frust::{GetUntracked, RwSignal, Set};

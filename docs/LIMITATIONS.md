@@ -3262,7 +3262,7 @@ upper bound for that library and ignores keys taken by non-Rust code. A debug An
 and warns when fewer than 24 are free.
 
 **Evidence**: `scripts/ci/tls-key-count.sh`'s header; `examples/native-widgets-demo/src/pages/common.rs`'s
-`local_sig!` and `LOCAL_SLOTS` (the demo's page signals moved into one type-keyed map, after which
+`local_sig!` (the demo's page signals share one type-keyed map, now `frust::thread_slot!`'s, after which
 the demo no longer aborted on text-field focus); the OnePlus 9 (Android 15) chrome-additions row and the `Android (pthread keys)` row (2026-11-22) of `examples/native-widgets-demo/README.md` (every number above); `crates/frust/src/thread_slot.rs`; `crates/frust-shell-android/src/tls_keys.rs`.
 
 ---
