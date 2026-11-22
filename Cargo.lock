@@ -2587,6 +2587,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "frust-models"
+version = "0.6.6"
+dependencies = [
+ "frust-paths",
+ "log",
+ "objc2 0.6.4",
+ "objc2-foundation 0.3.2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "frust-native-widgets"
 version = "0.6.6"
 dependencies = [
