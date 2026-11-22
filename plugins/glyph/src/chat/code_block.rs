@@ -14,9 +14,9 @@
 //!   `rich_text` each; an append changes only the last chunk's view, so
 //!   earlier chunks are not re-shaped. A selection stays inside one chunk;
 //!   the copy control copies the whole text.
-//! - **Max visible lines.** `.max_visible_lines(n)` collapses a longer block
-//!   to its first `n` lines under a show-all row, only while `.on_toggle(..)`
-//!   is set (a block that cannot expand is never cut).
+//! - **Max visible lines.** `.max_visible_lines(n)` cuts a longer block to
+//!   its first `n` lines (only those are built, hit and exposed) under a
+//!   show-all row, while `.on_toggle(..)` is set (else it is never cut).
 //! - **Copy.** A press writes the clipboard, then calls `.on_copy(..)` with
 //!   the exact text; the label reads "Copied" for a moment. While
 //!   `.streaming(true)` the control stays in place but inert.
@@ -190,8 +190,18 @@ impl<State: 'static> CodeBlockView<State> {
         self
     }
 
+    /// The line count a collapsed block is cut to, or `None` when every
+    /// line shows; mirrors [`CodeBlockWidget::collapsed`].
+    fn shown_lines(&self) -> Option<usize> {
+        let lines = line_ranges(&self.code).len();
+        self.max_visible_lines
+            .filter(|n| *n > 0 && lines > *n && self.on_toggle.is_some() && !self.expanded)
+    }
+
+    /// The body: while collapsed it holds only the visible lines, so its
+    /// hit testing and semantics match what is painted.
     fn body_view(&self) -> impl View<State> + use<State> {
-        let chunks = chunk_views(&self.code, &self.spans);
+        let chunks = chunk_views(&self.code, &self.spans, self.shown_lines());
         custom_scroll_view(column().children(chunks)).axis(ScrollAxis::Horizontal)
     }
 }
@@ -281,9 +291,12 @@ fn tone_span(text: &str, tone: CodeTone) -> frust::SpanView {
 }
 
 /// The body's views: one selectable paragraph per [`CHUNK_LINES`] lines.
-fn chunk_views(code: &str, spans: &[CodeSpan]) -> Vec<RichTextView> {
+/// With `max_lines`, only the first that many lines.
+fn chunk_views(code: &str, spans: &[CodeSpan], max_lines: Option<usize>) -> Vec<RichTextView> {
     let spans = clean_spans(code, spans);
-    line_ranges(code)
+    let mut lines = line_ranges(code);
+    lines.truncate(max_lines.unwrap_or(usize::MAX));
+    lines
         .chunks(CHUNK_LINES)
         .map(|lines| {
             let mut pieces = Vec::new();
@@ -465,7 +478,10 @@ impl<State: 'static> View<State> for CodeBlockView<State> {
         let mut flags = ChangeFlags::NONE;
         element.on_copy = self.on_copy.as_ref().map(erase_callback_arg);
         element.on_toggle = self.on_toggle.as_ref().map(erase_callback);
-        if prev.code != self.code || prev.spans != self.spans {
+        if prev.code != self.code
+            || prev.spans != self.spans
+            || prev.shown_lines() != self.shown_lines()
+        {
             element.code = self.code.clone();
             element.lines = line_ranges(&self.code).len();
             flags |= rebuild_child(&prev.body_view(), &self.body_view(), &mut element.body, ctx);
@@ -501,7 +517,7 @@ impl Widget for CodeBlockWidget {
         self.header_h = self.label_h + style::PAD_SMALL * 2.0;
         let btn_w = self.copy_w() + style::PAD_SMALL * 2.0;
         self.copy_rect = Rect::new(
-            self.width - btn_w - style::PAD_SMALL,
+            (self.width - btn_w - style::PAD_SMALL).max(0.0),
             0.0,
             self.width,
             self.header_h,
@@ -509,13 +525,12 @@ impl Widget for CodeBlockWidget {
         self.body_y = self.header_h + style::PAD_SMALL;
 
         let body_w = (self.width - style::PAD * 2.0).max(0.0);
-        let natural = self.lines as f64 * self.line_h;
         let shown = match (self.limit(), self.collapsed()) {
-            (Some(n), true) => n as f64 * self.line_h,
-            _ => natural,
+            (Some(n), true) => n,
+            _ => self.lines,
         };
-        self.visible_h = shown.min(natural);
-        let body_bc = BoxConstraints::tight(Size::new(body_w, natural));
+        self.visible_h = shown as f64 * self.line_h;
+        let body_bc = BoxConstraints::tight(Size::new(body_w, self.visible_h));
         self.body.layout_child(ctx, &body_bc);
         self.body.set_origin(Point::new(style::PAD, self.body_y));
 
@@ -845,15 +860,15 @@ mod tests {
 
     #[test]
     fn appending_a_line_changes_only_the_last_chunk_view() {
-        let before = chunk_views(&numbered(40), &[]);
-        let after = chunk_views(&numbered(41), &[]);
+        let before = chunk_views(&numbered(40), &[], None);
+        let after = chunk_views(&numbered(41), &[], None);
         assert_eq!(before.len(), 3);
         assert_eq!(after.len(), 3);
         assert_eq!(before[0], after[0]);
         assert_eq!(before[1], after[1]);
         assert_ne!(before[2], after[2]);
-        let grown = chunk_views(&numbered(48), &[]);
-        let spill = chunk_views(&numbered(49), &[]);
+        let grown = chunk_views(&numbered(48), &[], None);
+        let spill = chunk_views(&numbered(49), &[], None);
         assert_eq!(spill.len(), grown.len() + 1);
         assert_eq!(&spill[..3], &grown[..]);
     }
@@ -993,6 +1008,51 @@ mod tests {
         rig.show(|_| code_block(numbered(30)).max_visible_lines(5));
         let uncut = rig.block();
         assert!(uncut.height() > short.height(), "no toggle, no limit");
+    }
+
+    #[test]
+    fn a_collapsed_body_covers_only_its_visible_lines() {
+        let view = |expanded: bool| {
+            move |_: &mut App| {
+                code_block(numbered(30))
+                    .max_visible_lines(5)
+                    .expanded(expanded)
+                    .on_toggle(|app: &mut App| app.toggles += 1)
+            }
+        };
+        let mut rig = Rig::new(true, 400.0);
+        rig.show(view(false));
+        let block = rig.block();
+        for chunk in rig.node("RichTextWidget") {
+            assert!(
+                chunk.y1 <= block.y1 + 0.01,
+                "a chunk runs past {block:?}: {chunk:?}"
+            );
+        }
+        let update = rig.root.semantics();
+        let mut texts = Vec::new();
+        for (_, node) in &update.nodes {
+            if let Some(b) = node.bounds().filter(|_| node.role() != Role::Window) {
+                let inside = b.x0 >= block.x0 - 0.01
+                    && b.x1 <= block.x1 + 0.01
+                    && b.y0 >= block.y0 - 0.01
+                    && b.y1 <= block.y1 + 0.01;
+                assert!(inside, "{:?} {b:?} outside {block:?}", node.role());
+            }
+            texts.extend(node.label().map(str::to_owned));
+            texts.extend(node.value().map(str::to_owned));
+        }
+        let all = texts.join("\n");
+        assert!(all.contains("line 5"), "the visible lines are exposed");
+        assert!(!all.contains("line 6"), "a hidden line is not: {all}");
+        rig.show(view(true));
+        let update = rig.root.semantics();
+        let expanded = update.nodes.iter().any(|(_, n)| {
+            n.value()
+                .or(n.label())
+                .is_some_and(|t| t.contains("line 30"))
+        });
+        assert!(expanded, "expanded, every line is exposed");
     }
 
     #[test]
