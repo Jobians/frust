@@ -3436,33 +3436,38 @@ that reaches an owner without a full walk.
 
 ---
 
-### `selection-toolbar-no-handles-magnifier-v1` — the framework selection route ships the bar alone: no drag handles, no magnifier
+### `selection-toolbar-no-handles-magnifier-v1` — the framework selection route has no magnifier, and a text field has no drag handles
 
-**Observed**: under `SelectionToolbarPolicy::Framework` a field's selection affordance is the
+**Observed**: under `SelectionToolbarPolicy::Framework` a `TextInput`'s selection affordance is the
 floated toolbar and nothing else. There are no draggable handles at the selection's ends, so the
 only pointer route that adjusts a selection is a drag still belonging to the press that made it
 (by word after a long-press, by cluster otherwise) — once the finger is up, a selection can be
 re-made but not adjusted, since the next primary `Down` puts the bar away and starts over. A
-hardware keyboard's Shift+arrows still extend one. And there is no magnifier loupe over the caret or the grab point,
-so on a touch device the finger covers exactly what it is positioning. Neither surface exists
-anywhere in the widget tier: this is absence, not degradation.
+hardware keyboard's Shift+arrows still extend one. A selectable `rich_text` block does draw a
+handle at each end of its selection on touch (an Android-shaped stem and knob, dragged by grapheme),
+so a block's selection can be adjusted after the finger lifts. Neither widget has a magnifier loupe
+over the caret or the grab point, so on a touch device the finger covers exactly what it is
+positioning. The loupe exists nowhere in the widget tier: this is absence, not degradation.
 
 **Applies to**: every platform on the framework route — Android, desktop and web. iOS is
-unaffected: it selects `SelectionToolbarPolicy::Native` and gets UIKit's own handles and loupe.
+unaffected for `TextInput`: it selects `SelectionToolbarPolicy::Native` and gets UIKit's own handles
+and loupe. A selectable `rich_text` block draws its own handles under either policy and has no
+native counterpart, so it has no loupe on iOS either.
 
-**Why accepted**: handles and a loupe are each a rendered, hit-tested, platform-flavoured surface
-in their own right, and the bar is what makes the clipboard verbs reachable at all — the distance
-between "no way to copy" and "copy works, adjusting a selection does not" is the one worth closing
-first. A design system that wants them is not blocked: the builder seam replaces the whole floated
-view.
+**Why accepted**: a loupe is a rendered, hit-tested, platform-flavoured surface in its own right,
+and the bar is what makes the clipboard verbs reachable at all — the distance between "no way to
+copy" and "copy works, adjusting a selection does not" is the one worth closing first. A design
+system that wants handles for a field or a loupe is not blocked: the builder seam replaces the
+whole floated view.
 
 **Evidence**: `crates/frust-widgets/src/selection_toolbar.rs` (the entire baseline view — a pill of
 verb buttons and nothing else); `crates/frust-widgets/src/textinput.rs`'s "Selection gestures and
 the toolbar" section, which enumerates the four gestures that reach a selection, none of them a
-handle drag.
+handle drag; `crates/frust-widgets/src/text_selection.rs` ("Handles") and the "Selection" section
+of `crates/frust-widgets/src/rich_text.rs` for the block's handles.
 
-**Trigger for removal**: a handle and loupe surface in the widget tier, which needs a second
-floated-surface owner per field and a magnifier able to sample the painted scene.
+**Trigger for removal**: a loupe in the widget tier, which needs a magnifier able to sample the
+painted scene, and handles on `TextInput`, which need a second floated-surface owner per field.
 
 ---
 
@@ -3718,10 +3723,16 @@ in one respect a worse failure than never advertising them, since the field's ow
 action offered and then refused is worse than one never offered, and this is that case one layer
 down. It is recorded here rather than left silent for exactly that reason. (2026-09-12)
 
+A selectable `rich_text` block has the same gap: it publishes Copy (while a selection exists) and
+Select all (while it is not wholly selected) on its paragraph node under the same ids, and the same
+dropped `data` leaves both uninvocable. The open finding for this seam is not fixed and covers both
+widgets.
+
 **Applies to**: every platform with an accessibility adapter — the desktop shells and both mobile
-bridges alike, since the seam that drops `data` is the shared one. The field's own half is
-complete: every verb already has a route into its command handler the moment one arrives as an
-`InputEvent::EditCommand`, which is precisely what a shell dispatches for a platform edit menu.
+bridges alike, since the seam that drops `data` is the shared one — for `TextInput` and for
+`RichTextView::selectable`. Each widget's own half is complete: every verb already has a route into
+its command handler the moment one arrives as an `InputEvent::EditCommand`, which is precisely what
+a shell dispatches for a platform edit menu.
 
 **Why accepted**: closing it is not a widget change. `RenderRoot::perform_accessibility_action`,
 `AppTree::perform_accessibility_action` and the `Widget` trait have to widen together — the seam
@@ -3734,10 +3745,11 @@ technology" section ("What is still missing is the dispatch, and it does not liv
 `A11Y_CUT_ID` neighbours' `set_custom_actions` publication;
 `crates/frust-shell-common/src/app_tree.rs`'s `AppTree::perform_accessibility_action` signature;
 `crates/frust-core/src/app/semantics.rs`'s `RenderRoot::perform_accessibility_action` (a `Click` arm, a
-`Focus` arm, nothing else).
+`Focus` arm, nothing else); `crates/frust-widgets/src/rich_text.rs`'s "Selection" section (the block's
+custom actions) and `crates/frust-widgets/src/text_selection.rs`'s shared id space.
 
 **Trigger for removal**: the three widened together, proven by a custom action invoked from a real
-screen reader landing as an `EditCommand` in the focused field.
+screen reader landing as an `EditCommand` in the focused field or selectable block.
 
 ---
 
@@ -4674,8 +4686,10 @@ eased offset ramp), publishing each frame's value into a caller-owned signal rat
 **Applies to**: `frust-shadcn`'s and `frust-beui`'s `message_scroller`; `frust-beui`'s `scroll_to`.
 A baseline `ScrollView` feel/physics tuning has no mechanism to propagate into either
 `message_scroller` copy and will silently drift. Neither port gets overscroll rubber-band or
-pull-to-refresh either, for the same reason: a transcript's live edge is not `ScrollView`'s own
-rubber-band surface, and riding the baseline surface through the controller is what would bring it.
+pull-to-refresh either. A keyed variable-extent `ListView` now has a live-edge mode
+(`.stick_to_end(true)`, with `on_stick_change`, `ListViewWidget::is_stuck_to_end` and
+`ScrollController::jump_to_end`/`animate_to_end`) on the baseline surface, which is what migrating a
+port would bring along with the baseline's overscroll and refresh.
 
 **Why accepted**: migrating each is per-catalog follow-up work now that the seam exists and is
 proven (`scroll_area`'s thumb drag), not a missing framework capability; each parallel
@@ -8348,19 +8362,198 @@ flush per `onStop`, 12.1 ms then 0.1 ms, none for the share sheet, and the cache
 
 ---
 
-### `rich-text-no-span-hit-test` — no per-span tap, link or semantics
+### `rich-text-link-no-focus-stop` — a `rich_text` link has no keyboard focus stop of its own
 
-**Observed**: a `rich_text` is one paragraph with one `Role::Label` semantics node whose value is the concatenated text. A span cannot be tapped, cannot act as a link, and has no semantics node of its own.
+**Observed**: a link span fires `on_link` on a primary tap only. The paragraph publishes one `Role::Link` child per link
+in its semantics, but a link has no Tab stop and no activation key, so a keyboard user cannot reach or follow one; the
+paragraph itself is not a stop unless it is `selectable`, and then the stop is the block, not a link.
 
-**Applies to**: apps that want inline links, tappable mentions or per-span accessibility actions inside a `rich_text`.
+**Applies to**: apps that put inline links in a `rich_text` and need them keyboard-operable on desktop or web.
 
-**Workaround**: lay the tappable pieces out as separate widgets (`TextView`s in gesture detectors) instead of spans of one paragraph.
+**Workaround**: offer the same destination as a focusable control (a button or link widget) beside the text.
 
-**Why accepted**: the layout API takes styled pieces without byte ranges, and a span hit-test and per-span semantics need a position-to-span query that no consumer has required yet.
+**Why accepted**: a link's focus ring, order inside a paragraph and activation key are a design of their own; the first
+cut makes the tap and the semantics node real and leaves keyboard traversal for a follow-up.
 
-**Trigger for removal**: a span hit-test API on the rich layout.
+**Trigger for removal**: per-link focus stops with a ring and an activation key.
 
-**Evidence**: (2026-11-07) `crates/frust-widgets/src/rich_text.rs`.
+**Evidence**: (2026-11-22) `crates/frust-widgets/src/rich_text.rs` (module docs: "with no focus stop of its own"); headless tests in `crates/frust-widgets/tests/rich_text_spans.rs`. Code and headless tests.
+
+---
+
+### `rich-text-link-past-reported-width-untappable` — a link painted outside the widget's width by an aligned line cannot be tapped
+
+**Observed**: link fragments come from the paragraph's layout geometry, but a press reaches the widget only inside its
+reported box. When an aligned line (centre or end alignment within a wider wrap width) paints a link past the width the
+widget reports, the part of the link outside that box receives no press, so a tap there does not fire `on_link`.
+
+**Applies to**: `rich_text` with `.align(..)` other than start whose reported width is narrower than the width its lines
+are aligned in.
+
+**Workaround**: keep link text on start-aligned lines, or give the block the full width it aligns in.
+
+**Why accepted**: the box a press is tested against is the widget's own, shared with every other gesture of the block; widening
+it for links alone is a layout change, not a hit-test one.
+
+**Trigger for removal**: a reported size that covers aligned lines, or a link hit test that is not clipped to it.
+
+**Evidence**: (2026-11-22) established from the code path (`inside` in `crates/frust-widgets/src/rich_text.rs` against the laid-out size) and a Phase review finding; not observed on a device.
+
+---
+
+### `rich-text-handle-knob-outside-last-line` — on a block's last line a selection handle's knob lies outside the hit area
+
+**Observed**: a selection handle is a stem along the caret plus a knob hanging below the line, with a hit area wider than
+what it paints. Presses are hit-tested against the block's box, and the knob below the last line lies outside it, so only
+the part of the hit area inside the box can be grabbed: on the last line the knob itself is not the target, the stem is.
+
+**Applies to**: a `selectable` `rich_text` block on touch, with a selection end on its last line; the handle still works,
+with a smaller target.
+
+**Workaround**: none in the framework; the stem and the part of the knob's hit area inside the box still grab the handle.
+
+**Why accepted**: handles are painted and tested by the block and the box is the hit-test region the framework gives it; a
+target outside the box needs a floated handle surface.
+
+**Trigger for removal**: handles hosted in a surface that is not bounded by the block's box.
+
+**Evidence**: (2026-11-22) `crates/frust-widgets/src/text_selection.rs` ("Handles": "a knob hangs below its line, so on the block's last line it lies outside the block's box"). Code and headless tests.
+
+---
+
+### `rich-text-selection-not-published-to-at` — a `rich_text` block's selected range is not exposed to assistive technology
+
+**Observed**: the block publishes its text on one label node, and Copy and Select all as custom actions
+(`selection-verbs-advertised-not-invocable`). The selected range itself is not published: an accesskit text selection names
+positions in `Role::TextRun` nodes, which the paragraph does not have, so a screen reader neither announces the selection
+nor can follow its handles.
+
+**Applies to**: `RichTextView::selectable` on every platform with an accessibility adapter.
+
+**Workaround**: none in the framework; the text stays readable as the paragraph label.
+
+**Why accepted**: publishing a range needs text-run children with per-run positions, which the one-node paragraph does not
+build; `TextInput` has the same absence.
+
+**Trigger for removal**: text-run semantics for the paragraph and a published selection.
+
+**Evidence**: (2026-11-22) `crates/frust-widgets/src/rich_text.rs` ("Selection" section: "The selected range itself is not published"). Code and headless tests.
+
+---
+
+### `rich-text-selectable-tap-keeps-field-focus` — a tap on a selectable block does not end a text field's focus
+
+**Observed**: a press on a selectable `rich_text` block keeps another widget's focus session (`EventCtx::keep_focus`), so
+a tap or a scroll on the block leaves a focused text field's caret and soft keyboard up. Only a gesture that selects moves
+focus to the block. Tapping selectable text is therefore not a way to dismiss the keyboard.
+
+**Applies to**: a screen with a text field and a `selectable` block (a chat with a composer and message text).
+
+**Workaround**: dismiss through a non-selectable area, the field's own submit or an explicit blur.
+
+**Why accepted**: this is deliberate: scrolling or tapping a message must not take the keyboard away from a composer; the
+cost is that the same tap cannot also dismiss it.
+
+**Trigger for removal**: a ruling that a tap with no selection outcome should end the focus session.
+
+**Evidence**: (2026-11-22) `crates/frust-widgets/src/rich_text.rs` ("Selection" section, focus paragraph); `crates/frust-widgets/tests/rich_text_selection.rs`. Headless tests only.
+
+---
+
+### `rich-text-mouse-drag-selects-not-scrolls` — a mouse drag on selectable text inside a scroll view selects instead of scrolling
+
+**Observed**: a mouse press-drag on a `selectable` block selects by grapheme and vetoes the takeover of every enclosing scroll
+surface, the desktop convention. Dragging the mouse over such text inside a `ScrollView` or `ListView` therefore never
+scrolls the list; the wheel, the scrollbar and a touch drag still do (a touch drag that is not a handle drag scrolls the
+parent).
+
+**Applies to**: desktop and web, a `selectable` block inside a scroll surface that the mouse would otherwise drag.
+
+**Workaround**: scroll with the wheel, the scrollbar or the keyboard; start the drag outside the text.
+
+**Why accepted**: it matches how desktop text behaves; selecting is the point of a mouse drag over text.
+
+**Trigger for removal**: not planned; this entry records the behaviour.
+
+**Evidence**: (2026-11-22) `crates/frust-widgets/src/rich_text.rs` ("Selection" section, Mouse bullet); `crates/frust-widgets/tests/rich_text_selection.rs`. Headless tests only.
+
+---
+
+### `rich-text-selection-single-block-no-autoscroll` — selection stops at one block and a drag does not autoscroll
+
+**Observed**: a selection lives inside one `rich_text` block, never across two (a drag past a block's edge clamps to its
+ends), and a selecting drag near the edge of a scroll view does not scroll it. Selecting a span of several messages, or
+text longer than the viewport, is not possible in one gesture.
+
+**Applies to**: `RichTextView::selectable` blocks inside a scroll surface, for example a transcript.
+
+**Workaround**: select within one block at a time; put long text in one block that is scrolled by wheel or touch before
+selecting its far end.
+
+**Why accepted**: a cross-block selection needs a selection scope above the blocks and a virtualized list that keeps a
+selection's rows alive; autoscroll needs the same scope to know the surface to move. Both are design work beyond one block.
+
+**Trigger for removal**: a selection scope spanning blocks, and a drag-to-autoscroll hook on the scroll surface.
+
+**Evidence**: (2026-11-22) `crates/frust-widgets/src/rich_text.rs` ("one block at a time, never across two"; a disposed block drops its selection). Code and headless tests.
+
+---
+
+### `list-stick-to-end-jump-away-pulled-back` — a programmatic jump away from a stuck list is pulled back when the end next moves
+
+**Observed**: on a `stick_to_end` list that is stuck, `ScrollController::jump_to` or `scroll_to_item` away from the end lands, and
+the list stays stuck: `is_stuck_to_end` stays `true` and no `on_stick_change` fires, because only a user's move releases it.
+The next layout that finds the end moved (a row grew or arrived, the viewport changed) pins the content back to the end,
+so the jump is undone without a user action.
+
+**Applies to**: keyed variable-extent `ListView` with `stick_to_end(true)`, while stuck.
+
+**Workaround**: turn `stick_to_end` off before navigating away programmatically; turning it back on sticks only a list
+already within the release threshold of the end.
+
+**Why accepted**: a programmatic command never releases by design (growth and commands must not unstick a list the user
+has not left); a command that means to leave the end needs the mode switched off first.
+
+**Trigger for removal**: a controller command that leaves the end and releases the list, or a ruling that a jump releases.
+
+**Evidence**: (2026-11-22) `crates/frust-widgets/src/list_view.rs` ("Stick to end" module section: "A `jump_to` or `scroll_to_item` away while stuck lands, and is pinned back by the next layout that finds the end moved"); a Phase review finding; `crates/frust-widgets/tests/list_stick_to_end.rs`. Headless tests only.
+
+---
+
+### `list-stick-to-end-fling-from-overscroll-loses-momentum` — a fling back from an overscrolled end of a stuck list loses its momentum
+
+**Observed**: when a user pulls a stuck list past its end and releases with velocity back toward the content, the fling does
+not carry its momentum: the end pin is held while any post-release motion is live and the fling's simulation fixes its
+bounds at release, so the momentum is lost (per a Phase review finding).
+
+**Applies to**: keyed variable-extent `ListView` with `stick_to_end(true)`, a release from beyond the end (bouncing
+overscroll physics).
+
+**Workaround**: none; a second drag scrolls on normally.
+
+**Why accepted**: the stuck list's end is the fixed anchor and the settle is the safe outcome; carrying momentum back through
+the pin needs the fling simulation to be re-bounded as the end moves.
+
+**Trigger for removal**: a fling that keeps its momentum when released from an overscrolled end of a stuck list.
+
+**Evidence**: (2026-11-22) a Phase review finding; `crates/frust-widgets/src/list_view.rs` ("Stick to end", release and re-stick paragraph); established from the code path and headless tests, not a device observation.
+
+---
+
+### `selection-and-stick-to-end-linux-headless-only` — selectable `rich_text` and `stick_to_end` have headless Linux evidence only
+
+**Observed**: `RichTextView::selectable` (long-press, handles, toolbar, mouse and keyboard gestures, the focus rules) and the
+keyed `ListView` live-edge mode (opening at the end, the same-frame pin, release and re-stick, the transition callback) are
+covered by headless tests run on Linux. No recorded run on an Android phone, an iPhone or macOS exists for the touch
+gestures, the handles, the soft keyboard interplay or the live edge under a real fling and keyboard resize.
+
+**Applies to**: all hosts; touch input, the soft keyboard and real frame pacing are what a headless test cannot show.
+
+**Why accepted**: the device gate walks these after they land; until it is recorded the behaviour is code and headless-test only.
+
+**Trigger for removal**: the device gate's results are recorded.
+
+**Evidence**: (2026-11-22) `crates/frust-widgets/tests/rich_text_selection.rs`, `crates/frust-widgets/tests/rich_text_spans.rs`, `crates/frust-widgets/tests/list_stick_to_end.rs`; no device run.
 
 ---
 
@@ -9084,7 +9277,9 @@ shows the guard works, not that it was needed. Notification display was not obse
 
 **Observed**: a keyed exact-extent `ListView` keeps its anchor row in place when rows change above the viewport, but rows inserted into the gap between the window's first buffered row (the leading buffer is 2 rows) and the viewport-top row, or the one row in that gap removed, go uncorrected. The scroll offset stays put and the content moves by their summed extent: up on removal, down on insert, however many rows were inserted. Removing the row that holds the top edge itself is likewise uncorrected: the next row takes its on-screen place. An edit at the window's first row or anywhere above it is corrected. The same probe serves the estimated keyed mode, so it is expected there too, but it was not observed there.
 
-**Applies to**: keyed `ListView`s (`builder_keyed`); for example a message deleted just off-screen.
+**Applies to**: keyed `ListView`s (`builder_keyed`) that are not stuck to their end; for example a message
+deleted just off-screen. A list under `stick_to_end` that is stuck anchors on its end instead of the
+viewport-top row, so the gap does not apply while it is stuck.
 
 **Workaround**: none in the framework. An app can compensate with `ScrollController::jump_to` by the summed extent of the rows edited.
 

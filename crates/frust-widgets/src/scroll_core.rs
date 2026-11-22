@@ -705,6 +705,17 @@ pub(crate) trait ScrollSurface {
     /// when [`ScrollSurface::handles_item_commands`]).
     fn apply_item_command(&mut self, _request: ScrollToItem) {}
 
+    /// A [`ScrollController::jump_to_end`] (`animated == false`) or
+    /// [`ScrollController::animate_to_end`] just applied against the maximum
+    /// this pass resolved; an owner that follows its end as it is measured
+    /// (a stick-to-end list) takes over from here.
+    fn after_end_command(&mut self, _animated: bool) {}
+
+    /// A jump this surface's own scrollbar recorded for the user just
+    /// applied (after [`ScrollSurface::after_jump`]): the move is the user's,
+    /// not a program's.
+    fn after_user_jump(&mut self) {}
+
     // --- Provided: the shared machinery. ---
 
     /// This surface's extent/position snapshot for the physics, reading
@@ -1000,6 +1011,22 @@ pub(crate) trait ScrollSurface {
                         ScrollCommand::AnimateTo(target, options) => {
                             self.apply_animate_to(target, options, reduce_motion);
                         }
+                        ScrollCommand::UserJumpTo(target) => {
+                            self.apply_jump(target);
+                            self.after_user_jump();
+                        }
+                        // The end is resolved here, against the extent this
+                        // pass knows — never a value fixed at record time.
+                        ScrollCommand::JumpToEnd => {
+                            let end = self.max_scroll_extent();
+                            self.apply_jump(end);
+                            self.after_end_command(false);
+                        }
+                        ScrollCommand::AnimateToEnd(options) => {
+                            let end = self.max_scroll_extent();
+                            self.apply_animate_to(end, options, reduce_motion);
+                            self.after_end_command(true);
+                        }
                     }
                 }
                 ControllerCommand::ScrollToItem(request) => self.apply_item_command(request),
@@ -1209,8 +1236,10 @@ pub(crate) trait ScrollSurface {
                 BarEvent::Pass => {}
                 BarEvent::Handled => return EventResult::Handled,
                 BarEvent::JumpTo(target) => {
+                    // Applied exactly like `jump_to`, but drained as the
+                    // user's move (`ScrollSurface::after_user_jump`).
                     if let Some(handle) = handle {
-                        handle.jump_to(target);
+                        handle.user_jump_to(target);
                     }
                     return EventResult::Handled;
                 }

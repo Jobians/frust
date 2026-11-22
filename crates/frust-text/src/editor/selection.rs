@@ -70,9 +70,15 @@ impl Selection {
     /// The word at the point nearest `(x, y)`: from the word boundary at or
     /// before the unit hit to the next one.
     pub(crate) fn word_from_point(layout: &EditLayout, x: f32, y: f32) -> Self {
-        let Some((mut u, _)) = layout.hit(x, y) else {
+        let Some((u, _)) = layout.hit(x, y) else {
             return Cursor::from_byte_index(layout, layout.text_len, Affinity::Upstream).into();
         };
+        Self::word_at_unit(layout, u)
+    }
+
+    /// The word holding unit `u`: from the word boundary at or before it to
+    /// the next one.
+    pub(crate) fn word_at_unit(layout: &EditLayout, mut u: usize) -> Self {
         if !layout.units[u].word_boundary
             && let Some(previous) = layout.previous_logical_word(u)
         {
