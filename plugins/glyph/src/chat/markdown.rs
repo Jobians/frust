@@ -13,7 +13,9 @@
 //!   by position; a block whose model (and streaming role) is unchanged keeps
 //!   its widget across a rebuild: no re-render, re-shape or layout.
 //! - **Parsing.** Only a changed source is parsed, and each change re-parses
-//!   the whole of it: coalesce streamed chunks to one update per frame.
+//!   the whole of it: coalesce streamed chunks to one update per frame. A
+//!   source over [`MARKDOWN_MAX_SOURCE_BYTES`] (256 KiB) is plain wrapped
+//!   text, never parsed.
 //! - **Streaming.** `.streaming(true)` draws a dots row under the last block,
 //!   marks an unclosed code fence as streaming and lets a trailing table keep
 //!   its column widths.
@@ -67,6 +69,15 @@ const CHECK_TOP: f64 = 3.0;
 const RULE_H: f64 = style::BLOCK_GAP;
 /// Bullet of a top-level list item (U+2022, present in the mono face).
 const BULLET: &str = "\u{2022}";
+/// Bytes per paragraph of a source shown as plain text.
+const PLAIN_CHUNK_BYTES: usize = 4 * 1024;
+
+/// The largest source [`markdown`] parses: a longer one is shown as plain
+/// wrapped text, unparsed. Every change re-parses the whole source, and the
+/// parse and the block diff grow with it; 256 KiB is far beyond an assistant
+/// reply (a few KiB) yet keeps one re-parse well inside a frame, and matches
+/// the order of the diff view's own per-side guard.
+pub const MARKDOWN_MAX_SOURCE_BYTES: usize = 256 * 1024;
 
 type OnText<State> = Rc<dyn Fn(&mut State, &str)>;
 
@@ -552,12 +563,54 @@ pub struct MarkdownWidget {
 
 impl MarkdownWidget {
     fn parse(&mut self, source: &str) -> Vec<MdBlock> {
+        if source.len() > MARKDOWN_MAX_SOURCE_BYTES {
+            return plain_blocks(source);
+        }
         #[cfg(test)]
         {
             self.parses += 1;
         }
         parse_markdown(source)
     }
+}
+
+/// `source` as plain text, unparsed: paragraphs of about
+/// [`PLAIN_CHUNK_BYTES`] cut at line ends (a longer line at a character
+/// boundary), each line ending in a hard break, so appends stay cheap.
+fn plain_blocks(source: &str) -> Vec<MdBlock> {
+    let mut blocks = Vec::new();
+    let mut lines: Vec<MdInline> = Vec::new();
+    let mut bytes = 0;
+    let mut flush = |lines: &mut Vec<MdInline>, bytes: &mut usize| {
+        if !lines.is_empty() {
+            blocks.push(MdBlock::Paragraph(std::mem::take(lines)));
+        }
+        *bytes = 0;
+    };
+    for line in source.split('\n') {
+        let mut rest = line.strip_suffix('\r').unwrap_or(line);
+        loop {
+            let mut cut = rest.len().min(PLAIN_CHUNK_BYTES);
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let (piece, tail) = rest.split_at(cut);
+            if !lines.is_empty() {
+                lines.push(MdInline::HardBreak);
+            }
+            lines.push(MdInline::Text(piece.to_owned()));
+            bytes += piece.len();
+            if bytes >= PLAIN_CHUNK_BYTES {
+                flush(&mut lines, &mut bytes);
+            }
+            if tail.is_empty() {
+                break;
+            }
+            rest = tail;
+        }
+    }
+    flush(&mut lines, &mut bytes);
+    blocks
 }
 
 impl<State: 'static> View<State> for MarkdownView<State> {
@@ -1164,6 +1217,46 @@ mod tests {
         assert_eq!(HEADING_SIZES[1], scale.title_large.size);
         assert_eq!(HEADING_SIZES[2], scale.body_large.size);
         assert_eq!(BODY_SIZE, scale.body_large.size);
+    }
+
+    #[test]
+    fn a_source_past_the_limit_is_plain_text_and_returns_promptly() {
+        let line = "# not a heading **not bold** [not a link](javascript:x)\n";
+        let mut source = line.repeat((1 << 20) / line.len());
+        source.push_str(&"x".repeat(64 * 1024));
+        assert!(source.len() >= 1 << 20);
+        let started = std::time::Instant::now();
+        let mut counter = 0u64;
+        let view = markdown::<App>(source.as_str());
+        let widget = View::<App>::build(&view, &mut BuildCtx::new(&mut counter));
+        assert_eq!(widget.parses, 0, "past the limit nothing is parsed");
+        assert!(
+            widget
+                .blocks
+                .iter()
+                .all(|b| matches!(b, MdBlock::Paragraph(_))),
+            "plain paragraphs only"
+        );
+        let mut rig = Rig::new(true, 320.0);
+        rig.show(|_| markdown(source.as_str()));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "took {elapsed:?}"
+        );
+        let texts = rig.texts();
+        assert!(texts[0].0.starts_with("# not a heading **not bold**"));
+        for (_, rect) in &texts {
+            assert!(rect.x1 <= 320.0 + 0.01, "{rect:?} past the width");
+        }
+        let shown: usize = texts.iter().map(|(t, _)| t.len()).sum();
+        assert!(
+            shown + texts.len() * 64 >= source.len(),
+            "every byte is shown"
+        );
+        let small = markdown::<App>("# heading");
+        let small = View::<App>::build(&small, &mut BuildCtx::new(&mut counter));
+        assert_eq!(small.parses, 1, "under the limit it parses");
     }
 
     #[test]

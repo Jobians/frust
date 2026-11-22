@@ -48,7 +48,7 @@ pub use diff::{
     DIFF_DEFAULT_COLLAPSE_ABOVE, DIFF_DEFAULT_CONTEXT, DIFF_MAX_BYTES, DIFF_MAX_LINES, DiffHunk,
     DiffLine, DiffLineKind, DiffModel, DiffView, compute_diff, diff_view,
 };
-pub use markdown::{MarkdownView, markdown};
+pub use markdown::{MARKDOWN_MAX_SOURCE_BYTES, MarkdownView, markdown};
 pub use message::{MessageRowView, message_row};
 pub use model::{
     ApprovalOption, ApprovalOptionKind, ApprovalState, ChatRole, DiffInput, PlanEntry,

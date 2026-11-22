@@ -18,11 +18,11 @@ use frust_glyph::chat::{
     ApprovalCardView, ApprovalDeadline, ApprovalOption, ApprovalOptionKind, ApprovalState,
     ChatRole, CodeBlockView, CodeSpan, CodeTone, ComposerView, DEFAULT_ESTIMATED_ROW_EXTENT,
     DIFF_DEFAULT_COLLAPSE_ABOVE, DIFF_DEFAULT_CONTEXT, DIFF_MAX_BYTES, DIFF_MAX_LINES, DiffHunk,
-    DiffInput, DiffLine, DiffLineKind, DiffModel, DiffView, MarkdownView, MessageRowView,
-    MessageScrollerView, NoticeRowView, NoticeTone, PlanBlockView, PlanEntry, PlanEntryStatus,
-    ToolCallView, ToolContent, ToolKind, ToolStatus, UsageLabel, UsageMeterView, approval_card,
-    code_block, composer, compute_diff, diff_view, markdown, message_row, message_scroller,
-    notice_row, plan_block, tool_call, usage_meter,
+    DiffInput, DiffLine, DiffLineKind, DiffModel, DiffView, MARKDOWN_MAX_SOURCE_BYTES,
+    MarkdownView, MessageRowView, MessageScrollerView, NoticeRowView, NoticeTone, PlanBlockView,
+    PlanEntry, PlanEntryStatus, ToolCallView, ToolContent, ToolKind, ToolStatus, UsageLabel,
+    UsageMeterView, approval_card, code_block, composer, compute_diff, diff_view, markdown,
+    message_row, message_scroller, notice_row, plan_block, tool_call, usage_meter,
 };
 
 /// Compiles only for a `View` that is also `Debug`.
@@ -166,7 +166,7 @@ fn the_data_types_and_constants_are_reachable() {
     let line: &DiffLine = &hunk.lines[1];
     assert_eq!(line.kind, DiffLineKind::Removed);
     assert_eq!(DiffLineKind::Added.marker(), '+');
-    let limits: [usize; 2] = [DIFF_MAX_BYTES, DIFF_MAX_LINES];
+    let limits: [usize; 3] = [DIFF_MAX_BYTES, DIFF_MAX_LINES, MARKDOWN_MAX_SOURCE_BYTES];
     assert!(limits.iter().all(|&n| n > 0));
 
     assert!(edit().old_text.is_some() && !edit().is_new_file());
