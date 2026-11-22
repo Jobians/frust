@@ -16,7 +16,7 @@ demos are **not** part of this catalog's charter — those live in
 ## What it shows
 
 A header (app title + a brightness toggle + a reduce-motion toggle) sits above
-a 9-tab section strip, each tab hosting one catalog section in a
+a 10-tab section strip, each tab hosting one catalog section in a
 `pattern_switcher` (`GlyphSlide`) so switching tabs plays a themed slide
 transition:
 
@@ -50,6 +50,18 @@ transition:
    variations of the catalog's own root `frust_glyph::app_bar`: scroll collapse,
    back-nav title crossfade, an overflow menu, selection mode, and a
    connection banner.
+10. **Agent chat** — a scripted agent turn played through every
+    `frust_glyph::chat` component (the opt-in `chat` feature, enabled by this app): the
+    message scroller with user, assistant and thought rows, a plan, four tool calls (text
+    output, an edit diff, a new-file diff, a failure), three approval cards (one to answer,
+    one that expires on its 30 s countdown, one answered elsewhere), a streamed markdown
+    reply (a table, a task list, a code fence held open for a moment, a safe link, an unsafe
+    link, raw HTML and an image shown as text), notices, a usage meter and the composer. Controls: **Play turn**
+    sends the demo prompt, **Load 5,000 rows** installs a synthetic transcript to exercise
+    the virtualized list, **Restart** resets the transcript. Links and copies only raise a
+    toast. Unlike the other sections the page owns its scrolling (the shell gives it the
+    bounded body rather than wrapping it in a `scroll_view`) and sits above the soft
+    keyboard so the composer stays visible. Leaving the section restarts the transcript.
 
 A toast host overlays every section (Feedback's and Motion's toast triggers
 both queue into the same shared FIFO).
@@ -83,11 +95,11 @@ person at a desk, not something a sandboxed, display-less CI
 run could produce:
 
 1. `cargo run` from this directory (desktop preview).
-2. Click each of the 9 tabs; toggle brightness (◐/◑) and reduce-motion
+2. Click each of the 10 tabs; toggle brightness (◐/◑) and reduce-motion
    (▶/⏸) at each tab, confirming every specimen/demo repaints live (no stale
    hardcoded color, no residual animation once reduced-motion is on).
 3. A screenshot tool of the reviewer's choice (`cmd+shift+4` on macOS, or an
-   OS screenshot utility) captures each of the 9 states for a visual diff
+   OS screenshot utility) captures each of the 10 states for a visual diff
    against the vendored reference builds.
 
 The automated gate this repo *does* ship — `tests/smoke.rs`'s
@@ -256,6 +268,24 @@ Gate run 2026-11-02 (switcher follow-ups branch): Pixel 5 (Android 14, 90 Hz) ov
 Android stops dead at the strip ends (platform clamping physics, no stretch drawn) and both phones draw
 the dots over the bar in landscape; ramps on the Pixel 5 held p95 under 16.7 ms (CPU 13.0–15.9 ms, GPU
 9.9–13.6 ms, no skipped frames).
+
+### §10 Agent chat (`pages/agent_chat.rs`)
+
+No reference-build precedent: this section demonstrates `frust_glyph::chat` and is the reference
+composition for app authors.
+
+| Item | Status |
+|---|---|
+| Message scroller, user / assistant / thought rows | ✓ |
+| Streamed markdown (table, task list, open code fence, safe and unsafe links, HTML and an image as text) | ✓ |
+| Code block and diff view | ✓ (the diffs sit in tool calls; the code block is in the markdown reply) |
+| Tool call, plan block | ✓ |
+| Approval card (30 s countdown, answered and expired states) | ✓ |
+| Notice row, usage meter | ✓ |
+| Composer (send and stop) | ✓ |
+| Large transcript (5,000 rows) | ✓ — **Load 5,000 rows** |
+
+Its headless tests are `tests/agent_chat.rs`; the section has no recorded device run.
 
 ### Components the reference inventory listed as "no direct Frust widget"
 

@@ -8557,6 +8557,196 @@ gestures, the handles, the soft keyboard interplay or the live edge under a real
 
 ---
 
+### `glyph-chat-markdown-subset` — chat markdown is CommonMark plus tables, strikethrough and task lists, and shows HTML, images and non-http links as text
+
+**Observed**: `frust_glyph::chat::markdown` parses CommonMark with GFM tables, strikethrough and task lists. Footnotes, math and heading attributes are not rendered (a footnote reference or math shows as literal text). Raw HTML, block or inline, shows as literal text. An image shows as its alt text and URL as text, and nothing is fetched. A link is tappable only for `http`, `https` and `mailto`, and `on_link` receives exactly the validated URL string; any other scheme, a control character in the URL, or a label that is an http(s) URL naming a different host shows as text followed by the real URL. Lists and quotes nested past a fixed depth flatten to text, spans past a fixed inline depth lose their styling, and table cells past 32 columns join the last column.
+
+**Applies to**: apps rendering agent output with `markdown` or `message_row`, with the `chat` feature on.
+
+**Workaround**: none for the unsupported syntax; an app that wants an image, an HTML fragment or another scheme handles the source itself before or beside the component.
+
+**Why accepted**: the text is untrusted and often half-streamed, so the parser emits a small block model with no HTML, no image fetch and no scheme beyond the three safe ones; the subset covers what an assistant reply uses.
+
+**Trigger for removal**: a supported footnote, math or image seam, or an app-supplied link policy, where the app needs it.
+
+**Evidence**: (2026-11-22) `plugins/glyph/src/chat/markdown_parse.rs` and `plugins/glyph/src/chat/markdown.rs` module docs. Code and headless tests.
+
+---
+
+### `glyph-chat-no-syntax-highlighting` — chat code blocks are not syntax highlighted
+
+**Observed**: `code_block` and the code inside `markdown` and `tool_call` draw one monospace tone. The block has a `CodeSpan`/`CodeTone` seam for coloured ranges, but `markdown` and `tool_call` supply no spans and the crate ships no highlighter.
+
+**Applies to**: `frust_glyph::chat::code_block` as the caller's own view, and every code fence in `markdown`.
+
+**Workaround**: build the `code_block` view directly and pass `.spans(..)` computed by the app; a fence inside `markdown` cannot be given spans.
+
+**Why accepted**: a highlighter is a dependency and a grammar set the family does not carry; the seam keeps the choice with the app.
+
+**Trigger for removal**: a highlighter hook on `markdown`, or a bundled highlighter behind its own feature.
+
+**Evidence**: (2026-11-22) `plugins/glyph/src/chat/code_block.rs` (`CodeSpan`, `CodeTone`, `spans`). Code and headless tests.
+
+---
+
+### `glyph-chat-selection-per-block` — chat text selection is per block, not in table cells, not across a code block's 16-line chunk
+
+**Observed**: `markdown` makes each paragraph, heading, list item and quote paragraph its own selectable `rich_text`, so a selection stays inside one block and cannot run from one paragraph into the next. Table cells are not selectable. A code block's body is split into chunks of 16 lines, one selectable block each, so a selection cannot cross a chunk boundary. The copy control copies the whole code block or message, not the selection. The collapsed thought summary is not selectable.
+
+**Applies to**: `markdown`, `message_row` and `code_block`, with `.selectable(true)` (the default for `markdown` and `message_row`).
+
+**Workaround**: use the copy control for a whole block or message; there is none for a table cell.
+
+**Why accepted**: it is the single-block scope of selectable `rich_text` (see `rich-text-selection-single-block-no-autoscroll`), and the chunking is what keeps an appended code line from re-shaping the earlier ones.
+
+**Trigger for removal**: a selection scope that spans blocks, and a larger or selectable-as-one code chunk.
+
+**Evidence**: (2026-11-22) `plugins/glyph/src/chat/markdown.rs`, `plugins/glyph/src/chat/code_block.rs` and `plugins/glyph/src/chat/message.rs` module docs. Code and headless tests.
+
+---
+
+### `glyph-chat-markdown-source-limit` — chat markdown past 256 KiB is plain text, and every change re-parses the whole source
+
+**Observed**: a source over `MARKDOWN_MAX_SOURCE_BYTES` (256 KiB) is not parsed: it renders as plain wrapped paragraphs of about 4 KiB each. Below the limit, every change to the source re-parses all of it; blocks whose model is unchanged keep their widgets, so only the parse itself repeats. A stream that appends per chunk re-parses once per update.
+
+**Applies to**: `markdown` and an assistant `message_row` while a reply streams.
+
+**Workaround**: coalesce stream chunks to one update per frame; split a very large output into several messages.
+
+**Why accepted**: 256 KiB is far beyond an assistant reply and keeps one re-parse well inside a frame; an incremental parser is not worth its state for replies of that size.
+
+**Trigger for removal**: an incremental parse, or a measured frame miss below the limit.
+
+**Evidence**: (2026-11-22) `plugins/glyph/src/chat/markdown.rs` (`MARKDOWN_MAX_SOURCE_BYTES`, module doc "Parsing"). Code and headless tests.
+
+---
+
+### `glyph-chat-approval-options-active-while-detail-unread` — an approval card's options stay active while a long detail is not fully read
+
+**Observed**: a detail taller than six lines scrolls inside the card with a fixed "More lines below, scroll to read" note, but the options respond whether or not the rest was scrolled into view, so a request can be answered without reading its detail.
+
+**Applies to**: `frust_glyph::chat::approval_card` with a long `.detail(..)`.
+
+**Workaround**: keep the detail short, or put the decisive text in the title; an app that must force reading disables the options with `.busy(true)` until it has its own signal.
+
+**Why accepted**: an owner decision: the card cannot know what the user read, and forcing a scroll would block a user who already knows the request.
+
+**Trigger for removal**: a read-to-end gate on the options, or an app-visible "detail reached" callback.
+
+**Evidence**: (2026-11-22) `plugins/glyph/src/chat/approval.rs` module doc ("Long detail"). Code and headless tests.
+
+---
+
+### `glyph-chat-approval-select-no-request-identity` — an approval card's `on_select` reports only the option id
+
+**Observed**: `ApprovalCardView::on_select` hands the callback the chosen option's id and nothing identifying the request. An app with several pending requests must close over the request in the callback it builds for each card; one shared callback cannot tell which request an answer belongs to. The same hazard is recorded for beUI in `beui-consent-correlation-is-opt-in`.
+
+**Applies to**: apps showing more than one approval request at a time.
+
+**Workaround**: build each card with its own `on_select` closure over that request's id, and key the card per request.
+
+**Why accepted**: a controlled card keeps no request model of its own; the app already owns the list of requests.
+
+**Trigger for removal**: a request-id builder method and a callback that carries it.
+
+**Evidence**: (2026-11-22) `plugins/glyph/src/chat/approval.rs` (`on_select`, module doc "Contract"). Code and headless tests.
+
+---
+
+### `glyph-chat-approval-identical-requests-share-state` — two identical consecutive requests in one approval card widget share the answered state
+
+**Observed**: the card treats a change of title, detail, options or deadline as a new request and resets its answered state. Two consecutive requests with the same title, detail and options and no deadline, shown by the same card widget, are not told apart: the second inherits the first's answered state and cannot be answered.
+
+**Applies to**: an app that rebuilds one `approval_card` in place for successive requests.
+
+**Workaround**: key each request's card by its own id (the rows of a keyed `message_scroller` already do this), so each request gets its own widget.
+
+**Why accepted**: the card has no request identity to compare (see `glyph-chat-approval-select-no-request-identity`); the open decision is a request id on the builder.
+
+**Trigger for removal**: a request id on the builder that the card compares.
+
+**Evidence**: (2026-11-22) `plugins/glyph/src/chat/approval.rs` (request comparison on rebuild; module doc "Contract"); the catalog's Agent chat page keys one card per request. Code and headless tests.
+
+---
+
+### `glyph-chat-approval-countdown-paced-frames` — an approval countdown redraws on paced frames while pending
+
+**Observed**: a pending card with an `ApprovalDeadline` requests paced frames to redraw its countdown (the semantics timer moves in ten-second steps), and stops requesting frames once the card is answered or expired. The card offers no arming delay after it appears. An `ApprovalDeadline` made again on each rebuild restarts the countdown.
+
+**Applies to**: `approval_card` with `.expires(..)`, while pending and on screen.
+
+**Workaround**: make the `ApprovalDeadline` once, when the request arrives, and store it in app state; omit `.expires(..)` for a card with no timeout.
+
+**Why accepted**: the countdown is visible motion, so it needs frames; paced frames keep the cost low.
+
+**Trigger for removal**: a countdown driven without frames while the text is unchanged, or an arming delay on the options.
+
+**Evidence**: (2026-11-22) `plugins/glyph/src/chat/approval.rs` (`ApprovalDeadline`, module doc "Countdown"). Code and headless tests.
+
+---
+
+### `glyph-chat-strings-fixed-english` — the chat components' own strings are fixed English constants
+
+**Observed**: the text the components add themselves is English and not localisable: the approval overflow note, countdown label and outcome labels ("Answered elsewhere" and its siblings), option tags, the thought label, copy confirmations and the semantics labels. Only caller-supplied text (titles, labels, `.expired_hint(..)`, `.semantics_label(..)`, `.placeholder(..)`) follows the app's language.
+
+**Applies to**: apps shipping a non-English UI with the `chat` feature.
+
+**Workaround**: pass localised text through the builders that take it; the fixed constants have no override.
+
+**Why accepted**: the family ships no string table and the plugin tier has no shared localisation seam for catalog strings.
+
+**Trigger for removal**: a string-override struct or a catalog-wide localisation route.
+
+**Evidence**: (2026-11-22) string constants in `plugins/glyph/src/chat/approval.rs`, `message.rs`, `code_block.rs` and `scroller.rs`. Code only.
+
+---
+
+### `glyph-chat-semantics-gaps` — some chat content publishes less to assistive technology than it shows
+
+**Observed**: a markdown heading is a heading node over its paragraph label, so a platform that flattens containers may drop the level. A thematic rule and the streaming dots publish no node. Table cell alignment is not published. Text selection publishes no range (see `rich-text-selection-not-published-to-at`).
+
+**Applies to**: `markdown` and the streaming indicator, under a screen reader.
+
+**Workaround**: none; the text and table structure are published, the omissions are visual cues.
+
+**Why accepted**: the gaps are cues with no text of their own, and the heading level is published through the node's level.
+
+**Trigger for removal**: a device pass with TalkBack, VoiceOver or Narrator that shows one of them matters, or a framework seam that publishes it.
+
+**Evidence**: (2026-11-22) `plugins/glyph/src/chat/markdown.rs` (heading node, rule and dots) and `plugins/glyph/src/chat/table.rs`. Code and headless tests; no screen-reader pass.
+
+---
+
+### `glyph-chat-hidden-character-filter-incomplete` — the chat hidden-character filter misses some invisible characters and marks some legitimate ones
+
+**Observed**: agent-supplied text in an approval card, a link label and a shown URL has control characters (other than newline and tab), bidi embeddings, overrides and isolates, and the zero-width range `U+200B` to `U+200F` plus `U+FEFF` replaced with `?`. Other invisible characters (for example the word joiner `U+2060` and the tag characters) pass through. The same filter shows `?` for the joiner inside an emoji sequence and for the CR of a CRLF line ending.
+
+**Applies to**: `approval_card`, and links in `markdown` and `message_row`.
+
+**Workaround**: normalise line endings and strip other invisible characters from untrusted text before building the view.
+
+**Why accepted**: the filter covers the characters that reorder or hide the text a user reads; a full Unicode default-ignorable table is not carried.
+
+**Trigger for removal**: a filter that covers the default-ignorable code points and passes emoji joiners and CRLF.
+
+**Evidence**: (2026-11-22) `plugins/glyph/src/chat/style.rs` (`is_hidden_char`, `display_text`). Code and headless tests.
+
+---
+
+### `glyph-chat-linux-headless-only` — the chat family has headless Linux tests only and no device run
+
+**Observed**: every `frust_glyph::chat` component is covered by headless tests run on Linux. No recorded run on an Android phone, an iPhone or macOS exists for touch gestures, the soft keyboard with the composer, the transcript under a real fling, or the frame cost of a long stream.
+
+**Applies to**: all hosts; touch input, the keyboard and real frame pacing are what a headless test cannot show.
+
+**Why accepted**: the device gate walks the catalog's Agent chat page after the family lands; until it is recorded the behaviour is code and headless-test only.
+
+**Trigger for removal**: the device gate's results are recorded.
+
+**Evidence**: (2026-11-22) `plugins/glyph/tests/chat_api.rs`, `plugins/glyph/tests/layout_skip_audit.rs`, `examples/glyph-catalog/tests/agent_chat.rs`; no device run.
+
+---
+
 ### `permissions-android-asked-flag-local` — Android's "never asked" state is a flag the plugin keeps, not one the system reports
 
 **Observed**: Android has no never-asked state: an unasked permission and one refused for good both read as not granted with no rationale. `frust-permissions` tells `NotDetermined` from `Blocked` with its own flag, a boolean per Android permission in the `frust.permissions` `SharedPreferences` file (key `frust.permissions.asked.<permission>`). Granted and Limited always come from `checkSelfPermission`; the flag is only a never-asked hint. It lives in app data, so clearing the data or reinstalling resets it while the system's own record may differ (a permission refused earlier then reads `NotDetermined` until the next ask). A prompt dismissed without an answer, which Android 11+ does not count, is recognised only by inference: a first denial with no rationale before or after the request, answered after more than 500 ms, leaves the flag unset. Other requesters (another plugin such as `frust-camera`, the app) may not write the flag, so two rules recover from that: a permission that shows a rationale reads `Denied` and gets its flag written; a denial the system answers within 500 ms (`AUTO_DENY_MS`) with no rationale is taken as a system refusal and the flag is written, so the status reads `Blocked` after one request. The 500 ms rule is a heuristic in both directions: a person who dismisses the dialog faster than 500 ms reads `Blocked` although nothing was refused for good, and a system refusal slower than 500 ms (a cold permission-controller start on a slow or loaded device; measured at about 90 ms on a Pixel 5, Android 14) is taken as a dismissal, so the permission keeps reading `NotDetermined`. Media location is excluded from it.
