@@ -261,6 +261,89 @@
 //! those rows; a prepend landing inside the window takes both steps in
 //! consecutive frames, the estimate shift then the measured refinement.
 //!
+//! # Stick to end (keyed variable extents only)
+//!
+//! [`ListView::stick_to_end`] keeps a transcript on its live edge. It covers
+//! the keyed variable-extent list alone; on a uniform, exact-extent or
+//! positional list it is inert (and [`sliver_list`](crate::sliver_list) has no
+//! such mode). The widget holds a `stuck` flag, `true` from the first build.
+//!
+//! **While stuck the end, not the viewport-top row, is the anchor.** Whenever a
+//! layout finds the maximum offset moved since the last unsuspended layout —
+//! the last row grew, rows were appended or prepended, the viewport changed
+//! height, or rows re-wrapped to a new width — or a pin is owed (opening, a
+//! re-stick, [`ScrollController::jump_to_end`]), it places the content at the
+//! new maximum **in the same frame**, right after measuring the window. Two
+//! steps: if the last row is materialized, the window's content positions are
+//! first re-pinned so that row's bottom is exactly the content extent (erasing
+//! prefix drift at the end, as reaching item 0 erases it at the top); then the
+//! pending correction becomes `max − offset`. A rebuild that sees the end move
+//! (an append, a prepend) first moves the offset itself to the partly
+//! estimated end, so the window it plans holds the rows at the end and the
+//! layout that follows lands on the measured one. An end that did not move is
+//! left alone, so a user's own step that stays inside the threshold is not
+//! snapped back — which is what lets a run of small trackpad steps add up and
+//! escape.
+//!
+//! **The pin rides the measured-correction channel, so the pending-correction
+//! invariant holds unchanged.** Layout's only offset write is still the range
+//! clamp: the pin is *recorded* as `pending_correction`, honored by
+//! [`ListViewWidget::placement_offset`] the frame it is made (so the frame
+//! paints the end, with no frame short of it) and committed by the next
+//! rebuild like any correction. It cannot conflict with an anchor correction
+//! withheld across a fling, because the pin is **suspended** — neither pass
+//! makes it — while a drag is established or any post-release motion (fling,
+//! spring, controller tween) is live, which is exactly when a correction is
+//! withheld; once motion stops the pin *replaces* whatever was pending, since
+//! the end-anchored placement already accounts for the rows above it. Growth
+//! during a suspended stretch is still followed afterwards: the end is
+//! measured from the last *unsuspended* layout's maximum.
+//!
+//! **Release and re-stick.** A user's move — a drag `Move`, a wheel or
+//! trackpad step, a scrollbar press or thumb drag, a release fling's frames,
+//! or a user input interrupting an [`ScrollController::animate_to_end`] —
+//! that leaves the content more than [`ListViewWidget::STICK_TO_END_THRESHOLD_PX`]
+//! short of the end clears `stuck`; content growth and programmatic commands
+//! never do. A `jump_to` or `scroll_to_item` away while stuck lands, and is
+//! pinned back by the next layout that finds the end moved — which includes
+//! the measurement of estimated rows it landed among; an app that means to
+//! leave the end programmatically turns `stick_to_end` off first (turning it
+//! back on then sticks only a list within the threshold). Coming within the
+//! threshold by any means sticks it again and owes a pin to the true end.
+//! While motion is suspended the end counted is also the one the last
+//! unsuspended layout left, because a fling simulation fixes its bounds at
+//! release; and a release fling that arrives at the end of a stuck list ends
+//! there (its overshoot eases back on the release settle) instead of springing
+//! back to an end the content has since grown past.
+//!
+//! **Transitions** reach [`ListView::on_stick_change`] from an event pass only:
+//! a drag or wheel transition with that event, one made at rebuild, layout or
+//! paint on the next event, with the `Housekeeping` flush owed (the near-edge
+//! callbacks' path). The initial state and a mode switch are not transitions;
+//! turning the mode on mid-flight sticks a list already within the threshold.
+//! The pin is a genuine move of the placement, so a near-end callback may fire
+//! on the next event after one. [`ScrollInfo`] gains nothing: the flag is
+//! exposed through the callback and [`ListViewWidget::is_stuck_to_end`].
+//!
+//! **Opening at the end.** The first build sets the offset to the whole
+//! estimated content (the maximum against a zero viewport), so the first window
+//! is the last row plus the leading [`BUFFER`] and no row far from it is ever
+//! built. The first layout measures those rows and pins the true end; while
+//! the window does not yet cover the viewport's top, paint asks for the
+//! convergence frame that widens it, each one pinning again. The end is on the
+//! viewport's bottom edge from the first painted frame and the list settles
+//! within three frames; the content above the window stays estimated until
+//! scrolled over, as everywhere else.
+//!
+//! **Known limits.** The pin leaves the window planned by the rebuild, so a
+//! viewport that *grows* by more than the leading buffer covers shows its top
+//! edge unfilled for the one convergence frame *Viewport staleness* describes
+//! (the end itself is in place). A burst appended wholly outside the window
+//! with measured heights far below the estimate can likewise leave the top
+//! uncovered for that frame. An [`ScrollController::animate_to_end`] tween
+//! lands on the end resolved when it started, and growth during it is
+//! followed once it lands.
+//!
 //! # Viewport staleness
 //!
 //! [`frust_core::BuildCtx`] carries no viewport size, so the widget caches
@@ -423,6 +506,13 @@
 //!   command, ends it. A settle step never runs while a drag is live: the
 //!   request waits it out, consuming none of its bounded frames, and resumes
 //!   once the drag ends.
+//! * **`jump_to_end` / `animate_to_end`.** The end is resolved at drain time
+//!   against the extents known then. On a stick-to-end list the command sticks
+//!   it and the pin (*Stick to end*, above) follows the measured end; on any
+//!   other variable-extent list each following layout re-pins the end the
+//!   same way until a layout finds it unmoved, bounded to
+//!   [`ITEM_SETTLE_MAX_FRAMES`] layouts and ended by user input or a later
+//!   command, like an item request's settle.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -509,6 +599,14 @@ const ITEM_SETTLE_MAX_FRAMES: u8 = 4;
 /// pixel, below anything a correction jump could visibly improve.
 const ITEM_SETTLE_TOLERANCE_PX: f64 = 0.5;
 
+/// How far (logical px) short of its end a [`ListView::stick_to_end`] list
+/// may sit and still count as *at* the end: a user's move that leaves it
+/// farther than this releases the list, and coming back within it (by any
+/// means) sticks it again. Read through
+/// [`ListViewWidget::STICK_TO_END_THRESHOLD_PX`]; see the [module docs](self)'
+/// *Stick to end* section.
+const STICK_TO_END_THRESHOLD_PX: f64 = 24.0;
+
 /// A view-held near-start "load older" callback (erased to [`ErasedCallback`] on
 /// build).
 type OnNearStart<State> = Rc<dyn Fn(&mut State)>;
@@ -525,6 +623,11 @@ type OnVisibleRange<State> = crate::authoring::TypedArgCallback<State, (usize, u
 /// on build). Mirrors [`crate::ScrollView`]'s type of the same shape exactly —
 /// see the [module docs](self)' *Overscroll and pull-to-refresh* section.
 type OnRefresh<State> = Rc<dyn Fn(&mut State)>;
+
+/// A view-held stick-to-end transition callback, receiving the new stuck
+/// state (erased to an [`ErasedArgCallback`] on build). See
+/// [`ListView::on_stick_change`].
+type OnStickChange<State> = crate::authoring::TypedArgCallback<State, bool>;
 
 /// A view-held stable-key function (`item index -> row identity`), installed by
 /// [`ListView::builder_keyed`] and absent for the positional
@@ -699,6 +802,11 @@ pub struct ListView<State: 'static> {
     controller: Option<ScrollController>,
     /// The opt-in scrollbar. See [`ListView::scrollbar`].
     scrollbar: Option<ScrollbarStyle>,
+    /// Whether the list follows its end (keyed variable-extent lists only).
+    /// See [`ListView::stick_to_end`].
+    stick_to_end: bool,
+    /// Told each stuck/released transition. See [`ListView::on_stick_change`].
+    on_stick_change: Option<OnStickChange<State>>,
 }
 
 impl<State: 'static> ListView<State> {
@@ -756,6 +864,8 @@ impl<State: 'static> ListView<State> {
             effect: default_overscroll_effect(),
             controller: None,
             scrollbar: None,
+            stick_to_end: false,
+            on_stick_change: None,
         }
     }
 
@@ -820,6 +930,8 @@ impl<State: 'static> ListView<State> {
             effect: default_overscroll_effect(),
             controller: None,
             scrollbar: None,
+            stick_to_end: false,
+            on_stick_change: None,
         }
     }
 
@@ -1155,6 +1267,59 @@ impl<State: 'static> ListView<State> {
     /// extent (the converging estimate in variable-extent mode).
     pub fn scrollbar(mut self, style: ScrollbarStyle) -> Self {
         self.scrollbar = Some(style);
+        self
+    }
+
+    /// Follow the end of the list — the live edge of a chat transcript or a
+    /// log — while it grows (default `false`). **Keyed variable-extent lists
+    /// only** ([`ListView::builder_keyed`] with
+    /// [`ListView::estimated_item_extent`]); anywhere else it is inert.
+    ///
+    /// The list opens at its end and is **stuck** there: whenever a layout
+    /// finds the end moved — the last row grew, rows were appended, the
+    /// viewport changed height (a keyboard, a rotation) or width (rows
+    /// re-wrapping) — the content is placed at the new end in that same
+    /// frame. A user's drag, wheel, scrollbar or fling that leaves the list
+    /// more than [`ListViewWidget::STICK_TO_END_THRESHOLD_PX`] short of the
+    /// end **releases** it, after which growth no longer moves it; coming back
+    /// within that distance by any means (scrolling, a fling settling,
+    /// [`ScrollController::jump_to_end`]) sticks it again. Programmatic
+    /// commands and content growth never release it. Each transition is
+    /// reported to [`ListView::on_stick_change`], which is how a caller shows
+    /// a jump-to-latest control. See the [module docs]' *Stick to end*
+    /// section for the frame-by-frame contract.
+    ///
+    /// ```
+    /// use frust_widgets::{ChildKey, ListView, text};
+    /// let list: ListView<()> = ListView::builder_keyed(
+    ///     100,
+    ///     48.0,
+    ///     |i| ChildKey::new(i),
+    ///     |i| text(format!("message {i}")),
+    /// )
+    /// .estimated_item_extent(48.0)
+    /// .stick_to_end(true);
+    /// # let _ = list;
+    /// ```
+    ///
+    /// [module docs]: self
+    pub fn stick_to_end(mut self, stick: bool) -> Self {
+        self.stick_to_end = stick;
+        self
+    }
+
+    /// Tell `handler` each time a [`ListView::stick_to_end`] list becomes
+    /// stuck to its end (`true`) or is released from it (`false`). It runs
+    /// once per transition — never for the initial stuck state — from an
+    /// event pass, where state writes are legal: a transition made by a drag
+    /// or a wheel is delivered with that event; one made at layout or paint (a
+    /// fling frame, an applied [`ScrollController::jump_to_end`]) is delivered
+    /// by the next event, and a frame-gated shell is asked for the
+    /// `Housekeeping` flush that carries it. A release and a re-stick inside
+    /// one such gap deliver nothing (the delivered state did not change). A
+    /// `Cancel` never delivers it.
+    pub fn on_stick_change<F: Fn(&mut State, bool) + 'static>(mut self, handler: F) -> Self {
+        self.on_stick_change = Some(Rc::new(handler));
         self
     }
 }
@@ -1559,6 +1724,34 @@ pub struct ListViewWidget {
     /// sees this requests the flush. The counterpart of the core's own owed
     /// `on_scroll` flush.
     flush_owed: bool,
+    /// The view's [`ListView::stick_to_end`]. Honored only in keyed
+    /// variable-extent mode (see [`ListViewWidget::stick_enabled`]).
+    stick_to_end: bool,
+    /// Whether the list is stuck to its end — initially `true`. Cleared only
+    /// by a user's move past [`STICK_TO_END_THRESHOLD_PX`], set again by any
+    /// return within it. See the [module docs](self)' *Stick to end* section.
+    stuck: bool,
+    /// The stuck state last handed to `on_stick_change` (initially `true`,
+    /// matching `stuck`, so the initial state is never reported).
+    delivered_stuck: bool,
+    /// The transition callback (`None` if the view set none).
+    on_stick_change: Option<ErasedArgCallback<bool>>,
+    /// Whether the next unsuspended pass owes the end pin even if the end has
+    /// not moved: opening at the end, a re-stick, an end command, or a pin
+    /// that could not reach a materialized last row yet.
+    pin_owed: bool,
+    /// The maximum offset the last unsuspended layout left the list against —
+    /// what "the end moved" is measured from. `NaN` until a layout has run,
+    /// so the first one always counts as a move.
+    stick_max: f64,
+    /// Layouts left to re-pin the end after an end command on a list *not*
+    /// stuck (stick-to-end off), bounded by [`ITEM_SETTLE_MAX_FRAMES`] like an
+    /// item request's settle.
+    end_settle_frames: u8,
+    /// Whether the controller tween in flight is an
+    /// [`ScrollController::animate_to_end`] — a user input interrupting it is
+    /// a user-made stop short of the end.
+    end_tween: bool,
 }
 
 /// The in-file tests predate the core and name its state as this widget's own
@@ -1620,6 +1813,14 @@ impl ListViewWidget {
             motion: ControllerMotion::from_theme(None),
             item_target: None,
             flush_owed: false,
+            stick_to_end: false,
+            stuck: true,
+            delivered_stuck: true,
+            on_stick_change: None,
+            pin_owed: false,
+            stick_max: f64::NAN,
+            end_settle_frames: 0,
+            end_tween: false,
         }
     }
 
@@ -2587,6 +2788,192 @@ impl ListViewWidget {
         };
     }
 
+    // --- Stick to end (keyed variable extents only). See the module docs'
+    //     *Stick to end* section; every method here is inert otherwise. ---
+
+    /// How far (logical px) short of its end a stick-to-end list may sit and
+    /// still count as at the end — the release/re-stick threshold. See
+    /// [`ListView::stick_to_end`].
+    pub const STICK_TO_END_THRESHOLD_PX: f64 = STICK_TO_END_THRESHOLD_PX;
+
+    /// Whether the list is currently stuck to its end: `true` only for a
+    /// [`ListView::stick_to_end`] list in keyed variable-extent mode that no
+    /// user move has released (or that has since come back).
+    pub fn is_stuck_to_end(&self) -> bool {
+        self.stick_enabled() && self.stuck
+    }
+
+    /// Whether stick-to-end is in force: the view asked for it and the list
+    /// runs keyed variable extents (the only mode it covers).
+    fn stick_enabled(&self) -> bool {
+        self.stick_to_end && self.is_variable()
+    }
+
+    /// Whether some pass owes the end pin: the list is stuck, or a
+    /// stick-off end command is still settling.
+    fn pin_active(&self) -> bool {
+        self.is_variable() && ((self.stick_to_end && self.stuck) || self.end_settle_frames > 0)
+    }
+
+    /// Whether the pin waits: while a drag is established or post-release
+    /// motion (a fling, a spring, a controller tween) is live, the position
+    /// belongs to that motion, so nothing pins it — which is also exactly when
+    /// a measured correction is withheld (see the module docs).
+    fn pin_suspended(&self) -> bool {
+        self.core.scrolling || self.core.is_flinging()
+    }
+
+    /// The distance (logical px) between where the content sits and the end.
+    fn distance_to_end(&self) -> f64 {
+        self.max_offset() - self.placement_offset()
+    }
+
+    /// Re-decide `stuck` from where the content now sits: within the
+    /// threshold sticks it (and owes the pin, so a re-stick lands on the
+    /// true end); beyond it releases only on a `user` move. Returns whether
+    /// `stuck` changed.
+    ///
+    /// While a drag or post-release motion is live the end it is measured
+    /// against may also be the one the last unsuspended layout left
+    /// (`stick_max`): a fling simulation fixes its bounds at release, so one
+    /// headed for the end lands on *that* end even when content grew under
+    /// it, and arriving there still counts as coming back.
+    fn note_stick_position(&mut self, user: bool) -> bool {
+        if !self.stick_enabled() {
+            return false;
+        }
+        let mut distance = self.distance_to_end();
+        if self.pin_suspended() && self.stick_max.is_finite() {
+            distance = distance.min(self.stick_max - self.placement_offset());
+        }
+        let near = distance <= STICK_TO_END_THRESHOLD_PX;
+        if near && !self.stuck {
+            self.stuck = true;
+            self.pin_owed = true;
+            true
+        } else if !near && self.stuck && user {
+            self.stuck = false;
+            self.pin_owed = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// [`ListViewWidget::note_stick_position`] from a pass with no
+    /// `EventCtx`: a transition is owed to the next event, and the paint that
+    /// sees it asks for the `Housekeeping` flush that delivers it.
+    fn note_stick_position_deferred(&mut self, user: bool) {
+        if self.note_stick_position(user) && self.on_stick_change.is_some() {
+            self.flush_owed = true;
+        }
+    }
+
+    /// Whether a stuck/released transition is waiting for an event.
+    fn stick_change_pending(&self) -> bool {
+        self.stick_enabled() && self.stuck != self.delivered_stuck && self.on_stick_change.is_some()
+    }
+
+    /// Hand the current stuck state to `on_stick_change` if it differs from
+    /// the one last delivered — from an event pass only.
+    fn deliver_stick_change(&mut self, ctx: &mut EventCtx) {
+        if !self.stick_enabled() || self.stuck == self.delivered_stuck {
+            return;
+        }
+        self.delivered_stuck = self.stuck;
+        let stuck = self.stuck;
+        if let Some(cb) = self.on_stick_change.as_mut() {
+            cb(ctx, stuck);
+        }
+    }
+
+    /// Place the content at the end, through the measured-correction channel
+    /// rather than the offset: when the last row is materialized the window's
+    /// content positions are first re-pinned so its bottom is exactly the
+    /// content extent (erasing prefix drift at the end, as reaching item 0
+    /// does at the top), then the pending correction becomes `max − offset`,
+    /// which every placement reader honors this frame and the next rebuild
+    /// commits. Returns whether the last row was materialized (so the end is
+    /// the measured one, not an estimate).
+    fn pin_to_end(&mut self) -> bool {
+        if self.item_count == 0 {
+            // No end to reach: nothing can stay owed.
+            self.pending_correction = 0.0;
+            return true;
+        }
+        let last_in_window = self
+            .keys
+            .last()
+            .is_some_and(|&last| last + 1 == self.item_count);
+        if last_in_window
+            && self.anchor_index > 0
+            && let (Some(&y_last), Some(pod)) = (self.slot_y.last(), self.children.last())
+        {
+            let drift = self.content_extent() - (y_last + pod.size().height);
+            if drift != 0.0 {
+                self.anchor_y = (self.anchor_y + drift).max(0.0);
+                for y in &mut self.slot_y {
+                    *y += drift;
+                }
+            }
+        }
+        self.pending_correction = self.max_offset() - self.offset;
+        last_in_window
+    }
+
+    /// The layout half of the pin, run right after this layout measured the
+    /// window: when the pin is active and not suspended, and the end moved
+    /// since the last unsuspended layout (or a pin is owed), place the
+    /// content at the new end. An end that did not move leaves a user's own
+    /// sub-threshold displacement alone. Also counts down a stick-off end
+    /// settle, which ends at the first layout that finds nothing moved.
+    fn pin_end_at_layout(&mut self) {
+        // Nothing to follow (stick-to-end off and no end command settling):
+        // the list does no stick work at all.
+        if !(self.stick_to_end || self.end_settle_frames > 0)
+            || !self.is_variable()
+            || self.pin_suspended()
+        {
+            return;
+        }
+        if self.pin_active() {
+            let moved = self.max_offset() != self.stick_max;
+            if moved || self.pin_owed {
+                let reached = self.pin_to_end();
+                self.pin_owed = !reached;
+                self.end_settle_frames = self.end_settle_frames.saturating_sub(1);
+            } else {
+                // Landed: the settle has nothing left to correct.
+                self.end_settle_frames = 0;
+            }
+        } else {
+            // Content shrinking (or a viewport growing) can bring a released
+            // list back within the threshold without any scroll.
+            self.note_stick_position_deferred(false);
+        }
+        self.stick_max = self.max_offset();
+    }
+
+    /// The rebuild half of the pin, after the measured correction is
+    /// committed and the controller drained and before the window is
+    /// planned: when the end moved (an append, a prepend, a re-measure) or a
+    /// pin is owed, move the offset to the current, partly estimated end, so
+    /// the window materializes the rows at the end. Layout then measures them
+    /// and [`ListViewWidget::pin_end_at_layout`] lands on the measured end in
+    /// the same frame. Returns whether the offset moved.
+    fn pin_end_at_rebuild(&mut self) -> bool {
+        if !self.pin_active() || self.pin_suspended() {
+            return false;
+        }
+        if !self.pin_owed && self.max_offset() == self.stick_max {
+            return false;
+        }
+        let before = self.offset;
+        self.pending_correction = 0.0;
+        self.set_offset(self.max_offset());
+        self.offset != before
+    }
+
     /// Deliver a synthetic `Cancel` to whichever child holds the capture path,
     /// disarming an armed `ListItem` press when the scroll drag takes over.
     fn cancel_children(&mut self, ctx: &mut EventCtx, pos: Point) {
@@ -2633,6 +3020,7 @@ impl ListViewWidget {
             self.deliver_pending_near_start(ctx);
             self.deliver_pending_near_end(ctx);
             self.deliver_pending_visible(ctx);
+            self.deliver_stick_change(ctx);
         }
         match event {
             // A broadcast reaches every realized child unconditionally and is
@@ -2761,14 +3149,25 @@ impl ScrollSurface for ListViewWidget {
         self.cancel_children(ctx, position);
     }
 
-    /// User input wins over a settling `scroll_to_item`.
+    /// User input wins over a settling `scroll_to_item` and a settling end
+    /// command. Interrupting an [`ScrollController::animate_to_end`] tween is
+    /// the user stopping the list where it stands, so a stop farther than the
+    /// threshold from the end releases a stick-to-end list.
     fn on_user_input(&mut self) {
         self.item_target = None;
+        self.end_settle_frames = 0;
+        if std::mem::take(&mut self.end_tween) {
+            self.note_stick_position_deferred(true);
+        }
     }
 
+    /// A drag `Move` or a wheel step is the user's move: it may release or
+    /// re-stick a stick-to-end list, delivered with this very event.
     fn after_input_scroll(&mut self, ctx: &mut EventCtx) {
         self.fire_near_start(ctx);
         self.fire_near_end(ctx);
+        self.note_stick_position(true);
+        self.deliver_stick_change(ctx);
     }
 
     /// The pump moved the offset with no `EventCtx` in scope: a near-start or
@@ -2785,6 +3184,30 @@ impl ScrollSurface for ListViewWidget {
             self.pending_near_end = true;
             self.flush_owed |= tween;
         }
+        // A release fling, spring or settle frame is the user's motion and
+        // may release a stick-to-end list; a controller tween frame may only
+        // stick it.
+        self.note_stick_position_deferred(!tween);
+        if !self.core.controller_animating {
+            self.end_tween = false;
+        }
+        // A release fling that arrives at the end of a stuck list ends there:
+        // its simulation fixed the bounds at release, so it would spring back
+        // to an end the content has since grown past. Any overshoot eases
+        // back through the settle, and the pin takes the end from here.
+        if !tween && self.stuck && self.stick_enabled() && self.core.is_flinging() {
+            let arrived = self.distance_to_end() <= 0.0;
+            if arrived {
+                self.core.fling = None;
+                self.core.stop_ballistic();
+                self.settle_ballistic_residual();
+                if !self.core.settling {
+                    // Below what the settle would animate: snap the residue.
+                    self.core.edge_pull = 0.0;
+                    self.overscroll = 0.0;
+                }
+            }
+        }
     }
 
     /// A near-start/near-end edge the jump crosses is recorded for the next
@@ -2797,6 +3220,36 @@ impl ScrollSurface for ListViewWidget {
         if self.evaluate_near_end() {
             self.pending_near_end = true;
             self.flush_owed = true;
+        }
+        // A programmatic jump never releases a stick-to-end list, but one
+        // landing within the threshold of the end sticks it.
+        self.note_stick_position_deferred(false);
+    }
+
+    /// The scrollbar's jump is the user's move: re-decided as one, so it can
+    /// release the list.
+    fn after_user_jump(&mut self) {
+        self.note_stick_position_deferred(true);
+    }
+
+    /// An end command sticks a stick-to-end list (the pin then follows the
+    /// measured end); on any other variable-extent list it starts a bounded
+    /// settle that re-pins the end as the rows near it are measured.
+    fn after_end_command(&mut self, animated: bool) {
+        self.end_tween = animated && self.core.controller_animating;
+        if !self.is_variable() {
+            return;
+        }
+        self.pin_owed = true;
+        if self.stick_enabled() {
+            if !self.stuck {
+                self.stuck = true;
+                if self.on_stick_change.is_some() {
+                    self.flush_owed = true;
+                }
+            }
+        } else {
+            self.end_settle_frames = ITEM_SETTLE_MAX_FRAMES;
         }
     }
 
@@ -2835,9 +3288,13 @@ impl ScrollSurface for ListViewWidget {
     /// it replaces a tween.
     fn before_offset_command(&mut self) {
         self.item_target = None;
+        self.end_settle_frames = 0;
+        self.end_tween = false;
     }
 
     fn apply_item_command(&mut self, request: ScrollToItem) {
+        self.end_settle_frames = 0;
+        self.end_tween = false;
         self.apply_scroll_to_item(request);
     }
 }
@@ -2899,6 +3356,19 @@ impl<State: 'static> View<State> for ListView<State> {
         widget.extent_of = self.item_extent_of.clone();
         widget.extent_generation = self.extent_generation;
         widget.refresh_extent_prefix();
+        widget.on_stick_change = self
+            .on_stick_change
+            .as_ref()
+            .map(crate::authoring::erase_callback_arg);
+        widget.stick_to_end = self.stick_to_end;
+        if widget.stick_enabled() {
+            // Open at the end: with no viewport known yet the maximum is the
+            // whole (estimated) content, so the first window is the last row
+            // plus the leading buffer, and the first layout owes the pin that
+            // lands on the measured end (see the module docs' *Stick to end*).
+            widget.set_offset(widget.max_offset());
+            widget.pin_owed = true;
+        }
         // Conservative initial window from a zero viewport (converges within one
         // extra frame via paint's continuation request — see the module docs).
         let plan = widget.desired_window();
@@ -2952,6 +3422,10 @@ impl<State: 'static> View<State> for ListView<State> {
             .on_refresh_release
             .as_ref()
             .map(crate::authoring::erase_callback);
+        element.on_stick_change = self
+            .on_stick_change
+            .as_ref()
+            .map(crate::authoring::erase_callback_arg);
         // A `.physics(...)`-carrying view reinstalls it every rebuild, like the
         // erased callbacks above; a view with no opinion (`None`) leaves the
         // widget's currently-installed physics alone — see `ListView::physics`'s
@@ -2997,6 +3471,18 @@ impl<State: 'static> View<State> for ListView<State> {
         let replaced_prefix = element.refresh_extent_prefix();
         if replaced_prefix.is_some() {
             flags |= ChangeFlags::LAYOUT | ChangeFlags::PAINT;
+        }
+        // Stick to end switched on mid-flight: stuck when the list already
+        // sits within the threshold of its end, released otherwise — a mode
+        // switch is not a transition, so nothing is reported for it.
+        if element.stick_to_end != self.stick_to_end {
+            element.stick_to_end = self.stick_to_end;
+            if element.stick_enabled() {
+                let near = element.distance_to_end() <= STICK_TO_END_THRESHOLD_PX;
+                element.stuck = near;
+                element.delivered_stuck = near;
+                element.pin_owed = near;
+            }
         }
 
         // Prepend/removal scroll anchoring — keyed lists only (positional
@@ -3134,6 +3620,18 @@ impl<State: 'static> View<State> for ListView<State> {
             flags |= ChangeFlags::PAINT;
         }
 
+        // Stick to end: an append, a prepend or an owed pin moves the offset
+        // to the (partly estimated) end *before* the window is planned, so
+        // this frame materializes the rows at the end and its layout lands on
+        // the measured end (see the module docs' *Stick to end* section). A
+        // settling end command, or a pin still owed, owes that layout.
+        if element.pin_end_at_rebuild()
+            || element.end_settle_frames > 0
+            || (element.pin_owed && element.pin_active())
+        {
+            flags |= ChangeFlags::LAYOUT | ChangeFlags::PAINT;
+        }
+
         let plan = element.desired_window();
         let delta = self.item_count as isize - old_item_count as isize;
         flags |= match self.key_of.as_ref() {
@@ -3202,6 +3700,11 @@ impl Widget for ListViewWidget {
                 }
             }
         }
+        // Stick to end: the rows were just measured, so a stuck list whose end
+        // moved is placed at the new end now, in this frame — recorded as a
+        // pending correction, never an offset write (see the module docs'
+        // *Stick to end* section).
+        self.pin_end_at_layout();
         // A controller command resolves against the viewport and extents just
         // measured; a settling `scroll_to_item` re-resolves against them too.
         self.core.laid_out = true;
@@ -3222,7 +3725,10 @@ impl Widget for ListViewWidget {
         self.motion = ControllerMotion::from_theme(Theme::from_paint_ctx(ctx));
         self.paint_motion(ctx, self.motion.reduce_motion);
         if std::mem::take(&mut self.flush_owed)
-            && (self.pending_near_start || self.pending_near_end || self.pending_visible.is_some())
+            && (self.pending_near_start
+                || self.pending_near_end
+                || self.pending_visible.is_some()
+                || self.stick_change_pending())
         {
             // Paint has no `&mut State`: owe the jump's (or tween's) edge fire
             // to the next frame's Housekeeping flush (the `ScrollWidget`
@@ -3230,9 +3736,13 @@ impl Widget for ListViewWidget {
             frust_core::mark_pending_result_flush();
             ctx.request_frame();
         }
-        if self.item_target.is_some() {
-            // A settling `scroll_to_item` corrects at layout: make sure the
-            // next frame lays out even under the mobile intra-frame skip.
+        if self.item_target.is_some()
+            || self.end_settle_frames > 0
+            || (self.pin_owed && self.pin_active())
+        {
+            // A settling `scroll_to_item`, a settling end command and an owed
+            // end pin all correct at layout: make sure the next frame lays
+            // out even under the mobile intra-frame skip.
             ctx.request_layout();
         }
         scene.push_clip(ctx.origin(), ctx.size());
@@ -7535,6 +8045,240 @@ mod tests {
             "the copy was answered by the focused row, through this router"
         );
         assert_eq!(state.value, "hello", "a copy edits nothing");
+    }
+
+    // --- (N) Stick to end: the pin rides the measured-correction channel. ---
+
+    /// [`VarRows::logic`] with [`ListView::stick_to_end`] on and the
+    /// transition log wired to a shared cell (the state is `()`).
+    fn stick_logic(
+        fx: &VarRows,
+        log: &Rc<RefCell<Vec<bool>>>,
+    ) -> impl FnMut(&mut ()) -> ListView<()> + use<> {
+        let mut inner = fx.logic();
+        let log = log.clone();
+        move |state: &mut ()| {
+            let log = log.clone();
+            inner(state)
+                .stick_to_end(true)
+                .on_stick_change(move |_: &mut (), stuck| log.borrow_mut().push(stuck))
+        }
+    }
+
+    #[test]
+    fn a_stuck_layout_records_the_pin_as_a_correction_and_never_writes_the_offset() {
+        // The invariant restated for the stuck case: layout's only offset
+        // write is still the range clamp. The pin is a pending correction
+        // (`max − offset`) that placement honors in the same frame and the
+        // next rebuild commits, so paint draws the end before any commit.
+        let fx = VarRows::new(tall_ids(80));
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut logic = stick_logic(&fx, &log);
+        let mut root = converged_var(&mut logic, &fx);
+        let w = list_widget(&root);
+        assert!(w.is_stuck_to_end());
+        assert_eq!(w.placement_offset(), w.max_offset(), "opened at the end");
+
+        // Append rows that measure taller than the estimate: the rebuild moves
+        // the offset to the estimated end (a rebuild-time write, like an
+        // anchor shift), layout measures them and pins the measured end.
+        fx.rows.borrow_mut().extend([10_003u64, 10_008, 10_013]);
+        fx.probe.pass.set(Pass::Rebuild);
+        root.rebuild(&mut logic, &mut ());
+        let after_rebuild = list_widget(&root).offset();
+        assert_eq!(
+            after_rebuild,
+            list_widget(&root).max_offset(),
+            "the rebuild planned the window against the estimated end"
+        );
+
+        fx.probe.pass.set(Pass::Layout);
+        root.layout(KEYED_WINDOW);
+        let w = list_widget(&root);
+        assert_eq!(w.offset(), after_rebuild, "layout did not write the offset");
+        let owed = 3.0 * (TALL - ESTIMATE);
+        assert!(
+            (w.pending_correction - owed).abs() < 1e-9,
+            "the pin is exactly the measured growth past the estimate ({})",
+            w.pending_correction
+        );
+        assert_eq!(
+            w.placement_offset(),
+            w.max_offset(),
+            "placed at the end now"
+        );
+
+        fx.probe.pass.set(Pass::Paint);
+        let mut sink = NullScene;
+        let outcome = root.paint(&mut sink, FrameTime::from_nanos(500_000_000));
+        fx.probe.pass.set(Pass::Idle);
+        let w = list_widget(&root);
+        assert_eq!(w.offset(), after_rebuild, "paint did not write it either");
+        let last = w.children.last().expect("rows");
+        assert!(
+            (last.origin().y + last.size().height - KEYED_WINDOW.height).abs() < 1e-9,
+            "the frame paints the last row on the viewport's bottom edge"
+        );
+        assert!(
+            outcome.needs_frame,
+            "and asks for the frame that commits it"
+        );
+
+        let (flags, _) = var_frame(&mut root, &mut logic, &fx, 516.0);
+        let w = list_widget(&root);
+        assert_eq!(w.pending_correction, 0.0, "the rebuild committed the pin");
+        assert_eq!(w.offset(), w.max_offset());
+        assert!(flags.contains(ChangeFlags::LAYOUT));
+        assert!(fx.probe.violations.borrow().is_empty());
+        assert!(log.borrow().is_empty(), "growth is never a transition");
+    }
+
+    #[test]
+    fn a_live_fling_suspends_the_pin_so_it_never_meets_a_withheld_correction() {
+        // The argument for (2), at its own granularity: the pin is made only
+        // when no fling is live, which is exactly when a pending correction is
+        // committable, so the two never coexist in conflict.
+        let mut w = pending_correction_widget(120.0);
+        w.stick_to_end = true;
+        w.stuck = true;
+        w.stick_max = 0.0; // the end "moved"
+        w.fling = Some(2_000.0);
+        w.pin_end_at_layout();
+        assert_eq!(w.pending_correction, 120.0, "a fling withholds the pin too");
+        assert!(!w.pin_end_at_rebuild(), "in either pass");
+        assert_eq!(w.stick_max, 0.0, "and the end it measures from is kept");
+
+        w.fling = None;
+        w.pin_end_at_layout();
+        assert_eq!(
+            w.placement_offset(),
+            w.max_offset(),
+            "once the fling stops the pin replaces the correction outright"
+        );
+        assert_eq!(w.offset(), 50.0, "still without an offset write");
+    }
+
+    #[test]
+    fn a_stick_transition_made_outside_an_event_waits_for_one() {
+        // Never from paint: an end command applied at layout records the
+        // re-stick and owes the flush; the next event delivers it, once.
+        let mut w = pending_correction_widget(0.0);
+        w.stick_to_end = true;
+        w.stuck = false;
+        w.delivered_stuck = false;
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let cb: crate::authoring::TypedArgCallback<Loads, bool> = {
+            let seen = seen.clone();
+            Rc::new(move |_: &mut Loads, stuck| seen.borrow_mut().push(stuck))
+        };
+        w.on_stick_change = Some(crate::authoring::erase_callback_arg(&cb));
+        w.after_end_command(false);
+        assert!(w.is_stuck_to_end());
+        assert!(w.flush_owed, "the paint that follows owes the flush");
+        assert!(seen.borrow().is_empty(), "nothing ran outside an event");
+
+        let mut state = Loads::default();
+        let cancel = InputEvent::Pointer(PointerEvent {
+            phase: PointerPhase::Cancel,
+            position: Point::ZERO,
+            button: PointerButton::Primary,
+        });
+        run_loads(&mut w, &mut state, &cancel);
+        assert!(seen.borrow().is_empty(), "a Cancel never delivers it");
+        run_loads(&mut w, &mut state, &InputEvent::Housekeeping);
+        assert_eq!(*seen.borrow(), vec![true], "the flush delivers it");
+        run_loads(&mut w, &mut state, &InputEvent::Housekeeping);
+        assert_eq!(*seen.borrow(), vec![true], "exactly once");
+    }
+
+    #[test]
+    fn a_scrollbar_jump_releases_and_a_programmatic_one_does_not() {
+        let stuck_at_end = |controller: &ScrollController| {
+            let mut w = pending_correction_widget(0.0);
+            w.stick_to_end = true;
+            w.offset = w.max_offset();
+            w.core.laid_out = true;
+            w.core.attach_controller(Some(controller));
+            assert!(w.is_stuck_to_end());
+            w
+        };
+
+        let controller = ScrollController::new();
+        let mut w = stuck_at_end(&controller);
+        controller.jump_to(0.0);
+        w.drain_controller(false);
+        assert_eq!(w.offset(), 0.0, "the program's jump lands");
+        assert!(w.is_stuck_to_end(), "and never releases the list");
+
+        let controller = ScrollController::new();
+        let mut w = stuck_at_end(&controller);
+        controller.user_jump_to(0.0);
+        w.drain_controller(false);
+        assert_eq!(w.offset(), 0.0);
+        assert!(
+            !w.is_stuck_to_end(),
+            "the scrollbar's jump is the user's move"
+        );
+
+        controller.user_jump_to(w.max_offset() - 10.0);
+        w.drain_controller(false);
+        assert!(
+            w.is_stuck_to_end(),
+            "and one back within the threshold sticks"
+        );
+    }
+
+    #[test]
+    fn stick_to_end_is_inert_outside_keyed_variable_extents() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let fx = KeyedRows::new((0..200).collect());
+        let mut inner = fx.keyed_logic();
+        let log_l = log.clone();
+        let mut logic = move |state: &mut ()| {
+            let log = log_l.clone();
+            inner(state)
+                .stick_to_end(true)
+                .on_stick_change(move |_: &mut (), stuck| log.borrow_mut().push(stuck))
+        };
+        let mut root = converged(&mut logic, &fx.log);
+        let w = list_widget(&root);
+        assert_eq!(w.offset(), 0.0, "a uniform keyed list opens at the top");
+        assert!(!w.is_stuck_to_end());
+        root.event(&mut (), &wheel(400.0));
+        keyed_frame(&mut root, &mut logic, &fx.log, 64.0);
+        assert!(log.borrow().is_empty(), "and reports nothing");
+    }
+
+    #[test]
+    fn switching_stick_to_end_on_mid_flight_sticks_only_a_list_already_at_its_end() {
+        let fx = VarRows::new((0..120).collect());
+        let on = Rc::new(Cell::new(false));
+        let mut inner = fx.logic();
+        let on_l = on.clone();
+        let mut logic = move |state: &mut ()| inner(state).stick_to_end(on_l.get());
+        let mut root = converged_var(&mut logic, &fx);
+        on.set(true);
+        settle(&mut root, &mut logic, &fx, 100.0, 4);
+        assert!(
+            !list_widget(&root).is_stuck_to_end(),
+            "a list at its top is released when the mode turns on"
+        );
+        on.set(false);
+        settle(&mut root, &mut logic, &fx, 200.0, 4);
+        // Wheel to the end until the rows there are measured and it is the
+        // true one (an unstuck list does not follow an estimate's revision).
+        for k in 0..3 {
+            root.event(&mut (), &wheel(1_000_000.0));
+            settle(&mut root, &mut logic, &fx, 300.0 + 100.0 * k as f64, 6);
+        }
+        let w = list_widget(&root);
+        assert_eq!(w.offset(), w.max_offset(), "at the measured end");
+        on.set(true);
+        settle(&mut root, &mut logic, &fx, 700.0, 6);
+        assert!(
+            list_widget(&root).is_stuck_to_end(),
+            "one already at its end is stuck"
+        );
     }
 }
 
