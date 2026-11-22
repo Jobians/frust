@@ -6,22 +6,22 @@
 //! - **Controlled and non-reactive.** The caller owns the source text and
 //!   re-builds the view as it grows; nothing here opens a URL, loads an image
 //!   or interprets HTML. A safe link is reported through `.on_link(..)`; an
-//!   unsafe one is plain text followed by its URL in parentheses.
+//!   unsafe one, or one whose label is an http(s) URL of another host, is
+//!   plain text then its URL in parentheses. Hidden characters in a label or
+//!   a shown URL read as `?`.
 //! - **One widget per block.** Every top-level block is its own child, keyed
-//!   by position. On a rebuild a block whose model (and streaming role) is
-//!   unchanged keeps its widget: it is not re-rendered, re-shaped or laid out
-//!   again, so a message can grow chunk by chunk cheaply.
-//! - **Parsing.** The source is parsed when it differs from the previous
-//!   view's, never for an equal one. Each change re-parses the whole source,
-//!   so a caller streaming text should coalesce chunks to at most one update
-//!   per frame.
-//! - **Streaming.** `.streaming(true)` draws a dots row under the last block
-//!   (earlier blocks keep their height), marks an unclosed code fence as
-//!   streaming and lets a trailing table keep its column widths.
+//!   by position; a block whose model (and streaming role) is unchanged keeps
+//!   its widget across a rebuild: no re-render, re-shape or layout.
+//! - **Parsing.** Only a changed source is parsed, and each change re-parses
+//!   the whole of it: coalesce streamed chunks to one update per frame. A
+//!   source over [`MARKDOWN_MAX_SOURCE_BYTES`] (256 KiB) is plain wrapped
+//!   text, never parsed.
+//! - **Streaming.** `.streaming(true)` draws a dots row under the last block,
+//!   marks an unclosed code fence as streaming and lets a trailing table keep
+//!   its column widths.
 //! - **Selection.** With `.selectable(true)`, the default, every paragraph,
 //!   heading, list item and quote paragraph is its own selectable
-//!   `rich_text`: a selection stays inside one block. Table cells are not
-//!   selectable, so a mouse drag on a table scrolls it.
+//!   `rich_text`: a selection stays inside one block. Table cells are not.
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -40,15 +40,15 @@ use frust::{
 };
 
 use super::code_block::code_block;
-use super::markdown_parse::{MdBlock, MdInline, MdListItem, parse_markdown};
+use super::markdown_parse::{MdBlock, MdInline, MdListItem, parse_markdown, plain_text};
 use super::style;
 use super::table::table;
 
 /// Body text size: the Glyph `body` token.
-pub(crate) const BODY_SIZE: f32 = 13.0;
+const BODY_SIZE: f32 = style::BODY_FONT_SIZE;
 /// Heading sizes for levels 1, 2 and 3 to 6: the Glyph `heading`, `title`
 /// and `body` tokens.
-pub(crate) const HEADING_SIZES: [f32; 3] = [20.0, 15.0, 13.0];
+const HEADING_SIZES: [f32; 3] = [20.0, 15.0, 13.0];
 /// Height of the streaming indicator row.
 const INDICATOR_H: f64 = 12.0;
 /// Side of one streaming indicator dot.
@@ -60,17 +60,24 @@ const QUOTE_BAR_W: f64 = 3.0;
 /// Narrowest list marker column.
 const LIST_INDENT: f64 = 18.0;
 /// Space between a list marker and the item text.
-const MARKER_GAP: f64 = 6.0;
+const MARKER_GAP: f64 = style::PAD_SMALL;
 /// Side of a task-list checkbox.
 const CHECK_SIDE: f64 = 11.0;
 /// Space above a task-list checkbox, to sit it on the first text line.
 const CHECK_TOP: f64 = 3.0;
 /// Height of a thematic break's row.
 const RULE_H: f64 = style::BLOCK_GAP;
-/// Width used when the incoming constraints are unbounded.
-const FALLBACK_WIDTH: f64 = 480.0;
 /// Bullet of a top-level list item (U+2022, present in the mono face).
 const BULLET: &str = "\u{2022}";
+/// Bytes per paragraph of a source shown as plain text.
+const PLAIN_CHUNK_BYTES: usize = 4 * 1024;
+
+/// The largest source [`markdown`] parses: a longer one is shown as plain
+/// wrapped text, unparsed. Every change re-parses the whole source, and the
+/// parse and the block diff grow with it; 256 KiB is far beyond an assistant
+/// reply (a few KiB) yet keeps one re-parse well inside a frame, and matches
+/// the order of the diff view's own per-side guard.
+pub const MARKDOWN_MAX_SOURCE_BYTES: usize = 256 * 1024;
 
 type OnText<State> = Rc<dyn Fn(&mut State, &str)>;
 
@@ -103,17 +110,28 @@ pub struct MarkdownView<State: 'static> {
     streaming: bool,
     selectable: bool,
     on_link: Option<OnText<State>>,
-    on_copy_code: Option<OnText<State>>,
+    on_copy: Option<OnText<State>>,
 }
 
-/// Render `source` as markdown in Glyph styling.
+impl<State: 'static> std::fmt::Debug for MarkdownView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarkdownView")
+            .field("source", &self.source)
+            .field("streaming", &self.streaming)
+            .field("selectable", &self.selectable)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Render `source` as markdown in Glyph styling. The caller owns the source
+/// and passes the whole current text on every build.
 pub fn markdown<State: 'static>(source: impl Into<String>) -> MarkdownView<State> {
     MarkdownView {
         source: source.into(),
         streaming: false,
         selectable: true,
         on_link: None,
-        on_copy_code: None,
+        on_copy: None,
     }
 }
 
@@ -125,7 +143,9 @@ impl<State: 'static> MarkdownView<State> {
     }
 
     /// Run `on_link` with the app state and the exact URL of a safe link the
-    /// user taps. Nothing is opened here.
+    /// user taps. Nothing is opened here. The URL is attacker-controlled and
+    /// may differ from the link's visible text: show or confirm the
+    /// destination before opening it.
     pub fn on_link(mut self, on_link: impl Fn(&mut State, &str) + 'static) -> Self {
         self.on_link = Some(Rc::new(on_link));
         self
@@ -139,8 +159,8 @@ impl<State: 'static> MarkdownView<State> {
 
     /// Run `on_copy` with the app state and the code when a code block's copy
     /// control is pressed (the clipboard is written first).
-    pub fn on_copy_code(mut self, on_copy: impl Fn(&mut State, &str) + 'static) -> Self {
-        self.on_copy_code = Some(Rc::new(on_copy));
+    pub fn on_copy(mut self, on_copy: impl Fn(&mut State, &str) + 'static) -> Self {
+        self.on_copy = Some(Rc::new(on_copy));
         self
     }
 
@@ -160,7 +180,7 @@ impl<State: 'static> MarkdownView<State> {
 
     fn install(&self, hooks: &Hooks<State>) {
         hooks.on_link.replace(self.on_link.clone());
-        hooks.on_copy.replace(self.on_copy_code.clone());
+        hooks.on_copy.replace(self.on_copy.clone());
     }
 }
 
@@ -178,7 +198,11 @@ fn is_live(block: &MdBlock) -> bool {
 
 fn has_safe_link(inlines: &[MdInline]) -> bool {
     inlines.iter().any(|inline| match inline {
-        MdInline::Link { safe: true, .. } => true,
+        MdInline::Link {
+            url,
+            safe: true,
+            content,
+        } if tappable(url, content) => true,
         MdInline::Link { content, .. }
         | MdInline::Emphasis(content)
         | MdInline::Strong(content)
@@ -187,11 +211,40 @@ fn has_safe_link(inlines: &[MdInline]) -> bool {
     })
 }
 
-/// An unsafe URL as shown: control characters become `?`.
+/// An unsafe URL as shown: control, bidi and zero-width characters become
+/// `?` (a URL has no line breaks or tabs to keep).
 fn shown_url(url: &str) -> String {
-    url.chars()
+    style::display_text(url)
+        .chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()
+}
+
+/// The host of an `http(s)://` URL, lowercased: `None` for anything else.
+fn http_host(text: &str) -> Option<String> {
+    let text = text.trim();
+    let rest = ["http://", "https://"].iter().find_map(|scheme| {
+        let head = text.get(..scheme.len())?;
+        head.eq_ignore_ascii_case(scheme)
+            .then(|| &text[scheme.len()..])
+    })?;
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    let host = host.trim_end_matches('.').to_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether a safe link may be tapped: unless its label itself reads as an
+/// http(s) URL naming another host than the destination, which would show
+/// the user one site and open another.
+fn tappable(url: &str, content: &[MdInline]) -> bool {
+    let mut label = String::new();
+    plain_text(content, &mut label);
+    http_host(&label).is_none_or(|shown| http_host(url) == Some(shown))
 }
 
 /// Everything a top-level block's views depend on besides its model.
@@ -238,6 +291,8 @@ struct Look {
     italic: bool,
     bold: bool,
     strike: bool,
+    /// Inside a link's label: hidden characters are shown as `?`.
+    label: bool,
 }
 
 fn styled(
@@ -251,6 +306,12 @@ fn styled(
         FontWeight::BOLD
     } else {
         FontWeight::REGULAR
+    };
+    let text: String = text.into();
+    let text = if look.label {
+        style::display_text(&text)
+    } else {
+        text
     };
     let mut s = span(text).size(base.size).weight(weight);
     s = if code {
@@ -308,8 +369,18 @@ fn push_spans(
                 url,
                 safe: true,
                 content,
-            } => push_spans(content, base, look, Some(url), out),
+            } if tappable(url, content) => {
+                let look = Look {
+                    label: true,
+                    ..look
+                };
+                push_spans(content, base, look, Some(url), out);
+            }
             MdInline::Link { url, content, .. } => {
+                let look = Look {
+                    label: true,
+                    ..look
+                };
                 push_spans(content, base, look, link, out);
                 let muted = Base {
                     role: ThemeTextColor::OnSurfaceVariant,
@@ -492,12 +563,54 @@ pub struct MarkdownWidget {
 
 impl MarkdownWidget {
     fn parse(&mut self, source: &str) -> Vec<MdBlock> {
+        if source.len() > MARKDOWN_MAX_SOURCE_BYTES {
+            return plain_blocks(source);
+        }
         #[cfg(test)]
         {
             self.parses += 1;
         }
         parse_markdown(source)
     }
+}
+
+/// `source` as plain text, unparsed: paragraphs of about
+/// [`PLAIN_CHUNK_BYTES`] cut at line ends (a longer line at a character
+/// boundary), each line ending in a hard break, so appends stay cheap.
+fn plain_blocks(source: &str) -> Vec<MdBlock> {
+    let mut blocks = Vec::new();
+    let mut lines: Vec<MdInline> = Vec::new();
+    let mut bytes = 0;
+    let mut flush = |lines: &mut Vec<MdInline>, bytes: &mut usize| {
+        if !lines.is_empty() {
+            blocks.push(MdBlock::Paragraph(std::mem::take(lines)));
+        }
+        *bytes = 0;
+    };
+    for line in source.split('\n') {
+        let mut rest = line.strip_suffix('\r').unwrap_or(line);
+        loop {
+            let mut cut = rest.len().min(PLAIN_CHUNK_BYTES);
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let (piece, tail) = rest.split_at(cut);
+            if !lines.is_empty() {
+                lines.push(MdInline::HardBreak);
+            }
+            lines.push(MdInline::Text(piece.to_owned()));
+            bytes += piece.len();
+            if bytes >= PLAIN_CHUNK_BYTES {
+                flush(&mut lines, &mut bytes);
+            }
+            if tail.is_empty() {
+                break;
+            }
+            rest = tail;
+        }
+    }
+    flush(&mut lines, &mut bytes);
+    blocks
 }
 
 impl<State: 'static> View<State> for MarkdownView<State> {
@@ -607,17 +720,9 @@ impl<State: 'static> View<State> for MarkdownView<State> {
     }
 }
 
-fn width_of(bc: &BoxConstraints) -> f64 {
-    if bc.max().width.is_finite() {
-        bc.max().width
-    } else {
-        FALLBACK_WIDTH
-    }
-}
-
 impl Widget for MarkdownWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        let width = width_of(bc);
+        let width = style::width_of(bc);
         let child_bc = BoxConstraints::loose(Size::new(width, f64::INFINITY));
         let mut y = 0.0;
         for (index, pod) in self.children.iter_mut().enumerate() {
@@ -735,7 +840,7 @@ impl<State: 'static> View<State> for GutterView<State> {
 
 impl Widget for GutterWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        let width = width_of(bc);
+        let width = style::width_of(bc);
         let GutterKind::List { ordered } = self.kind else {
             let body_bc =
                 BoxConstraints::loose(Size::new((width - QUOTE_INDENT).max(0.0), f64::INFINITY));
@@ -878,7 +983,7 @@ impl Widget for CheckWidget {
         let muted = style::muted(theme);
         scene.stroke_path(o, &outline, style::BORDER_WIDTH, &Brush::Solid(muted));
         if self.checked {
-            let ink = theme.map_or(style::FALLBACK_MUTED, |t| t.scheme().on_surface);
+            let ink = style::ink(theme);
             let mut mark = BezPath::new();
             mark.move_to(Point::new(CHECK_SIDE * 0.2, CHECK_SIDE * 0.55));
             mark.line_to(Point::new(CHECK_SIDE * 0.42, CHECK_SIDE * 0.78));
@@ -923,7 +1028,7 @@ impl<State: 'static> View<State> for RuleView {
 
 impl Widget for RuleWidget {
     fn layout(&mut self, _ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        bc.constrain(Size::new(width_of(bc), RULE_H))
+        bc.constrain(Size::new(style::width_of(bc), RULE_H))
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
@@ -1112,6 +1217,46 @@ mod tests {
         assert_eq!(HEADING_SIZES[1], scale.title_large.size);
         assert_eq!(HEADING_SIZES[2], scale.body_large.size);
         assert_eq!(BODY_SIZE, scale.body_large.size);
+    }
+
+    #[test]
+    fn a_source_past_the_limit_is_plain_text_and_returns_promptly() {
+        let line = "# not a heading **not bold** [not a link](javascript:x)\n";
+        let mut source = line.repeat((1 << 20) / line.len());
+        source.push_str(&"x".repeat(64 * 1024));
+        assert!(source.len() >= 1 << 20);
+        let started = std::time::Instant::now();
+        let mut counter = 0u64;
+        let view = markdown::<App>(source.as_str());
+        let widget = View::<App>::build(&view, &mut BuildCtx::new(&mut counter));
+        assert_eq!(widget.parses, 0, "past the limit nothing is parsed");
+        assert!(
+            widget
+                .blocks
+                .iter()
+                .all(|b| matches!(b, MdBlock::Paragraph(_))),
+            "plain paragraphs only"
+        );
+        let mut rig = Rig::new(true, 320.0);
+        rig.show(|_| markdown(source.as_str()));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "took {elapsed:?}"
+        );
+        let texts = rig.texts();
+        assert!(texts[0].0.starts_with("# not a heading **not bold**"));
+        for (_, rect) in &texts {
+            assert!(rect.x1 <= 320.0 + 0.01, "{rect:?} past the width");
+        }
+        let shown: usize = texts.iter().map(|(t, _)| t.len()).sum();
+        assert!(
+            shown + texts.len() * 64 >= source.len(),
+            "every byte is shown"
+        );
+        let small = markdown::<App>("# heading");
+        let small = View::<App>::build(&small, &mut BuildCtx::new(&mut counter));
+        assert_eq!(small.parses, 1, "under the limit it parses");
     }
 
     #[test]
@@ -1334,6 +1479,77 @@ mod tests {
     }
 
     #[test]
+    fn on_link_receives_exactly_the_url_that_was_validated() {
+        // (source, label, what on_link receives)
+        let cases = [
+            (
+                "[padded](<  https://example.com/a  >) tail",
+                "padded",
+                Some("https://example.com/a"),
+            ),
+            ("[ctl](<\u{1}https://example.com/b>) tail", "ctl", None),
+        ];
+        for (source, label, received) in cases {
+            let mut rig = Rig::new(true, 400.0);
+            rig.show(|_| {
+                markdown(source).on_link(|app: &mut App, url| app.links.push(url.to_owned()))
+            });
+            let rect = rig.text_rect(label);
+            rig.click(Point::new(rect.x0 + 6.0, rect.y0 + 6.0));
+            let expected: Vec<String> = received.into_iter().map(str::to_owned).collect();
+            assert_eq!(rig.app.links, expected, "{source:?}");
+            if received.is_none() {
+                let shown = &rig.texts()[0].0;
+                assert_eq!(shown, "ctl (?https://example.com/b) tail");
+            }
+        }
+    }
+
+    #[test]
+    fn link_labels_and_shown_urls_show_hidden_characters() {
+        let mut rig = Rig::new(true, 400.0);
+        rig.show(|_| {
+            markdown("[a\u{202E}b\u{200B}c\u{2066}d\u{FEFF}e](https://x.example/) and [f](<javascript:\u{202D}g\u{200F}>)")
+                .on_link(|app: &mut App, url| app.links.push(url.to_owned()))
+        });
+        assert_eq!(rig.texts()[0].0, "a?b?c?d?e and f (javascript:?g?)");
+        assert_eq!(shown_url("x\u{2069}\n\u{200C}y"), "x???y");
+        let rect = rig.text_rect("a?b");
+        rig.click(Point::new(rect.x0 + 6.0, rect.y0 + 6.0));
+        assert_eq!(
+            rig.app.links,
+            ["https://x.example/".to_owned()],
+            "still tappable"
+        );
+    }
+
+    #[test]
+    fn a_label_naming_another_host_is_not_tappable() {
+        let source = "[https://bank.example/login](https://evil.example/) tail";
+        let mut rig = Rig::new(true, 400.0);
+        rig.show(|_| markdown(source).on_link(|app: &mut App, url| app.links.push(url.to_owned())));
+        assert_eq!(
+            rig.texts()[0].0,
+            "https://bank.example/login (https://evil.example/) tail"
+        );
+        let rect = rig.text_rect("https://bank");
+        rig.click(Point::new(rect.x0 + 6.0, rect.y0 + 6.0));
+        assert!(rig.app.links.is_empty());
+        let update = rig.root.semantics();
+        assert!(!update.nodes.iter().any(|(_, n)| n.role() == Role::Link));
+
+        let same = "[HTTPS://Docs.Example:443/](https://user@docs.example/a) tail";
+        let mut rig = Rig::new(true, 400.0);
+        rig.show(|_| markdown(same).on_link(|app: &mut App, url| app.links.push(url.to_owned())));
+        let rect = rig.text_rect("HTTPS://Docs");
+        rig.click(Point::new(rect.x0 + 6.0, rect.y0 + 6.0));
+        assert_eq!(rig.app.links, ["https://user@docs.example/a".to_owned()]);
+        assert_eq!(http_host("http://[::1]:80/x").as_deref(), Some("::1"));
+        assert_eq!(http_host("docs.example"), None, "a bare name is not a URL");
+        assert_eq!(http_host("mailto:a@b"), None);
+    }
+
+    #[test]
     fn a_link_keeps_reaching_the_latest_callback_across_rebuilds() {
         let mut rig = Rig::new(true, 400.0);
         let source = "[docs](https://x.example/) tail";
@@ -1345,11 +1561,11 @@ mod tests {
     }
 
     #[test]
-    fn a_code_block_copy_reaches_on_copy_code() {
+    fn a_code_block_copy_reaches_on_copy() {
         let mut rig = Rig::new(true, 400.0);
         rig.show(|_| {
             markdown("intro\n\n```sh\necho hi\n```\n")
-                .on_copy_code(|app: &mut App, code| app.copied.push(code.to_owned()))
+                .on_copy(|app: &mut App, code| app.copied.push(code.to_owned()))
         });
         let block = rig.node("CodeBlockWidget")[0];
         rig.click(Point::new(block.x1 - style::PAD, block.y0 + 8.0));

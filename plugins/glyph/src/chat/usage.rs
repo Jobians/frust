@@ -7,7 +7,8 @@
 //!   holds no signals and rebuilds only when one of its inputs changes.
 //! - **Fixed width per label mode.** The tone mark and the label each reserve
 //!   the width of a widest-case sample, so the header does not shift as the
-//!   numbers change. Digits use tabular figures.
+//!   numbers change. Digits use tabular figures, and the label caps at
+//!   `999%+` and `999M+` so no value outgrows the reservation.
 //! - **Tone is not colour alone.** From `warn_at` a `!` mark and the warning
 //!   tone; from `critical_at` a `×` mark and the error tone.
 //! - **True numbers past the limit.** A `used` above `size` clamps the bar,
@@ -17,24 +18,23 @@
 
 use std::marker::PhantomData;
 
+use frust::Theme;
 use frust::authoring::text::{TextContext, TextLayout, TextStyle};
 use frust::authoring::{
     BoxConstraints, BuildCtx, ChangeFlags, LayoutCtx, PaintCtx, PaintScene, Role, SemanticsCtx,
     View, Widget,
 };
-use frust::{ColorScheme, StatusPalette, Theme};
 use kurbo::{Point, Size};
 use peniko::Color;
 
 use super::style;
-use crate::tokens::color;
 
 /// Bar length, in logical px.
 const BAR_WIDTH: f64 = 64.0;
 /// Bar thickness, in logical px.
 const BAR_HEIGHT: f64 = 6.0;
 /// Gap between the mark, the bar and the label, in logical px.
-const GAP: f64 = 6.0;
+const GAP: f64 = style::PAD_SMALL;
 /// Slack for threshold comparisons: `0.8` as an `f32` is not the `f64`
 /// quotient `80 / 100`.
 const THRESHOLD_EPSILON: f64 = 1e-6;
@@ -43,14 +43,15 @@ const THRESHOLD_EPSILON: f64 = 1e-6;
 const WARNING_MARK: &str = "!";
 /// Mark drawn at the critical tone.
 const CRITICAL_MARK: &str = "\u{d7}"; // ×
+/// The label past 999 %: the formatter's widest percentage.
+const PERCENT_CAP: &str = "999%+";
+/// A count past 999.9M: the formatter's widest count form is `999.9M`.
+const COUNT_CAP: &str = "999M+";
 /// Widest-case label samples the reserved label widths are measured from.
-const PERCENT_SAMPLE: &str = "999%";
+const PERCENT_SAMPLE: &str = PERCENT_CAP;
 const COUNTS_SAMPLE: &str = "999.9M / 999.9M";
 /// Label of a meter whose size is unknown.
 const UNKNOWN_TEXT: &str = "unknown";
-
-const DARK: ColorScheme = color::dark();
-const DARK_STATUS: StatusPalette = color::status();
 
 /// What the meter's label shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -119,7 +120,10 @@ impl MeterModel {
         match self.label {
             UsageLabel::None => String::new(),
             _ if self.size == 0 => UNKNOWN_TEXT.to_owned(),
-            UsageLabel::Percent => format!("{}%", self.percent().unwrap_or(0)),
+            UsageLabel::Percent => match self.percent().unwrap_or(0) {
+                p if p > 999 => PERCENT_CAP.to_owned(),
+                p => format!("{p}%"),
+            },
             UsageLabel::Counts => {
                 format!("{} / {}", format_count(self.used), format_count(self.size))
             }
@@ -141,18 +145,21 @@ impl MeterModel {
     }
 }
 
-/// Formats a count with k and M suffixes: `999`, `42k`, `1.5M`.
+/// Formats a count with k and M suffixes: `999`, `42k`, `1.5M`, capped at
+/// [`COUNT_CAP`] past 999.9M so the label never outgrows its reservation.
 fn format_count(n: u64) -> String {
     if n < 1_000 {
         return n.to_string();
     }
-    let thousands = (n + 500) / 1_000;
+    let thousands = n.saturating_add(500) / 1_000;
     if thousands < 1_000 {
         return format!("{thousands}k");
     }
     // Tenths of a million, so 999,600 reads as `1M` and not `1000k`.
-    let tenths = (n + 50_000) / 100_000;
-    if tenths.is_multiple_of(10) {
+    let tenths = n.saturating_add(50_000) / 100_000;
+    if tenths >= 10_000 {
+        COUNT_CAP.to_owned()
+    } else if tenths.is_multiple_of(10) {
         format!("{}M", tenths / 10)
     } else {
         format!("{}.{}M", tenths / 10, tenths % 10)
@@ -161,27 +168,11 @@ fn format_count(n: u64) -> String {
 
 /// The filled part of the bar, and the tone's text and mark colour.
 fn fill_color(theme: Option<&Theme>, tone: MeterTone) -> Color {
-    let Some(t) = theme else {
-        return match tone {
-            MeterTone::Normal => DARK.primary,
-            MeterTone::Warning => DARK_STATUS.dark.warning,
-            MeterTone::Critical => DARK.error,
-        };
-    };
     match tone {
-        MeterTone::Normal => t.scheme().primary,
-        MeterTone::Warning => t
-            .extension::<StatusPalette>()
-            .map_or(DARK_STATUS.dark.warning, |s| s.colors(t.brightness).warning),
-        MeterTone::Critical => t.scheme().error,
+        MeterTone::Normal => style::accent(theme),
+        MeterTone::Warning => style::warning(theme),
+        MeterTone::Critical => style::error(theme),
     }
-}
-
-/// The unfilled part of the bar.
-fn track_color(theme: Option<&Theme>) -> Color {
-    theme.map_or(DARK.surface_container_highest, |t| {
-        t.scheme().surface_container_highest
-    })
 }
 
 /// A declarative usage meter. See the [module docs](self).
@@ -190,9 +181,23 @@ pub struct UsageMeterView<State> {
     state: PhantomData<fn() -> State>,
 }
 
+impl<State> std::fmt::Debug for UsageMeterView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsageMeterView")
+            .field("used", &self.model.used)
+            .field("size", &self.model.size)
+            .field("label", &self.model.label)
+            .field("warn_at", &self.model.warn_at)
+            .field("critical_at", &self.model.critical_at)
+            .field("compact", &self.model.compact)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Create a usage meter for `used` of `size` (the unit is the caller's:
 /// tokens, bytes, anything). It shows a percentage label, warns at 80 % and
 /// turns critical at 95 %; see the builder methods to change any of that.
+/// The caller owns the counts and passes the current ones on every build.
 pub fn usage_meter<State: 'static>(used: u64, size: u64) -> UsageMeterView<State> {
     UsageMeterView {
         model: MeterModel {
@@ -279,11 +284,12 @@ pub struct UsageMeterWidget {
 }
 
 impl UsageMeterWidget {
-    /// The label text's reserved width for `label`, from its widest sample.
-    fn sample(label: UsageLabel) -> Option<&'static str> {
+    /// The widest texts `label` can show, its reserved width measured from
+    /// them: every output of the formatter fits one of these.
+    fn samples(label: UsageLabel) -> Option<[&'static str; 2]> {
         match label {
-            UsageLabel::Percent => Some(PERCENT_SAMPLE),
-            UsageLabel::Counts => Some(COUNTS_SAMPLE),
+            UsageLabel::Percent => Some([PERCENT_SAMPLE, UNKNOWN_TEXT]),
+            UsageLabel::Counts => Some([COUNTS_SAMPLE, UNKNOWN_TEXT]),
             UsageLabel::None => None,
         }
     }
@@ -307,7 +313,7 @@ impl Widget for UsageMeterWidget {
         let muted = style::muted(theme);
         let family = style::mono_family(theme);
         let base = |color: Color| {
-            TextStyle::new(style::LABEL_FONT_SIZE as f32, color)
+            TextStyle::new(style::LABEL_FONT_SIZE, color)
                 .with_family(family.clone())
                 .with_feature(*b"tnum", 1)
         };
@@ -318,16 +324,20 @@ impl Widget for UsageMeterWidget {
             fill
         });
         let label_text = self.model.label_text();
-        let show_label = !self.model.compact && Self::sample(self.model.label).is_some();
+        let show_label = !self.model.compact && Self::samples(self.model.label).is_some();
 
         let text = ctx.text_context::<TextContext>();
         self.mark_w = text.layout(CRITICAL_MARK, &mark_style, None).size().width;
         self.mark = Self::mark_text(tone).map(|m| text.layout(m, &mark_style, None));
-        self.label_w = match Self::sample(self.model.label) {
-            Some(sample) if show_label => text.layout(sample, &label_style, None).size().width,
+        self.label = show_label.then(|| text.layout(&label_text, &label_style, None));
+        self.label_w = match Self::samples(self.model.label) {
+            Some(samples) if show_label => samples
+                .iter()
+                .map(|s| text.layout(s, &label_style, None).size().width)
+                .chain(self.label.as_ref().map(|l| l.size().width))
+                .fold(0.0, f64::max),
             _ => 0.0,
         };
-        self.label = show_label.then(|| text.layout(&label_text, &label_style, None));
         self.line_h = text.layout("0", &label_style, None).size().height;
 
         let mut width = self.mark_w + GAP + BAR_WIDTH;
@@ -340,7 +350,7 @@ impl Widget for UsageMeterWidget {
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
         let theme = Theme::from_paint_ctx(ctx);
-        let track = track_color(theme);
+        let track = style::track(theme);
         let fill = fill_color(theme, self.model.tone());
         let origin = ctx.origin();
         let size = ctx.size();
@@ -360,12 +370,12 @@ impl Widget for UsageMeterWidget {
 
         if let Some(mark) = &self.mark {
             let y = origin.y + (size.height - mark.size().height) / 2.0;
-            paint_layout(mark, Point::new(origin.x, y), scene);
+            style::paint_layout(mark, Point::new(origin.x, y), scene);
         }
         if let Some(label) = &self.label {
             let x = bar_origin.x + BAR_WIDTH + GAP;
             let y = origin.y + (size.height - label.size().height) / 2.0;
-            paint_layout(label, Point::new(x, y), scene);
+            style::paint_layout(label, Point::new(x, y), scene);
         }
     }
 
@@ -380,12 +390,6 @@ impl Widget for UsageMeterWidget {
                 node.set_max_numeric_value(1.0);
             }
         });
-    }
-}
-
-fn paint_layout(layout: &TextLayout, origin: Point, scene: &mut dyn PaintScene) {
-    for run in layout.to_scene_runs(origin) {
-        scene.draw_glyph_run(run);
     }
 }
 
@@ -525,6 +529,44 @@ mod tests {
     }
 
     #[test]
+    fn huge_values_cap_the_label_but_not_the_semantics() {
+        let tera = 1_000_000_000_000_u64;
+        assert_eq!(model(1_000, 100).label_text(), "999%+", "1000 %");
+        assert_eq!(model(999, 100).label_text(), "999%");
+        assert_eq!(format_count(999_949_999), "999.9M");
+        assert_eq!(format_count(999_950_000), COUNT_CAP);
+        assert_eq!(format_count(u64::MAX), COUNT_CAP);
+        let counts = with_label(tera, tera, UsageLabel::Counts);
+        assert_eq!(counts.label_text(), "999M+ / 999M+");
+        let m = model(1_000, 100);
+        assert!(m.semantics_text().contains("1000 percent"));
+        assert!(
+            counts
+                .semantics_text()
+                .contains(&format!("{tera} of {tera}"))
+        );
+
+        for label in [UsageLabel::Percent, UsageLabel::Counts] {
+            let mut widths = Vec::new();
+            for (used, size) in [(1_000, 100), (tera, tera), (u64::MAX, 1), (42, 100), (1, 0)] {
+                let view = usage_meter::<()>(used, size).label(label);
+                let mut counter = 0u64;
+                let mut w = View::<()>::build(&view, &mut BuildCtx::new(&mut counter));
+                widths.push(layout(&mut w, None).width);
+                let shown = w.label.as_ref().expect("a label").size().width;
+                assert!(
+                    shown <= w.label_w + 1e-6,
+                    "{label:?} {used}/{size} paints past"
+                );
+            }
+            assert!(
+                widths.windows(2).all(|p| (p[0] - p[1]).abs() < 1e-6),
+                "{label:?}: {widths:?}"
+            );
+        }
+    }
+
+    #[test]
     fn no_label_has_no_text() {
         assert_eq!(with_label(10, 20, UsageLabel::None).label_text(), "");
     }
@@ -589,7 +631,7 @@ mod tests {
         let size = Size::new(200.0, 20.0);
         let rec = paint(&mut w, size, Some(&theme));
         assert_eq!(rec.rrects.len(), 2, "track and fill");
-        assert_eq!(rec.rrects[0].3, track_color(Some(&theme)));
+        assert_eq!(rec.rrects[0].3, style::track(Some(&theme)));
         assert!(rec.glyph_runs > 0);
     }
 

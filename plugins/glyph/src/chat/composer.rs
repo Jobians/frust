@@ -3,25 +3,25 @@
 //! # Contract
 //!
 //! - **Controlled and non-reactive.** The caller owns the text: `.on_change`
-//!   reports each edit, and the composer never clears itself after a submit;
-//!   the caller sets the next value.
-//! - **Field.** A multi-line `text_input` that is one line tall when empty,
-//!   grows with its content up to `.max_visible_lines(n)` (default 6), then
-//!   scrolls inside. The growth is ordinary layout, so a parent sees the new
-//!   height on the same pass. The field's own Enter and IME handling is used
-//!   as is: Enter never submits while a composition is active.
+//!   reports each edit, and the composer never clears itself after a submit.
+//! - **Field.** A multi-line `text_input`, one line tall when empty, growing
+//!   with its content up to `.max_visible_lines(n)` (default 6), then
+//!   scrolling inside; the parent sees the new height on the same pass. Enter
+//!   never submits while an IME composition is active.
 //! - **Submit.** The send control and, with `.submit_on_enter(true)`, Enter
 //!   run `.on_submit(app state, text)` when the trimmed text is non-empty and
 //!   the composer is not disabled. With `false` (default) Enter inserts a
 //!   newline; Shift+Enter always does the opposite of the setting.
 //! - **Running.** `.running(true)` turns the send control into a stop control
-//!   that runs `.on_stop`; typing stays allowed.
-//! - **Disabled.** `.disabled(reason)` shows the reason as a line above the
-//!   field and disables the field and send. A running stop control stays live.
+//!   that runs `.on_stop`. Typing and Enter's submit stay allowed: the caller
+//!   decides whether a prompt sent mid-turn is queued or refused.
+//! - **One press, one action.** A release runs the control the press began
+//!   on; if the control changes (send to stop or back) mid-press, the press
+//!   is cancelled.
+//! - **Disabled.** `.disabled(reason)` shows the reason above the field and
+//!   disables the field and send; a running stop control stays live.
 //! - **Trailing action.** `.trailing_action(view)` fills one icon-sized slot
-//!   between the field and the send control; the send control never moves.
-//! - **Semantics.** The field is labelled by the placeholder; send and stop
-//!   are buttons with labels; the reason is plain text.
+//!   left of the send control, which never moves.
 
 use std::rc::Rc;
 
@@ -33,15 +33,13 @@ use frust::authoring::{
     View, Widget, any, build_child, erase_callback, erase_callback_arg, rebuild_child,
     route_event_single, teardown_child,
 };
-use frust::{ColorScheme, Theme, text, text_input};
+use frust::{Theme, text, text_input};
 
 use super::style;
 use crate::press::presses;
 
-/// Width used when the incoming constraints are unbounded.
-const FALLBACK_WIDTH: f64 = 480.0;
 /// Touch target of the send, stop and trailing slots.
-const TARGET: f64 = 44.0;
+const TARGET: f64 = style::MIN_TARGET;
 /// Diameter of the painted disc inside a send or stop target.
 const DISC: f64 = 36.0;
 /// Edge of the square the send arrow is drawn in.
@@ -50,8 +48,6 @@ const ARROW_BOX: f64 = 18.0;
 const STOP_BOX: f64 = 12.0;
 /// Corner radius of the stop square.
 const STOP_RADIUS: f64 = 2.0;
-/// Opacity of the ink tint laid over a pressed disc.
-const PRESSED_TINT: f32 = 0.16;
 /// Field line cap when the caller names none.
 const DEFAULT_MAX_LINES: usize = 6;
 /// Placeholder when the caller sets none.
@@ -60,8 +56,6 @@ const DEFAULT_PLACEHOLDER: &str = "Message";
 const SEND_LABEL: &str = "Send";
 /// Accessible name of the stop control.
 const STOP_LABEL: &str = "Stop";
-
-const DARK: ColorScheme = crate::tokens::color::dark();
 
 type OnChange<State> = Rc<dyn Fn(&mut State, String)>;
 type OnStop<State> = Rc<dyn Fn(&mut State)>;
@@ -80,7 +74,22 @@ pub struct ComposerView<State: 'static> {
     trailing: Option<AnyView<State>>,
 }
 
-/// A prompt input showing `value`; the caller owns the text.
+impl<State: 'static> std::fmt::Debug for ComposerView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComposerView")
+            .field("value", &self.value)
+            .field("placeholder", &self.placeholder)
+            .field("max_lines", &self.max_lines)
+            .field("submit_on_enter", &self.submit_on_enter)
+            .field("running", &self.running)
+            .field("disabled", &self.disabled)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A prompt input showing `value`. The caller owns the text: it stores what
+/// `.on_change(..)` reports, passes it back, and sets the next value after a
+/// submit (the composer never clears itself).
 pub fn composer<State: 'static>(value: impl Into<String>) -> ComposerView<State> {
     ComposerView {
         value: value.into(),
@@ -185,7 +194,7 @@ impl<State: 'static> ComposerView<State> {
 
 fn reason_view<State: 'static>(reason: &str) -> impl View<State> + use<State> {
     text(reason)
-        .size(style::LABEL_FONT_SIZE as f32)
+        .size(style::LABEL_FONT_SIZE)
         .themed_role(ThemeTextColor::OnSurfaceVariant)
         .overflow_wrap(OverflowWrap::Anywhere)
 }
@@ -275,7 +284,7 @@ impl ComposerWidget {
             Control::Stop => (colors.stop_fill, colors.stop_ink),
         };
         let fill = if self.pressed {
-            mix(fill, ink, PRESSED_TINT)
+            style::mix(fill, ink, style::PRESSED_TINT)
         } else {
             fill
         };
@@ -334,27 +343,16 @@ struct ControlColors {
 
 impl ControlColors {
     fn resolve(theme: Option<&Theme>) -> Self {
-        let scheme = theme.map_or(DARK, |t| *t.scheme());
+        let scheme = style::scheme(theme);
         Self {
             send_fill: scheme.primary,
             send_ink: scheme.on_primary,
             stop_fill: scheme.on_surface,
             stop_ink: scheme.surface,
-            idle_fill: scheme.surface_container_high,
+            idle_fill: style::surface_high(theme),
             idle_ink: style::muted(theme),
         }
     }
-}
-
-/// `over` blended onto `base` at opacity `t` (alpha of `base` kept).
-fn mix(base: Color, over: Color, t: f32) -> Color {
-    let (b, o) = (base.components, over.components);
-    Color::new([
-        b[0] + (o[0] - b[0]) * t,
-        b[1] + (o[1] - b[1]) * t,
-        b[2] + (o[2] - b[2]) * t,
-        b[3],
-    ])
 }
 
 impl<State: 'static> View<State> for ComposerView<State> {
@@ -437,10 +435,9 @@ impl<State: 'static> View<State> for ComposerView<State> {
         let control = Control::of(self.running, self.can_send());
         if element.control != control {
             element.control = control;
-            if !control.live() {
-                element.pressed = false;
-                element.captured = false;
-            }
+            // A release only acts on the control its press began on.
+            element.pressed = false;
+            element.captured = false;
             // Semantics-only too, but `PAINT` is what reaches the semantics gate.
             flags |= ChangeFlags::PAINT;
         }
@@ -460,11 +457,7 @@ impl<State: 'static> View<State> for ComposerView<State> {
 
 impl Widget for ComposerWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        let width = if bc.max().width.is_finite() {
-            bc.max().width
-        } else {
-            FALLBACK_WIDTH
-        };
+        let width = style::width_of(bc);
         let pad = style::PAD_SMALL;
         let inner = (width - pad * 2.0).max(0.0);
         let loose_w = |w: f64| BoxConstraints::new(Size::new(w, 0.0), Size::new(w, f64::INFINITY));
@@ -565,12 +558,7 @@ impl Widget for ComposerWidget {
             } else {
                 node.set_disabled();
             }
-            node.set_bounds(frust::accesskit::Rect {
-                x0: origin.x + r.x0,
-                y0: origin.y + r.y0,
-                x1: origin.x + r.x1,
-                y1: origin.y + r.y1,
-            });
+            node.set_bounds(style::node_bounds(origin, r));
         });
     }
 
@@ -779,6 +767,71 @@ mod tests {
         rig.click_field();
         rig.type_text("!");
         assert!(rig.app.value.contains('!'), "typing stays allowed");
+    }
+
+    #[test]
+    fn a_control_change_mid_press_cancels_the_press() {
+        // Send to Stop: the turn started while the send control was held.
+        let mut rig = Rig::new(with_value("hi"), true, 320.0);
+        let at = rig.button().1.center();
+        rig.send(pointer(PointerPhase::Down, at));
+        rig.app.running = true;
+        rig.refresh();
+        assert_eq!(rig.button().0, "Stop");
+        rig.send(pointer(PointerPhase::Up, at));
+        assert_eq!(
+            (rig.app.submits.len(), rig.app.stops),
+            (0, 0),
+            "send to stop"
+        );
+
+        // Stop to Send: the turn ended while the stop control was held.
+        let mut rig = Rig::new(
+            App {
+                running: true,
+                value: "next".into(),
+                ..App::default()
+            },
+            true,
+            320.0,
+        );
+        rig.send(pointer(PointerPhase::Down, at));
+        rig.app.running = false;
+        rig.refresh();
+        assert_eq!(rig.button().0, "Send");
+        rig.send(pointer(PointerPhase::Up, at));
+        assert_eq!(
+            (rig.app.submits.len(), rig.app.stops),
+            (0, 0),
+            "stop to send"
+        );
+
+        // A press that sees no change still fires.
+        rig.tap_button();
+        assert_eq!(rig.app.submits, ["next"]);
+    }
+
+    #[test]
+    fn enter_submits_while_running_and_the_control_stays_stop() {
+        let mut rig = Rig::new(
+            App {
+                running: true,
+                enter_submits: true,
+                ..App::default()
+            },
+            true,
+            320.0,
+        );
+        rig.click_field();
+        rig.type_text("queue this");
+        rig.key(NamedKey::Enter, false);
+        assert_eq!(
+            rig.app.submits,
+            ["queue this"],
+            "the caller decides to queue"
+        );
+        assert_eq!(rig.app.stops, 0);
+        assert_eq!(rig.button().0, "Stop");
     }
 
     #[test]

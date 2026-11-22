@@ -1,26 +1,26 @@
-//! Chat components for agent-style conversation UIs: transcript messages,
-//! markdown, code and diff blocks, tool calls, plans, approvals, a composer.
+//! Chat components for agent-style conversation UIs, behind the non-default
+//! `chat` feature and reached as `frust_glyph::chat::*` (not re-exported at
+//! the crate root, where `message` or `plan` would be too generic).
 //!
-//! Behind the non-default `chat` cargo feature; reach items as
-//! `frust_glyph::chat::*` (they are deliberately not re-exported at the crate
-//! root, where names like `message` and `plan` would be too generic).
+//! | Component | Shows |
+//! |---|---|
+//! | [`message_scroller`] | the virtualized transcript, stuck to its live end |
+//! | [`message_row`] | a user, assistant or thought message |
+//! | [`markdown`] | assistant markdown, one widget per block |
+//! | [`code_block`] / [`diff_view`] | code, and a file edit as a line diff |
+//! | [`tool_call`] / [`plan_block`] | a tool call card, the agent's plan |
+//! | [`approval_card`] | a permission request and its answer |
+//! | [`notice_row`] / [`usage_meter`] | a status line, a context meter |
+//! | [`composer`] | the prompt input |
 //!
-//! # Contract
-//!
-//! - **Controlled and non-reactive.** Every component takes its data and
-//!   callbacks from the caller and holds no signals; the app owns the
-//!   transcript and re-builds the views when it changes.
-//! - **Token-driven.** Colors, radii and the monospace family resolve from
-//!   the live `Theme` (with an unthemed Glyph-dark fallback per value), never
-//!   by matching on a design language. Shared values live in `style`.
-//! - **Facade-only.** Authored against `frust::authoring`; no other framework
-//!   crate is named.
-//! - **Untrusted content.** Message text is untrusted. Markdown never emits
-//!   raw HTML, images are never fetched (alt text is shown instead), and a
-//!   link is only ever reported through the app's callback, never opened by
-//!   the component.
-//!
-//! [`model`] holds the plain data types shared by the components.
+//! **Controlled, non-reactive:** each takes data and callbacks, holds no
+//! signals and never applies a toggle itself; the app owns the transcript.
+//! **Untrusted content:** markdown emits no HTML and fetches no image; a
+//! link's URL is attacker-controlled and may differ from its label, so show
+//! or confirm it before opening; approval titles, details and options are
+//! agent-supplied. **Performance:** markdown re-parses per change and keeps
+//! unchanged blocks, so coalesce stream chunks to one update per frame; key
+//! scroller rows by a stable message id. Composed example: `tests/chat_api.rs`.
 
 mod approval;
 mod code_block;
@@ -29,7 +29,7 @@ mod diff;
 mod markdown;
 mod markdown_parse;
 mod message;
-pub mod model;
+mod model;
 mod notice;
 mod plan;
 mod scroller;
@@ -38,33 +38,24 @@ mod table;
 mod tool_call;
 mod usage;
 
-// The stub modules below are empty until their cards land, and a glob
-// import of an empty module warns; the last card of the plan removes every
-// `allow(unused_imports)` here.
-#[allow(unused_imports)]
-pub use approval::*;
-#[allow(unused_imports)]
-pub use code_block::*;
-#[allow(unused_imports)]
-pub use composer::*;
-#[allow(unused_imports)]
-pub use diff::*;
-#[allow(unused_imports)]
-pub use markdown::*;
-#[allow(unused_imports)]
-pub use markdown_parse::*;
-#[allow(unused_imports)]
-pub use message::*;
-pub use model::*;
-#[allow(unused_imports)]
-pub use notice::*;
-#[allow(unused_imports)]
-pub use plan::*;
-#[allow(unused_imports)]
-pub use scroller::*;
-#[allow(unused_imports)]
-pub use table::*;
-#[allow(unused_imports)]
-pub use tool_call::*;
-#[allow(unused_imports)]
-pub use usage::*;
+// The widget structs stay `pub` inside these private modules (a public
+// view's `Element` cannot name a crate-private type) and are not listed
+// here, so no path outside the crate reaches them.
+pub use approval::{ApprovalCardView, ApprovalDeadline, approval_card};
+pub use code_block::{CodeBlockView, CodeSpan, CodeTone, code_block};
+pub use composer::{ComposerView, composer};
+pub use diff::{
+    DIFF_DEFAULT_COLLAPSE_ABOVE, DIFF_DEFAULT_CONTEXT, DIFF_MAX_BYTES, DIFF_MAX_LINES, DiffHunk,
+    DiffLine, DiffLineKind, DiffModel, DiffView, compute_diff, diff_view,
+};
+pub use markdown::{MARKDOWN_MAX_SOURCE_BYTES, MarkdownView, markdown};
+pub use message::{MessageRowView, message_row};
+pub use model::{
+    ApprovalOption, ApprovalOptionKind, ApprovalState, ChatRole, DiffInput, PlanEntry,
+    PlanEntryStatus, ToolKind, ToolStatus,
+};
+pub use notice::{NoticeRowView, NoticeTone, notice_row};
+pub use plan::{PlanBlockView, plan_block};
+pub use scroller::{DEFAULT_ESTIMATED_ROW_EXTENT, MessageScrollerView, message_scroller};
+pub use tool_call::{ToolCallView, ToolContent, tool_call};
+pub use usage::{UsageLabel, UsageMeterView, usage_meter};

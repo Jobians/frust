@@ -25,11 +25,11 @@ use std::rc::Rc;
 
 use frust::accesskit::Role;
 use frust::authoring::{
-    BoxConstraints, BuildCtx, ChangeFlags, ChildPod, Color, EventCtx, EventResult, InputEvent,
-    LayoutCtx, PaintCtx, PaintScene, Point, SemanticsCtx, Size, View, Widget, build_child,
-    rebuild_child, route_event, route_event_single, teardown_child,
+    BoxConstraints, BuildCtx, ChangeFlags, ChildPod, EventCtx, EventResult, InputEvent, LayoutCtx,
+    PaintCtx, PaintScene, Point, SemanticsCtx, Size, View, Widget, build_child, rebuild_child,
+    route_event, route_event_single, teardown_child,
 };
-use frust::{ColorScheme, CustomScrollView, RichTextView, ScrollAxis, Theme, custom_scroll_view};
+use frust::{CustomScrollView, RichTextView, ScrollAxis, Theme, custom_scroll_view};
 
 use super::markdown_parse::MdAlignment;
 use super::style;
@@ -42,12 +42,6 @@ pub(crate) const COL_MAX: f64 = 320.0;
 const CELL_PAD_X: f64 = style::PAD_SMALL;
 /// Vertical padding inside a cell.
 const CELL_PAD_Y: f64 = style::ROW_GAP;
-/// Width used when the incoming constraints are unbounded.
-const FALLBACK_WIDTH: f64 = 480.0;
-
-const DARK: ColorScheme = crate::tokens::color::dark();
-/// Unthemed header-row fill.
-const FALLBACK_HEADER_BG: Color = DARK.surface_container_high;
 
 /// The cells of one table, shared by the outer view and its grid.
 #[derive(Clone, Debug, PartialEq)]
@@ -167,11 +161,7 @@ impl<State: 'static> View<State> for TableView<State> {
 
 impl Widget for TableWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        let width = if bc.max().width.is_finite() {
-            bc.max().width
-        } else {
-            FALLBACK_WIDTH
-        };
+        let width = style::width_of(bc);
         // The viewport takes its height from its constraints; the grid inside
         // reports the height it needs, and a change is laid out again at once.
         let before = self.height.get();
@@ -363,7 +353,7 @@ impl Widget for GridWidget {
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
         let theme = Theme::from_paint_ctx(ctx);
         let border = style::border(theme);
-        let header_bg = theme.map_or(FALLBACK_HEADER_BG, |t| t.scheme().surface_container_high);
+        let header_bg = style::surface_high(theme);
         let o = ctx.origin();
         let width = self.col_x.last().copied().unwrap_or(0.0);
         if let [top, below, ..] = self.row_y[..] {
