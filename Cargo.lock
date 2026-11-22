@@ -2438,6 +2438,7 @@ dependencies = [
  "kurbo",
  "peniko",
  "pulldown-cmark",
+ "web-time",
 ]
 
 [[package]]
