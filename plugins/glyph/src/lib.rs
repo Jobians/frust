@@ -67,6 +67,11 @@
 //! `frust_glyph::show_glyph_dialog`, `frust_glyph::baseline()` — alongside the
 //! `frust::*` baseline widgets a Glyph screen composes with.
 //!
+//! The opt-in `chat` cargo feature adds [`chat`], a family of components for
+//! agent-style conversation UIs. It is deliberately *not* glob re-exported
+//! here: its names (`message`, `plan`, …) are too generic for the flat
+//! namespace, so reach them as `frust_glyph::chat::*`.
+//!
 //! # Charter
 //!
 //! - **Token-driven, never design-language-branching.** A Glyph widget
@@ -105,6 +110,8 @@ pub mod badge;
 pub mod breadcrumb;
 pub mod card;
 pub mod card_switcher;
+#[cfg(feature = "chat")]
+pub mod chat;
 pub mod command_palette;
 pub mod dialog;
 pub mod dots;
