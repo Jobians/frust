@@ -75,6 +75,7 @@ mod slider;
 mod slivers;
 mod stack;
 mod text;
+mod text_selection;
 mod textinput;
 mod texture_view;
 mod thread_state;
