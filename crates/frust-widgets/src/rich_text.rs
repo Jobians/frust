@@ -65,6 +65,12 @@
 //! live the press claims focus directly, and a press that ends selecting
 //! nothing (a tap, or one a parent scroll took over) releases it again.
 //!
+//! A double or triple click is measured on the paint clock, so a block that
+//! completed a click asks for plain continuation frames until
+//! [`DOUBLE_TAP_MS`](crate::gesture) has passed and none after. Replacing
+//! the text ends the live press, clears the selection and gives back any focus
+//! it no longer needs.
+//!
 //! The selection survives a scroll and a relayout, and a view change that
 //! keeps the text. A disposed block (a virtualized row leaving the window)
 //! drops its selection, toolbar and scroll vetoes with it.
@@ -502,7 +508,7 @@ impl<State: 'static> View<State> for RichTextView {
             match (self.selectable, element.select.as_mut()) {
                 (true, None) => element.select = Some(Box::new(Selection::new())),
                 // Offsets into another text mean nothing: start over.
-                (true, Some(select)) if !same_text => select.clear(),
+                (true, Some(select)) if !same_text => select.text_replaced(),
                 (true, Some(_)) => {}
                 (false, Some(select)) => {
                     select.dispose(ctx);
@@ -1018,9 +1024,10 @@ struct Selection {
     vetoes: Vec<Rc<Cell<bool>>>,
     /// This block raised `vetoes` and has not lowered them yet.
     raised: bool,
-    /// The last completed click: where, the paint clock then, and how many
-    /// clicks it completed — the double/triple-click window.
-    last_click: Option<(Point, FrameTime, u8)>,
+    /// The last completed click: where, the paint clock when the first paint
+    /// after it dated it (`None` until then), and how many clicks it
+    /// completed — the double/triple-click window.
+    last_click: Option<(Point, Option<FrameTime>, u8)>,
     /// The input time of the most recent paint: the event pass's clock.
     last_input_time: FrameTime,
     toolbar: OverlaySlot<()>,
@@ -1069,6 +1076,20 @@ impl Selection {
         self.range = 0..0;
         self.handles = false;
         self.toolbar_open = false;
+    }
+
+    /// The text was replaced: offsets held by the live press, the selection
+    /// and the click window mean nothing in the new text. The press ends (its
+    /// scroll vetoes are lowered), and a block left holding focus with
+    /// nothing selected gives it back through its handle.
+    fn text_replaced(&mut self) {
+        self.end_press();
+        self.clear();
+        self.last_click = None;
+        if self.focused {
+            self.focus.release();
+            self.lose_focus();
+        }
     }
 
     /// The block lost focus: its selection goes with it.
@@ -1144,6 +1165,18 @@ impl Selection {
     fn before_paint(&mut self, ctx: &mut PaintCtx) {
         let now = ctx.input_time();
         self.last_input_time = now;
+        // The click window is measured on this paint clock, which only
+        // advances while something paints: ask for plain frames until the
+        // window has passed (the first paint after the click dates it), then
+        // drop the click so an idle block asks for none.
+        if let Some((_, time, _)) = self.last_click.as_mut() {
+            let dated = *time.get_or_insert(now);
+            if now.saturating_sub(dated).as_secs_f64() * 1000.0 > DOUBLE_TAP_MS {
+                self.last_click = None;
+            } else {
+                ctx.request_frame();
+            }
+        }
         if matches!(self.press, SelectPress::Tap { touch: true, .. })
             && let Some(hold) = self.hold.as_mut()
         {
@@ -1517,9 +1550,10 @@ impl RichTextWidget {
                     Some((at, time, count))
                         if !touch
                             && within_slop(at)
-                            && select.last_input_time.saturating_sub(time).as_secs_f64()
-                                * 1000.0
-                                <= DOUBLE_TAP_MS =>
+                            && time.is_none_or(|time| {
+                                select.last_input_time.saturating_sub(time).as_secs_f64() * 1000.0
+                                    <= DOUBLE_TAP_MS
+                            }) =>
                     {
                         count + 1
                     }
@@ -1632,6 +1666,11 @@ impl RichTextWidget {
                     select.press = press.clone();
                     if self.fire_hold(select, ctx) {
                         select.end_press();
+                        // A hold that found no word selects nothing: the
+                        // focus its `Down` claimed goes back.
+                        if select.range.is_empty() && select.focused {
+                            select.release(ctx);
+                        }
                         return EventResult::Handled;
                     }
                     select.press = SelectPress::None;
@@ -1659,12 +1698,12 @@ impl RichTextWidget {
                             None => select.release(ctx),
                         }
                         if !touch {
-                            select.last_click = Some((at, select.last_input_time, 1));
+                            select.last_click = Some((at, None, 1));
                         }
                     }
                     SelectPress::Word { at, hold, .. } => {
                         if !hold {
-                            select.last_click = Some((at, select.last_input_time, 2));
+                            select.last_click = Some((at, None, 2));
                         }
                     }
                     SelectPress::Handle { .. } => select.toolbar_open = true,
@@ -1751,7 +1790,11 @@ fn marked_fragments(
     let mut out: Vec<(usize, Fragment)> = Vec::new();
     for (range, span) in marked {
         let mut piece = range.start;
-        let ends = text[range.clone()]
+        // A stale range must not panic: skip what is not a slice of `text`.
+        let Some(slice) = text.get(range.clone()) else {
+            continue;
+        };
+        let ends = slice
             .char_indices()
             .filter(|(_, c)| is_newline(*c))
             .map(|(at, c)| (range.start + at, c.len_utf8()))
@@ -2606,5 +2649,45 @@ mod tests {
         assert_eq!(fixed, 6, "dragging the end keeps the start");
         assert!((end.center() + grab - Point::new(end.x0, end.center().y)).hypot() < 1e-9);
         assert_eq!(widget.handle_at(select, Point::new(1.0, 1.0)), None);
+    }
+
+    #[test]
+    fn marked_fragments_skip_a_stale_or_off_boundary_range() {
+        let _slot = crate::test_support::LocaleSlotGuard::hold();
+        let mut tcx = TextContext::new();
+        let text = "h\u{e9}llo";
+        let layout = tcx.layout(text, &TextStyle::default(), Some(300.0));
+        // Past the end, and inside the two-byte e-acute (bytes 1..3).
+        for range in [0..100, 2..4, 6..9] {
+            let marked = [(range, 0)];
+            let _ = marked_fragments(&layout, text, &marked);
+        }
+        let whole = marked_fragments(&layout, text, &[(0..text.len(), 0)]);
+        assert!(!whole.is_empty(), "a valid range still yields fragments");
+    }
+
+    #[test]
+    fn replacing_the_text_ends_the_press_and_lowers_its_vetoes() {
+        let _slot = crate::test_support::LocaleSlotGuard::hold();
+        let mut tcx = TextContext::new();
+        let view = rich_text([span("alpha beta")]).selectable(true);
+        let (mut widget, _) = lay_out(&view, None, 300.0, &mut tcx);
+        let veto = Rc::new(Cell::new(false));
+        let select = widget.select.as_deref_mut().expect("selectable");
+        select.vetoes = vec![Rc::clone(&veto)];
+        select.raise_vetoes();
+        select.press = SelectPress::Drag { anchor: 7 };
+        select.range = 3..7;
+        select.focused = true;
+        assert!(veto.get(), "the press holds the scroll lock");
+
+        let next = rich_text([span("ab")]).selectable(true);
+        let mut id = 0u64;
+        View::<()>::rebuild(&next, &view, &mut widget, &mut BuildCtx::new(&mut id));
+        let select = widget.select.as_deref().expect("still selectable");
+        assert!(!veto.get(), "the lock is released");
+        assert_eq!(select.press, SelectPress::None);
+        assert!(select.range.is_empty());
+        assert!(!select.focused, "focus nothing needs is given back");
     }
 }

@@ -80,6 +80,8 @@ struct Harness {
     /// The block's text origin as last painted.
     origin: Point,
     scene: Scene,
+    /// Whether the last paint asked for a continuation frame.
+    needs_frame: bool,
 }
 
 impl Harness {
@@ -95,6 +97,7 @@ impl Harness {
             window: Size::new(WIDTH, 400.0),
             origin: Point::ZERO,
             scene: Scene::default(),
+            needs_frame: false,
         };
         h.frame(0.0);
         h
@@ -106,8 +109,10 @@ impl Harness {
         self.root
             .layout_with_text(self.window, &mut self.tcx as &mut dyn std::any::Any);
         let mut scene = Scene::default();
-        self.root
-            .paint(&mut scene, FrameTime::from_nanos((ms * 1e6) as u64));
+        self.needs_frame = self
+            .root
+            .paint(&mut scene, FrameTime::from_nanos((ms * 1e6) as u64))
+            .needs_frame;
         if let Some(origin) = scene.origins.first() {
             self.origin = *origin;
         }
@@ -660,4 +665,199 @@ fn an_installed_toolbar_builder_floats_copy_and_select_all_and_its_copy_lands() 
     set_selection_toolbar_builder(Arc::new(|request: &SelectionToolbarRequest, _: Size| {
         frust_widgets::selection_toolbar(request)
     }));
+}
+
+/// A shell's idle loop: paint every 16 ms from `from` to `to` while the last
+/// paint asked for a continuation frame, and stop at the first that did not.
+fn settle(h: &mut Harness, from: f64, to: f64) {
+    let mut ms = from;
+    while h.needs_frame && ms < to {
+        ms += 16.0;
+        h.frame(ms);
+    }
+}
+
+const DOUBLE_TAP_MS: f64 = 300.0;
+
+#[test]
+fn a_second_click_after_the_window_is_a_single_click_with_or_without_paints() {
+    let _policy = framework_policy();
+    let mut h = Harness::new(block);
+    let gamma = h.at(TEXT, 11..16);
+    // The shell's own continuation frames carry the clock past the window;
+    // nothing paints after that until the second click arrives.
+    h.click(gamma);
+    h.frame(0.0);
+    settle(&mut h, 0.0, 10_000.0);
+    assert!(!h.needs_frame, "the idle block stopped asking for frames");
+    h.click(gamma);
+    assert_eq!(h.copied(), None, "ten seconds later is a single click");
+    // The same with a paint between every step, late ones included.
+    let mut h = Harness::new(block);
+    let gamma = h.at(TEXT, 11..16);
+    h.click(gamma);
+    h.frame(10.0);
+    h.frame(DOUBLE_TAP_MS + 60.0);
+    h.frame(5_000.0);
+    h.click(gamma);
+    assert_eq!(h.copied(), None);
+}
+
+#[test]
+fn clicks_inside_the_window_select_the_word_and_then_the_block() {
+    let _policy = framework_policy();
+    let mut h = Harness::new(block);
+    let gamma = h.at(TEXT, 11..16);
+    h.click(gamma);
+    h.frame(100.0);
+    h.click(gamma);
+    assert_eq!(h.copied().as_deref(), Some("gamma"));
+    h.frame(200.0);
+    h.click(gamma);
+    assert_eq!(h.copied().as_deref(), Some(TEXT));
+}
+
+#[test]
+fn an_idle_block_requests_no_frames_once_its_click_window_has_passed() {
+    let _policy = framework_policy();
+    let mut h = Harness::new(block);
+    let gamma = h.at(TEXT, 11..16);
+    h.frame(1.0);
+    assert!(!h.needs_frame, "no click, no frames");
+    h.click(gamma);
+    h.frame(2.0);
+    assert!(h.needs_frame, "the window is open: the clock must advance");
+    h.frame(3.0);
+    assert!(
+        h.needs_frame,
+        "and it stays open until the window has passed"
+    );
+    h.frame(2.0 + DOUBLE_TAP_MS + 1.0);
+    assert!(!h.needs_frame, "the window has passed");
+    h.frame(2.0 + 2.0 * DOUBLE_TAP_MS);
+    assert!(!h.needs_frame, "and stays at rest");
+}
+
+fn replaceable(app: &mut App) -> FlexView<App> {
+    column().child(rich_text([span(app.field.clone())]).selectable(true))
+}
+
+fn replaceable_harness() -> Harness {
+    let mut h = Harness::new(replaceable);
+    h.app.field = TEXT.to_string();
+    h.frame(1.0);
+    h
+}
+
+/// The state after a replacement: nothing selected, copied or painted, and
+/// the block no longer the focused node.
+fn assert_no_stale_selection(h: &mut Harness, drag_to: Point) {
+    h.pointer(PointerPhase::Move, drag_to, false);
+    h.pointer(PointerPhase::Move, drag_to + Vec2::new(5.0, 0.0), true);
+    h.pointer(PointerPhase::Up, drag_to, false);
+    h.frame(900.0);
+    assert!(h.scene.highlights.is_empty(), "no highlight is painted");
+    assert!(h.scene.knobs.is_empty(), "no handles survive");
+    assert_eq!(h.copied(), None, "nothing is copied");
+}
+
+#[test]
+fn text_replaced_during_a_handle_drag_leaves_no_selection_from_old_offsets() {
+    for replacement in [
+        "ab",
+        "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+    ] {
+        let _policy = framework_policy();
+        let mut h = replaceable_harness();
+        // "gamma" starts at the odd byte 11, the end handle's fixed end.
+        let gamma = h.at(TEXT, 11..16);
+        h.hold(gamma);
+        h.pointer(PointerPhase::Up, gamma, true);
+        h.frame(700.0);
+        let knob = h
+            .scene
+            .knobs
+            .iter()
+            .max_by(|a, b| a.x0.total_cmp(&b.x0))
+            .expect("two knobs")
+            .center();
+        let end = Point::new(knob.x - 2.0, gamma.y);
+        assert!(h.pointer(PointerPhase::Down, end, true), "a handle drag");
+        h.app.field = replacement.to_string();
+        h.frame(710.0);
+        assert_no_stale_selection(&mut h, Point::new(end.x - 20.0, end.y));
+    }
+}
+
+#[test]
+fn text_replaced_during_a_mouse_drag_leaves_no_selection_from_old_offsets() {
+    for replacement in [
+        "ab",
+        "\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}",
+    ] {
+        let _policy = framework_policy();
+        let mut h = replaceable_harness();
+        // Byte 1 is inside a two-byte character of the second replacement.
+        let from = h.caret(TEXT, 1);
+        let to = h.caret(TEXT, 8);
+        h.pointer(PointerPhase::Down, from, false);
+        h.pointer(PointerPhase::Move, to, false);
+        h.app.field = replacement.to_string();
+        h.frame(710.0);
+        assert_no_stale_selection(&mut h, to);
+    }
+}
+
+fn paragraph_is_focused(h: &Harness) -> bool {
+    let update = h.root.semantics();
+    update
+        .nodes
+        .iter()
+        .any(|(id, node)| node.role() == Role::Label && Some(*id) == update.focus)
+}
+
+#[test]
+fn a_long_press_that_finds_no_word_gives_the_focus_back() {
+    let _policy = framework_policy();
+    // Stretched, so the empty paragraph still has a box to press in. Empty
+    // text, and a max_lines cut that leaves nothing, have no word to select.
+    for cut in [None, Some(0usize)] {
+        let mut h = Harness::new(move |_: &mut App| {
+            let text = if cut.is_some() { "cut away" } else { "" };
+            let mut view = rich_text([span(text)]).selectable(true);
+            if let Some(lines) = cut {
+                view = view.max_lines(lines);
+            }
+            column()
+                .cross_axis(frust_widgets::CrossAxisAlignment::Stretch)
+                .child(view)
+        });
+        let at = Point::new(h.origin.x + 5.0, h.origin.y + 3.0);
+        assert!(h.pointer(PointerPhase::Down, at, true), "the press lands");
+        h.frame(10.0);
+        h.frame(10.0 + LONG_PRESS_MS + 50.0);
+        h.send(InputEvent::Housekeeping);
+        h.pointer(PointerPhase::Up, at, true);
+        h.frame(800.0);
+        assert!(!paragraph_is_focused(&h), "no word, no focus ({cut:?})");
+    }
+}
+
+/// A press-and-release that never painted in between: the hold's threshold
+/// elapsed, so the `Up` itself fires it.
+#[test]
+fn an_up_that_fires_the_hold_on_empty_text_gives_the_focus_back() {
+    let _policy = framework_policy();
+    let mut h = Harness::new(|_: &mut App| {
+        column()
+            .cross_axis(frust_widgets::CrossAxisAlignment::Stretch)
+            .child(rich_text([span("")]).selectable(true))
+    });
+    let at = Point::new(5.0, 3.0);
+    assert!(h.pointer(PointerPhase::Down, at, true));
+    h.frame(10.0);
+    h.frame(10.0 + LONG_PRESS_MS + 50.0);
+    h.pointer(PointerPhase::Up, at, true);
+    h.frame(800.0);
+    assert!(!paragraph_is_focused(&h));
 }
