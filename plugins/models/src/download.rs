@@ -29,7 +29,7 @@ use ureq::Body;
 use ureq::http::Response;
 
 use crate::error::{HubError, ModelsError};
-use crate::hub::{HubClient, Origin, check_status, header};
+use crate::hub::{HubClient, check_status, check_url, header, refuse_ui_thread};
 use crate::id::ModelId;
 use crate::store::{LocalModel, ModelManifest, ModelSource, ModelStore};
 
@@ -48,7 +48,8 @@ pub type DownloadSink = Arc<dyn Fn(DownloadEvent) + Send + Sync>;
 pub struct DownloadItem {
     /// Where the file is stored.
     pub id: ModelId,
-    /// Where it is fetched from: `https://`, or `http://` on a loopback address.
+    /// Where it is fetched from: `https://`, or `http://` on a loopback address. Redirects
+    /// must stay on `https://` (or loopback to loopback) and are followed at most 5 times.
     pub url: String,
     /// Recorded in the manifest.
     pub source: ModelSource,
@@ -70,14 +71,6 @@ pub struct DownloadRequest {
     pub verified: bool,
     /// Upper bound on the bundle's total size in bytes.
     pub max_bytes: Option<u64>,
-}
-
-fn check_url(url: &str) -> Result<(), HubError> {
-    match Origin::parse(url) {
-        Some(origin) if origin.scheme == "https" => Ok(()),
-        Some(origin) if origin.scheme == "http" && origin.is_loopback() => Ok(()),
-        _ => Err(HubError::InsecureUrl),
-    }
 }
 
 impl DownloadRequest {
@@ -110,12 +103,16 @@ impl DownloadRequest {
 impl HubClient {
     /// A download of `paths` from `repo` at `revision`, with sizes and SHA-256 digests taken
     /// from the repository listing. A path missing from the listing is [`HubError::NotFound`].
+    ///
+    /// Blocks on the listing request and refuses the UI thread like [`HubClient::files`]; a
+    /// component uses `DownloadTracker::start_hub` instead.
     pub fn request_for(
         &self,
         repo: &str,
         revision: &str,
         paths: &[&str],
     ) -> Result<DownloadRequest, ModelsError> {
+        refuse_ui_thread()?;
         let files = self.files(repo, revision)?;
         let mut items = Vec::with_capacity(paths.len());
         for path in paths {
@@ -142,12 +139,13 @@ impl HubClient {
         })
     }
 
-    /// [`request_for`](Self::request_for) at the `main` revision.
+    /// [`request_for`](Self::request_for) at the `main` revision. Blocks the same way.
     pub fn request_for_main(
         &self,
         repo: &str,
         paths: &[&str],
     ) -> Result<DownloadRequest, ModelsError> {
+        refuse_ui_thread()?;
         self.request_for(repo, "main", paths)
     }
 }
@@ -262,7 +260,11 @@ impl DownloadHandle {
 
     /// Blocks until the download ends. A cancelled download returns
     /// [`ModelsError::Cancelled`].
+    ///
+    /// On iOS and macOS a call on the main thread fails with [`ModelsError::UiThread`] at once;
+    /// the download keeps running, as it does whenever the handle is dropped.
     pub fn wait(self) -> Result<Vec<LocalModel>, ModelsError> {
+        refuse_ui_thread()?;
         self.thread
             .join()
             .unwrap_or_else(|_| Err(ModelsError::Storage("download thread panicked".into())))

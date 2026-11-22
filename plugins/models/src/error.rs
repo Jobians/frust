@@ -27,6 +27,11 @@ pub enum ModelsError {
     #[cfg(feature = "hub")]
     #[error("download cancelled")]
     Cancelled,
+    /// A call that blocks on the network or on a download was made on the platform UI thread
+    /// and refused. Run it on `frust::spawn_blocking` or another worker thread.
+    #[cfg(feature = "hub")]
+    #[error("this call blocks and cannot run on the UI thread")]
+    UiThread,
 }
 
 impl ModelsError {
@@ -41,6 +46,7 @@ impl ModelsError {
             Self::Unsupported(msg) => Self::Unsupported(msg.clone()),
             Self::Hub(err) => Self::Hub(err.clone()),
             Self::Cancelled => Self::Cancelled,
+            Self::UiThread => Self::UiThread,
         }
     }
 }
@@ -82,7 +88,15 @@ pub enum HubError {
     /// The bundle would reach `actual` bytes, past `DownloadRequest::max_bytes` (`limit`).
     #[error("download of {actual} bytes exceeds the limit of {limit}")]
     TooLarge { limit: u64, actual: u64 },
-    /// The URL is not `https://` (plain `http://` is accepted for loopback addresses only).
+    /// The URL, a redirect target, or the base URL a token would travel to is not `https://`.
+    /// Plain `http://` is accepted only when the first URL was on a loopback address and the
+    /// target is too.
     #[error("only https urls are allowed")]
     InsecureUrl,
+    /// A request was redirected more than 5 times.
+    #[error("too many redirects")]
+    TooManyRedirects,
+    /// A listing's `Link: rel="next"` page is not on the scheme, host and port of the base URL.
+    #[error("the next page of a listing is on another origin")]
+    CrossOriginPage,
 }

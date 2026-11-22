@@ -1,9 +1,17 @@
 //! A blocking Hugging Face Hub client: search, repository file listings and file URLs.
 //!
 //! Requests go through `ureq` on a TLS connector this module owns: rustls on the ring provider
-//! with the bundled Mozilla roots, so no platform verifier is consulted on any target. The
-//! access token is sent only to the Hub's own origin and never follows a redirect, so a CDN
-//! never sees it. See the README's "Downloading" section.
+//! with the bundled Mozilla roots, so no platform verifier is consulted on any target.
+//!
+//! Redirects are followed here rather than by the agent, so every hop passes the same checks
+//! as the first URL: it must be `https://`, or plain `http://` when the first URL was on a
+//! loopback address and the hop is too, and at most 5 hops are followed. The access token is
+//! attached to a hop only when its scheme, host and port are the base URL's, so a CDN never
+//! sees it, and a token is never sent to a plain-`http://` base URL off loopback. See the
+//! README's "Downloading" section.
+//!
+//! Every call here blocks. The public entry points refuse the platform UI thread with
+//! [`ModelsError::UiThread`] where the platform has one to refuse; see `refuse_ui_thread`.
 
 use std::fmt;
 use std::io::{Read, Write};
@@ -12,7 +20,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
-use ureq::config::RedirectAuthHeaders;
 use ureq::http::Response;
 use ureq::unversioned::resolver::DefaultResolver;
 use ureq::unversioned::transport::{
@@ -30,6 +37,72 @@ const USER_AGENT: &str = concat!("frust-models/", env!("CARGO_PKG_VERSION"));
 const JSON_LIMIT: u64 = 64 * 1024 * 1024;
 const EXCERPT_LIMIT: usize = 256;
 const MAX_TREE_PAGES: usize = 64;
+/// Redirect hops followed for one request.
+const MAX_REDIRECTS: usize = 5;
+
+/// Refuses a blocking call on the platform UI thread with [`ModelsError::UiThread`].
+///
+/// On iOS and macOS the UI thread is the main thread, tested with `MainThreadMarker` as the
+/// sibling platform plugins do. Other targets refuse nothing here.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn refuse_ui_thread() -> Result<(), ModelsError> {
+    if objc2::MainThreadMarker::new().is_some() {
+        return Err(ModelsError::UiThread);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn refuse_ui_thread() -> Result<(), ModelsError> {
+    Ok(())
+}
+
+/// Checks `url` against the scheme policy for a request whose first URL had `first`'s origin:
+/// `https://` always, plain `http://` only when both are loopback addresses.
+fn check_hop(first: &Origin, url: &str) -> Result<(), HubError> {
+    match Origin::parse(url) {
+        Some(target) if target.scheme == "https" => Ok(()),
+        Some(target) if target.scheme == "http" && first.is_loopback() && target.is_loopback() => {
+            Ok(())
+        }
+        _ => Err(HubError::InsecureUrl),
+    }
+}
+
+/// Checks the first URL of a request: `https://`, or plain `http://` on a loopback address.
+pub(crate) fn check_url(url: &str) -> Result<(), HubError> {
+    let first = Origin::parse(url).ok_or(HubError::InsecureUrl)?;
+    check_hop(&first, url)
+}
+
+/// The absolute URL a `Location` header names, resolved against the URL that answered.
+fn resolve_location(current: &str, location: &str) -> Option<String> {
+    let location = location.trim();
+    let (scheme, rest) = current.split_once("://")?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(authority_end);
+    let has_scheme = location.split_once("://").is_some_and(|(s, _)| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    if has_scheme {
+        return Some(location.to_owned());
+    }
+    if let Some(net_path) = location.strip_prefix("//") {
+        return Some(format!("{scheme}://{net_path}"));
+    }
+    if location.starts_with('/') {
+        return Some(format!("{scheme}://{authority}{location}"));
+    }
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    if location.starts_with('?') {
+        return Some(format!("{scheme}://{authority}{path}{location}"));
+    }
+    let dir = path.rfind('/').map_or("/", |i| &path[..=i]);
+    Some(format!("{scheme}://{authority}{dir}{location}"))
+}
 
 /// Whether a repository asks users to accept terms before downloading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -128,6 +201,12 @@ pub struct HubFile {
 }
 
 /// Blocking Hub client. Cheap to clone; clones share one connection pool.
+///
+/// [`search`](Self::search), [`files`](Self::files), [`request_for`](Self::request_for) and
+/// [`request_for_main`](Self::request_for_main) wait on the network: call them from a worker
+/// thread such as `frust::spawn_blocking`, never from a component's handler or `build`. On iOS
+/// and macOS a call on the main thread fails with [`ModelsError::UiThread`].
+/// `DownloadTracker::start_hub` in `frust_models::api` is the non-blocking path for a component.
 #[derive(Clone)]
 pub struct HubClient {
     agent: Agent,
@@ -149,8 +228,8 @@ impl HubClient {
     pub fn new() -> Result<Self, ModelsError> {
         let config = Agent::config_builder()
             .http_status_as_error(false)
-            .max_redirects(5)
-            .redirect_auth_headers(RedirectAuthHeaders::Never)
+            // Redirects are followed by `HubClient::get` so each hop is checked.
+            .max_redirects(0)
             .timeout_connect(Some(Duration::from_secs(30)))
             .timeout_recv_response(Some(Duration::from_secs(60)))
             .timeout_per_read(Some(Duration::from_secs(60)))
@@ -168,6 +247,9 @@ impl HubClient {
     }
 
     /// Uses `token` as a bearer token for requests to the Hub origin. It is never logged.
+    ///
+    /// A token with a plain-`http://` base URL off loopback is refused at request time with
+    /// [`HubError::InsecureUrl`], so it never travels in clear text.
     pub fn with_token(mut self, token: Option<String>) -> Self {
         self.token = token.filter(|t| !t.is_empty());
         self
@@ -185,7 +267,10 @@ impl HubClient {
     }
 
     /// Searches repositories. Returns one page of at most `options.limit` results.
+    ///
+    /// Blocks on the network; see the type's documentation for the UI-thread rule.
     pub fn search(&self, options: &SearchOptions) -> Result<Vec<HubModel>, ModelsError> {
+        refuse_ui_thread()?;
         let mut query = vec![
             ("sort", options.sort.as_query().to_owned()),
             ("direction", "-1".to_owned()),
@@ -208,7 +293,12 @@ impl HubClient {
     }
 
     /// Lists every file of `repo` at `revision`, following the listing's pagination.
+    ///
+    /// A `Link: rel="next"` page off the base URL's scheme, host and port fails with
+    /// [`HubError::CrossOriginPage`]. Blocks on the network; see the type's documentation for
+    /// the UI-thread rule.
     pub fn files(&self, repo: &str, revision: &str) -> Result<Vec<HubFile>, ModelsError> {
+        refuse_ui_thread()?;
         check_repo(repo)?;
         let mut url = Some(format!(
             "{}/api/models/{repo}/tree/{}",
@@ -228,6 +318,11 @@ impl HubClient {
             let raw: Vec<RawTreeEntry> = parse_json(&body)?;
             files.extend(raw.into_iter().filter_map(RawTreeEntry::into_file));
             url = link.as_deref().and_then(next_link);
+            if let Some(next) = &url
+                && !self.same_origin_as_base(next)
+            {
+                return Err(HubError::CrossOriginPage.into());
+            }
         }
         Ok(files)
     }
@@ -246,16 +341,47 @@ impl HubClient {
         )
     }
 
-    /// Whether the token may be sent to `url`: only to the origin of the base URL.
-    fn may_authorize(&self, url: &str) -> bool {
+    /// Whether `url` has the scheme, host and port of the base URL.
+    fn same_origin_as_base(&self, url: &str) -> bool {
         match (Origin::parse(url), Origin::parse(&self.base_url)) {
             (Some(target), Some(hub)) => target == hub,
             _ => false,
         }
     }
 
-    /// Sends a GET to `url`, adding `Range` when `range_from` is set and the token when allowed.
+    /// Sends a GET to `url` and follows at most [`MAX_REDIRECTS`] redirects, checking each hop
+    /// before connecting to it. `Range` is sent on every hop when `range_from` is set; the
+    /// token only on hops to the base URL's origin.
     pub(crate) fn get(
+        &self,
+        url: &str,
+        query: &[(&str, String)],
+        range_from: Option<u64>,
+    ) -> Result<Response<Body>, HubError> {
+        if self.token.is_some() {
+            check_url(&self.base_url)?;
+        }
+        let first = Origin::parse(url).ok_or(HubError::InsecureUrl)?;
+        let mut current = url.to_owned();
+        let mut query = query;
+        let mut hops = 0;
+        loop {
+            check_hop(&first, &current)?;
+            let response = self.send(&current, query, range_from)?;
+            let Some(location) = redirect_location(&response) else {
+                return Ok(response);
+            };
+            if hops == MAX_REDIRECTS {
+                return Err(HubError::TooManyRedirects);
+            }
+            hops += 1;
+            current = resolve_location(&current, &location).ok_or(HubError::InsecureUrl)?;
+            query = &[];
+        }
+    }
+
+    /// One request without following redirects.
+    fn send(
         &self,
         url: &str,
         query: &[(&str, String)],
@@ -269,7 +395,7 @@ impl HubClient {
             request = request.header("Range", format!("bytes={from}-"));
         }
         if let Some(token) = &self.token
-            && self.may_authorize(url)
+            && self.same_origin_as_base(url)
         {
             request = request.header("Authorization", format!("Bearer {token}"));
         }
@@ -294,6 +420,13 @@ impl HubClient {
             .map_err(|err| HubError::Transport(err.to_string()))?;
         Ok((body, link))
     }
+}
+
+/// The `Location` of a redirect response; `None` for any other response.
+fn redirect_location(response: &Response<Body>) -> Option<String> {
+    matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308)
+        .then(|| header(response, "location"))
+        .flatten()
 }
 
 pub(crate) fn header(response: &Response<Body>, name: &str) -> Option<String> {
@@ -636,6 +769,68 @@ mod tests {
         assert_eq!(
             Origin::parse("https://user:pw@example.com/").unwrap().host,
             "example.com"
+        );
+    }
+
+    #[test]
+    fn hop_policy() {
+        let loopback = Origin::parse("http://127.0.0.1:8080/x").unwrap();
+        let public = Origin::parse("https://huggingface.co/x").unwrap();
+        assert!(check_hop(&public, "https://cdn.example.com/a").is_ok());
+        assert!(check_hop(&loopback, "http://127.0.0.1:9/a").is_ok());
+        assert!(check_hop(&loopback, "https://cdn.example.com/a").is_ok());
+        assert_eq!(
+            check_hop(&loopback, "http://cdn.example.com/a"),
+            Err(HubError::InsecureUrl)
+        );
+        assert_eq!(
+            check_hop(&public, "http://127.0.0.1:9/a"),
+            Err(HubError::InsecureUrl)
+        );
+        assert_eq!(
+            check_hop(&public, "file:///etc/passwd"),
+            Err(HubError::InsecureUrl)
+        );
+    }
+
+    #[test]
+    fn locations_resolve_against_the_answering_url() {
+        let at = "https://hub.example/a/b/c?x=1";
+        assert_eq!(
+            resolve_location(at, "https://cdn.example/f").as_deref(),
+            Some("https://cdn.example/f")
+        );
+        assert_eq!(
+            resolve_location(at, "//cdn.example/f").as_deref(),
+            Some("https://cdn.example/f")
+        );
+        assert_eq!(
+            resolve_location(at, "/api/resolve-cache/f").as_deref(),
+            Some("https://hub.example/api/resolve-cache/f")
+        );
+        assert_eq!(
+            resolve_location(at, "d?y=2").as_deref(),
+            Some("https://hub.example/a/b/d?y=2")
+        );
+        assert_eq!(
+            resolve_location(at, "?y=2").as_deref(),
+            Some("https://hub.example/a/b/c?y=2")
+        );
+        assert_eq!(
+            resolve_location("http://127.0.0.1:9", "f").as_deref(),
+            Some("http://127.0.0.1:9/f")
+        );
+    }
+
+    #[test]
+    fn a_token_never_goes_to_a_plain_http_base_off_loopback() {
+        let client = HubClient::new()
+            .unwrap()
+            .with_base_url("http://hub.example".into())
+            .with_token(Some("hf_secret".into()));
+        assert_eq!(
+            client.get("https://cdn.example/f", &[], None).err(),
+            Some(HubError::InsecureUrl)
         );
     }
 

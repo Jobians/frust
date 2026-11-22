@@ -3,12 +3,17 @@
 //! Two listeners on `127.0.0.1:0` share one handler: `hub` plays huggingface.co and `cdn` the
 //! host its file URLs redirect to. Being on different ports they are different origins, so a
 //! test can see which one received an `Authorization` header. Every request is logged.
+//!
+//! [`Fixture::hold_next_body`] parks the next file response after its first [`HELD_PREFIX`]
+//! bytes until [`Fixture::release`], so a test can act while a download is mid-transfer;
+//! [`Fixture::hold_next_listing`] parks the next repository listing before it is answered.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
@@ -20,6 +25,14 @@ pub const BLOB: &str = "model.gguf";
 pub const NESTED: &str = "onnx/model.onnx";
 /// A small file served without LFS, so the listing carries no SHA-256 for it.
 pub const TOKENIZER: &str = "tokenizer.json";
+/// A repository whose listing has a second page on the same origin.
+pub const PAGED_REPO: &str = "acme/paged";
+/// A repository whose listing points its next page at the CDN's origin.
+pub const FOREIGN_PAGE_REPO: &str = "acme/foreign";
+/// A host name a redirect points at; it never resolves and is never contacted.
+pub const OFF_LOOPBACK_HOST: &str = "models.example.invalid";
+/// Bytes a held response sends before it parks.
+pub const HELD_PREFIX: usize = 64 * 1024;
 
 /// One file of the fixture repository.
 pub struct FixtureFile {
@@ -38,10 +51,31 @@ pub struct Logged {
     pub authorization: Option<String>,
 }
 
+/// Which response a hold parks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldKind {
+    /// A file body, after its first [`HELD_PREFIX`] bytes.
+    Body,
+    /// A repository listing, before anything is written.
+    Listing,
+}
+
+#[derive(Default)]
+struct Hold {
+    /// The kind of the next response that parks.
+    armed: Option<HoldKind>,
+    /// A response is parked.
+    parked: bool,
+    /// The parked response may finish.
+    released: bool,
+}
+
 struct State {
     files: Vec<FixtureFile>,
     log: Mutex<Vec<Logged>>,
     ignore_range: AtomicBool,
+    hold: Mutex<Hold>,
+    hold_changed: Condvar,
     hub: OnceLock<String>,
     cdn: OnceLock<String>,
 }
@@ -93,6 +127,8 @@ impl Fixture {
             ],
             log: Mutex::new(Vec::new()),
             ignore_range: AtomicBool::new(false),
+            hold: Mutex::new(Hold::default()),
+            hold_changed: Condvar::new(),
             hub: OnceLock::new(),
             cdn: OnceLock::new(),
         });
@@ -110,6 +146,40 @@ impl Fixture {
     /// Makes every file route answer `200` with the whole body, whatever `Range` asked for.
     pub fn set_ignore_range(&self, on: bool) {
         self.state.ignore_range.store(on, Ordering::SeqCst);
+    }
+
+    /// Parks the next file response after [`HELD_PREFIX`] bytes until [`release`](Self::release).
+    pub fn hold_next_body(&self) {
+        self.arm(HoldKind::Body);
+    }
+
+    /// Parks the next repository listing before it is answered, until [`release`](Self::release).
+    pub fn hold_next_listing(&self) {
+        self.arm(HoldKind::Listing);
+    }
+
+    fn arm(&self, kind: HoldKind) {
+        *self.state.hold.lock().unwrap() = Hold {
+            armed: Some(kind),
+            ..Hold::default()
+        };
+    }
+
+    /// Blocks until a held response is parked, failing after 30 s.
+    pub fn wait_held(&self) {
+        let hold = self.state.hold.lock().unwrap();
+        let (hold, timeout) = self
+            .state
+            .hold_changed
+            .wait_timeout_while(hold, Duration::from_secs(30), |h| !h.parked)
+            .unwrap();
+        assert!(!timeout.timed_out() && hold.parked, "no response was held");
+    }
+
+    /// Lets the held response finish.
+    pub fn release(&self) {
+        self.state.hold.lock().unwrap().released = true;
+        self.state.hold_changed.notify_all();
     }
 
     pub fn log(&self) -> Vec<Logged> {
@@ -141,6 +211,8 @@ struct Reply {
     headers: Vec<(&'static str, String)>,
     body: Vec<u8>,
     content_length: bool,
+    /// The hold that may park this response.
+    holdable: Option<HoldKind>,
 }
 
 fn reply(status: u16, body: impl Into<Vec<u8>>) -> Reply {
@@ -149,6 +221,7 @@ fn reply(status: u16, body: impl Into<Vec<u8>>) -> Reply {
         headers: Vec::new(),
         body: body.into(),
         content_length: true,
+        holdable: None,
     }
 }
 
@@ -184,7 +257,7 @@ fn handle(state: &State, server: &'static str, stream: TcpStream) -> std::io::Re
         authorization,
     });
     let response = route(state, &target, range.as_deref());
-    write_reply(stream, response)
+    write_reply(state, stream, response)
 }
 
 fn route(state: &State, target: &str, range: Option<&str>) -> Reply {
@@ -220,14 +293,25 @@ fn route(state: &State, target: &str, range: Option<&str>) -> Reply {
             next,
         );
     }
-    if path == format!("/api/models/{REPO}/tree/main") {
-        return with(
-            reply(200, tree_json(&state.files)),
-            "Content-Type",
-            "application/json",
-        );
-    }
+    let hub = state.hub.get().cloned().unwrap_or_default();
     let find = |p: &str| state.files.iter().find(|f| f.path == p);
+    let json = |body: String| with(reply(200, body), "Content-Type", "application/json");
+    if path == format!("/api/models/{PAGED_REPO}/tree/main") {
+        if target.contains("cursor=2") {
+            return json(tree_page(find(TOKENIZER)));
+        }
+        let next = format!("<{hub}{path}?recursive=true&cursor=2>; rel=\"next\"");
+        return with(json(tree_page(find(BLOB))), "Link", next);
+    }
+    if path == format!("/api/models/{FOREIGN_PAGE_REPO}/tree/main") {
+        let next = format!("<{cdn}{path}?recursive=true&cursor=2>; rel=\"next\"");
+        return with(json(tree_page(find(BLOB))), "Link", next);
+    }
+    if path == format!("/api/models/{REPO}/tree/main") {
+        let mut r = json(tree_json(&state.files));
+        r.holdable = Some(HoldKind::Listing);
+        return r;
+    }
     if let Some(rest) = path.strip_prefix(&format!("/{REPO}/resolve/main/")) {
         return match find(rest) {
             Some(f) if f.lfs => with(reply(302, ""), "Location", format!("{cdn}/blobs/{rest}")),
@@ -237,6 +321,24 @@ fn route(state: &State, target: &str, range: Option<&str>) -> Reply {
     }
     if let Some(rest) = path.strip_prefix("/redirect/") {
         return with(reply(302, ""), "Location", format!("{cdn}/blobs/{rest}"));
+    }
+    if let Some(rest) = path.strip_prefix("/insecure/") {
+        let target = format!("http://{OFF_LOOPBACK_HOST}/blobs/{rest}");
+        return with(reply(302, ""), "Location", target);
+    }
+    // `/hops/<n>/<file>` redirects `n` times, with relative locations, then serves the file.
+    if let Some(rest) = path.strip_prefix("/hops/")
+        && let Some((n, file)) = rest.split_once('/')
+        && let Ok(n) = n.parse::<u32>()
+    {
+        if n > 0 {
+            let next = format!("/hops/{}/{file}", n - 1);
+            return with(reply(302, ""), "Location", next);
+        }
+        return match find(file) {
+            Some(f) => serve(state, &f.bytes, range),
+            None => reply(404, "no such file"),
+        };
     }
     if let Some(rest) = path.strip_prefix("/blobs/") {
         return match find(rest) {
@@ -261,20 +363,49 @@ fn serve(state: &State, bytes: &[u8], range: Option<&str>) -> Reply {
         .and_then(|r| r.strip_prefix("bytes="))
         .and_then(|r| r.strip_suffix('-'))
         .and_then(|s| s.parse::<usize>().ok());
-    match start {
+    let mut r = match start {
         None => reply(200, bytes.to_vec()),
         Some(start) if start >= len => {
-            with(reply(416, ""), "Content-Range", format!("bytes */{len}"))
+            return with(reply(416, ""), "Content-Range", format!("bytes */{len}"));
         }
         Some(start) => with(
             reply(206, bytes[start..].to_vec()),
             "Content-Range",
             format!("bytes {start}-{}/{len}", len - 1),
         ),
-    }
+    };
+    r.holdable = Some(HoldKind::Body);
+    r
 }
 
-fn write_reply(mut stream: TcpStream, r: Reply) -> std::io::Result<()> {
+/// Takes the armed hold for a response, so only one response parks per arming.
+fn take_hold(state: &State, r: &Reply) -> Option<HoldKind> {
+    let mut hold = state.hold.lock().unwrap();
+    let take = r.holdable.filter(|kind| {
+        hold.armed == Some(*kind) && (*kind == HoldKind::Listing || r.body.len() > HELD_PREFIX)
+    });
+    if take.is_some() {
+        hold.armed = None;
+    }
+    take
+}
+
+/// Parks until [`Fixture::release`], or 30 s so a failed test never hangs the process.
+fn park(state: &State) {
+    let mut hold = state.hold.lock().unwrap();
+    hold.parked = true;
+    state.hold_changed.notify_all();
+    let _ = state
+        .hold_changed
+        .wait_timeout_while(hold, Duration::from_secs(30), |h| !h.released)
+        .unwrap();
+}
+
+fn write_reply(state: &State, mut stream: TcpStream, r: Reply) -> std::io::Result<()> {
+    let hold = take_hold(state, &r);
+    if hold == Some(HoldKind::Listing) {
+        park(state);
+    }
     let mut head = format!("HTTP/1.1 {} Fixture\r\nConnection: close\r\n", r.status);
     for (name, value) in &r.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
@@ -284,7 +415,14 @@ fn write_reply(mut stream: TcpStream, r: Reply) -> std::io::Result<()> {
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes())?;
-    stream.write_all(&r.body)?;
+    if hold == Some(HoldKind::Body) {
+        stream.write_all(&r.body[..HELD_PREFIX])?;
+        stream.flush()?;
+        park(state);
+        stream.write_all(&r.body[HELD_PREFIX..])?;
+    } else {
+        stream.write_all(&r.body)?;
+    }
     stream.flush()?;
     stream.shutdown(std::net::Shutdown::Write)
 }
@@ -305,6 +443,16 @@ fn search_json() -> String {
    "private":false,"tags":["onnx"],"modelId":"other/auto"}
 ]"#
     .to_owned()
+}
+
+/// A one-file listing page.
+fn tree_page(file: Option<&FixtureFile>) -> String {
+    let f = file.unwrap();
+    format!(
+        r#"[{{"type":"file","oid":"0000","size":{},"path":"{}"}}]"#,
+        f.bytes.len(),
+        f.path
+    )
 }
 
 /// Shaped after a live `GET /api/models/{repo}/tree/main?recursive=true` answer.

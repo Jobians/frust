@@ -12,7 +12,9 @@ use frust_models::{
     HubError, ModelId, ModelSource, ModelStore, ModelsError, SearchOptions,
 };
 use support::Temp;
-use support::http_fixture::{BLOB, Fixture, NESTED, REPO, TOKENIZER};
+use support::http_fixture::{
+    BLOB, FOREIGN_PAGE_REPO, Fixture, NESTED, OFF_LOOPBACK_HOST, PAGED_REPO, REPO, TOKENIZER,
+};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -478,6 +480,117 @@ fn plain_http_is_refused_unless_loopback() {
         Downloader::start(&HubClient::new().unwrap(), &store, req, sink),
         Err(ModelsError::Hub(HubError::InsecureUrl))
     ));
+}
+
+#[test]
+fn redirect_to_plain_http_off_loopback_is_refused_before_connecting() {
+    let fx = Fixture::start();
+    let tmp = Temp::new();
+    let store = tmp.store();
+    let client = client(&fx);
+    let id = ModelId::new("mirror", "insecure", "model.gguf").unwrap();
+    let req = DownloadRequest::from_url(
+        format!("{}/insecure/{BLOB}", fx.hub),
+        id.clone(),
+        None,
+        None,
+    )
+    .unwrap();
+    let (result, events) = run(&client, &store, req);
+    assert_stream(&events);
+    assert!(
+        matches!(result, Err(ModelsError::Hub(HubError::InsecureUrl))),
+        "{result:?}"
+    );
+    let part_len = fs::metadata(store.part_path_for(&id)).map_or(0, |m| m.len());
+    assert_eq!(part_len, 0, "nothing was written");
+    assert!(progress_bytes(&events).iter().all(|b| *b == 0));
+    let log = fx.log();
+    assert_eq!(log.len(), 1, "only the first hop was requested: {log:?}");
+    assert!(log[0].target.starts_with("/insecure/"));
+    assert!(
+        store.get(&id).is_none(),
+        "{OFF_LOOPBACK_HOST} served nothing"
+    );
+}
+
+#[test]
+fn five_redirects_are_followed_and_a_sixth_fails() {
+    let fx = Fixture::start();
+    let tmp = Temp::new();
+    let store = tmp.store();
+    let client = client(&fx).with_token(Some("hf_fixture_token".into()));
+    let bearer = Some("Bearer hf_fixture_token".to_owned());
+
+    let id = ModelId::new("mirror", "five", "tokenizer.json").unwrap();
+    let req = DownloadRequest::from_url(format!("{}/hops/5/{TOKENIZER}", fx.hub), id, None, None)
+        .unwrap();
+    let models = run(&client, &store, req).0.unwrap();
+    assert_eq!(fs::read(&models[0].path).unwrap(), fx.file(TOKENIZER).bytes);
+    let log = fx.log();
+    assert_eq!(log.len(), 6, "{log:?}");
+    assert!(
+        log.iter().all(|l| l.authorization == bearer),
+        "every hop stays on the Hub origin, so each carries the token: {log:?}"
+    );
+
+    fx.clear_log();
+    let id = ModelId::new("mirror", "six", "tokenizer.json").unwrap();
+    let req = DownloadRequest::from_url(
+        format!("{}/hops/6/{TOKENIZER}", fx.hub),
+        id.clone(),
+        None,
+        None,
+    )
+    .unwrap();
+    let (result, events) = run(&client, &store, req);
+    assert_stream(&events);
+    assert!(
+        matches!(result, Err(ModelsError::Hub(HubError::TooManyRedirects))),
+        "{result:?}"
+    );
+    let log = fx.log();
+    assert_eq!(log.len(), 6, "{log:?}");
+    assert!(log.iter().all(|l| !l.target.starts_with("/hops/0/")));
+    assert!(store.get(&id).is_none());
+}
+
+#[test]
+fn listing_pages_must_stay_on_the_base_origin() {
+    let fx = Fixture::start();
+    let client = client(&fx);
+    let files = client.files(PAGED_REPO, "main").unwrap();
+    let paths: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
+    assert_eq!(paths, [BLOB, TOKENIZER]);
+    assert_eq!(fx.log().len(), 2);
+
+    fx.clear_log();
+    assert!(matches!(
+        client.files(FOREIGN_PAGE_REPO, "main"),
+        Err(ModelsError::Hub(HubError::CrossOriginPage))
+    ));
+    let log = fx.log();
+    assert_eq!(log.len(), 1, "the foreign page is never requested: {log:?}");
+    assert_eq!(log[0].server, "hub");
+}
+
+#[test]
+fn a_plain_http_base_off_loopback_is_refused_with_or_without_a_token() {
+    let base = format!("http://{OFF_LOOPBACK_HOST}");
+    for token in [None, Some("hf_secret".to_owned())] {
+        let client = HubClient::new()
+            .unwrap()
+            .with_base_url(base.clone())
+            .with_token(token);
+        assert!(matches!(
+            client.search(&SearchOptions::default()),
+            Err(ModelsError::Hub(HubError::InsecureUrl))
+        ));
+        assert!(matches!(
+            client.files(REPO, "main"),
+            Err(ModelsError::Hub(HubError::InsecureUrl))
+        ));
+    }
 }
 
 #[test]
