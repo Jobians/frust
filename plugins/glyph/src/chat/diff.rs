@@ -8,8 +8,8 @@
 //!
 //! - **Controlled.** `.expanded(bool)` and `.on_toggle(..)` work like
 //!   `crate::accordion`: a header or show-all press is reported, never
-//!   self-applied. Only a diff with more rows than `.collapse_above(..)`
-//!   collapses (to its header, totals and a show-all row).
+//!   self-applied. Only a diff with more rows than `.collapse_above(..)` and
+//!   an `.on_toggle(..)` collapses (to its header, totals and a show-all row).
 //! - **Computed once per input.** The model is rebuilt only when the old or
 //!   new text (or the context) differs from the previous build.
 //! - **Line semantics.** A trailing `\r` is ignored and never drawn, and a
@@ -481,8 +481,12 @@ impl DiffWidget {
         }
     }
 
+    /// Whether the diff can collapse: it is long, and a toggle can expand it
+    /// again (a diff that cannot expand is never cut).
     fn collapsible(&self) -> bool {
-        !self.model.too_large && self.model.row_count() > self.collapse_above
+        !self.model.too_large
+            && self.model.row_count() > self.collapse_above
+            && self.on_toggle.is_some()
     }
 
     fn refresh_rows(&mut self) {
@@ -654,10 +658,10 @@ impl DiffWidget {
 
     fn hit(&self, p: Point) -> Option<Target> {
         if p.y < self.header_h {
-            return (self.collapsible() && self.on_toggle.is_some()).then_some(Target::Header);
+            return self.collapsible().then_some(Target::Header);
         }
         if self.rows == [Row::ShowAll] {
-            return self.on_toggle.is_some().then_some(Target::ShowAll);
+            return Some(Target::ShowAll);
         }
         (self.max_h_offset > 0.0).then_some(Target::Body)
     }
@@ -732,13 +736,16 @@ impl<State: 'static> View<State> for DiffView<State> {
             element.header_path = None;
             flags |= ChangeFlags::LAYOUT | ChangeFlags::PAINT;
         }
-        if prev.expanded != self.expanded || prev.collapse_above != self.collapse_above {
+        element.on_toggle = self.on_toggle.as_ref().map(erase_callback);
+        if prev.expanded != self.expanded
+            || prev.collapse_above != self.collapse_above
+            || prev.on_toggle.is_some() != self.on_toggle.is_some()
+        {
             element.expanded = self.expanded;
             element.collapse_above = self.collapse_above;
             element.refresh_rows();
             flags |= ChangeFlags::LAYOUT | ChangeFlags::PAINT;
         }
-        element.on_toggle = self.on_toggle.as_ref().map(erase_callback);
         flags
     }
 }
@@ -1285,19 +1292,58 @@ mod tests {
     fn collapsed_shows_one_show_all_row_above_the_threshold_only() {
         let edit = long_edit();
         let rows = compute_diff(edit.old_text.as_deref(), &edit.new_text, 3).row_count();
-        let collapsed: DiffView<()> = diff_view(edit.clone()).collapse_above(rows - 1);
+        let collapsed: DiffView<()> = diff_view(edit.clone())
+            .collapse_above(rows - 1)
+            .on_toggle(|_| {});
         let w = build(&collapsed);
         assert_eq!(w.rows, [Row::ShowAll]);
         let expanded: DiffView<()> = diff_view(edit.clone())
             .collapse_above(rows - 1)
+            .on_toggle(|_| {})
             .expanded(true);
         assert_eq!(build(&expanded).rows.len(), rows);
-        let small: DiffView<()> = diff_view(edit).collapse_above(rows);
+        let small: DiffView<()> = diff_view(edit).collapse_above(rows).on_toggle(|_| {});
         assert_eq!(
             build(&small).rows.len(),
             rows,
             "at the threshold nothing collapses"
         );
+    }
+
+    #[test]
+    fn a_diff_without_on_toggle_never_collapses_and_offers_no_click() {
+        let _slot = frust_widgets::test_support::LocaleSlotGuard::hold();
+        let edit = long_edit();
+        let rows = compute_diff(edit.old_text.as_deref(), &edit.new_text, 3).row_count();
+        let view: DiffView<()> = diff_view(edit.clone()).collapse_above(4);
+        let mut w = build(&view);
+        assert_eq!(w.rows.len(), rows, "a diff that cannot expand is never cut");
+        assert!(!w.collapsible());
+        layout(&mut w, 320.0, None);
+        let header = Point::new(40.0, w.header_h / 2.0);
+        assert_eq!(
+            pointer(&mut w, &mut (), PointerPhase::Down, header),
+            EventResult::Ignored,
+            "an inert header takes no press"
+        );
+        pointer(&mut w, &mut (), PointerPhase::Up, header);
+
+        let clicks = |view: fn(&mut ()) -> DiffView<()>| {
+            let mut root: frust_core::RenderRoot<(), DiffView<()>> = frust_core::RenderRoot::new();
+            let mut view = view;
+            root.rebuild(&mut view, &mut ());
+            let mut tcx = TextContext::new();
+            root.layout_with_text(Size::new(320.0, 4000.0), &mut tcx as &mut dyn Any);
+            let update = root.semantics();
+            update
+                .nodes
+                .iter()
+                .filter(|(_, n)| n.role() == Role::Button || n.supports_action(Action::Click))
+                .count()
+        };
+        assert_eq!(clicks(|_| diff_view(long_edit()).collapse_above(4)), 0);
+        let toggled = clicks(|_| diff_view(long_edit()).collapse_above(4).on_toggle(|_| {}));
+        assert_eq!(toggled, 2, "header and show-all, both live");
     }
 
     #[test]
