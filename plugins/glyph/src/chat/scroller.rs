@@ -250,6 +250,7 @@ impl Presence {
                 GLYPH_SLIDE_EXIT
             };
             if elapsed < span {
+                // GlyphSlide maps both layers onto the enter timeline; its exit ends at 150 of 340 ms.
                 let p = elapsed.as_secs_f64() / GLYPH_SLIDE_ENTER.as_secs_f64();
                 return Some(if self.shown {
                     GlyphSlide::new(SlideDirection::Up)
