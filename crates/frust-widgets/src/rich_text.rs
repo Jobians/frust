@@ -6,26 +6,52 @@
 //! layout exactly as [`crate::TextView`] does for a single run (themed colour
 //! unless explicit, themed family roles, the theme's text scale for spans
 //! without an explicit size), shapes the spans as one paragraph, and paints
-//! underline rects, glyph runs, then line-through rects.
+//! span backgrounds, underline rects, glyph runs, then line-through rects.
 //!
-//! Spans carry no tap or hit-testing of their own.
+//! [`SpanView::background`] fills behind each line fragment of a span, padded
+//! sideways without touching layout. [`RichTextView::on_link`] receives a
+//! [`SpanView::link`] id on a primary tap that starts and ends on that link
+//! within [`TOUCH_SLOP`]; a press elsewhere is not consumed, and a scroll
+//! taking it over cancels it. Each link is a `Role::Link` child of the
+//! paragraph node, with no focus stop of its own.
+//!
+//! `frust-text` publishes no per-range geometry, so fragments come from a
+//! probe layout striking each marked group through in a colour encoding its
+//! index (decoration never changes shaping or breaking), on line boxes
+//! measured as the layout's height capped at each line count.
 
-use frust_core::accesskit::Role;
+use std::any::TypeId;
+use std::ops::Range;
+use std::rc::Rc;
+
+use frust_core::accesskit::{Action, Rect as AccessRect, Role};
 use frust_core::{
-    BoxConstraints, BuildCtx, ChangeFlags, InspectDetail, LayoutCtx, PaintCtx, PaintScene,
-    SemanticsCtx, TextInspect, View, Widget,
+    BoxConstraints, BuildCtx, ChangeFlags, CursorIcon, EventCtx, EventResult, InputEvent,
+    InspectDetail, LayoutCtx, PaintCtx, PaintScene, PointerPhase, SemanticsCtx, TOUCH_SLOP,
+    TextInspect, View, Widget,
 };
 use frust_text::{
-    FontFamily, FontStyle, FontWeight, LocaleStamp, OverflowWrap, TextAlign, TextContext,
-    TextDecoration, TextLayout, TextOverflow, TextSpan, TextStyle,
+    DecorationKind, FontFamily, FontStyle, FontWeight, LocaleStamp, OverflowWrap, TextAlign,
+    TextContext, TextDecoration, TextLayout, TextOverflow, TextSpan, TextStyle,
 };
-use frust_theme::Theme;
-use kurbo::Size;
+use frust_theme::{ColorScheme, ShapeScale, SurfaceRole, Theme};
+use kurbo::{Point, Rect, Size};
 use peniko::Color;
 
+use crate::authoring::{ErasedArgCallback, TypedArgCallback, erase_callback_arg, presses};
 use crate::text::{
     FamilySource, ThemeTextColor, ThemeTextType, paint_layout, resolve_style, text_inspect,
 };
+
+/// How far a span background reaches past its glyphs on each side, in
+/// logical px. Paint-only, so layout and line height are unchanged;
+/// `frust-theme` has no spacing token to resolve it from.
+const BG_PAD_X: f64 = 2.0;
+/// Corner radius of a span background without a theme; a theme resolves it
+/// from `shape.extra_small`.
+const BG_RADIUS: f64 = 3.0;
+/// Fill of a [`SpanView::themed_background`] span when no theme is threaded.
+const BG_FALLBACK: Color = Color::from_rgb8(0xE5, 0xE7, 0xEB);
 
 /// A styled piece of text inside a [`RichTextView`].
 ///
@@ -42,6 +68,10 @@ pub struct SpanView {
     family_explicit: bool,
     size_explicit: bool,
     family_source: Option<FamilySource>,
+    /// The explicit background fill; wins over `background_role`.
+    background: Option<Color>,
+    background_role: Option<SurfaceRole>,
+    link: Option<String>,
 }
 
 /// Create a span rendering `content` with default styling.
@@ -54,6 +84,9 @@ pub fn span(content: impl Into<String>) -> SpanView {
         family_explicit: false,
         size_explicit: false,
         family_source: None,
+        background: None,
+        background_role: None,
+        link: None,
     }
 }
 
@@ -164,6 +197,53 @@ impl SpanView {
         self
     }
 
+    /// Fill a small rounded rectangle of `color` behind the span, one per
+    /// line fragment it occupies. Marks the background explicit, so it wins
+    /// over [`Self::themed_background`].
+    pub fn background(mut self, color: Color) -> Self {
+        self.background = Some(color);
+        self
+    }
+
+    /// Fill the span's background from the active theme's surface `role`,
+    /// resolved at paint (a neutral grey with no theme). An explicit
+    /// [`Self::background`] wins.
+    pub fn themed_background(mut self, role: SurfaceRole) -> Self {
+        self.background_role = Some(role);
+        self
+    }
+
+    /// Mark the span as a link carrying the opaque `id` that
+    /// [`RichTextView::on_link`] receives. Adds no styling: colour and
+    /// underline stay the caller's. Adjacent spans with the same id form one
+    /// link.
+    pub fn link(mut self, id: impl Into<String>) -> Self {
+        self.link = Some(id.into());
+        self
+    }
+
+    /// Whether the span needs fragment geometry (a background or a link).
+    fn is_marked(&self) -> bool {
+        self.background.is_some() || self.background_role.is_some() || self.link.is_some()
+    }
+
+    /// Whether `other` paints the same background and belongs to the same
+    /// link, so the two may share a shaping group.
+    fn same_marks(&self, other: &SpanView) -> bool {
+        self.background == other.background
+            && self.background_role == other.background_role
+            && self.link == other.link
+    }
+
+    /// The background fill: explicit, else the themed role, else none.
+    fn background_color(&self, theme: Option<&Theme>) -> Option<Color> {
+        if let Some(color) = self.background {
+            return Some(color);
+        }
+        let role = self.background_role?;
+        Some(theme.map_or(BG_FALLBACK, |t| surface_color(t.scheme(), role)))
+    }
+
     fn effective_style(&self, theme: Option<&Theme>) -> TextStyle {
         resolve_style(
             &self.style,
@@ -177,6 +257,18 @@ impl SpanView {
     }
 }
 
+/// The colour a surface `role` names in `scheme`.
+fn surface_color(scheme: &ColorScheme, role: SurfaceRole) -> Color {
+    match role {
+        SurfaceRole::Surface => scheme.surface,
+        SurfaceRole::SurfaceContainerLowest => scheme.surface_container_lowest,
+        SurfaceRole::SurfaceContainerLow => scheme.surface_container_low,
+        SurfaceRole::SurfaceContainer => scheme.surface_container,
+        SurfaceRole::SurfaceContainerHigh => scheme.surface_container_high,
+        SurfaceRole::SurfaceContainerHighest => scheme.surface_container_highest,
+    }
+}
+
 /// Create a rich text from `spans`, laid out as one paragraph.
 pub fn rich_text(spans: impl IntoIterator<Item = SpanView>) -> RichTextView {
     RichTextView {
@@ -185,6 +277,7 @@ pub fn rich_text(spans: impl IntoIterator<Item = SpanView>) -> RichTextView {
         overflow_wrap: None,
         max_lines: None,
         overflow: TextOverflow::default(),
+        on_link: LinkHandler::default(),
     }
 }
 
@@ -200,6 +293,47 @@ pub struct RichTextView {
     overflow_wrap: Option<OverflowWrap>,
     max_lines: Option<usize>,
     overflow: TextOverflow,
+    on_link: LinkHandler,
+}
+
+/// The view-held [`RichTextView::on_link`] callback, erased at the call
+/// because the view is not generic over the app state. Equality sees only
+/// whether one is set, so a fresh closure each build keeps `prev == self`.
+#[derive(Clone, Default)]
+struct LinkHandler(Option<Rc<LinkCallback>>);
+
+struct LinkCallback {
+    /// The app-state type the callback was written against.
+    state: TypeId,
+    /// Makes the widget-held adapter; reinstalled on every build and rebuild.
+    erase: Box<dyn Fn() -> ErasedArgCallback<String>>,
+}
+
+impl PartialEq for LinkHandler {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.is_some() == other.0.is_some()
+    }
+}
+
+impl std::fmt::Debug for LinkHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() { "Some(..)" } else { "None" })
+    }
+}
+
+impl LinkHandler {
+    /// The adapter for a view built under `State`, or `None` when no callback
+    /// is set or it names another state type (a wiring bug: debug builds
+    /// panic, release builds leave the links inert).
+    fn install<State: 'static>(&self) -> Option<ErasedArgCallback<String>> {
+        let callback = self.0.as_ref()?;
+        debug_assert_eq!(
+            callback.state,
+            TypeId::of::<State>(),
+            "RichTextView::on_link names a different state type than the view is built under"
+        );
+        (callback.state == TypeId::of::<State>()).then(|| (callback.erase)())
+    }
 }
 
 impl RichTextView {
@@ -228,6 +362,21 @@ impl RichTextView {
         self.overflow = overflow;
         self
     }
+
+    /// Run `on_link` against the app state with the id of a
+    /// [`SpanView::link`] the user activates: a tap that starts and ends on
+    /// that link, or the link node's accessibility Click. `State` is the
+    /// state this view is built under; type it in the closure
+    /// (`|app: &mut App, id| ..`).
+    pub fn on_link<State: 'static>(mut self, on_link: impl Fn(&mut State, &str) + 'static) -> Self {
+        let typed: TypedArgCallback<State, String> =
+            Rc::new(move |state: &mut State, id: String| on_link(state, &id));
+        self.on_link = LinkHandler(Some(Rc::new(LinkCallback {
+            state: TypeId::of::<State>(),
+            erase: Box::new(move || erase_callback_arg(&typed)),
+        })));
+        self
+    }
 }
 
 impl<State: 'static> View<State> for RichTextView {
@@ -241,6 +390,10 @@ impl<State: 'static> View<State> for RichTextView {
             inspect: None,
             laid_out_span_styles: Vec::new(),
             laid_out_locale_stamp: LocaleStamp::default(),
+            fragments: Vec::new(),
+            links: link_runs(&self.spans),
+            on_link: self.on_link.install::<State>(),
+            press: None,
         }
     }
 
@@ -250,13 +403,61 @@ impl<State: 'static> View<State> for RichTextView {
         element: &mut RichTextWidget,
         _ctx: &mut BuildCtx<'_>,
     ) -> ChangeFlags {
+        // Closures are not comparable: reinstall the adapter every time.
+        element.on_link = self.on_link.install::<State>();
         if prev == self {
             return ChangeFlags::NONE;
         }
         element.view = self.clone();
         element.layout = None;
+        element.fragments.clear();
+        element.links = link_runs(&self.spans);
+        element.press = None;
         ChangeFlags::LAYOUT
     }
+}
+
+/// One link: consecutive spans sharing a [`SpanView::link`] id.
+struct LinkRun {
+    id: String,
+    /// The link's text, its accessible label.
+    label: String,
+    spans: Range<usize>,
+}
+
+/// The links of `spans`, in order.
+fn link_runs(spans: &[SpanView]) -> Vec<LinkRun> {
+    let mut runs: Vec<LinkRun> = Vec::new();
+    for (index, span) in spans.iter().enumerate() {
+        let Some(id) = &span.link else { continue };
+        match runs.last_mut() {
+            Some(last) if last.spans.end == index && last.id == *id => {
+                last.label.push_str(&span.content);
+                last.spans.end = index + 1;
+            }
+            _ => runs.push(LinkRun {
+                id: id.clone(),
+                label: span.content.clone(),
+                spans: index..index + 1,
+            }),
+        }
+    }
+    runs
+}
+
+/// One line's share of a marked span group, in layout coordinates: the
+/// glyphs' pen extent across, the line box down.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Fragment {
+    /// The first span of the group, whose marks every span in it shares.
+    span: usize,
+    rect: Rect,
+}
+
+/// A press that began on link `link` at `start`.
+struct LinkPress {
+    link: usize,
+    start: Point,
 }
 
 /// Retained widget for [`RichTextView`]: caches the shaped [`TextLayout`]
@@ -276,9 +477,28 @@ pub struct RichTextWidget {
     laid_out_span_styles: Vec<TextStyle>,
     /// The locale stamp read just before shaping.
     laid_out_locale_stamp: LocaleStamp,
+    /// Every marked group's line fragments from the last layout, in line
+    /// order; empty when no span has a background or link.
+    fragments: Vec<Fragment>,
+    links: Vec<LinkRun>,
+    on_link: Option<ErasedArgCallback<String>>,
+    press: Option<LinkPress>,
 }
 
 impl RichTextWidget {
+    /// The link whose glyphs lie under the local point `at`, if any.
+    fn link_at(&self, at: Point) -> Option<usize> {
+        self.fragments
+            .iter()
+            .filter(|f| f.rect.contains(at))
+            .find_map(|f| self.link_of(f.span))
+    }
+
+    /// The link span `span` belongs to.
+    fn link_of(&self, span: usize) -> Option<usize> {
+        self.links.iter().position(|l| l.spans.contains(&span))
+    }
+
     /// Every span's effective style, with the paragraph knobs applied.
     fn effective_styles(&self, theme: Option<&Theme>) -> Vec<TextStyle> {
         self.view
@@ -305,16 +525,30 @@ struct SpanGroup {
     spans: std::ops::Range<usize>,
 }
 
-/// Groups the non-empty spans (`contents`, with effective `styles`) for
-/// shaping: empty spans are dropped, adjacent spans of equal style merge, and
-/// past `limit` groups the excess folds into the last kept one (its text
-/// takes that group's style) instead of overflowing the shaper's span index.
+/// What decides whether two adjacent spans may be shaped as one group: equal
+/// effective style, background and link.
+struct GroupKey<'a> {
+    style: &'a TextStyle,
+    span: &'a SpanView,
+}
+
+impl PartialEq for GroupKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.style == other.style && self.span.same_marks(other.span)
+    }
+}
+
+/// Groups the non-empty spans (`contents`) for shaping: empty spans are
+/// dropped, adjacent spans with equal `keys` merge (the widget keys on
+/// effective style, background and link), and past `limit` groups
+/// the excess folds into the last kept one (its text takes that group's
+/// style) instead of overflowing the shaper's span index.
 ///
 /// Text with no non-empty span keeps its first span so the empty layout is
 /// still sized by that span's style.
-fn group_spans<'a>(
+fn group_spans<'a, K: PartialEq>(
     contents: impl ExactSizeIterator<Item = &'a str>,
-    styles: &[TextStyle],
+    keys: &[K],
     limit: usize,
 ) -> Vec<SpanGroup> {
     let mut groups: Vec<SpanGroup> = Vec::new();
@@ -325,7 +559,7 @@ fn group_spans<'a>(
         }
         let full = groups.len() >= limit;
         match groups.last_mut() {
-            Some(last) if styles[last.style] == styles[index] => last.spans.end = index + 1,
+            Some(last) if keys[last.style] == keys[index] => last.spans.end = index + 1,
             Some(last) if full => last.spans.end = index + 1,
             _ => groups.push(SpanGroup {
                 style: index,
@@ -358,9 +592,15 @@ impl Widget for RichTextWidget {
             return bc.constrain(cached.size());
         }
 
+        let view_spans = &self.view.spans;
+        let keys: Vec<GroupKey<'_>> = view_spans
+            .iter()
+            .zip(&all_styles)
+            .map(|(span, style)| GroupKey { style, span })
+            .collect();
         let groups = group_spans(
-            self.view.spans.iter().map(|s| s.content.as_str()),
-            &all_styles,
+            view_spans.iter().map(|s| s.content.as_str()),
+            &keys,
             usize::from(u16::MAX),
         );
         let styles: Vec<TextStyle> = groups.iter().map(|g| all_styles[g.style].clone()).collect();
@@ -385,10 +625,24 @@ impl Widget for RichTextWidget {
             self.view.max_lines,
             self.view.overflow,
         );
+        let tags: Vec<Option<usize>> = groups
+            .iter()
+            .map(|g| self.view.spans[g.style].is_marked().then_some(g.style))
+            .collect();
+        let fragments = marked_fragments(
+            text_ctx,
+            &spans,
+            &tags,
+            &layout,
+            max_width,
+            self.view.max_lines,
+            self.view.overflow,
+        );
         let size = bc.constrain(layout.size());
         let joined: String = self.view.spans.iter().map(|s| s.content.as_str()).collect();
         self.inspect = Some(text_inspect(&joined, &layout, self.view.max_lines));
         self.layout = Some(layout);
+        self.fragments = fragments;
         self.laid_out_max_width = max_width;
         self.laid_out_span_styles = all_styles;
         self.laid_out_locale_stamp = locale_stamp;
@@ -396,8 +650,82 @@ impl Widget for RichTextWidget {
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
-        if let Some(layout) = &self.layout {
-            paint_layout(layout, ctx.origin(), scene);
+        let Some(layout) = &self.layout else {
+            return;
+        };
+        let origin = ctx.origin();
+        let theme = Theme::from_paint_ctx(ctx);
+        for fragment in &self.fragments {
+            let Some(color) = self.view.spans[fragment.span].background_color(theme) else {
+                continue;
+            };
+            let rect = fragment.rect.inflate(BG_PAD_X, 0.0);
+            let radius = theme.map_or(BG_RADIUS, |t| t.shape.extra_small);
+            let radius = ShapeScale::resolve(radius, rect.width(), rect.height());
+            scene.fill_rounded_rect(origin + rect.origin().to_vec2(), rect.size(), radius, color);
+        }
+        paint_layout(layout, origin, scene);
+    }
+
+    fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
+        if self.on_link.is_none() || self.links.is_empty() {
+            return EventResult::Ignored;
+        }
+        let InputEvent::Pointer(p) = event else {
+            return EventResult::Ignored;
+        };
+        let within_slop = |press: &LinkPress| (p.position - press.start).hypot() <= TOUCH_SLOP;
+        match p.phase {
+            PointerPhase::Down => {
+                self.press = None;
+                if !presses(p) {
+                    return EventResult::Ignored;
+                }
+                let Some(link) = self.link_at(p.position) else {
+                    return EventResult::Ignored;
+                };
+                self.press = Some(LinkPress {
+                    link,
+                    start: p.position,
+                });
+                ctx.capture_pointer();
+                EventResult::Handled
+            }
+            PointerPhase::Move => {
+                if self.press.as_ref().is_some_and(|press| !within_slop(press)) {
+                    // It became a drag: let it go without firing.
+                    self.press = None;
+                }
+                if self.link_at(p.position).is_some() {
+                    ctx.set_cursor(CursorIcon::Pointer);
+                }
+                if self.press.is_some() {
+                    EventResult::Handled
+                } else {
+                    EventResult::Ignored
+                }
+            }
+            PointerPhase::Up => {
+                let Some(press) = self.press.take() else {
+                    return EventResult::Ignored;
+                };
+                if presses(p)
+                    && within_slop(&press)
+                    && self.link_at(p.position) == Some(press.link)
+                    && let Some(on_link) = self.on_link.as_mut()
+                {
+                    on_link(ctx, self.links[press.link].id.clone());
+                    ctx.request_redraw();
+                }
+                EventResult::Handled
+            }
+            PointerPhase::Cancel => {
+                if self.press.take().is_some() {
+                    EventResult::Handled
+                } else {
+                    EventResult::Ignored
+                }
+            }
         }
     }
 
@@ -407,10 +735,185 @@ impl Widget for RichTextWidget {
 
     fn semantics(&self, ctx: &mut SemanticsCtx) {
         let value: String = self.view.spans.iter().map(|s| s.content.as_str()).collect();
-        ctx.push_node(Role::Label, |node| {
-            node.set_value(value);
-        });
+        if self.links.is_empty() {
+            ctx.push_node(Role::Label, |node| {
+                node.set_value(value);
+            });
+            return;
+        }
+        let origin = ctx.origin();
+        ctx.push_container(
+            Role::Label,
+            |node| node.set_value(value),
+            |ctx| {
+                for (index, link) in self.links.iter().enumerate() {
+                    // A link cut off by `max_lines` has no glyphs to activate.
+                    let Some(first) = self
+                        .fragments
+                        .iter()
+                        .find(|f| self.link_of(f.span) == Some(index))
+                    else {
+                        continue;
+                    };
+                    // The first fragment's bounds, so a Click synthesized at
+                    // their centre lands on this link's glyphs.
+                    let bounds = first.rect + origin.to_vec2();
+                    ctx.push_node(Role::Link, |node| {
+                        node.set_label(link.label.as_str());
+                        node.set_bounds(AccessRect {
+                            x0: bounds.x0,
+                            y0: bounds.y0,
+                            x1: bounds.x1,
+                            y1: bounds.y1,
+                        });
+                        if self.on_link.is_some() {
+                            node.add_action(Action::Click);
+                        }
+                    });
+                }
+            },
+        );
     }
+}
+
+/// Encodes group index `group` as a decoration colour the probe layout
+/// hands back unchanged on its line-through rects. Zero marks a group that
+/// is not tagged (it still gets a rect, so every line with text has one).
+fn group_tag(group: usize) -> Color {
+    Color::new([(group + 1) as f32, 0.0, 0.0, 1.0])
+}
+
+/// The line fragments of every tagged group (`tags[g]` names its first
+/// span), in line order, for `layout`: the layout of `spans` at
+/// `max_width`, capped by `max_lines` and `overflow`.
+///
+/// A probe re-lays `spans` with every group struck through in its
+/// [`group_tag`], so the line-through rects give each group's pen extent
+/// per line. The rects arrive line by line, so when they fall into exactly
+/// `layout.line_count()` bands (every line has text) a rect's band is its
+/// line with no further layout. Otherwise (blank lines, whitespace-only
+/// lines) each rect's line is bisected over line tops. Either way the line
+/// boxes are the heights of `spans` capped at `k` lines (breaking is greedy,
+/// so the first `k` lines are unchanged), measured only at the boundaries a
+/// marked fragment needs, never for unmarked lines above it. Touching pieces
+/// of one group on a line (a face change inside it) merge.
+fn marked_fragments(
+    text_ctx: &mut TextContext,
+    spans: &[TextSpan<'_>],
+    tags: &[Option<usize>],
+    layout: &TextLayout,
+    max_width: Option<f32>,
+    max_lines: Option<usize>,
+    overflow: TextOverflow,
+) -> Vec<Fragment> {
+    if tags.iter().all(Option::is_none) {
+        return Vec::new();
+    }
+    let probe_styles: Vec<TextStyle> = spans
+        .iter()
+        .enumerate()
+        .map(|(group, span)| {
+            let mut style = span.style.clone();
+            style.decoration = TextDecoration::line_through().with_color(group_tag(group));
+            style
+        })
+        .collect();
+    let probe_spans: Vec<TextSpan<'_>> = spans
+        .iter()
+        .zip(&probe_styles)
+        .map(|(span, style)| TextSpan::new(span.text, style))
+        .collect();
+    let probe = text_ctx.layout_rich_bounded(&probe_spans, max_width, max_lines, overflow);
+
+    let lines = layout.line_count();
+    let height = layout.size().height;
+    let mut tops: std::collections::BTreeMap<usize, f64> = std::collections::BTreeMap::new();
+    let mut top_of = |line: usize| -> f64 {
+        if line == 0 {
+            return 0.0;
+        }
+        if line >= lines {
+            return height;
+        }
+        *tops.entry(line).or_insert_with(|| {
+            text_ctx
+                .layout_rich_bounded(spans, max_width, Some(line), TextOverflow::Clip)
+                .size()
+                .height
+        })
+    };
+
+    // (group, rect) of every line-through rect, in line order.
+    let rects: Vec<(usize, Rect)> = probe
+        .decoration_rects(Point::ZERO)
+        .into_iter()
+        .filter(|d| d.kind == DecorationKind::LineThrough)
+        .filter_map(|d| {
+            let tag = d.color.components[0];
+            (tag >= 1.0).then(|| ((tag as usize) - 1, d.rect))
+        })
+        .collect();
+
+    // Band the rects: a new band starts when a rect sits more than half an
+    // average line below everything in the current one.
+    let tolerance = height / lines.max(1) as f64 / 2.0;
+    let mut bands: Vec<usize> = Vec::with_capacity(rects.len());
+    let mut band_max = f64::NEG_INFINITY;
+    let mut band = 0usize;
+    for (index, (_, rect)) in rects.iter().enumerate() {
+        let mid = (rect.y0 + rect.y1) / 2.0;
+        if index > 0 && mid > band_max + tolerance {
+            band += 1;
+            band_max = mid;
+        } else {
+            band_max = band_max.max(mid);
+        }
+        bands.push(band);
+    }
+    let banded = !rects.is_empty() && band + 1 == lines;
+
+    let mut out: Vec<(usize, Fragment)> = Vec::new();
+    let mut line = 0;
+    for (index, (group, rect)) in rects.iter().enumerate() {
+        let Some(span) = tags.get(*group).copied().flatten() else {
+            continue;
+        };
+        if banded {
+            line = bands[index];
+        } else {
+            let mid = (rect.y0 + rect.y1) / 2.0;
+            // The last line in `line..lines` whose top is at or above `mid`.
+            let (mut lo, mut hi) = (line, lines - 1);
+            while lo < hi {
+                let m = (lo + hi).div_ceil(2);
+                if top_of(m) <= mid {
+                    lo = m;
+                } else {
+                    hi = m - 1;
+                }
+            }
+            line = lo;
+        }
+        let touches =
+            |f: &Fragment| (rect.x0 - f.rect.x1).abs() < 0.5 || (f.rect.x0 - rect.x1).abs() < 0.5;
+        match out.last_mut() {
+            Some((on, f)) if *on == line && f.span == span && touches(f) => {
+                f.rect.x0 = f.rect.x0.min(rect.x0);
+                f.rect.x1 = f.rect.x1.max(rect.x1);
+            }
+            _ => {
+                let (y0, y1) = (top_of(line), top_of(line + 1));
+                out.push((
+                    line,
+                    Fragment {
+                        span,
+                        rect: Rect::new(rect.x0, y0, rect.x1, y1),
+                    },
+                ));
+            }
+        }
+    }
+    out.into_iter().map(|(_, f)| f).collect()
 }
 
 #[cfg(test)]
@@ -783,5 +1286,313 @@ mod tests {
         let (widget, size) = lay_out(&view, None, 300.0, &mut tcx);
         assert_eq!(group_styles(&widget).len(), usize::from(u16::MAX));
         assert!(size.width > 0.0);
+    }
+
+    /// Paint ops for the background and link tests: rounded fills, plain
+    /// fills and every glyph's position.
+    #[derive(Debug, PartialEq)]
+    enum Mark {
+        Round(Rect, f64, Color),
+        Rect,
+        Glyphs(Vec<(f32, f32)>),
+    }
+
+    #[derive(Default)]
+    struct MarkRecorder(Vec<Mark>);
+
+    impl PaintScene for MarkRecorder {
+        fn fill_rect(&mut self, _o: Point, _s: Size, _c: Color) {
+            self.0.push(Mark::Rect);
+        }
+        fn fill_rounded_rect(&mut self, o: Point, s: Size, radius: f64, c: Color) {
+            self.0
+                .push(Mark::Round(Rect::from_origin_size(o, s), radius, c));
+        }
+        fn draw_text(&mut self, _o: Point, _t: &str) {}
+        fn draw_glyph_run(&mut self, run: GlyphRun) {
+            self.0.push(Mark::Glyphs(
+                run.glyphs.iter().map(|g| (g.x, g.y)).collect(),
+            ));
+        }
+    }
+
+    fn marks(widget: &mut RichTextWidget) -> Vec<Mark> {
+        let mut rec = MarkRecorder::default();
+        widget.paint(
+            &mut PaintCtx::new(Point::ZERO, Size::new(300.0, 400.0)),
+            &mut rec,
+        );
+        rec.0
+    }
+
+    fn grey() -> Color {
+        Color::from_rgb8(220, 220, 220)
+    }
+
+    /// A paragraph whose middle span wraps across lines at a 120 px width.
+    fn wrapped(middle: SpanView) -> RichTextView {
+        rich_text([span("see "), middle, span(" after")])
+    }
+
+    const CODE: &str = "alpha beta gamma delta epsilon";
+
+    #[test]
+    fn a_wrapped_background_paints_one_padded_rect_per_line_fragment() {
+        let _slot = crate::test_support::LocaleSlotGuard::hold();
+        let mut tcx = TextContext::new();
+        let (mut widget, size) = lay_out(
+            &wrapped(span(CODE).background(grey())),
+            None,
+            120.0,
+            &mut tcx,
+        );
+        let fragments = widget.fragments.clone();
+        assert!(fragments.len() >= 2, "the span wraps: {fragments:?}");
+        let first = fragments[0].rect;
+        assert_eq!(first.y0, 0.0, "it starts on the first line");
+        assert!(first.x0 > 0.0, "it starts mid-line, after \"see \"");
+        for pair in fragments.windows(2) {
+            assert_eq!(pair[0].rect.y1, pair[1].rect.y0, "line boxes stack");
+            assert!(pair[0].rect.height() > 0.0);
+        }
+        assert!(fragments.last().unwrap().rect.y1 <= size.height + 0.01);
+
+        let ops = marks(&mut widget);
+        let rounds: Vec<(Rect, f64, Color)> = ops
+            .iter()
+            .filter_map(|op| match op {
+                Mark::Round(r, radius, c) => Some((*r, *radius, *c)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rounds.len(), fragments.len());
+        for ((rect, radius, color), fragment) in rounds.iter().zip(&fragments) {
+            assert_eq!(*rect, fragment.rect.inflate(BG_PAD_X, 0.0));
+            assert_eq!(*radius, BG_RADIUS);
+            assert_eq!(*color, grey());
+        }
+        let first_glyphs = ops.iter().position(|op| matches!(op, Mark::Glyphs(_)));
+        assert!(
+            first_glyphs.is_some_and(|g| g >= rounds.len()),
+            "backgrounds paint under the glyphs: {ops:?}"
+        );
+    }
+
+    fn glyph_positions(ops: &[Mark]) -> Vec<(f32, f32)> {
+        ops.iter()
+            .flat_map(|op| match op {
+                Mark::Glyphs(g) => g.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_background_or_link_changes_neither_size_nor_glyph_positions() {
+        let _slot = crate::test_support::LocaleSlotGuard::hold();
+        let mut tcx = TextContext::new();
+        let (mut plain, plain_size) = lay_out(&wrapped(span(CODE)), None, 120.0, &mut tcx);
+        let reference = glyph_positions(&marks(&mut plain));
+        for marked in [
+            span(CODE).background(grey()),
+            span(CODE).link("x"),
+            span(CODE).themed_background(SurfaceRole::SurfaceContainerHigh),
+        ] {
+            let (mut widget, size) = lay_out(&wrapped(marked), None, 120.0, &mut tcx);
+            assert_eq!(size, plain_size);
+            assert_eq!(glyph_positions(&marks(&mut widget)), reference);
+            assert_eq!(
+                widget.layout.as_ref().map(TextLayout::line_count),
+                plain.layout.as_ref().map(TextLayout::line_count)
+            );
+        }
+    }
+
+    #[test]
+    fn a_background_resolves_explicit_then_themed_then_fallback() {
+        let theme = Theme::neutral();
+        let high = theme.scheme().surface_container_high;
+        let themed = span("x").themed_background(SurfaceRole::SurfaceContainerHigh);
+        assert_eq!(themed.background_color(Some(&theme)), Some(high));
+        assert_eq!(themed.background_color(None), Some(BG_FALLBACK));
+        let explicit_last = themed.clone().background(red());
+        let explicit_first = span("x")
+            .background(red())
+            .themed_background(SurfaceRole::SurfaceContainerHigh);
+        for s in [explicit_last, explicit_first] {
+            assert_eq!(s.background_color(Some(&theme)), Some(red()));
+        }
+        assert_eq!(span("x").background_color(Some(&theme)), None);
+    }
+
+    #[test]
+    fn a_link_hits_on_every_fragment_and_misses_elsewhere() {
+        let _slot = crate::test_support::LocaleSlotGuard::hold();
+        let mut tcx = TextContext::new();
+        let (widget, size) = lay_out(&wrapped(span(CODE).link("docs")), None, 120.0, &mut tcx);
+        assert_eq!(widget.links.len(), 1);
+        assert!(widget.fragments.len() >= 2, "{:?}", widget.fragments);
+        for fragment in &widget.fragments {
+            assert_eq!(widget.link_at(fragment.rect.center()), Some(0));
+        }
+        let first = widget.fragments[0].rect;
+        assert_eq!(widget.link_at(Point::new(1.0, first.center().y)), None);
+        assert_eq!(
+            widget.link_at(Point::new(first.x0 - BG_PAD_X / 2.0, 1.0)),
+            None
+        );
+        assert_eq!(widget.link_at(Point::new(5.0, size.height + 5.0)), None);
+    }
+
+    #[test]
+    fn link_spans_group_apart_from_equal_style_neighbours() {
+        let _slot = crate::test_support::LocaleSlotGuard::hold();
+        let view = rich_text([
+            span("a "),
+            span("b").link("one"),
+            span("c").link("one").weight(FontWeight::BOLD),
+            span(" d "),
+            span("e").link("two"),
+        ]);
+        let runs = link_runs(&view.spans);
+        let ids: Vec<&str> = runs.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["one", "two"]);
+        assert_eq!(runs[0].label, "bc");
+        assert_eq!(runs[0].spans, 1..3);
+
+        let mut tcx = TextContext::new();
+        let (widget, _) = lay_out(&view, None, 300.0, &mut tcx);
+        let spans: Vec<usize> = widget.fragments.iter().map(|f| f.span).collect();
+        assert_eq!(spans, [1, 2, 4], "one fragment per marked group");
+        assert_eq!(widget.link_of(2), Some(0));
+        assert_eq!(widget.link_of(4), Some(1));
+    }
+
+    #[test]
+    fn a_mid_line_span_in_right_to_left_text_gets_its_visual_extent() {
+        let _slot = crate::test_support::LocaleSlotGuard::hold();
+        let view = rich_text([
+            span("\u{5d0}\u{5d1}\u{5d2} "),
+            span("\u{5d3}\u{5d4}").background(grey()).link("he"),
+            span(" \u{5d5}\u{5d6}\u{5d7}"),
+        ]);
+        let mut tcx = TextContext::new();
+        let (mut widget, _) = lay_out(&view, None, 300.0, &mut tcx);
+        assert_eq!(widget.fragments.len(), 1, "{:?}", widget.fragments);
+        let rect = widget.fragments[0].rect;
+        // The line is right-aligned; the span sits between the other two.
+        let xs: Vec<f64> = glyph_positions(&marks(&mut widget))
+            .iter()
+            .map(|&(x, _)| f64::from(x))
+            .collect();
+        let (left, right) = xs
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(l, r), &x| (l.min(x), r.max(x)));
+        assert!(
+            rect.x0 > left && rect.x1 < right,
+            "{rect:?} in {left}..{right}"
+        );
+        assert_eq!(widget.link_at(rect.center()), Some(0));
+        assert_eq!(
+            widget.link_at(Point::new(rect.x0 - 3.0, rect.center().y)),
+            None
+        );
+        assert_eq!(
+            widget.link_at(Point::new(rect.x1 + 3.0, rect.center().y)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_link_cut_by_max_lines_has_no_fragment() {
+        let _slot = crate::test_support::LocaleSlotGuard::hold();
+        let words = "word ".repeat(40);
+        let view = rich_text([span(words), span("tail").link("gone")]).max_lines(1);
+        let mut tcx = TextContext::new();
+        let (widget, _) = lay_out(&view, None, 120.0, &mut tcx);
+        assert!(widget.fragments.is_empty(), "{:?}", widget.fragments);
+    }
+
+    #[test]
+    fn spans_and_views_compare_by_content_not_by_callback() {
+        let make = |id: &str| {
+            rich_text([span("x").background(grey()).link(id)]).on_link(|_: &mut (), _| {})
+        };
+        assert_eq!(make("a"), make("a"));
+        assert_ne!(make("a"), make("b"));
+        assert_ne!(
+            make("a"),
+            rich_text([span("x").background(grey()).link("a")]),
+            "having a callback is part of the view"
+        );
+        assert_ne!(span("x").background(grey()), span("x"));
+    }
+
+    /// The shape cache's events (shapes, re-breaks and hits): one per
+    /// layout of any cap, so its delta counts the layouts a call made.
+    fn layout_events(tcx: &TextContext) -> u64 {
+        let stats = tcx.shape_cache_stats();
+        stats.shapes + stats.line_breaks + stats.hits
+    }
+
+    /// `lines` one-word lines at 40 px wide, with `marked` giving the line
+    /// indices whose word is a link. Returns the widget, its height and the
+    /// layouts the widget's first layout made.
+    fn tall_paragraph(lines: usize, marked: &[usize]) -> (RichTextWidget, f64, u64) {
+        let _slot = crate::test_support::LocaleSlotGuard::hold();
+        let mut tcx = TextContext::new();
+        let spans: Vec<SpanView> = (0..lines)
+            .map(|i| {
+                let word = span(if i == 0 {
+                    "word000".to_owned()
+                } else {
+                    format!("\nword{i:03}")
+                });
+                if marked.contains(&i) {
+                    word.link("x")
+                } else {
+                    word
+                }
+            })
+            .collect();
+        let view = rich_text(spans);
+        let mut widget = View::<()>::build(&view, &mut BuildCtx::new(&mut 0u64));
+        let before = layout_events(&tcx);
+        let size = layout_widget(&mut widget, None, 300.0, &mut tcx);
+        (widget, size.height, layout_events(&tcx) - before)
+    }
+
+    #[test]
+    fn measuring_a_link_on_the_last_line_does_not_scale_with_the_lines_above() {
+        let (small, _, small_layouts) = tall_paragraph(40, &[39]);
+        let (large, _, large_layouts) = tall_paragraph(90, &[89]);
+        assert_eq!(small.fragments.len(), 1);
+        assert_eq!(large.fragments.len(), 1);
+        // The fragment is the last of at least 40 line boxes.
+        let f = small.fragments[0].rect;
+        assert!(f.y1 / f.height() >= 39.5, "{f:?}");
+        let f = large.fragments[0].rect;
+        assert!(f.y1 / f.height() >= 89.5, "{f:?}");
+        assert_eq!(
+            small_layouts, large_layouts,
+            "extra layouts must not grow with the unmarked lines above"
+        );
+        assert!(small_layouts <= 6, "{small_layouts} layouts");
+    }
+
+    #[test]
+    fn measuring_marks_on_two_adjacent_lines_is_bounded() {
+        let (small, _, small_layouts) = tall_paragraph(40, &[20, 21]);
+        let (large, _, large_layouts) = tall_paragraph(90, &[60, 61]);
+        assert_eq!(small.fragments.len(), 2);
+        assert_eq!(large.fragments.len(), 2);
+        let (a, b) = (small.fragments[0].rect, small.fragments[1].rect);
+        assert!(
+            (a.y1 - b.y0).abs() < 0.01,
+            "adjacent line boxes share an edge"
+        );
+        assert!(a.y0 > 0.0 && b.y1 > b.y0);
+        assert_eq!(small_layouts, large_layouts);
+        assert!(small_layouts <= 7, "{small_layouts} layouts");
     }
 }
