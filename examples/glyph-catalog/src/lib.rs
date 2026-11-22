@@ -9,8 +9,8 @@
 //! brand mark, "glyph catalog" title, and the brightness/reduce-motion/
 //! animations toggles folded into its trailing actions (superseding the old
 //! header-row `Row`) — over a [`safe_area`]'d body: the
-//! 9-section tab strip plus a [`pattern_switcher`](frust::motion::switcher::pattern_switcher)
-//! hosting one of nine section pages in a [`scroll_view`], under a bare
+//! 10-section tab strip plus a [`pattern_switcher`](frust::motion::switcher::pattern_switcher)
+//! hosting one of ten section pages in a [`scroll_view`], under a bare
 //! [`toast_host`](frust_glyph::toast_host) overlay (default bottom-center
 //! anchoring, no app-side positioning)), and the
 //! [`frust::app!`] entry binding all three platforms. The AppBar consumes the
@@ -397,7 +397,7 @@ fn catalog_app_bar(state: &CatalogState) -> impl View<CatalogState> + use<> {
 }
 
 /// The navigator's home page: the root AppBar over a safe-area'd body (the
-/// 9-section tab strip plus the pattern-switched section body in a scroll
+/// 10-section tab strip plus the pattern-switched section body in a scroll
 /// view), all under a bare toast overlay, over an [`AppBackground`] base
 /// layer (see the module docs' "Mode B background" section). Re-run on every
 /// rebuild (the navigator re-invokes its page builder), so the signal reads
@@ -432,15 +432,26 @@ fn home_page(state: &CatalogState) -> impl View<CatalogState> + use<> {
     // viewport would never be smaller than the content and scrolling would
     // never engage (found on-device 2026-07-23). `on_scroll` feeds the root
     // AppBar's `elevated` flag off the body's own offset.
+    //
+    // The Agent chat page is the exception: its transcript scrolls itself, so
+    // it takes the bounded body directly, and the safe area holds it above
+    // the soft keyboard so the composer stays visible while typing.
     let handles = state.clone();
+    let chat = section == pages::AGENT_CHAT;
     let body = flexible(
         1,
         pattern_switcher(
             section,
             GlyphSlide::new(slide),
-            scroll_view(pages::current(section, &handles)).on_scroll(
-                move |state: &mut CatalogState, info: ScrollInfo| {
-                    state.elevated.set(info.offset > ELEVATION_THRESHOLD_PX);
+            either(
+                chat,
+                || pages::current(section, &handles),
+                || {
+                    scroll_view(pages::current(section, &handles)).on_scroll(
+                        move |state: &mut CatalogState, info: ScrollInfo| {
+                            state.elevated.set(info.offset > ELEVATION_THRESHOLD_PX);
+                        },
+                    )
                 },
             ),
         ),
@@ -448,7 +459,9 @@ fn home_page(state: &CatalogState) -> impl View<CatalogState> + use<> {
 
     // Bottom/left/right edges only — the AppBar above already consumes the
     // top inset, so padding it again here would double-pad (module docs).
-    let body_column = safe_area(column().push(tab_strip).push(body)).top(false);
+    let body_column = safe_area(column().push(tab_strip).push(body))
+        .top(false)
+        .keyboard(chat);
 
     let column = column().child(catalog_app_bar(state)).flex(1, body_column);
 
