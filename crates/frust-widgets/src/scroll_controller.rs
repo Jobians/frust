@@ -52,6 +52,16 @@
 //!   out (ignoring each with a debug-build log) and keeps the offset ones in
 //!   recording order, so `ScrollView` never sees — and never has to match
 //!   on — a variant it cannot act on.
+//! - **The end is resolved when the command drains.**
+//!   [`ScrollController::jump_to_end`] and [`ScrollController::animate_to_end`]
+//!   are offset commands whose target is the surface's maximum *at drain
+//!   time*, not a number fixed when they were recorded; a keyed
+//!   variable-extent [`ListView`](crate::ListView) additionally follows the end
+//!   as its rows are measured (and sticks to it under
+//!   [`ListView::stick_to_end`](crate::ListView::stick_to_end)). They queue and
+//!   supersede as a jump and an animate respectively. A surface's own
+//!   scrollbar records its writes through a crate-internal user-jump variant
+//!   that applies exactly like `jump_to` but drains as the user's move.
 //! - **The queue is bounded, not an unbounded backlog.** Offset commands
 //!   are grouped into segments by the item commands between them, and
 //!   within a segment a `jump_to` supersedes every earlier offset command
@@ -103,6 +113,27 @@ pub(crate) enum ScrollCommand {
     /// Ease to this offset over the paired [`AnimateTo`]'s duration/curve,
     /// clamped to `[0, max_offset]`.
     AnimateTo(f64, AnimateTo),
+    /// Move to the maximum offset at once, resolved against the extent the
+    /// draining pass measured — [`ScrollController::jump_to_end`].
+    JumpToEnd,
+    /// Ease to the maximum offset as resolved at drain time —
+    /// [`ScrollController::animate_to_end`].
+    AnimateToEnd(AnimateTo),
+    /// A [`ScrollCommand::JumpTo`] a surface's own scrollbar recorded for a
+    /// press or thumb drag: applied identically, but a user's move rather
+    /// than a program's (a stick-to-end list may release on it).
+    UserJumpTo(f64),
+}
+
+impl ScrollCommand {
+    /// Whether this command sets the position outright (a jump of any kind),
+    /// superseding every earlier offset command in its segment.
+    fn is_jump(&self) -> bool {
+        matches!(
+            self,
+            ScrollCommand::JumpTo(_) | ScrollCommand::JumpToEnd | ScrollCommand::UserJumpTo(_)
+        )
+    }
 }
 
 /// Every command a [`ScrollController`] queues: an offset command any
@@ -276,11 +307,11 @@ fn supersede_segment(commands: &mut Vec<ControllerCommand>, start: usize) {
     let mut animate = None;
     for command in commands.drain(start..end) {
         match command {
-            ControllerCommand::Offset(ScrollCommand::JumpTo(_)) => {
+            ControllerCommand::Offset(offset) if offset.is_jump() => {
                 jump = Some(command);
                 animate = None;
             }
-            ControllerCommand::Offset(ScrollCommand::AnimateTo(..)) => animate = Some(command),
+            ControllerCommand::Offset(_) => animate = Some(command),
             ControllerCommand::ScrollToItem(_) => {
                 unreachable!("the segment ends before the next item command")
             }
@@ -328,6 +359,44 @@ impl ScrollController {
         self.record(ControllerCommand::Offset(ScrollCommand::AnimateTo(
             offset, options,
         )));
+    }
+
+    /// Scroll to the end — the maximum offset — at once.
+    ///
+    /// Unlike `jump_to(f64::INFINITY)`, which clamps against the extent known
+    /// when it applies, the end is **resolved at drain time** and, on a keyed
+    /// variable-extent [`ListView`](crate::ListView), followed to the *measured*
+    /// end: with [`ListView::stick_to_end`](crate::ListView::stick_to_end) on
+    /// the list becomes stuck to its end (and reports it through
+    /// [`ListView::on_stick_change`](crate::ListView::on_stick_change)); with it
+    /// off, the following layouts re-pin the end as the rows near it are
+    /// measured, for at most the bounded settle frames `scroll_to_item` uses. A
+    /// [`ScrollView`](crate::ScrollView) (or any other surface) simply goes to
+    /// its maximum. Otherwise applied, queued and superseded exactly like
+    /// [`ScrollController::jump_to`].
+    pub fn jump_to_end(&self) {
+        self.record(ControllerCommand::Offset(ScrollCommand::JumpToEnd));
+    }
+
+    /// Ease to the end over `options.duration_ms`/`options.curve` — the
+    /// [`ScrollController::animate_to`] counterpart of
+    /// [`ScrollController::jump_to_end`]: the target is the maximum offset as
+    /// resolved when the command drains, the tween runs (and is interrupted,
+    /// replaced, or collapsed by `reduce_motion`) exactly as an `animate_to`
+    /// does, and on a stick-to-end list the list is stuck from the moment the
+    /// command applies. Content that grows while the tween runs is followed
+    /// once it lands, not mid-flight.
+    pub fn animate_to_end(&self, options: AnimateTo) {
+        self.record(ControllerCommand::Offset(ScrollCommand::AnimateToEnd(
+            options,
+        )));
+    }
+
+    /// Record a scrollbar press or thumb drag on behalf of the user: applied
+    /// exactly like [`ScrollController::jump_to`], but drained as a user move
+    /// ([`ScrollCommand::UserJumpTo`]).
+    pub(crate) fn user_jump_to(&self, offset: f64) {
+        self.record(ControllerCommand::Offset(ScrollCommand::UserJumpTo(offset)));
     }
 
     /// Scroll a keyed [`ListView`](crate::ListView) so the row whose key is
@@ -945,5 +1014,65 @@ mod tests {
             "dropping the current binding clears animating"
         );
         assert!(!controller.is_attached());
+    }
+
+    #[test]
+    fn the_end_commands_supersede_like_their_offset_counterparts() {
+        let options = AnimateTo {
+            duration_ms: 200.0,
+            curve: Curve::Linear,
+        };
+        let controller = ScrollController::new();
+        let binding = controller.bind();
+        controller.animate_to(20.0, options);
+        controller.jump_to_end();
+        controller.animate_to_end(options);
+        assert_eq!(
+            binding.take_all_commands(),
+            vec![
+                ControllerCommand::Offset(ScrollCommand::JumpToEnd),
+                ControllerCommand::Offset(ScrollCommand::AnimateToEnd(options)),
+            ],
+            "jump_to_end is a jump (it drops the earlier animate), animate_to_end an animate"
+        );
+
+        let controller = ScrollController::new();
+        let binding = controller.bind();
+        controller.jump_to_end();
+        controller.user_jump_to(30.0);
+        controller.jump_to(40.0);
+        assert_eq!(
+            binding.take_all_commands(),
+            vec![ControllerCommand::Offset(ScrollCommand::JumpTo(40.0))],
+            "every jump kind supersedes every earlier one in its segment"
+        );
+    }
+
+    #[test]
+    fn a_scroll_view_goes_to_its_maximum_on_the_end_commands() {
+        let controller = ScrollController::new();
+        let view: ScrollView<()> = scroll_view(leaf(200.0, 1000.0)).controller(controller.clone());
+        let mut counter = 0u64;
+        let mut widget = View::<()>::build(&view, &mut BuildCtx::new(&mut counter));
+        let viewport = BoxConstraints::loose(Size::new(200.0, 100.0));
+        widget.layout(&mut LayoutCtx::new(), &viewport);
+
+        controller.jump_to_end();
+        widget.layout(&mut LayoutCtx::new(), &viewport);
+        assert_eq!(widget.offset(), 900.0, "jump_to_end lands on the maximum");
+        assert_eq!(controller.offset(), 900.0);
+
+        controller.jump_to(0.0);
+        widget.layout(&mut LayoutCtx::new(), &viewport);
+        controller.animate_to_end(AnimateTo {
+            duration_ms: 0.0,
+            curve: Curve::Linear,
+        });
+        widget.layout(&mut LayoutCtx::new(), &viewport);
+        assert_eq!(
+            widget.offset(),
+            900.0,
+            "animate_to_end with no duration collapses to the same jump"
+        );
     }
 }

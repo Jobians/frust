@@ -30,7 +30,7 @@ pub use editor::{
     EditOp, EditingState, EditingStateBytes, TextEditor, byte_to_utf16, sanitize_paste,
     utf16_to_byte,
 };
-pub use layout::{DecorationKind, DecorationRect, TextLayout};
+pub use layout::{DecorationKind, DecorationRect, TextAffinity, TextLayout, TextPosition};
 /// The shared lock over the default-locale slot for tests (`test-support` feature).
 #[cfg(any(test, feature = "test-support"))]
 pub use locale::test_support;

@@ -454,9 +454,9 @@ use frust_core::accesskit::{Action, CustomAction, Role};
 use frust_core::{
     AnyView, BoxConstraints, BuildCtx, ChangeFlags, CornerRadii, EditCommand, EditingState,
     EventCtx, EventResult, FocusHandle, FrameTime, ImeContentType, ImeEvent, ImeState, InputEvent,
-    Key, LayoutCtx, NamedKey, OutsideTap, OverlayBand, OverlayInput, PaintCtx, PaintScene,
-    PointerPhase, SelectionToolbarActions, SelectionToolbarPolicy, SelectionToolbarRequest,
-    SemanticsCtx, TOUCH_SLOP, View, Widget, selection_toolbar_builder, selection_toolbar_policy,
+    Key, LayoutCtx, NamedKey, PaintCtx, PaintScene, PointerPhase, SelectionToolbarActions,
+    SelectionToolbarPolicy, SelectionToolbarRequest, SemanticsCtx, TOUCH_SLOP, View, Widget,
+    selection_toolbar_builder, selection_toolbar_policy,
 };
 use frust_text::{
     EditOp, EditingStateBytes, TextContext, TextEditor, TextStyle, sanitize_paste, utf16_to_byte,
@@ -468,8 +468,14 @@ use peniko::Color;
 use crate::authoring::presses;
 use crate::container::resolve_corner_radii;
 use crate::gesture::{DOUBLE_TAP_MS, LONG_PRESS_MS};
-use crate::overlay::{OverlayAlign, OverlayAnchor, OverlayPlacement, OverlaySide, OverlaySlot};
+use crate::overlay::{OverlayAnchor, OverlaySlot};
 use crate::text::{FamilySource, ThemeTextType};
+#[cfg(test)]
+use crate::text_selection::TOOLBAR_GAP;
+use crate::text_selection::{
+    A11Y_COPY_ID, A11Y_CUT_ID, A11Y_PASTE_ID, A11Y_SELECT_ALL_ID, ClipboardVerb, SELECTION,
+    SELECTION_ALPHA, chord_verb, new_toolbar_slot,
+};
 
 /// Default corner radius of the field chrome, in logical px. Overridable
 /// per-instance with [`TextInputView::corner_radius`] — see the module docs'
@@ -497,11 +503,6 @@ const CARET_W: f32 = 1.5;
 const BLINK_MS: f64 = 500.0;
 /// Default field width when the incoming constraints are horizontally unbounded.
 const DEFAULT_WIDTH: f64 = 200.0;
-/// Gap between the selection's bounding box and the floated toolbar, in logical
-/// px — wider than [`crate::DEFAULT_OFFSET`]'s neutral 4px because this anchor
-/// is a run of text rather than a widget's own edge, and a bar sitting 4px off
-/// a line of glyphs reads as touching it.
-const TOOLBAR_GAP: f64 = 8.0;
 
 /// Field background (unthemed fallback; a theme resolves this from `surface`).
 const BG: Color = Color::WHITE;
@@ -511,14 +512,8 @@ const BORDER: Color = Color::from_rgb8(0xD1, 0xD5, 0xDB);
 const ACCENT: Color = Color::from_rgb8(0x3B, 0x82, 0xF6);
 /// Placeholder text color (unthemed fallback; themed from `on_surface_variant`).
 const PLACEHOLDER: Color = Color::from_rgb8(0x9C, 0xA3, 0xAF);
-/// Selection highlight color (unthemed fallback; themed from `primary` at alpha).
-const SELECTION: Color = Color::from_rgb8(0xBF, 0xDB, 0xFE);
 /// Caret color (unthemed fallback; themed from `primary`).
 const CARET: Color = Color::from_rgb8(0x1D, 0x4E, 0xD8);
-/// Alpha applied to `primary` for the themed selection highlight (a v1
-/// simplification — a translucent primary stands in for a dedicated selection
-/// role).
-const SELECTION_ALPHA: f32 = 0.30;
 
 /// Alpha multiplier applied to every resolved **content** color (glyphs,
 /// placeholder, caret, selection) while the field is disabled.
@@ -1081,21 +1076,10 @@ impl<State: 'static> TextInputView<State> {
     }
 }
 
-/// Stable accesskit custom-action ids for the four clipboard verbs the field
-/// publishes on its own semantics node (see [`TextInputWidget::semantics`]).
-///
-/// **Stable is the whole point.** An assistive-technology client holds on to
-/// the id it was offered and sends that number back when the user picks the
-/// action, so renumbering these would silently re-point a remembered "Copy" at
-/// some other verb. They are ordinary small integers because that is what
-/// [`accesskit::ActionData::CustomAction`] carries.
-const A11Y_CUT_ID: i32 = 1;
-/// See [`A11Y_CUT_ID`].
-const A11Y_COPY_ID: i32 = 2;
-/// See [`A11Y_CUT_ID`].
-const A11Y_PASTE_ID: i32 = 3;
-/// See [`A11Y_CUT_ID`].
-const A11Y_SELECT_ALL_ID: i32 = 4;
+// The clipboard verbs' accesskit custom-action ids (`A11Y_CUT_ID` and its
+// siblings) live in `crate::text_selection`, shared with a selectable
+// `rich_text` block: one id space, so a remembered "Copy" means the same verb
+// on either widget.
 
 /// The live long-press timer for one press — the field's own copy of
 /// [`crate::gesture`]'s paint-clock recogniser, in the one shape a text field
@@ -1355,8 +1339,9 @@ pub struct TextInputWidget {
     /// that is *about to* arrive here as well.
     ///
     /// A press outside every floated surface reaches this field **twice**: the
-    /// root delivers [`OutsideTap::Notify`] first, as an overlay broadcast, and
-    /// the press itself second (the registration does not consume it). By the
+    /// root delivers [`OutsideTap::Notify`](frust_core::OutsideTap::Notify)
+    /// first, as an overlay broadcast, and the press itself second (the
+    /// registration does not consume it). By the
     /// time the `Down` arm runs, `toolbar_open` has therefore already been
     /// cleared — so the tap-in-selection toggle reads this instead, and a
     /// second tap on a selection closes the bar rather than re-opening it.
@@ -1398,28 +1383,6 @@ pub struct TextInputWidget {
     /// The last [`CaretInfo`] handed to `on_caret_change` in this focus
     /// session; `None` until the first report and again once focus is lost.
     caret_reported: Option<CaretInfo>,
-}
-
-/// A closed portal slot configured the way a selection toolbar wants it.
-///
-/// `Floating` (a toolbar is not a tooltip: it is the thing the user aims at),
-/// `Interactive` (its whole purpose is being tapped), and
-/// [`OutsideTap::Notify`] **without** consuming — a press elsewhere dismisses
-/// the bar *and* still lands, so the tap that puts it away also moves the caret
-/// where the user pointed. Placement is above the selection, centred, at
-/// [`TOOLBAR_GAP`], flipping below and clamping inside the window when there is
-/// no room (the [`OverlayPlacement`] defaults for both).
-fn new_toolbar_slot() -> OverlaySlot<()> {
-    let mut slot = OverlaySlot::new();
-    slot.set_band(OverlayBand::Floating);
-    slot.set_input(OverlayInput::Interactive);
-    slot.set_outside_tap(OutsideTap::Notify { consume: false });
-    slot.set_placement(
-        OverlayPlacement::on(OverlaySide::Top)
-            .align(OverlayAlign::Center)
-            .offset(TOOLBAR_GAP),
-    );
-    slot
 }
 
 /// Whether `pos` (widget-local) lies within a `size`-sized field.
@@ -2175,34 +2138,24 @@ impl TextInputWidget {
         match key {
             Key::Character(s) => {
                 if modifiers.ctrl || modifiers.meta {
-                    // Chord decoding is **platform-uniform**: ctrl OR meta arms
-                    // the clipboard verbs on every OS, so a Mac keyboard's Cmd+C
-                    // works under Linux and a terminal habit's Ctrl+C works on
-                    // macOS. Flutter is platform-strict instead (meta on
-                    // macOS/iOS, ctrl elsewhere); a shell that wants exactly that
-                    // decodes the chord itself and dispatches an
-                    // [`EditCommand`] — the route the platform edit menus and the
-                    // hardware clipboard keys already take, and the one that
-                    // always wins, since this branch only sees what a shell chose
-                    // to forward as a key. Alt is deliberately not a chord
-                    // modifier: it composes characters.
-                    if s.eq_ignore_ascii_case("c") {
-                        return self.handle_command(ctx, &EditCommand::Copy);
-                    }
-                    if s.eq_ignore_ascii_case("x") {
-                        return self.handle_command(ctx, &EditCommand::Cut);
-                    }
-                    if s.eq_ignore_ascii_case("v") {
-                        self.request_paste_if_editable(ctx);
-                        return EventResult::Handled;
-                    }
-                    if s.eq_ignore_ascii_case("a") {
-                        return self.handle_command(ctx, &EditCommand::SelectAll);
-                    }
-                    // Every other chorded character (Cmd+Z, Ctrl+B, …) is
-                    // declined, never typed: a chord is never literal text. The
-                    // root's shortcut registry gets the chance to match it.
-                    return EventResult::Ignored;
+                    // Chord decoding is platform-uniform (ctrl OR meta, never
+                    // alt) and shared with a selectable `rich_text` block — see
+                    // `text_selection::chord_verb`. Every other chorded
+                    // character (Cmd+Z, Ctrl+B, …) is declined, never typed: a
+                    // chord is never literal text. The root's shortcut registry
+                    // gets the chance to match it.
+                    return match chord_verb(s) {
+                        Some(ClipboardVerb::Copy) => self.handle_command(ctx, &EditCommand::Copy),
+                        Some(ClipboardVerb::Cut) => self.handle_command(ctx, &EditCommand::Cut),
+                        Some(ClipboardVerb::Paste) => {
+                            self.request_paste_if_editable(ctx);
+                            EventResult::Handled
+                        }
+                        Some(ClipboardVerb::SelectAll) => {
+                            self.handle_command(ctx, &EditCommand::SelectAll)
+                        }
+                        None => EventResult::Ignored,
+                    };
                 }
                 if !self.editable() {
                     // Focusable but not editable: a read-only field takes no
