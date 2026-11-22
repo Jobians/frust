@@ -1337,6 +1337,33 @@ mod tests {
     }
 
     #[test]
+    fn on_link_receives_exactly_the_url_that_was_validated() {
+        // (source, label, what on_link receives)
+        let cases = [
+            (
+                "[padded](<  https://example.com/a  >) tail",
+                "padded",
+                Some("https://example.com/a"),
+            ),
+            ("[ctl](<\u{1}https://example.com/b>) tail", "ctl", None),
+        ];
+        for (source, label, received) in cases {
+            let mut rig = Rig::new(true, 400.0);
+            rig.show(|_| {
+                markdown(source).on_link(|app: &mut App, url| app.links.push(url.to_owned()))
+            });
+            let rect = rig.text_rect(label);
+            rig.click(Point::new(rect.x0 + 6.0, rect.y0 + 6.0));
+            let expected: Vec<String> = received.into_iter().map(str::to_owned).collect();
+            assert_eq!(rig.app.links, expected, "{source:?}");
+            if received.is_none() {
+                let shown = &rig.texts()[0].0;
+                assert_eq!(shown, "ctl (?https://example.com/b) tail");
+            }
+        }
+    }
+
+    #[test]
     fn a_link_keeps_reaching_the_latest_callback_across_rebuilds() {
         let mut rig = Rig::new(true, 400.0);
         let source = "[docs](https://x.example/) tail";

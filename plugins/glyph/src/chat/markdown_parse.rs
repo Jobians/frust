@@ -3,11 +3,11 @@
 //! task lists on; its events never leave this module.
 //!
 //! Untrusted content: raw HTML, block or inline, becomes literal text; an image
-//! becomes the text `alt (url)`, never an image; a link keeps its `url` verbatim
-//! (an email autolink gains `mailto:`) and is `safe` only for http, https and
-//! mailto. Lists and quotes nested past [`MAX_NESTING_DEPTH`] flatten to text,
-//! spans nested past [`MAX_INLINE_DEPTH`] lose their styling, and cells past
-//! [`MAX_TABLE_COLUMNS`] join the last column behind a ` | ` separator.
+//! the text `alt (url)`, never an image; a link's `url` is its trimmed
+//! destination (an email autolink gains `mailto:`), `safe` only for http, https
+//! and mailto with no control character. Lists and quotes nested past
+//! [`MAX_NESTING_DEPTH`] flatten to text, spans past [`MAX_INLINE_DEPTH`] lose
+//! their styling, and cells past [`MAX_TABLE_COLUMNS`] join the last column.
 //!
 //! Streaming: every prefix parses without panicking. A fence is `closed` once
 //! it can gain nothing (a closing fence line, or its list item or quote ended
@@ -120,9 +120,11 @@ pub(crate) enum MdInline {
     Code(String),
     /// A link. Show an unsafe link as plain text plus its `url`; never open it.
     Link {
-        /// The destination as written (an email autolink gains `mailto:`).
+        /// The destination, outer ASCII whitespace trimmed (an email autolink
+        /// gains `mailto:`). For a safe link, exactly the string checked.
         url: String,
-        /// True only for an http, https or mailto scheme without control characters.
+        /// True only for an http, https or mailto scheme with no control
+        /// character anywhere.
         safe: bool,
         /// The link text.
         content: Vec<MdInline>,
@@ -155,13 +157,13 @@ pub(crate) fn stable_prefix_len(blocks_prev: &[MdBlock], blocks_next: &[MdBlock]
         .count()
 }
 
-/// Whether a link destination may be offered to the app as a tappable link.
+/// Whether a (trimmed) link destination may be offered to the app as a
+/// tappable link: checked as is, so the app receives exactly this string.
 fn is_safe_url(url: &str) -> bool {
-    let trimmed = url.trim_matches(|c: char| c.is_ascii_whitespace() || c.is_control());
-    if trimmed.chars().any(char::is_control) {
+    if url.chars().any(char::is_control) {
         return false;
     }
-    let Some((scheme, _)) = trimmed.split_once(':') else {
+    let Some((scheme, _)) = url.split_once(':') else {
         return false;
     };
     ["http", "https", "mailto"]
@@ -309,7 +311,9 @@ impl<'s> Builder<'s> {
                 dest_url,
                 ..
             } => {
-                let mut url = dest_url.into_string();
+                let mut url = dest_url
+                    .trim_matches(|c: char| c.is_ascii_whitespace())
+                    .to_owned();
                 if link_type == LinkType::Email
                     && !url
                         .get(..7)
@@ -1193,7 +1197,8 @@ mod tests {
             ("[a](http://x)", "http://x", true),
             ("[a](HTTPS://x/y?q=1)", "HTTPS://x/y?q=1", true),
             ("[a](MailTo:me@x)", "MailTo:me@x", true),
-            ("[a](<\u{1}https://x>)", "\u{1}https://x", true),
+            ("[a](<\u{1}https://x>)", "\u{1}https://x", false),
+            ("[a](<  https://x  >)", "https://x", true),
             ("[a](/relative)", "/relative", false),
             ("[a](relative/path)", "relative/path", false),
             ("[a](#frag)", "#frag", false),
