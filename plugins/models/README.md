@@ -65,7 +65,7 @@ The default `hub` feature adds a blocking Hugging Face Hub client and a download
 **Which calls block.** `HubClient::search`, `HubClient::files`, `HubClient::request_for`,
 `HubClient::request_for_main` and `DownloadHandle::wait` wait on the network or on a download.
 Call them on a worker thread (`frust::spawn_blocking` in an app), never in a component's event
-handler or `build`; on iOS and macOS a call on the main thread fails at once with
+handler or `build`; on Android and Apple (iOS and macOS) a call on the UI thread fails at once with
 `ModelsError::UiThread`. `Downloader::start`, `DownloadHandle::cancel`,
 `DownloadRequest::from_url` and `HubClient::resolve_url` return without waiting. In a component,
 `DownloadTracker::start_hub` (under "In a component") does the blocking part for you.

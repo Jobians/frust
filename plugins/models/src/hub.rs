@@ -43,7 +43,9 @@ const MAX_REDIRECTS: usize = 5;
 /// Refuses a blocking call on the platform UI thread with [`ModelsError::UiThread`].
 ///
 /// On iOS and macOS the UI thread is the main thread, tested with `MainThreadMarker` as the
-/// sibling platform plugins do. Other targets refuse nothing here.
+/// sibling platform plugins do. On Android it is the main `Looper`, tested through
+/// `frust_plugin::android::with_jni_env`; without a JNI environment the call is refused with
+/// [`ModelsError::Unsupported`], as the sibling plugins refuse it. Other targets refuse nothing.
 #[cfg(target_vendor = "apple")]
 pub(crate) fn refuse_ui_thread() -> Result<(), ModelsError> {
     if objc2::MainThreadMarker::new().is_some() {
@@ -52,7 +54,50 @@ pub(crate) fn refuse_ui_thread() -> Result<(), ModelsError> {
     Ok(())
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(target_os = "android")]
+pub(crate) fn refuse_ui_thread() -> Result<(), ModelsError> {
+    use jni::{jni_sig, jni_str};
+
+    fn unavailable(what: &str) -> ModelsError {
+        log::warn!("frust-models: UI-thread check failed: {what}");
+        ModelsError::Unsupported("the Android UI-thread check is unavailable".to_owned())
+    }
+
+    let checked = frust_plugin::android::with_jni_env(|env, _context| {
+        let on_ui_thread = (|| {
+            let looper = env.find_class(jni_str!("android/os/Looper"))?;
+            let mine = env
+                .call_static_method(
+                    &looper,
+                    jni_str!("myLooper"),
+                    jni_sig!("()Landroid/os/Looper;"),
+                    &[],
+                )?
+                .l()?;
+            let main = env
+                .call_static_method(
+                    &looper,
+                    jni_str!("getMainLooper"),
+                    jni_sig!("()Landroid/os/Looper;"),
+                    &[],
+                )?
+                .l()?;
+            env.is_same_object(&mine, &main)
+        })();
+        if on_ui_thread.is_err() && env.exception_check() {
+            env.exception_clear();
+        }
+        on_ui_thread
+    });
+    match checked {
+        Ok(Ok(true)) => Err(ModelsError::UiThread),
+        Ok(Ok(false)) => Ok(()),
+        Ok(Err(err)) => Err(unavailable(&err.to_string())),
+        Err(err) => Err(unavailable(&err.to_string())),
+    }
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "android")))]
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn refuse_ui_thread() -> Result<(), ModelsError> {
     Ok(())
