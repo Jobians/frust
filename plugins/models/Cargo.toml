@@ -12,7 +12,8 @@ categories.workspace = true
 readme = "README.md"
 
 [features]
-default = []
+default = ["hub"]
+hub = ["dep:ureq", "dep:sha2", "dep:rustls", "dep:webpki-roots"]
 
 [dependencies]
 frust-paths = { path = "../../crates/frust-paths", version = "0.6.6" }
@@ -20,6 +21,10 @@ log = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+ureq = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
 
 # Backup exclusion on iOS and macOS goes through `NSURL` resource values.
 [target.'cfg(target_vendor = "apple")'.dependencies]

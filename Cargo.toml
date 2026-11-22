@@ -244,6 +244,9 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 # Mozilla roots on every target (muxr lesson: the Android platform verifier's CRL bug).
 # Floor 1.0.12 is the first release clear of the 2026 webpki-roots advisories.
 webpki-roots = "1.0.12"
+# frust-models' blocking Hub client. Like reqwest above it brings no provider: the plugin builds the
+# rustls config itself on ring + webpki-roots. No platform verifier, native-tls or gzip.
+ureq = { version = "3.5", default-features = false, features = ["rustls-no-provider"] }
 # intra-workspace
 frust-core = { path = "crates/frust-core", version = "0.6.6" }
 frust-scene = { path = "crates/frust-scene", version = "0.6.6" }
