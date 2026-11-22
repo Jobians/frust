@@ -5,7 +5,8 @@
 //! # Contract
 //!
 //! - **Leading, wrapping paragraph.** The mark and the text share the first
-//!   line; the text wraps to the width it is given, and the row fills it.
+//!   line; the text wraps to the width it is given (an unbroken token breaks
+//!   anywhere), and the row fills it.
 //! - **Tone is not colour alone.** Each tone has its own mark (`i`, `✓`,
 //!   `!`, `×`), and the accessible label names the tone.
 //! - **Working state.** `.working(true)` puts the Glyph dots loader before
@@ -16,7 +17,7 @@
 use std::marker::PhantomData;
 
 use frust::Theme;
-use frust::authoring::text::{TextContext, TextLayout, TextStyle};
+use frust::authoring::text::{OverflowWrap, TextContext, TextLayout, TextStyle};
 use frust::authoring::{
     BoxConstraints, BuildCtx, ChangeFlags, ChildPod, LayoutCtx, PaintCtx, PaintScene, Role,
     SemanticsCtx, View, Widget, build_child, teardown_child,
@@ -211,7 +212,9 @@ impl Widget for NoticeRowWidget {
         let text_color = style::muted(theme);
         let family = style::mono_family(theme);
         let mark_style = TextStyle::new(NOTICE_FONT_SIZE, mark_color).with_family(family.clone());
-        let text_style = TextStyle::new(NOTICE_FONT_SIZE, text_color).with_family(family);
+        let text_style = TextStyle::new(NOTICE_FONT_SIZE, text_color)
+            .with_family(family)
+            .with_overflow_wrap(OverflowWrap::Anywhere);
 
         let mut loader_w = 0.0;
         let mut loader_h = 0.0;
@@ -375,6 +378,24 @@ mod tests {
         let mut long = build(LONG, NoticeTone::Info, false);
         let long_h = layout(&mut long, 320.0, None).height;
         assert!(long_h > short_h, "a long notice takes more lines");
+    }
+
+    #[test]
+    fn an_unbroken_token_wider_than_the_row_wraps_inside_it() {
+        let token = "x".repeat(400);
+        let mut w = build(&token, NoticeTone::Info, false);
+        let size = layout(&mut w, 320.0, None);
+        assert!((size.width - 320.0).abs() < 1e-6);
+        let text = w.text_layout.as_ref().expect("text shaped").size();
+        assert!(
+            w.text_x + text.width <= 320.0 + 0.01,
+            "{} past the row",
+            w.text_x + text.width
+        );
+        assert!(
+            text.height > w.line_h * 2.0,
+            "the token takes several lines"
+        );
     }
 
     #[test]
