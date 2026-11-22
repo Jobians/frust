@@ -3,25 +3,25 @@
 //! # Contract
 //!
 //! - **Controlled and non-reactive.** The caller owns the text: `.on_change`
-//!   reports each edit, and the composer never clears itself after a submit;
-//!   the caller sets the next value.
-//! - **Field.** A multi-line `text_input` that is one line tall when empty,
-//!   grows with its content up to `.max_visible_lines(n)` (default 6), then
-//!   scrolls inside. The growth is ordinary layout, so a parent sees the new
-//!   height on the same pass. The field's own Enter and IME handling is used
-//!   as is: Enter never submits while a composition is active.
+//!   reports each edit, and the composer never clears itself after a submit.
+//! - **Field.** A multi-line `text_input`, one line tall when empty, growing
+//!   with its content up to `.max_visible_lines(n)` (default 6), then
+//!   scrolling inside; the parent sees the new height on the same pass. Enter
+//!   never submits while an IME composition is active.
 //! - **Submit.** The send control and, with `.submit_on_enter(true)`, Enter
 //!   run `.on_submit(app state, text)` when the trimmed text is non-empty and
 //!   the composer is not disabled. With `false` (default) Enter inserts a
 //!   newline; Shift+Enter always does the opposite of the setting.
 //! - **Running.** `.running(true)` turns the send control into a stop control
-//!   that runs `.on_stop`; typing stays allowed.
-//! - **Disabled.** `.disabled(reason)` shows the reason as a line above the
-//!   field and disables the field and send. A running stop control stays live.
+//!   that runs `.on_stop`. Typing and Enter's submit stay allowed: the caller
+//!   decides whether a prompt sent mid-turn is queued or refused.
+//! - **One press, one action.** A release runs the control the press began
+//!   on; if the control changes (send to stop or back) mid-press, the press
+//!   is cancelled.
+//! - **Disabled.** `.disabled(reason)` shows the reason above the field and
+//!   disables the field and send; a running stop control stays live.
 //! - **Trailing action.** `.trailing_action(view)` fills one icon-sized slot
-//!   between the field and the send control; the send control never moves.
-//! - **Semantics.** The field is labelled by the placeholder; send and stop
-//!   are buttons with labels; the reason is plain text.
+//!   left of the send control, which never moves.
 
 use std::rc::Rc;
 
@@ -435,10 +435,9 @@ impl<State: 'static> View<State> for ComposerView<State> {
         let control = Control::of(self.running, self.can_send());
         if element.control != control {
             element.control = control;
-            if !control.live() {
-                element.pressed = false;
-                element.captured = false;
-            }
+            // A release only acts on the control its press began on.
+            element.pressed = false;
+            element.captured = false;
             // Semantics-only too, but `PAINT` is what reaches the semantics gate.
             flags |= ChangeFlags::PAINT;
         }
@@ -768,6 +767,71 @@ mod tests {
         rig.click_field();
         rig.type_text("!");
         assert!(rig.app.value.contains('!'), "typing stays allowed");
+    }
+
+    #[test]
+    fn a_control_change_mid_press_cancels_the_press() {
+        // Send to Stop: the turn started while the send control was held.
+        let mut rig = Rig::new(with_value("hi"), true, 320.0);
+        let at = rig.button().1.center();
+        rig.send(pointer(PointerPhase::Down, at));
+        rig.app.running = true;
+        rig.refresh();
+        assert_eq!(rig.button().0, "Stop");
+        rig.send(pointer(PointerPhase::Up, at));
+        assert_eq!(
+            (rig.app.submits.len(), rig.app.stops),
+            (0, 0),
+            "send to stop"
+        );
+
+        // Stop to Send: the turn ended while the stop control was held.
+        let mut rig = Rig::new(
+            App {
+                running: true,
+                value: "next".into(),
+                ..App::default()
+            },
+            true,
+            320.0,
+        );
+        rig.send(pointer(PointerPhase::Down, at));
+        rig.app.running = false;
+        rig.refresh();
+        assert_eq!(rig.button().0, "Send");
+        rig.send(pointer(PointerPhase::Up, at));
+        assert_eq!(
+            (rig.app.submits.len(), rig.app.stops),
+            (0, 0),
+            "stop to send"
+        );
+
+        // A press that sees no change still fires.
+        rig.tap_button();
+        assert_eq!(rig.app.submits, ["next"]);
+    }
+
+    #[test]
+    fn enter_submits_while_running_and_the_control_stays_stop() {
+        let mut rig = Rig::new(
+            App {
+                running: true,
+                enter_submits: true,
+                ..App::default()
+            },
+            true,
+            320.0,
+        );
+        rig.click_field();
+        rig.type_text("queue this");
+        rig.key(NamedKey::Enter, false);
+        assert_eq!(
+            rig.app.submits,
+            ["queue this"],
+            "the caller decides to queue"
+        );
+        assert_eq!(rig.app.stops, 0);
+        assert_eq!(rig.button().0, "Stop");
     }
 
     #[test]
