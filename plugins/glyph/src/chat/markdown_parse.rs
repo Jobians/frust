@@ -9,8 +9,9 @@
 //! spans nested past [`MAX_INLINE_DEPTH`] lose their styling, and cells past
 //! [`MAX_TABLE_COLUMNS`] join the last column behind a ` | ` separator.
 //!
-//! Streaming: every prefix parses without panicking. An unclosed fence is a
-//! `CodeBlock { closed: false }` holding everything after it; half-written
+//! Streaming: every prefix parses without panicking. A fence is `closed` once
+//! it can gain nothing (a closing fence line, or its list item or quote ended
+//! before the source did); an open one holds everything after it. Half-written
 //! emphasis, links and table rows stay literal text. A block followed by
 //! another is final (the renderer keeps it as is), with these exceptions:
 //! - while the source's last line is unterminated, the block before the last
@@ -19,8 +20,8 @@
 //!   characters started;
 //! - a paragraph using `[label]` links changes when a later reference
 //!   definition resolves them;
-//! - only the last block can turn from paragraph into setext heading or table,
-//!   or have its fence close. The whole source is re-parsed on every call.
+//! - only the last block can turn from paragraph into setext heading or table.
+//!   The whole source is re-parsed on every call.
 
 use std::ops::Range;
 
@@ -454,8 +455,9 @@ impl<'s> Builder<'s> {
                         }
                     )
                 };
-                if let Some(Frame::Container { blocks, .. }) = self.pop_frame(quote) {
+                if let Some(Frame::Container { mut blocks, .. }) = self.pop_frame(quote) {
                     self.nesting = self.nesting.saturating_sub(1);
+                    self.seal_fence(&mut blocks, &range);
                     self.push_block(MdBlock::BlockQuote(blocks));
                 }
             }
@@ -472,9 +474,10 @@ impl<'s> Builder<'s> {
                 };
                 if let Some(Frame::Container {
                     kind: ContainerKind::Item { checked },
-                    blocks,
+                    mut blocks,
                 }) = self.pop_frame(item)
                 {
+                    self.seal_fence(&mut blocks, &range);
                     match self.frames.last_mut() {
                         Some(Frame::List { items, .. }) => {
                             items.push(MdListItem { checked, blocks })
@@ -516,6 +519,33 @@ impl<'s> Builder<'s> {
             | TagEnd::DefinitionListTitle
             | TagEnd::DefinitionListDefinition
             | TagEnd::MetadataBlock(_) => self.close_implicit(),
+        }
+    }
+
+    /// A fence still open when its list item or quote (`range`) ends can gain
+    /// nothing more once anything but whitespace or a quote marker follows
+    /// the container, so it is final and reads as closed. A fence open at the
+    /// end of the source stays unclosed.
+    fn seal_fence(&self, blocks: &mut [MdBlock], range: &Range<usize>) {
+        fn seal(blocks: &mut [MdBlock]) {
+            match blocks.last_mut() {
+                Some(MdBlock::CodeBlock { closed, .. }) => *closed = true,
+                Some(MdBlock::BlockQuote(inner)) => seal(inner),
+                Some(MdBlock::List { items, .. }) => {
+                    if let Some(item) = items.last_mut() {
+                        seal(&mut item.blocks);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let followed = !range.is_empty()
+            && self
+                .source
+                .get(range.end..)
+                .is_some_and(|rest| rest.chars().any(|c| !c.is_whitespace() && c != '>'));
+        if followed {
+            seal(blocks);
         }
     }
 
@@ -1487,6 +1517,51 @@ mod tests {
             &parse_markdown("[ref]\n\n[ref]: https://x")[0],
             MdBlock::Paragraph(content) if matches!(content[0], MdInline::Link { safe: true, .. })
         ));
+    }
+
+    /// The first code block anywhere in `blocks`, depth first.
+    fn first_fence(blocks: &[MdBlock]) -> Option<(String, bool)> {
+        blocks.iter().find_map(|block| match block {
+            MdBlock::CodeBlock { code, closed, .. } => Some((code.clone(), *closed)),
+            MdBlock::BlockQuote(inner) => first_fence(inner),
+            MdBlock::List { items, .. } => items.iter().find_map(|i| first_fence(&i.blocks)),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn a_fence_its_container_ended_is_closed_at_every_prefix() {
+        // (fixture, prefix that ends inside the still-open fence)
+        let fixtures = [
+            (
+                "- ```\n  code\n  more\n- second\n",
+                "- ```\n  code\n  more\n",
+            ),
+            (
+                "> ```\n> code\n> more\n\nafter\n",
+                "> ```\n> code\n> more\n",
+            ),
+        ];
+        for (fixture, open) in fixtures {
+            let full = first_fence(&parse_markdown(fixture)).expect("a fence");
+            assert_eq!(full, ("code\nmore".to_owned(), true), "{fixture:?}");
+            let still_open = first_fence(&parse_markdown(open)).expect("a fence");
+            assert!(!still_open.1, "open at the end of {open:?}");
+            let mut sealed: Option<(usize, String)> = None;
+            for end in 0..=fixture.len() {
+                let prefix = &fixture[..end];
+                let Some((code, closed)) = first_fence(&parse_markdown(prefix)) else {
+                    continue;
+                };
+                if let Some((at, sealed_code)) = &sealed {
+                    assert!(closed, "{prefix:?} reopened the fence closed at {at}");
+                    assert_eq!(&code, sealed_code, "{prefix:?} grew a final fence");
+                } else if closed {
+                    sealed = Some((end, code));
+                }
+            }
+            assert!(sealed.is_some(), "{fixture:?} never closed its fence");
+        }
     }
 
     #[test]
