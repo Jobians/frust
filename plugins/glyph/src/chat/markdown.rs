@@ -45,10 +45,10 @@ use super::style;
 use super::table::table;
 
 /// Body text size: the Glyph `body` token.
-pub(crate) const BODY_SIZE: f32 = 13.0;
+const BODY_SIZE: f32 = style::BODY_FONT_SIZE;
 /// Heading sizes for levels 1, 2 and 3 to 6: the Glyph `heading`, `title`
 /// and `body` tokens.
-pub(crate) const HEADING_SIZES: [f32; 3] = [20.0, 15.0, 13.0];
+const HEADING_SIZES: [f32; 3] = [20.0, 15.0, 13.0];
 /// Height of the streaming indicator row.
 const INDICATOR_H: f64 = 12.0;
 /// Side of one streaming indicator dot.
@@ -60,15 +60,13 @@ const QUOTE_BAR_W: f64 = 3.0;
 /// Narrowest list marker column.
 const LIST_INDENT: f64 = 18.0;
 /// Space between a list marker and the item text.
-const MARKER_GAP: f64 = 6.0;
+const MARKER_GAP: f64 = style::PAD_SMALL;
 /// Side of a task-list checkbox.
 const CHECK_SIDE: f64 = 11.0;
 /// Space above a task-list checkbox, to sit it on the first text line.
 const CHECK_TOP: f64 = 3.0;
 /// Height of a thematic break's row.
 const RULE_H: f64 = style::BLOCK_GAP;
-/// Width used when the incoming constraints are unbounded.
-const FALLBACK_WIDTH: f64 = 480.0;
 /// Bullet of a top-level list item (U+2022, present in the mono face).
 const BULLET: &str = "\u{2022}";
 
@@ -103,17 +101,28 @@ pub struct MarkdownView<State: 'static> {
     streaming: bool,
     selectable: bool,
     on_link: Option<OnText<State>>,
-    on_copy_code: Option<OnText<State>>,
+    on_copy: Option<OnText<State>>,
 }
 
-/// Render `source` as markdown in Glyph styling.
+impl<State: 'static> std::fmt::Debug for MarkdownView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MarkdownView")
+            .field("source", &self.source)
+            .field("streaming", &self.streaming)
+            .field("selectable", &self.selectable)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Render `source` as markdown in Glyph styling. The caller owns the source
+/// and passes the whole current text on every build.
 pub fn markdown<State: 'static>(source: impl Into<String>) -> MarkdownView<State> {
     MarkdownView {
         source: source.into(),
         streaming: false,
         selectable: true,
         on_link: None,
-        on_copy_code: None,
+        on_copy: None,
     }
 }
 
@@ -125,7 +134,9 @@ impl<State: 'static> MarkdownView<State> {
     }
 
     /// Run `on_link` with the app state and the exact URL of a safe link the
-    /// user taps. Nothing is opened here.
+    /// user taps. Nothing is opened here. The URL is attacker-controlled and
+    /// may differ from the link's visible text: show or confirm the
+    /// destination before opening it.
     pub fn on_link(mut self, on_link: impl Fn(&mut State, &str) + 'static) -> Self {
         self.on_link = Some(Rc::new(on_link));
         self
@@ -139,8 +150,8 @@ impl<State: 'static> MarkdownView<State> {
 
     /// Run `on_copy` with the app state and the code when a code block's copy
     /// control is pressed (the clipboard is written first).
-    pub fn on_copy_code(mut self, on_copy: impl Fn(&mut State, &str) + 'static) -> Self {
-        self.on_copy_code = Some(Rc::new(on_copy));
+    pub fn on_copy(mut self, on_copy: impl Fn(&mut State, &str) + 'static) -> Self {
+        self.on_copy = Some(Rc::new(on_copy));
         self
     }
 
@@ -160,7 +171,7 @@ impl<State: 'static> MarkdownView<State> {
 
     fn install(&self, hooks: &Hooks<State>) {
         hooks.on_link.replace(self.on_link.clone());
-        hooks.on_copy.replace(self.on_copy_code.clone());
+        hooks.on_copy.replace(self.on_copy.clone());
     }
 }
 
@@ -607,17 +618,9 @@ impl<State: 'static> View<State> for MarkdownView<State> {
     }
 }
 
-fn width_of(bc: &BoxConstraints) -> f64 {
-    if bc.max().width.is_finite() {
-        bc.max().width
-    } else {
-        FALLBACK_WIDTH
-    }
-}
-
 impl Widget for MarkdownWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        let width = width_of(bc);
+        let width = style::width_of(bc);
         let child_bc = BoxConstraints::loose(Size::new(width, f64::INFINITY));
         let mut y = 0.0;
         for (index, pod) in self.children.iter_mut().enumerate() {
@@ -735,7 +738,7 @@ impl<State: 'static> View<State> for GutterView<State> {
 
 impl Widget for GutterWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        let width = width_of(bc);
+        let width = style::width_of(bc);
         let GutterKind::List { ordered } = self.kind else {
             let body_bc =
                 BoxConstraints::loose(Size::new((width - QUOTE_INDENT).max(0.0), f64::INFINITY));
@@ -878,7 +881,7 @@ impl Widget for CheckWidget {
         let muted = style::muted(theme);
         scene.stroke_path(o, &outline, style::BORDER_WIDTH, &Brush::Solid(muted));
         if self.checked {
-            let ink = theme.map_or(style::FALLBACK_MUTED, |t| t.scheme().on_surface);
+            let ink = style::ink(theme);
             let mut mark = BezPath::new();
             mark.move_to(Point::new(CHECK_SIDE * 0.2, CHECK_SIDE * 0.55));
             mark.line_to(Point::new(CHECK_SIDE * 0.42, CHECK_SIDE * 0.78));
@@ -923,7 +926,7 @@ impl<State: 'static> View<State> for RuleView {
 
 impl Widget for RuleWidget {
     fn layout(&mut self, _ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        bc.constrain(Size::new(width_of(bc), RULE_H))
+        bc.constrain(Size::new(style::width_of(bc), RULE_H))
     }
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
@@ -1345,11 +1348,11 @@ mod tests {
     }
 
     #[test]
-    fn a_code_block_copy_reaches_on_copy_code() {
+    fn a_code_block_copy_reaches_on_copy() {
         let mut rig = Rig::new(true, 400.0);
         rig.show(|_| {
             markdown("intro\n\n```sh\necho hi\n```\n")
-                .on_copy_code(|app: &mut App, code| app.copied.push(code.to_owned()))
+                .on_copy(|app: &mut App, code| app.copied.push(code.to_owned()))
         });
         let block = rig.node("CodeBlockWidget")[0];
         rig.click(Point::new(block.x1 - style::PAD, block.y0 + 8.0));

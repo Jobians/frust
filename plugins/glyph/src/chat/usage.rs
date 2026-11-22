@@ -17,24 +17,23 @@
 
 use std::marker::PhantomData;
 
+use frust::Theme;
 use frust::authoring::text::{TextContext, TextLayout, TextStyle};
 use frust::authoring::{
     BoxConstraints, BuildCtx, ChangeFlags, LayoutCtx, PaintCtx, PaintScene, Role, SemanticsCtx,
     View, Widget,
 };
-use frust::{ColorScheme, StatusPalette, Theme};
 use kurbo::{Point, Size};
 use peniko::Color;
 
 use super::style;
-use crate::tokens::color;
 
 /// Bar length, in logical px.
 const BAR_WIDTH: f64 = 64.0;
 /// Bar thickness, in logical px.
 const BAR_HEIGHT: f64 = 6.0;
 /// Gap between the mark, the bar and the label, in logical px.
-const GAP: f64 = 6.0;
+const GAP: f64 = style::PAD_SMALL;
 /// Slack for threshold comparisons: `0.8` as an `f32` is not the `f64`
 /// quotient `80 / 100`.
 const THRESHOLD_EPSILON: f64 = 1e-6;
@@ -48,9 +47,6 @@ const PERCENT_SAMPLE: &str = "999%";
 const COUNTS_SAMPLE: &str = "999.9M / 999.9M";
 /// Label of a meter whose size is unknown.
 const UNKNOWN_TEXT: &str = "unknown";
-
-const DARK: ColorScheme = color::dark();
-const DARK_STATUS: StatusPalette = color::status();
 
 /// What the meter's label shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -161,27 +157,11 @@ fn format_count(n: u64) -> String {
 
 /// The filled part of the bar, and the tone's text and mark colour.
 fn fill_color(theme: Option<&Theme>, tone: MeterTone) -> Color {
-    let Some(t) = theme else {
-        return match tone {
-            MeterTone::Normal => DARK.primary,
-            MeterTone::Warning => DARK_STATUS.dark.warning,
-            MeterTone::Critical => DARK.error,
-        };
-    };
     match tone {
-        MeterTone::Normal => t.scheme().primary,
-        MeterTone::Warning => t
-            .extension::<StatusPalette>()
-            .map_or(DARK_STATUS.dark.warning, |s| s.colors(t.brightness).warning),
-        MeterTone::Critical => t.scheme().error,
+        MeterTone::Normal => style::accent(theme),
+        MeterTone::Warning => style::warning(theme),
+        MeterTone::Critical => style::error(theme),
     }
-}
-
-/// The unfilled part of the bar.
-fn track_color(theme: Option<&Theme>) -> Color {
-    theme.map_or(DARK.surface_container_highest, |t| {
-        t.scheme().surface_container_highest
-    })
 }
 
 /// A declarative usage meter. See the [module docs](self).
@@ -190,9 +170,23 @@ pub struct UsageMeterView<State> {
     state: PhantomData<fn() -> State>,
 }
 
+impl<State> std::fmt::Debug for UsageMeterView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UsageMeterView")
+            .field("used", &self.model.used)
+            .field("size", &self.model.size)
+            .field("label", &self.model.label)
+            .field("warn_at", &self.model.warn_at)
+            .field("critical_at", &self.model.critical_at)
+            .field("compact", &self.model.compact)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Create a usage meter for `used` of `size` (the unit is the caller's:
 /// tokens, bytes, anything). It shows a percentage label, warns at 80 % and
 /// turns critical at 95 %; see the builder methods to change any of that.
+/// The caller owns the counts and passes the current ones on every build.
 pub fn usage_meter<State: 'static>(used: u64, size: u64) -> UsageMeterView<State> {
     UsageMeterView {
         model: MeterModel {
@@ -307,7 +301,7 @@ impl Widget for UsageMeterWidget {
         let muted = style::muted(theme);
         let family = style::mono_family(theme);
         let base = |color: Color| {
-            TextStyle::new(style::LABEL_FONT_SIZE as f32, color)
+            TextStyle::new(style::LABEL_FONT_SIZE, color)
                 .with_family(family.clone())
                 .with_feature(*b"tnum", 1)
         };
@@ -340,7 +334,7 @@ impl Widget for UsageMeterWidget {
 
     fn paint(&mut self, ctx: &mut PaintCtx, scene: &mut dyn PaintScene) {
         let theme = Theme::from_paint_ctx(ctx);
-        let track = track_color(theme);
+        let track = style::track(theme);
         let fill = fill_color(theme, self.model.tone());
         let origin = ctx.origin();
         let size = ctx.size();
@@ -360,12 +354,12 @@ impl Widget for UsageMeterWidget {
 
         if let Some(mark) = &self.mark {
             let y = origin.y + (size.height - mark.size().height) / 2.0;
-            paint_layout(mark, Point::new(origin.x, y), scene);
+            style::paint_layout(mark, Point::new(origin.x, y), scene);
         }
         if let Some(label) = &self.label {
             let x = bar_origin.x + BAR_WIDTH + GAP;
             let y = origin.y + (size.height - label.size().height) / 2.0;
-            paint_layout(label, Point::new(x, y), scene);
+            style::paint_layout(label, Point::new(x, y), scene);
         }
     }
 
@@ -380,12 +374,6 @@ impl Widget for UsageMeterWidget {
                 node.set_max_numeric_value(1.0);
             }
         });
-    }
-}
-
-fn paint_layout(layout: &TextLayout, origin: Point, scene: &mut dyn PaintScene) {
-    for run in layout.to_scene_runs(origin) {
-        scene.draw_glyph_run(run);
     }
 }
 
@@ -589,7 +577,7 @@ mod tests {
         let size = Size::new(200.0, 20.0);
         let rec = paint(&mut w, size, Some(&theme));
         assert_eq!(rec.rrects.len(), 2, "track and fill");
-        assert_eq!(rec.rrects[0].3, track_color(Some(&theme)));
+        assert_eq!(rec.rrects[0].3, style::track(Some(&theme)));
         assert!(rec.glyph_runs > 0);
     }
 

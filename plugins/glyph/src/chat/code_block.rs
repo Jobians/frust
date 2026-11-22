@@ -25,39 +25,23 @@
 
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::Duration;
 
 use frust::FrameTime;
+use frust::authoring::ThemeTextColor;
 use frust::authoring::text::{FontWeight, TextContext, TextLayout, TextStyle};
 use frust::authoring::{
     Action, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, ErasedArgCallback, ErasedCallback,
     EventCtx, EventResult, InputEvent, LayoutCtx, PaintCtx, PaintScene, Point, PointerPhase, Rect,
-    Role, RoundedRect, SemanticsCtx, Shape, Size, TypedArgCallback, View, Widget, build_child,
-    erase_callback, erase_callback_arg, rebuild_child, route_event_single, teardown_child,
+    Role, SemanticsCtx, Size, TypedArgCallback, View, Widget, build_child, erase_callback,
+    erase_callback_arg, rebuild_child, route_event_single, teardown_child,
 };
-use frust::authoring::{Brush, Color, ThemeTextColor};
-use frust::{
-    ColorScheme, RichTextView, ScrollAxis, Theme, column, custom_scroll_view, rich_text, span,
-};
+use frust::{RichTextView, ScrollAxis, Theme, column, custom_scroll_view, rich_text, span};
 
 use super::style;
 use crate::press::presses;
 
 /// Lines per body chunk (one `rich_text` each).
-pub const CHUNK_LINES: usize = 16;
-
-/// Spaces a tab expands to on screen.
-const TAB_WIDTH: usize = 4;
-/// Width used when the incoming constraints are unbounded.
-const FALLBACK_WIDTH: f64 = 480.0;
-/// How long the copy control reads "Copied".
-const COPIED_FOR: Duration = Duration::from_millis(1500);
-/// Corner-rounding tolerance for the outline stroke.
-const PATH_TOLERANCE: f64 = 0.1;
-
-const DARK: ColorScheme = crate::tokens::color::dark();
-/// Unthemed active label text.
-const FALLBACK_TEXT: Color = DARK.on_surface;
+pub(crate) const CHUNK_LINES: usize = 16;
 
 /// What a run of code is, for colouring. A seam for a highlighter.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -128,7 +112,22 @@ pub struct CodeBlockView<State: 'static> {
     streaming: bool,
 }
 
+impl<State: 'static> std::fmt::Debug for CodeBlockView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodeBlockView")
+            .field("code", &self.code)
+            .field("language", &self.language)
+            .field("spans", &self.spans)
+            .field("max_visible_lines", &self.max_visible_lines)
+            .field("expanded", &self.expanded)
+            .field("streaming", &self.streaming)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Show `code` in a monospace block that scrolls sideways and can be copied.
+/// The caller owns the text and the expanded state and passes them on every
+/// build.
 pub fn code_block<State: 'static>(code: impl Into<String>) -> CodeBlockView<State> {
     CodeBlockView {
         code: code.into(),
@@ -233,14 +232,6 @@ fn clean_spans(code: &str, spans: &[CodeSpan]) -> Vec<(Range<usize>, CodeTone)> 
         .collect()
 }
 
-fn expand_tabs(text: &str) -> String {
-    if text.contains('\t') {
-        text.replace('\t', &" ".repeat(TAB_WIDTH))
-    } else {
-        text.to_owned()
-    }
-}
-
 fn push_piece(pieces: &mut Vec<(String, CodeTone)>, text: &str, tone: CodeTone) {
     match pieces.last_mut() {
         Some((last, t)) if *t == tone => last.push_str(text),
@@ -269,14 +260,14 @@ fn line_pieces(
             .rev()
             .find(|(r, _)| r.start <= w[0] && w[1] <= r.end)
             .map_or(CodeTone::Plain, |(_, t)| *t);
-        push_piece(pieces, &expand_tabs(&code[w[0]..w[1]]), tone);
+        push_piece(pieces, &style::expand_tabs(&code[w[0]..w[1]]), tone);
     }
 }
 
 fn tone_span(text: &str, tone: CodeTone) -> frust::SpanView {
     let (role, weight, italic, strike) = tone.look();
     let mut s = span(text)
-        .size(style::CODE_FONT_SIZE as f32)
+        .size(style::CODE_FONT_SIZE)
         .themed_mono_family()
         .themed_role(role)
         .weight(weight);
@@ -402,14 +393,11 @@ impl CodeBlockWidget {
     fn shape(&mut self, ctx: &mut LayoutCtx) {
         let theme = Theme::from_layout_ctx(ctx);
         let family = style::mono_family(theme);
-        let active = theme.map_or(FALLBACK_TEXT, |t| t.scheme().on_surface);
-        let done = style::status_color(theme, super::model::ToolStatus::Completed);
+        let active = style::ink(theme);
+        let done = style::success(theme);
         let muted = style::muted(theme);
-        let mk = |color| {
-            TextStyle::new(style::LABEL_FONT_SIZE as f32, color).with_family(family.clone())
-        };
-        let code_style =
-            TextStyle::new(style::CODE_FONT_SIZE as f32, active).with_family(family.clone());
+        let mk = |color| TextStyle::new(style::LABEL_FONT_SIZE, color).with_family(family.clone());
+        let code_style = TextStyle::new(style::CODE_FONT_SIZE, active).with_family(family.clone());
         let text = ctx.text_context::<TextContext>();
         self.line_h = text.layout("0", &code_style, None).size().height;
         self.labels = Labels {
@@ -417,9 +405,9 @@ impl CodeBlockWidget {
                 .language
                 .as_deref()
                 .map(|l| text.layout(l, &mk(muted), None)),
-            copy: Some(text.layout("Copy", &mk(active), None)),
-            copied: Some(text.layout("Copied", &mk(done), None)),
-            copy_off: Some(text.layout("Copy", &mk(muted), None)),
+            copy: Some(text.layout(style::COPY_TEXT, &mk(active), None)),
+            copied: Some(text.layout(style::COPIED_TEXT, &mk(done), None)),
+            copy_off: Some(text.layout(style::COPY_TEXT, &mk(muted), None)),
             show_all: self
                 .limit()
                 .map(|_| text.layout(&self.footer_text(), &mk(muted), None)),
@@ -507,11 +495,7 @@ impl<State: 'static> View<State> for CodeBlockView<State> {
 
 impl Widget for CodeBlockWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        self.width = if bc.max().width.is_finite() {
-            bc.max().width
-        } else {
-            FALLBACK_WIDTH
-        };
+        self.width = style::width_of(bc);
         self.shape(ctx);
 
         self.header_h = self.label_h + style::PAD_SMALL * 2.0;
@@ -548,7 +532,7 @@ impl Widget for CodeBlockWidget {
         if self.copied {
             let now = ctx.frame_time();
             let since = *self.copied_at.get_or_insert(now);
-            if now.saturating_sub(since) >= COPIED_FOR {
+            if now.saturating_sub(since) >= style::COPIED_FOR {
                 self.copied = false;
                 self.copied_at = None;
             } else {
@@ -563,7 +547,7 @@ impl Widget for CodeBlockWidget {
 
         let text_y = |top: f64, h: f64| top + (h - self.label_h) / 2.0;
         if let Some(l) = &self.labels.language {
-            paint_layout(
+            style::paint_layout(
                 l,
                 Point::new(o.x + style::PAD, text_y(o.y, self.header_h)),
                 scene,
@@ -581,7 +565,7 @@ impl Widget for CodeBlockWidget {
                 o.x + self.width - style::PAD - self.copy_w(),
                 text_y(o.y, self.header_h),
             );
-            paint_layout(l, at, scene);
+            style::paint_layout(l, at, scene);
         }
         let divider = |y: f64, scene: &mut dyn PaintScene| {
             scene.stroke_line(
@@ -604,17 +588,10 @@ impl Widget for CodeBlockWidget {
             let top = self.body_y + self.visible_h + style::PAD_SMALL;
             divider(top, scene);
             let at = Point::new(o.x + style::PAD, text_y(o.y + top, self.footer_h));
-            paint_layout(l, at, scene);
+            style::paint_layout(l, at, scene);
         }
 
-        let outline =
-            RoundedRect::from_rect(Rect::from_origin_size(Point::ORIGIN, size), style::RADIUS);
-        scene.stroke_path(
-            o,
-            &outline.to_path(PATH_TOLERANCE),
-            style::BORDER_WIDTH,
-            &Brush::Solid(border),
-        );
+        style::stroke_outline(scene, o, size, style::RADIUS, border);
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
@@ -677,12 +654,7 @@ impl Widget for CodeBlockWidget {
             |node| node.set_label(label.as_str()),
             |ctx| {
                 let origin = ctx.origin();
-                let bounds = |r: Rect| frust::accesskit::Rect {
-                    x0: origin.x + r.x0,
-                    y0: origin.y + r.y0,
-                    x1: origin.x + r.x1,
-                    y1: origin.y + r.y1,
-                };
+                let bounds = |r: Rect| style::node_bounds(origin, r);
                 ctx.push_node(Role::Button, |node| {
                     node.set_label("Copy code");
                     if !self.streaming {
@@ -713,17 +685,11 @@ impl Widget for CodeBlockWidget {
     frust::authoring::visit_children!(body);
 }
 
-fn paint_layout(layout: &TextLayout, origin: Point, scene: &mut dyn PaintScene) {
-    for run in layout.to_scene_runs(origin) {
-        scene.draw_glyph_run(run);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use frust::authoring::scene::GlyphRun;
-    use frust::authoring::{AnyView, DiscardScene, PointerButton, PointerEvent, any};
+    use frust::authoring::{AnyView, Color, DiscardScene, PointerButton, PointerEvent, any};
     use frust_core::RenderRoot;
     use std::any::Any;
 

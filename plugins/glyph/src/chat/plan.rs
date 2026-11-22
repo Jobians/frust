@@ -13,24 +13,19 @@
 //! - **Semantics.** The rows form a list; each item is one node labelled
 //!   with its status and text, e.g. "completed: write the parser".
 
-use frust::authoring::Brush;
 use frust::authoring::text::{FontWeight, OverflowWrap, TextOverflow};
 use frust::authoring::{
     BoxConstraints, BuildCtx, ChangeFlags, ChildPod, EventCtx, EventResult, InputEvent, LayoutCtx,
-    PaintCtx, PaintScene, Point, Rect, Role, RoundedRect, SemanticsCtx, Shape, Size,
-    ThemeTextColor, View, Widget, build_child, rebuild_child, route_event_single, teardown_child,
+    PaintCtx, PaintScene, Point, Role, SemanticsCtx, Size, ThemeTextColor, View, Widget,
+    build_child, rebuild_child, route_event_single, teardown_child,
 };
 use frust::{CrossAxisAlignment, Theme, any, column, flexible, row, semantics, text};
 
 use super::model::{PlanEntry, PlanEntryStatus};
 use super::style;
 
-/// Width used when the incoming constraints are unbounded.
-const FALLBACK_WIDTH: f64 = 480.0;
 /// Font size of entry text and the header.
-const FONT_SIZE: f32 = 13.0;
-/// Corner-rounding tolerance for the outline stroke.
-const PATH_TOLERANCE: f64 = 0.1;
+const FONT_SIZE: f32 = style::BODY_FONT_SIZE;
 /// Header text when the caller sets none.
 const DEFAULT_TITLE: &str = "Plan";
 
@@ -41,7 +36,17 @@ pub struct PlanBlockView<State: 'static> {
     _state: std::marker::PhantomData<fn(&mut State)>,
 }
 
-/// Show `entries` as a checklist with an "n of m" summary.
+impl<State: 'static> std::fmt::Debug for PlanBlockView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlanBlockView")
+            .field("entries", &self.entries)
+            .field("title", &self.title)
+            .finish()
+    }
+}
+
+/// Show `entries` as a checklist with an "n of m" summary. The caller owns
+/// the entries and passes the current list on every build.
 pub fn plan_block<State: 'static>(entries: impl Into<Vec<PlanEntry>>) -> PlanBlockView<State> {
     PlanBlockView {
         entries: entries.into(),
@@ -185,11 +190,7 @@ impl<State: 'static> View<State> for PlanBlockView<State> {
 
 impl Widget for PlanBlockWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        let width = if bc.max().width.is_finite() {
-            bc.max().width
-        } else {
-            FALLBACK_WIDTH
-        };
+        let width = style::width_of(bc);
         let inner = (width - style::PAD * 2.0).max(0.0);
         let child_bc = BoxConstraints::new(Size::new(inner, 0.0), Size::new(inner, f64::INFINITY));
         let size = self.body.layout_child(ctx, &child_bc);
@@ -204,14 +205,7 @@ impl Widget for PlanBlockWidget {
         let size = ctx.size();
         scene.fill_rounded_rect(o, size, style::RADIUS, surface);
         self.body.paint_child(ctx, scene);
-        let outline =
-            RoundedRect::from_rect(Rect::from_origin_size(Point::ORIGIN, size), style::RADIUS);
-        scene.stroke_path(
-            o,
-            &outline.to_path(PATH_TOLERANCE),
-            style::BORDER_WIDTH,
-            &Brush::Solid(border),
-        );
+        style::stroke_outline(scene, o, size, style::RADIUS, border);
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
@@ -230,7 +224,7 @@ mod tests {
     use super::*;
     use frust::FrameTime;
     use frust::authoring::text::TextContext;
-    use frust::authoring::{AnyView, DiscardScene};
+    use frust::authoring::{AnyView, DiscardScene, Rect};
     use frust_core::RenderRoot;
     use std::any::Any;
 

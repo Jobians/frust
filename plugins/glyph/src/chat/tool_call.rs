@@ -7,20 +7,17 @@
 //!   like `crate::accordion`: a press on the header is reported, never
 //!   self-applied. The default is closed.
 //! - **One-line header, fixed height.** The kind glyph, the title (one line,
-//!   end-elided; the full title is in the semantics label) and the status
-//!   indicator. The height depends on neither the status nor the title, and
-//!   the status area reserves the widest indicator, so a status update moves
+//!   end-elided; the full title is in the semantics label) and the status.
+//!   The status area reserves the widest indicator, so a status update moves
 //!   nothing in the transcript.
 //! - **Status never relies on colour.** Pending is a muted dot, in progress
 //!   the Glyph loader, completed a check, failed a cross and the word
 //!   "failed" in the error colour.
 //! - **Content.** [`ToolContent::Text`] is shown in a [`code_block`] with no
-//!   language label (the output is plain monospace text and the copy control
-//!   and line cap come with it); [`ToolContent::Diff`] in a [`diff_view`].
-//!   Both are capped: text by [`ToolCallView::max_visible_lines`], a diff by
-//!   its own collapse threshold. Their show-all rows need the matching
-//!   `.on_output_toggle(..)` / `.on_diff_toggle(..)` callback, and the
-//!   `.output_expanded(..)` / `.diff_collapsed(..)` state is app-owned.
+//!   language label (copy control and line cap included), a
+//!   [`ToolContent::Diff`] in a [`diff_view`]. Their show-all rows need the
+//!   matching `.on_output_toggle(..)` / `.on_diff_toggle(..)` callback, and
+//!   the `.output_expanded(..)` / `.diff_expanded(..)` state is app-owned.
 //! - **No content, no disclosure.** The header is then plain text and shows
 //!   no marker; with content it is a button carrying the expanded state.
 
@@ -28,12 +25,12 @@ use std::rc::Rc;
 
 use frust::authoring::text::{TextContext, TextLayout, TextOverflow, TextStyle};
 use frust::authoring::{
-    Action, AnyView, BoxConstraints, Brush, BuildCtx, ChangeFlags, ChildPod, Color, ErasedCallback,
-    EventCtx, EventResult, InputEvent, LayoutCtx, PaintCtx, PaintScene, Point, PointerPhase, Rect,
-    Role, RoundedRect, SemanticsCtx, Shape, Size, View, Widget, any, build_child, erase_callback,
-    rebuild_child, route_event_single, teardown_child,
+    Action, AnyView, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, Color, ErasedCallback,
+    EventCtx, EventResult, InputEvent, LayoutCtx, PaintCtx, PaintScene, Point, PointerPhase, Role,
+    SemanticsCtx, Size, View, Widget, any, build_child, erase_callback, rebuild_child,
+    route_event_single, teardown_child,
 };
-use frust::{ColorScheme, Theme, column};
+use frust::{Theme, column};
 
 use super::code_block::code_block;
 use super::diff::diff_view;
@@ -42,19 +39,11 @@ use super::style;
 use crate::dots::dots_loader;
 use crate::press::presses;
 
-/// Width used when the incoming constraints are unbounded.
-const FALLBACK_WIDTH: f64 = 480.0;
-/// Corner-rounding tolerance for the outline stroke.
-const PATH_TOLERANCE: f64 = 0.1;
 /// Lines of text output shown before the show-all row, by default.
 const DEFAULT_MAX_VISIBLE_LINES: usize = 12;
 /// Width the three-dot loader occupies (three 8px dots and two 6px gaps; the
 /// loader's own constants are private to `crate::dots`).
 const LOADER_WIDTH: f64 = 34.0;
-
-const DARK: ColorScheme = crate::tokens::color::dark();
-/// Unthemed title text.
-const FALLBACK_TEXT: Color = DARK.on_surface;
 
 /// What a tool call shows when opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,11 +88,28 @@ pub struct ToolCallView<State: 'static> {
     max_visible_lines: usize,
     output_expanded: bool,
     on_output_toggle: Option<OnToggle<State>>,
-    diff_collapsed: bool,
+    diff_expanded: bool,
     on_diff_toggle: Option<OnToggle<State>>,
 }
 
-/// Show one tool call: its `kind`, `title` and `status`, closed.
+impl<State: 'static> std::fmt::Debug for ToolCallView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolCallView")
+            .field("kind", &self.kind)
+            .field("title", &self.title)
+            .field("status", &self.status)
+            .field("open", &self.open)
+            .field("contents", &self.contents)
+            .field("max_visible_lines", &self.max_visible_lines)
+            .field("output_expanded", &self.output_expanded)
+            .field("diff_expanded", &self.diff_expanded)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Show one tool call: its `kind`, `title` and `status`, closed. The caller
+/// owns every piece of state (status, open, expanded) and passes it on every
+/// build.
 pub fn tool_call<State: 'static>(
     kind: ToolKind,
     title: impl Into<String>,
@@ -120,7 +126,7 @@ pub fn tool_call<State: 'static>(
         max_visible_lines: DEFAULT_MAX_VISIBLE_LINES,
         output_expanded: false,
         on_output_toggle: None,
-        diff_collapsed: true,
+        diff_expanded: false,
         on_diff_toggle: None,
     }
 }
@@ -177,10 +183,10 @@ impl<State: 'static> ToolCallView<State> {
         self
     }
 
-    /// Set the (app-owned) collapsed state of the diff items (default
-    /// collapsed; it only matters for a long diff).
-    pub fn diff_collapsed(mut self, collapsed: bool) -> Self {
-        self.diff_collapsed = collapsed;
+    /// Set the (app-owned) expanded state of the diff items (default
+    /// `false`; it only matters for a long diff with `.on_diff_toggle(..)`).
+    pub fn diff_expanded(mut self, expanded: bool) -> Self {
+        self.diff_expanded = expanded;
         self
     }
 
@@ -217,7 +223,7 @@ impl<State: 'static> ToolCallView<State> {
                 any(v)
             }
             ToolContent::Diff(input) => {
-                let mut v = diff_view(input.clone()).collapsed(self.diff_collapsed);
+                let mut v = diff_view(input.clone()).expanded(self.diff_expanded);
                 if let Some(cb) = &self.on_diff_toggle {
                     let cb = Rc::clone(cb);
                     v = v.on_toggle(move |s| cb(s));
@@ -317,9 +323,9 @@ impl ToolCallWidget {
     fn shape(&mut self, ctx: &mut LayoutCtx) {
         let theme = Theme::from_layout_ctx(ctx);
         let family = style::mono_family(theme);
-        let active = theme.map_or(FALLBACK_TEXT, |t| t.scheme().on_surface);
+        let active = style::ink(theme);
         let muted = style::muted(theme);
-        let mk = |size: f64, color| TextStyle::new(size as f32, color).with_family(family.clone());
+        let mk = |size: f32, color| TextStyle::new(size, color).with_family(family.clone());
         let title_style = mk(style::CODE_FONT_SIZE, active);
         let failed = style::status_color(theme, ToolStatus::Failed);
         let colors = [
@@ -484,11 +490,7 @@ impl<State: 'static> View<State> for ToolCallView<State> {
 
 impl Widget for ToolCallWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        self.width = if bc.max().width.is_finite() {
-            bc.max().width
-        } else {
-            FALLBACK_WIDTH
-        };
+        self.width = style::width_of(bc);
         self.shape(ctx);
 
         if let Some(pod) = self.loader.as_mut() {
@@ -539,21 +541,21 @@ impl Widget for ToolCallWidget {
         let centred = |l: &TextLayout| (self.header_h - l.size().height) / 2.0;
         let mut x = style::PAD;
         if let Some(l) = &self.labels.kind {
-            paint_layout(l, Point::new(o.x + x, o.y + centred(l)), scene);
+            style::paint_layout(l, Point::new(o.x + x, o.y + centred(l)), scene);
             x += l.size().width + style::PAD_SMALL;
         }
         if let Some(l) = &self.labels.title {
-            paint_layout(l, Point::new(o.x + x, o.y + centred(l)), scene);
+            style::paint_layout(l, Point::new(o.x + x, o.y + centred(l)), scene);
         }
         let mut right = self.width - style::PAD;
         if let Some(l) = &self.labels.disclosure {
             let w = l.size().width;
-            paint_layout(l, Point::new(o.x + right - w, o.y + centred(l)), scene);
+            style::paint_layout(l, Point::new(o.x + right - w, o.y + centred(l)), scene);
             right -= self.mark_w + style::PAD_SMALL;
         }
         if let Some(l) = &self.labels.status {
             let w = l.size().width;
-            paint_layout(l, Point::new(o.x + right - w, o.y + centred(l)), scene);
+            style::paint_layout(l, Point::new(o.x + right - w, o.y + centred(l)), scene);
         }
         if self.pressed {
             let wash = Color::new([1.0, 1.0, 1.0, 0.06]);
@@ -571,14 +573,7 @@ impl Widget for ToolCallWidget {
             );
             pod.paint_child(ctx, scene);
         }
-        let outline =
-            RoundedRect::from_rect(Rect::from_origin_size(Point::ORIGIN, size), style::RADIUS);
-        scene.stroke_path(
-            o,
-            &outline.to_path(PATH_TOLERANCE),
-            style::BORDER_WIDTH,
-            &Brush::Solid(border),
-        );
+        style::stroke_outline(scene, o, size, style::RADIUS, border);
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
@@ -673,17 +668,11 @@ impl Widget for ToolCallWidget {
     frust::authoring::visit_children!(body, loader);
 }
 
-fn paint_layout(layout: &TextLayout, origin: Point, scene: &mut dyn PaintScene) {
-    for run in layout.to_scene_runs(origin) {
-        scene.draw_glyph_run(run);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use frust::FrameTime;
-    use frust::authoring::{DiscardScene, PointerButton, PointerEvent};
+    use frust::authoring::{DiscardScene, PointerButton, PointerEvent, Rect};
     use frust_core::RenderRoot;
     use std::any::Any;
 

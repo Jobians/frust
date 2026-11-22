@@ -1,38 +1,37 @@
 //! [`diff_view`]: the edit a tool made to one file, shown as a unified line
-//! diff that [`compute_diff`] works out here from the old and new text (the
+//! diff that [`compute_diff`] works out from the old and new text (the
 //! `imara-diff` Histogram algorithm, then its line postprocessing).
+//! `compute_diff` is public so an app can show a change's totals or hunks
+//! (a "+12 -3" summary, a file list) without building the view.
 //!
 //! # Contract
 //!
-//! - **Controlled.** `.collapsed(bool)` and `.on_toggle(..)` work like
-//!   `crate::accordion`: the widget reports a header or show-all press and
-//!   never flips its own state. Only a diff with more rows than
-//!   `.collapse_above(..)` collapses (to its header, totals and one show-all
-//!   row); a smaller one always shows every row.
+//! - **Controlled.** `.expanded(bool)` and `.on_toggle(..)` work like
+//!   `crate::accordion`: a header or show-all press is reported, never
+//!   self-applied. Only a diff with more rows than `.collapse_above(..)`
+//!   collapses (to its header, totals and a show-all row).
 //! - **Computed once per input.** The model is rebuilt only when the old or
 //!   new text (or the context) differs from the previous build.
-//! - **Line semantics.** A trailing `\r` is ignored in comparison and never
-//!   drawn, and a final line without a newline equals the same line with one,
-//!   so an edit that only adds or drops the last newline reads as no change.
-//!   Above [`DIFF_MAX_BYTES`] or [`DIFF_MAX_LINES`] on either side nothing is
+//! - **Line semantics.** A trailing `\r` is ignored and never drawn, and a
+//!   final line without a newline equals the same line with one. Above
+//!   [`DIFF_MAX_BYTES`] or [`DIFF_MAX_LINES`] on either side nothing is
 //!   diffed: the model is flagged `too_large` and carries line counts only.
 //! - **One horizontal offset.** Rows never wrap; a horizontal drag or wheel
 //!   scrolls every row's text together while the gutter stays put. A drag
-//!   that turns vertical first is declined, so the enclosing transcript
-//!   scrolls instead.
+//!   that turns vertical first is declined, so the transcript scrolls.
 //! - **Not colour alone.** Added and removed rows carry a `+`/`-` marker
 //!   column as well as their wash.
 
 use std::rc::Rc;
 
+use frust::Theme;
 use frust::authoring::text::{TextContext, TextLayout, TextStyle};
 use frust::authoring::{
-    Action, BoxConstraints, Brush, BuildCtx, ChangeFlags, Color, ErasedCallback, EventCtx,
-    EventResult, InputEvent, LayoutCtx, PaintCtx, PaintScene, Point, PointerPhase, Rect, Role,
-    RoundedRect, ScrollDelta, SemanticsCtx, Shape, Size, View, Widget, erase_callback,
+    Action, BoxConstraints, BuildCtx, ChangeFlags, ErasedCallback, EventCtx, EventResult,
+    InputEvent, LayoutCtx, PaintCtx, PaintScene, Point, PointerPhase, Role, ScrollDelta,
+    SemanticsCtx, Size, View, Widget, erase_callback,
 };
 use frust::input::{TOUCH_SLOP, WHEEL_LINE_PX};
-use frust::{ColorScheme, StatusPalette, Theme};
 use imara_diff::{Algorithm, Diff, Hunk, InternedInput};
 
 use super::model::DiffInput;
@@ -56,26 +55,12 @@ const COLUMN_GAP: f64 = style::PAD_SMALL;
 const ROW_PAD_Y: f64 = 1.0;
 /// Gap between the header's path and its totals, and between the totals.
 const TOTALS_GAP: f64 = style::BLOCK_GAP;
-/// Spaces a tab expands to on screen.
-const TAB_WIDTH: usize = 4;
-/// Width used when the incoming constraints are unbounded.
-const FALLBACK_WIDTH: f64 = 480.0;
-/// Corner-rounding tolerance for the outline stroke.
-const PATH_TOLERANCE: f64 = 0.1;
 /// Middle-elision mark for a long path (present in the bundled mono face).
 const ELLIPSIS: char = '\u{2026}';
 
-const DARK: ColorScheme = crate::tokens::color::dark();
-const DARK_STATUS: StatusPalette = crate::tokens::color::status();
-/// Unthemed row text.
-const FALLBACK_TEXT: Color = DARK.on_surface;
-/// Unthemed added marker and total.
-const FALLBACK_ADDED_FG: Color = DARK_STATUS.dark.success;
-/// Unthemed removed marker and total.
-const FALLBACK_REMOVED_FG: Color = DARK.error;
-
 /// What one diff row is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DiffLineKind {
     /// Unchanged, shown for context.
     Context,
@@ -328,32 +313,36 @@ fn elide_middle(path: &str, max_chars: usize) -> String {
     out
 }
 
-fn expand_tabs(text: &str) -> String {
-    if text.contains('\t') {
-        text.replace('\t', &" ".repeat(TAB_WIDTH))
-    } else {
-        text.to_owned()
-    }
-}
-
 type OnToggle<State> = Rc<dyn Fn(&mut State)>;
 
 /// A declarative diff view. See the [module docs](self).
 pub struct DiffView<State: 'static> {
     input: DiffInput,
-    collapsed: bool,
+    expanded: bool,
     collapse_above: usize,
     context: usize,
     on_toggle: Option<OnToggle<State>>,
 }
 
-/// Show `input` as a unified diff. Starts collapsed (which only matters above
+impl<State: 'static> std::fmt::Debug for DiffView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiffView")
+            .field("input", &self.input)
+            .field("expanded", &self.expanded)
+            .field("collapse_above", &self.collapse_above)
+            .field("context", &self.context)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Show `input` as a unified diff, not expanded (which only matters above
 /// [`DIFF_DEFAULT_COLLAPSE_ABOVE`] rows) with [`DIFF_DEFAULT_CONTEXT`] lines of
-/// context.
+/// context. The caller owns the input and the expanded state and passes them
+/// on every build.
 pub fn diff_view<State: 'static>(input: DiffInput) -> DiffView<State> {
     DiffView {
         input,
-        collapsed: true,
+        expanded: false,
         collapse_above: DIFF_DEFAULT_COLLAPSE_ABOVE,
         context: DIFF_DEFAULT_CONTEXT,
         on_toggle: None,
@@ -361,15 +350,15 @@ pub fn diff_view<State: 'static>(input: DiffInput) -> DiffView<State> {
 }
 
 impl<State: 'static> DiffView<State> {
-    /// Set the (app-owned) collapsed state.
-    pub fn collapsed(mut self, collapsed: bool) -> Self {
-        self.collapsed = collapsed;
+    /// Set the (app-owned) expanded state of a collapsible diff.
+    pub fn expanded(mut self, expanded: bool) -> Self {
+        self.expanded = expanded;
         self
     }
 
     /// Fire on a header or show-all press of a collapsible diff. The widget
-    /// never flips `collapsed` itself; the app feeds the new value back in.
-    pub fn on_toggle<F: Fn(&mut State) + 'static>(mut self, on_toggle: F) -> Self {
+    /// never flips `expanded` itself; the app feeds the new value back in.
+    pub fn on_toggle(mut self, on_toggle: impl Fn(&mut State) + 'static) -> Self {
         self.on_toggle = Some(Rc::new(on_toggle));
         self
     }
@@ -443,35 +432,21 @@ struct Styles {
 impl Styles {
     fn resolve(theme: Option<&Theme>) -> Self {
         let family = style::mono_family(theme);
-        let make =
-            |color| TextStyle::new(style::CODE_FONT_SIZE as f32, color).with_family(family.clone());
+        let make = |color| TextStyle::new(style::CODE_FONT_SIZE, color).with_family(family.clone());
         Self {
-            body: make(theme.map_or(FALLBACK_TEXT, |t| t.scheme().on_surface)),
+            body: make(style::ink(theme)),
             muted: make(style::muted(theme)),
-            added: make(added_fg(theme)),
-            removed: make(removed_fg(theme)),
+            added: make(style::success(theme)),
+            removed: make(style::error(theme)),
         }
     }
-}
-
-/// The added marker and total: the success hue.
-fn added_fg(theme: Option<&Theme>) -> Color {
-    theme.map_or(FALLBACK_ADDED_FG, |t| {
-        t.extension::<StatusPalette>()
-            .map_or(FALLBACK_ADDED_FG, |s| s.colors(t.brightness).success)
-    })
-}
-
-/// The removed marker and total: the error hue.
-fn removed_fg(theme: Option<&Theme>) -> Color {
-    theme.map_or(FALLBACK_REMOVED_FG, |t| t.scheme().error)
 }
 
 /// The retained widget for a [`DiffView`].
 pub struct DiffWidget {
     path: String,
     model: DiffModel,
-    collapsed: bool,
+    expanded: bool,
     collapse_above: usize,
     on_toggle: Option<ErasedCallback>,
     rows: Vec<Row>,
@@ -513,7 +488,7 @@ impl DiffWidget {
     fn refresh_rows(&mut self) {
         self.rows = if self.model.too_large || !self.model.has_changes() {
             vec![Row::Notice]
-        } else if self.collapsed && self.collapsible() {
+        } else if !self.expanded && self.collapsible() {
             vec![Row::ShowAll]
         } else {
             let mut rows = Vec::with_capacity(self.model.row_count());
@@ -629,7 +604,7 @@ impl DiffWidget {
                         let line = self.line(h, l);
                         (
                             Some(self.gutter_text(line)),
-                            expand_tabs(&line.text),
+                            style::expand_tabs(&line.text),
                             &styles.body,
                         )
                     }
@@ -711,7 +686,7 @@ impl<State: 'static> View<State> for DiffView<State> {
         let mut widget = DiffWidget {
             path: self.input.path.clone(),
             model: DiffModel::default(),
-            collapsed: self.collapsed,
+            expanded: self.expanded,
             collapse_above: self.collapse_above,
             on_toggle: self.on_toggle.as_ref().map(erase_callback),
             rows: Vec::new(),
@@ -757,8 +732,8 @@ impl<State: 'static> View<State> for DiffView<State> {
             element.header_path = None;
             flags |= ChangeFlags::LAYOUT | ChangeFlags::PAINT;
         }
-        if prev.collapsed != self.collapsed || prev.collapse_above != self.collapse_above {
-            element.collapsed = self.collapsed;
+        if prev.expanded != self.expanded || prev.collapse_above != self.collapse_above {
+            element.expanded = self.expanded;
             element.collapse_above = self.collapse_above;
             element.refresh_rows();
             flags |= ChangeFlags::LAYOUT | ChangeFlags::PAINT;
@@ -772,11 +747,7 @@ impl Widget for DiffWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
         let styles = Styles::resolve(Theme::from_layout_ctx(ctx));
         self.sync_styles(styles.clone());
-        self.width = if bc.max().width.is_finite() {
-            bc.max().width
-        } else {
-            FALLBACK_WIDTH
-        };
+        self.width = style::width_of(bc);
         if self.char_size == Size::ZERO {
             let text = ctx.text_context::<TextContext>();
             self.char_size = text.layout("0", &styles.body, None).size();
@@ -810,7 +781,7 @@ impl Widget for DiffWidget {
 
         let text_y = |top: f64, h: f64| top + (h - self.char_size.height) / 2.0;
         if let Some((_, path)) = &self.header_path {
-            paint_layout(
+            style::paint_layout(
                 path,
                 Point::new(o.x + style::PAD, text_y(o.y, self.header_h)),
                 scene,
@@ -820,7 +791,7 @@ impl Widget for DiffWidget {
             let mut x = o.x + size.width - style::PAD;
             for total in [removed, added].into_iter().flatten() {
                 x -= total.size().width;
-                paint_layout(total, Point::new(x, text_y(o.y, self.header_h)), scene);
+                style::paint_layout(total, Point::new(x, text_y(o.y, self.header_h)), scene);
                 x -= TOTALS_GAP;
             }
         }
@@ -860,7 +831,7 @@ impl Widget for DiffWidget {
                     }
                     if let Some(gutter) = &self.runs[i].gutter {
                         let at = Point::new(o.x + style::PAD_SMALL, text_y(y, self.row_h));
-                        paint_layout(gutter, at, scene);
+                        style::paint_layout(gutter, at, scene);
                     }
                     let marker = self.markers.as_ref().and_then(|(add, rem)| match kind {
                         DiffLineKind::Added => Some(add),
@@ -869,7 +840,7 @@ impl Widget for DiffWidget {
                     });
                     if let Some(marker) = marker {
                         let at = Point::new(o.x + self.marker_x, text_y(y, self.row_h));
-                        paint_layout(marker, at, scene);
+                        style::paint_layout(marker, at, scene);
                     }
                 }
                 Row::Hunk(h) => {
@@ -883,13 +854,13 @@ impl Widget for DiffWidget {
                     }
                     if let Some(body) = &self.runs[i].body {
                         let at = Point::new(o.x + style::PAD_SMALL, text_y(y, self.row_h));
-                        paint_layout(body, at, scene);
+                        style::paint_layout(body, at, scene);
                     }
                 }
                 Row::ShowAll | Row::Notice => {
                     if let Some(body) = &self.runs[i].body {
                         let at = Point::new(o.x + style::PAD_SMALL, text_y(y, self.row_h));
-                        paint_layout(body, at, scene);
+                        style::paint_layout(body, at, scene);
                     }
                 }
             }
@@ -905,20 +876,13 @@ impl Widget for DiffWidget {
             if let (Row::Line(..), Some(body)) = (self.rows[i], &self.runs[i].body) {
                 let y = top + i as f64 * self.row_h;
                 let at = Point::new(clip_x - self.h_offset, text_y(y, self.row_h));
-                paint_layout(body, at, scene);
+                style::paint_layout(body, at, scene);
             }
         }
         scene.pop_clip();
         scene.pop_clip();
 
-        let outline =
-            RoundedRect::from_rect(Rect::from_origin_size(Point::ORIGIN, size), style::RADIUS);
-        scene.stroke_path(
-            o,
-            &outline.to_path(PATH_TOLERANCE),
-            style::BORDER_WIDTH,
-            &Brush::Solid(style::border(theme)),
-        );
+        style::stroke_outline(scene, o, size, style::RADIUS, style::border(theme));
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
@@ -1032,7 +996,7 @@ impl Widget for DiffWidget {
                 if self.collapsible() {
                     ctx.push_node(Role::Button, |node| {
                         node.set_label(self.path.as_str());
-                        node.set_expanded(!self.collapsed);
+                        node.set_expanded(self.expanded);
                         node.add_action(Action::Click);
                         node.set_bounds(bounds(0.0, self.header_h));
                     });
@@ -1058,15 +1022,10 @@ impl Widget for DiffWidget {
     }
 }
 
-fn paint_layout(layout: &TextLayout, origin: Point, scene: &mut dyn PaintScene) {
-    for run in layout.to_scene_runs(origin) {
-        scene.draw_glyph_run(run);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frust::authoring::Color;
     use frust::authoring::scene::GlyphRun;
     use std::any::Any;
     use std::time::{Duration, Instant};
@@ -1306,17 +1265,17 @@ mod tests {
         let a: DiffView<()> = diff_view(input("a.rs", Some("a\n"), "b\n"));
         let mut w = build(&a);
         assert_eq!(w.computations, 1);
-        let same: DiffView<()> = diff_view(input("a.rs", Some("a\n"), "b\n")).collapsed(false);
+        let same: DiffView<()> = diff_view(input("a.rs", Some("a\n"), "b\n")).expanded(true);
         rebuild(&same, &a, &mut w);
-        assert_eq!(w.computations, 1, "equal input, new collapsed flag");
-        let renamed: DiffView<()> = diff_view(input("b.rs", Some("a\n"), "b\n")).collapsed(false);
+        assert_eq!(w.computations, 1, "equal input, new expanded flag");
+        let renamed: DiffView<()> = diff_view(input("b.rs", Some("a\n"), "b\n")).expanded(true);
         rebuild(&renamed, &same, &mut w);
         assert_eq!(w.computations, 1, "a path change only re-labels");
-        let edited: DiffView<()> = diff_view(input("b.rs", Some("a\n"), "c\n")).collapsed(false);
+        let edited: DiffView<()> = diff_view(input("b.rs", Some("a\n"), "c\n")).expanded(true);
         rebuild(&edited, &renamed, &mut w);
         assert_eq!(w.computations, 2);
         let wider: DiffView<()> = diff_view(input("b.rs", Some("a\n"), "c\n"))
-            .collapsed(false)
+            .expanded(true)
             .context(5);
         rebuild(&wider, &edited, &mut w);
         assert_eq!(w.computations, 3);
@@ -1331,7 +1290,7 @@ mod tests {
         assert_eq!(w.rows, [Row::ShowAll]);
         let expanded: DiffView<()> = diff_view(edit.clone())
             .collapse_above(rows - 1)
-            .collapsed(false);
+            .expanded(true);
         assert_eq!(build(&expanded).rows.len(), rows);
         let small: DiffView<()> = diff_view(edit).collapse_above(rows);
         assert_eq!(
@@ -1374,7 +1333,7 @@ mod tests {
         );
         pointer(&mut w, &mut s, PointerPhase::Up, at);
         assert_eq!(s.toggles, 1);
-        assert!(w.collapsed);
+        assert!(!w.expanded);
         let header = Point::new(40.0, w.header_h / 2.0);
         pointer(&mut w, &mut s, PointerPhase::Down, header);
         pointer(&mut w, &mut s, PointerPhase::Up, header);
@@ -1415,7 +1374,7 @@ mod tests {
     #[test]
     fn layout_stays_within_the_width_and_long_lines_scroll() {
         let _slot = frust_widgets::test_support::LocaleSlotGuard::hold();
-        let view: DiffView<()> = diff_view(long_edit()).collapsed(false);
+        let view: DiffView<()> = diff_view(long_edit()).expanded(true);
         let mut w = build(&view);
         let size = layout(&mut w, 240.0, None);
         assert_eq!(size.width, 240.0);
@@ -1423,13 +1382,13 @@ mod tests {
         let rows = w.rows.len() as f64;
         assert!((size.height - (w.body_top() + rows * w.row_h + style::RADIUS)).abs() < 1e-9);
         let bounded = layout(&mut w, f64::INFINITY, None);
-        assert_eq!(bounded.width, FALLBACK_WIDTH);
+        assert_eq!(bounded.width, style::FALLBACK_WIDTH);
     }
 
     #[test]
     fn a_horizontal_drag_scrolls_every_row_and_a_vertical_one_is_declined() {
         let _slot = frust_widgets::test_support::LocaleSlotGuard::hold();
-        let view: DiffView<()> = diff_view(long_edit()).collapsed(false);
+        let view: DiffView<()> = diff_view(long_edit()).expanded(true);
         let mut w = build(&view);
         layout(&mut w, 240.0, None);
         let mut s = ();
@@ -1462,7 +1421,7 @@ mod tests {
     #[test]
     fn a_horizontal_wheel_scrolls_and_a_vertical_one_passes_through() {
         let _slot = frust_widgets::test_support::LocaleSlotGuard::hold();
-        let view: DiffView<()> = diff_view(long_edit()).collapsed(false);
+        let view: DiffView<()> = diff_view(long_edit()).expanded(true);
         let mut w = build(&view);
         layout(&mut w, 240.0, None);
         let at = Point::new(100.0, w.body_top() + w.row_h);
@@ -1533,10 +1492,9 @@ mod tests {
         ];
         for theme in [None, Some(&theme)] {
             for edit in &inputs {
-                for collapsed in [true, false] {
-                    let view: DiffView<()> = diff_view(edit.clone())
-                        .collapse_above(4)
-                        .collapsed(collapsed);
+                for expanded in [false, true] {
+                    let view: DiffView<()> =
+                        diff_view(edit.clone()).collapse_above(4).expanded(expanded);
                     let mut w = build(&view);
                     let size = layout(&mut w, 200.0, theme);
                     paint(&mut w, size, theme);

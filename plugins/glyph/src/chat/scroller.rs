@@ -27,14 +27,14 @@ use std::rc::Rc;
 use frust::FrameTime;
 use frust::authoring::text::{TextContext, TextLayout, TextStyle};
 use frust::authoring::{
-    Action, AnyView, BoxConstraints, Brush, BuildCtx, ChangeFlags, ChildPod, Color, EventCtx,
-    EventResult, InputEvent, LayoutCtx, Live, PaintCtx, PaintScene, Point, PointerPhase, Rect,
-    Role, RoundedRect, SemanticsCtx, Shape, Size, View, Widget, any, build_child, rebuild_child,
-    route_event_single, teardown_child,
+    Action, AnyView, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, Color, EventCtx, EventResult,
+    InputEvent, LayoutCtx, Live, PaintCtx, PaintScene, Point, PointerPhase, Rect, Role,
+    SemanticsCtx, Size, View, Widget, any, build_child, rebuild_child, route_event_single,
+    teardown_child,
 };
 use frust::motion::patterns::{PatternLayer, TransitionPattern};
 use frust::{
-    AnimateTo, ChildKey, ColorScheme, EdgeInsets, ListView, MotionScheme, Padding, PaddingView,
+    AnimateTo, ChildKey, EdgeInsets, ListView, MotionScheme, Padding, PaddingView,
     ScrollController, Theme,
 };
 
@@ -50,16 +50,10 @@ pub const DEFAULT_ESTIMATED_ROW_EXTENT: f64 = 72.0;
 const JUMP_HEIGHT: f64 = 32.0;
 /// The arrow on the jump control (vouched for by `style::kind_glyph`).
 const JUMP_ARROW: char = '\u{2193}';
-/// Opacity of the ink tint laid over the control's fill while pressed.
-const PRESSED_TINT: f32 = 0.14;
-/// Corner-rounding tolerance for the control's outline.
-const PATH_TOLERANCE: f64 = 0.1;
 /// Accessible name of the transcript region.
 const LOG_LABEL: &str = "Messages";
 /// Accessible name of the jump control, before any unread count.
 const JUMP_LABEL: &str = "Jump to latest";
-
-const DARK: ColorScheme = crate::tokens::color::dark();
 
 type OnAtEndChange<State> = Rc<dyn Fn(&mut State, bool)>;
 type RowBuilder<State> = Rc<dyn Fn(usize, EdgeInsets) -> PaddingView<State>>;
@@ -79,9 +73,23 @@ pub struct MessageScrollerView<State: 'static> {
     empty: Option<AnyView<State>>,
 }
 
+impl<State: 'static> std::fmt::Debug for MessageScrollerView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageScrollerView")
+            .field("len", &self.len)
+            .field("estimate", &self.estimate)
+            .field("at_end", &self.at_end)
+            .field("unread", &self.unread)
+            .field("row_gap", &self.row_gap)
+            .field("padding", &self.padding)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A transcript of `len` rows: `key_fn(i)` is row `i`'s stable identity and
 /// `row_builder(i)` its view, the same pair `ListView::builder_keyed` takes.
 /// Both are pure functions of the index, called only for materialized rows.
+/// The caller owns the transcript and the at-end flag (see the module docs).
 pub fn message_scroller<State: 'static, V: View<State>>(
     len: usize,
     key_fn: impl Fn(usize) -> ChildKey + 'static,
@@ -321,21 +329,15 @@ impl MessageScrollerWidget {
             size,
             radius,
             blur,
-            fade(shadow, alpha),
+            style::fade(shadow, alpha),
         );
         let fill = if self.pressed {
-            mix(colors.fill, colors.ink, PRESSED_TINT)
+            style::mix(colors.fill, colors.ink, style::PRESSED_TINT)
         } else {
             colors.fill
         };
-        scene.fill_rounded_rect(at, size, radius, fade(fill, alpha));
-        let outline = RoundedRect::from_rect(Rect::from_origin_size(Point::ORIGIN, size), radius);
-        scene.stroke_path(
-            at,
-            &outline.to_path(PATH_TOLERANCE),
-            style::BORDER_WIDTH,
-            &Brush::Solid(fade(colors.border, alpha)),
-        );
+        scene.fill_rounded_rect(at, size, radius, style::fade(fill, alpha));
+        style::stroke_outline(scene, at, size, radius, style::fade(colors.border, alpha));
         if let Some(label) = &self.label {
             let text = label.size();
             let text_at = Point::new(
@@ -369,52 +371,18 @@ struct JumpColors {
 impl JumpColors {
     fn resolve(theme: Option<&Theme>) -> Self {
         let level = crate::tokens::scales::floating();
-        match theme {
-            Some(t) => {
-                let spec = level.shadow(t.brightness);
-                Self {
-                    fill: t.scheme().surface_container_high,
-                    border: style::border(theme),
-                    ink: t.scheme().on_surface,
-                    shadow: (
-                        spec.y_offset,
-                        spec.blur_std_dev,
-                        fade(t.scheme().shadow, spec.color_alpha),
-                    ),
-                }
-            }
-            None => {
-                let spec = level.shadow_dark;
-                Self {
-                    fill: DARK.surface_container_high,
-                    border: style::border(None),
-                    ink: DARK.on_surface,
-                    shadow: (
-                        spec.y_offset,
-                        spec.blur_std_dev,
-                        fade(DARK.shadow, spec.color_alpha),
-                    ),
-                }
-            }
+        let spec = theme.map_or(level.shadow_dark, |t| *level.shadow(t.brightness));
+        Self {
+            fill: style::surface_high(theme),
+            border: style::border(theme),
+            ink: style::ink(theme),
+            shadow: (
+                spec.y_offset,
+                spec.blur_std_dev,
+                style::fade(style::scheme(theme).shadow, spec.color_alpha),
+            ),
         }
     }
-}
-
-/// `color` with its alpha scaled by `alpha`.
-fn fade(color: Color, alpha: f32) -> Color {
-    let c = color.components;
-    Color::new([c[0], c[1], c[2], c[3] * alpha])
-}
-
-/// `over` blended onto `base` at opacity `t` (alpha of `base` kept).
-fn mix(base: Color, over: Color, t: f32) -> Color {
-    let (b, o) = (base.components, over.components);
-    Color::new([
-        b[0] + (o[0] - b[0]) * t,
-        b[1] + (o[1] - b[1]) * t,
-        b[2] + (o[2] - b[2]) * t,
-        b[3],
-    ])
 }
 
 impl<State: 'static> View<State> for MessageScrollerView<State> {
@@ -526,7 +494,7 @@ impl Widget for MessageScrollerWidget {
             )
         };
         self.motion = motion;
-        let text_style = TextStyle::new(style::LABEL_FONT_SIZE as f32, ink).with_family(family);
+        let text_style = TextStyle::new(style::LABEL_FONT_SIZE, ink).with_family(family);
         let label =
             ctx.text_context::<TextContext>()
                 .layout(&jump_text(self.unread), &text_style, None);
@@ -635,12 +603,7 @@ impl Widget for MessageScrollerWidget {
                     ctx.push_node(Role::Button, |node| {
                         node.set_label(label.as_str());
                         node.add_action(Action::Click);
-                        node.set_bounds(frust::accesskit::Rect {
-                            x0: origin.x + r.x0,
-                            y0: origin.y + r.y0,
-                            x1: origin.x + r.x1,
-                            y1: origin.y + r.y1,
-                        });
+                        node.set_bounds(style::node_bounds(origin, r));
                     });
                 }
             },

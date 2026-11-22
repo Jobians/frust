@@ -15,26 +15,22 @@
 
 use std::marker::PhantomData;
 
+use frust::Theme;
 use frust::authoring::text::{TextContext, TextLayout, TextStyle};
 use frust::authoring::{
     BoxConstraints, BuildCtx, ChangeFlags, ChildPod, LayoutCtx, PaintCtx, PaintScene, Role,
     SemanticsCtx, View, Widget, build_child, teardown_child,
 };
-use frust::{ColorScheme, StatusPalette, Theme};
 use kurbo::{Point, Size};
 use peniko::Color;
 
 use super::style;
 use crate::dots::dots_loader;
-use crate::tokens::color;
 
 /// Font size of the notice text and mark, in logical px.
-const NOTICE_FONT_SIZE: f32 = 12.5;
+const NOTICE_FONT_SIZE: f32 = style::LABEL_FONT_SIZE;
 /// Gap between the mark, the loader and the text, in logical px.
-const GAP: f64 = 8.0;
-
-const DARK: ColorScheme = color::dark();
-const DARK_STATUS: StatusPalette = color::status();
+const GAP: f64 = style::BLOCK_GAP;
 
 /// The severity of a notice row.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -83,24 +79,11 @@ const TONES: [NoticeTone; 4] = [
 
 /// The mark's colour: the tone's accent, themed or the Glyph-dark fallback.
 fn tone_color(theme: Option<&Theme>, tone: NoticeTone) -> Color {
-    let Some(t) = theme else {
-        return match tone {
-            NoticeTone::Info => DARK_STATUS.dark.info,
-            NoticeTone::Success => DARK_STATUS.dark.success,
-            NoticeTone::Warning => DARK_STATUS.dark.warning,
-            NoticeTone::Error => DARK.error,
-        };
-    };
-    let status = t.extension::<StatusPalette>();
     match tone {
-        NoticeTone::Info => status.map_or(t.scheme().tertiary, |s| s.colors(t.brightness).info),
-        NoticeTone::Success => {
-            status.map_or(DARK_STATUS.dark.success, |s| s.colors(t.brightness).success)
-        }
-        NoticeTone::Warning => {
-            status.map_or(DARK_STATUS.dark.warning, |s| s.colors(t.brightness).warning)
-        }
-        NoticeTone::Error => t.scheme().error,
+        NoticeTone::Info => style::info(theme),
+        NoticeTone::Success => style::success(theme),
+        NoticeTone::Warning => style::warning(theme),
+        NoticeTone::Error => style::error(theme),
     }
 }
 
@@ -112,7 +95,18 @@ pub struct NoticeRowView<State> {
     state: PhantomData<fn() -> State>,
 }
 
+impl<State> std::fmt::Debug for NoticeRowView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoticeRowView")
+            .field("text", &self.text)
+            .field("tone", &self.tone)
+            .field("working", &self.working)
+            .finish()
+    }
+}
+
 /// Create a notice row with `text`, at the default [`NoticeTone::Info`].
+/// The caller owns the text and tone and passes them on every build.
 pub fn notice_row<State: 'static>(text: impl Into<String>) -> NoticeRowView<State> {
     NoticeRowView {
         text: text.into(),
@@ -273,7 +267,7 @@ impl Widget for NoticeRowWidget {
         let origin = ctx.origin();
         if let Some(mark) = &self.mark_layout {
             let y = origin.y + style::PAD_SMALL + (self.line_h - mark.size().height) / 2.0;
-            paint_layout(mark, Point::new(origin.x, y), scene);
+            style::paint_layout(mark, Point::new(origin.x, y), scene);
         }
         if self.working
             && let Some(pod) = self.loader.as_mut()
@@ -282,7 +276,7 @@ impl Widget for NoticeRowWidget {
         }
         if let Some(text) = &self.text_layout {
             let x = origin.x + self.text_x;
-            paint_layout(text, Point::new(x, origin.y + style::PAD_SMALL), scene);
+            style::paint_layout(text, Point::new(x, origin.y + style::PAD_SMALL), scene);
         }
     }
 
@@ -294,12 +288,6 @@ impl Widget for NoticeRowWidget {
     }
 
     frust::authoring::visit_children!(loader);
-}
-
-fn paint_layout(layout: &TextLayout, origin: Point, scene: &mut dyn PaintScene) {
-    for run in layout.to_scene_runs(origin) {
-        scene.draw_glyph_run(run);
-    }
 }
 
 #[cfg(test)]

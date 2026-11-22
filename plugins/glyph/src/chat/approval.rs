@@ -10,8 +10,8 @@
 //!   fires once and a new request in the same slot starts fresh. A press
 //!   only fires against the request it began on.
 //! - **Options**: allow kinds first (filled), then reject kinds (outlined),
-//!   each group in the given order; full-width buttons at least
-//!   [`MIN_TARGET`] px high, label wrapping to two lines then eliding.
+//!   each group in the given order; full-width buttons at least 44 px
+//!   high, label wrapping to two lines then eliding.
 //! - **Countdown.** `.expires(..)` takes an [`ApprovalDeadline`] made once per
 //!   request; at zero the options disable. Nothing requests frames once resolved.
 //! - **Untrusted text.** Control, bidi and zero-width characters in the title,
@@ -29,26 +29,23 @@ use frust::authoring::text::{
     FontWeight, OverflowWrap, TextContext, TextLayout, TextOverflow, TextStyle,
 };
 use frust::authoring::{
-    Action, BoxConstraints, Brush, BuildCtx, ChangeFlags, ChildPod, Color, ErasedArgCallback,
-    EventCtx, EventResult, InputEvent, LayoutCtx, Live, PaintCtx, PaintScene, Point, PointerPhase,
-    Rect, Role, RoundedRect, SemanticsCtx, Shape, Size, TypedArgCallback, View, Widget,
-    build_child, erase_callback_arg, rebuild_child, route_event_single, teardown_child,
+    Action, BoxConstraints, BuildCtx, ChangeFlags, ChildPod, Color, ErasedArgCallback, EventCtx,
+    EventResult, InputEvent, LayoutCtx, Live, PaintCtx, PaintScene, Point, PointerPhase, Rect,
+    Role, SemanticsCtx, Size, TypedArgCallback, View, Widget, build_child, erase_callback_arg,
+    rebuild_child, route_event_single, teardown_child,
 };
-use frust::{ColorScheme, ScrollView, TextView, Theme, scroll_view, text};
+use frust::{ScrollView, TextView, Theme, scroll_view, text};
 use web_time::Instant;
 
-use super::model::{ApprovalOption, ApprovalOptionKind, ApprovalState, ToolStatus};
-use super::style;
+use super::model::{ApprovalOption, ApprovalOptionKind, ApprovalState};
+use super::style::{self, display_text};
 use crate::dots::DotsLoaderView;
 use crate::press::presses;
 
 /// Minimum height of an option button (a touch target).
-pub const MIN_TARGET: f64 = 44.0;
-
-/// Width used when the incoming constraints are unbounded.
-const FALLBACK_WIDTH: f64 = 480.0;
+const MIN_TARGET: f64 = style::MIN_TARGET;
 const TITLE_FONT_SIZE: f32 = 14.0;
-const OPTION_FONT_SIZE: f32 = 13.0;
+const OPTION_FONT_SIZE: f32 = style::BODY_FONT_SIZE;
 /// Lines of detail shown before the block scrolls.
 const DETAIL_MAX_LINES: f64 = 6.0;
 /// The always-present note under a detail that scrolls.
@@ -60,16 +57,12 @@ const BUTTON_PAD_Y: f64 = 8.0;
 const BAR_HEIGHT: f64 = 3.0;
 const LOADER_ROW: f64 = 20.0;
 const DISABLED_ALPHA: f32 = 0.38;
-const PRESSED_TINT: f32 = 0.14;
-const PATH_TOLERANCE: f64 = 0.1;
 /// The tag on the allow-always and reject-always options.
 const ALWAYS_TAG: &str = "always";
 /// Name of the countdown's accessibility node.
 const TIMER_LABEL: &str = "Time left";
 /// Seconds per step of the countdown value assistive technology reads.
 const SPOKEN_STEP: u64 = 10;
-
-const DARK: ColorScheme = crate::tokens::color::dark();
 
 /// When an approval request stops waiting: made once, from the time left,
 /// when the request arrives, and stored in app state, so a rebuild with an
@@ -183,24 +176,6 @@ fn spoken_remaining(remaining: Duration) -> String {
     format!("about {step} seconds left")
 }
 
-/// `text` as displayed: control, bidi and zero-width characters (newline and
-/// tab kept) become a visible `?`.
-fn display_text(text: &str) -> String {
-    text.chars()
-        .map(|c| {
-            let hidden = (c.is_control() && c != '\n' && c != '\t')
-                || matches!(
-                    c,
-                    '\u{202A}'..='\u{202E}'
-                        | '\u{2066}'..='\u{2069}'
-                        | '\u{200B}'..='\u{200F}'
-                        | '\u{FEFF}'
-                );
-            if hidden { '?' } else { c }
-        })
-        .collect()
-}
-
 /// What a kind is called to assistive technology.
 fn kind_words(kind: ApprovalOptionKind) -> &'static str {
     match kind {
@@ -270,8 +245,24 @@ pub struct ApprovalCardView<State: 'static> {
     on_select: Option<TypedArgCallback<State, String>>,
 }
 
+impl<State: 'static> std::fmt::Debug for ApprovalCardView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApprovalCardView")
+            .field("title", &self.title)
+            .field("detail", &self.detail)
+            .field("options", &self.spec.options)
+            .field("state", &self.spec.state)
+            .field("deadline", &self.spec.deadline)
+            .field("selected", &self.spec.selected)
+            .field("busy", &self.spec.busy)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A card asking `title`, answered by one of `options` (shown allow kinds
-/// first, each group in the given order).
+/// first, each group in the given order). The title, detail and option
+/// labels are agent-supplied and untrusted. The caller owns the state, busy
+/// flag and deadline and passes them on every build.
 pub fn approval_card<State: 'static>(
     title: impl Into<String>,
     options: impl Into<Vec<ApprovalOption>>,
@@ -349,7 +340,7 @@ impl<State: 'static> ApprovalCardView<State> {
 fn detail_view<State: 'static>(detail: &str) -> ScrollView<State> {
     scroll_view(
         text(display_text(detail))
-            .size(style::CODE_FONT_SIZE as f32)
+            .size(style::CODE_FONT_SIZE)
             .themed_mono_family()
             .overflow_wrap(OverflowWrap::Anywhere),
     )
@@ -380,52 +371,19 @@ struct Palette {
 
 impl Palette {
     fn resolve(theme: Option<&Theme>) -> Self {
-        let s = theme.map_or(DARK, |t| *t.scheme());
+        let s = style::scheme(theme);
         Self {
             surface: style::surface(theme),
             border: style::border(theme),
-            ink: s.on_surface,
+            ink: style::ink(theme),
             accent: s.primary_container,
             on_accent: s.on_primary_container,
-            quiet: s.surface_container_high,
-            detail_bg: s.surface_container_high,
-            track: s.surface_container_highest,
-            bar: s.primary,
+            quiet: style::surface_high(theme),
+            detail_bg: style::surface_high(theme),
+            track: style::track(theme),
+            bar: style::accent(theme),
         }
     }
-}
-
-/// `color` with its alpha scaled by `alpha`.
-fn fade(color: Color, alpha: f32) -> Color {
-    let c = color.components;
-    Color::new([c[0], c[1], c[2], c[3] * alpha])
-}
-
-/// `over` blended onto `base` at opacity `t`.
-fn mix(base: Color, over: Color, t: f32) -> Color {
-    let (b, o) = (base.components, over.components);
-    Color::new([
-        b[0] + (o[0] - b[0]) * t,
-        b[1] + (o[1] - b[1]) * t,
-        b[2] + (o[2] - b[2]) * t,
-        b[3],
-    ])
-}
-
-fn paint_layout(layout: &TextLayout, at: Point, scene: &mut dyn PaintScene) {
-    for run in layout.to_scene_runs(at) {
-        scene.draw_glyph_run(run);
-    }
-}
-
-fn outline(scene: &mut dyn PaintScene, at: Point, size: Size, radius: f64, color: Color) {
-    let shape = RoundedRect::from_rect(Rect::from_origin_size(Point::ORIGIN, size), radius);
-    scene.stroke_path(
-        at,
-        &shape.to_path(PATH_TOLERANCE),
-        style::BORDER_WIDTH,
-        &Brush::Solid(color),
-    );
 }
 
 /// The retained widget for an [`ApprovalCardView`].
@@ -619,31 +577,31 @@ impl ApprovalCardWidget {
             let size = b.rect.size();
             let mut fill = if allow { pal.accent } else { pal.quiet };
             if self.pressed == Some(k) {
-                fill = mix(
+                fill = style::mix(
                     fill,
                     if allow { pal.on_accent } else { pal.ink },
-                    PRESSED_TINT,
+                    style::PRESSED_TINT,
                 );
             }
-            scene.fill_rounded_rect(at, size, style::RADIUS_SMALL, fade(fill, alpha));
+            scene.fill_rounded_rect(at, size, style::RADIUS_SMALL, style::fade(fill, alpha));
             if !allow {
-                outline(
+                style::stroke_outline(
                     scene,
                     at,
                     size,
                     style::RADIUS_SMALL,
-                    fade(pal.border, alpha),
+                    style::fade(pal.border, alpha),
                 );
             }
             if alpha < 1.0 {
                 scene.push_layer(at, size, alpha);
             }
             let label_y = at.y + (size.height - b.label.size().height) / 2.0;
-            paint_layout(&b.label, Point::new(at.x + BUTTON_PAD_X, label_y), scene);
+            style::paint_layout(&b.label, Point::new(at.x + BUTTON_PAD_X, label_y), scene);
             if let Some(tag) = &b.tag {
                 let t = tag.size();
                 let x = at.x + size.width - BUTTON_PAD_X - t.width;
-                paint_layout(
+                style::paint_layout(
                     tag,
                     Point::new(x, at.y + (size.height - t.height) / 2.0),
                     scene,
@@ -659,7 +617,7 @@ impl ApprovalCardWidget {
         let (Some(label), Some(deadline)) = (&self.count_label, &self.spec.deadline) else {
             return;
         };
-        paint_layout(
+        style::paint_layout(
             label,
             Point::new(o.x + self.count_at.x, o.y + self.count_at.y),
             scene,
@@ -713,7 +671,7 @@ impl Styles {
                 .with_family(family.clone())
                 .with_overflow_wrap(OverflowWrap::Anywhere)
         };
-        let small = style::LABEL_FONT_SIZE as f32;
+        let small = style::LABEL_FONT_SIZE;
         Self {
             ink: mk(OPTION_FONT_SIZE, pal.ink),
             ink_small: mk(small, pal.ink),
@@ -721,14 +679,8 @@ impl Styles {
             on_accent_small: mk(small, pal.on_accent),
             muted: mk(small, style::muted(theme)),
             quiet: mk(OPTION_FONT_SIZE, style::muted(theme)),
-            success: mk(
-                OPTION_FONT_SIZE,
-                style::status_color(theme, ToolStatus::Completed),
-            ),
-            error: mk(
-                OPTION_FONT_SIZE,
-                style::status_color(theme, ToolStatus::Failed),
-            ),
+            success: mk(OPTION_FONT_SIZE, style::success(theme)),
+            error: mk(OPTION_FONT_SIZE, style::error(theme)),
         }
     }
 }
@@ -840,16 +792,12 @@ impl<State: 'static> View<State> for ApprovalCardView<State> {
 
 impl Widget for ApprovalCardWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        let width = if bc.max().width.is_finite() {
-            bc.max().width
-        } else {
-            FALLBACK_WIDTH
-        };
+        let width = style::width_of(bc);
         let inner = (width - style::PAD * 2.0).max(0.0);
         let (ts, line_h) = {
             let theme = Theme::from_layout_ctx(ctx);
             let family = style::mono_family(theme);
-            let probe = TextStyle::new(style::CODE_FONT_SIZE as f32, Palette::resolve(theme).ink)
+            let probe = TextStyle::new(style::CODE_FONT_SIZE, Palette::resolve(theme).ink)
                 .with_family(family);
             (Styles::resolve(theme), probe)
         };
@@ -949,9 +897,9 @@ impl Widget for ApprovalCardWidget {
             .into_iter()
             .flatten()
         {
-            paint_layout(layout, Point::new(o.x + at.x, o.y + at.y), scene);
+            style::paint_layout(layout, Point::new(o.x + at.x, o.y + at.y), scene);
         }
-        outline(scene, o, size, style::RADIUS, pal.border);
+        style::stroke_outline(scene, o, size, style::RADIUS, pal.border);
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &InputEvent) -> EventResult {
@@ -1018,12 +966,7 @@ impl Widget for ApprovalCardWidget {
                     detail.semantics_child(ctx);
                 }
                 let origin = ctx.origin();
-                let bounds = |r: Rect| frust::accesskit::Rect {
-                    x0: origin.x + r.x0,
-                    y0: origin.y + r.y0,
-                    x1: origin.x + r.x1,
-                    y1: origin.y + r.y1,
-                };
+                let bounds = |r: Rect| style::node_bounds(origin, r);
                 if let Some((note, at)) = &self.overflow {
                     let r = Rect::from_origin_size(*at, note.size());
                     ctx.push_node(Role::Label, |node| {

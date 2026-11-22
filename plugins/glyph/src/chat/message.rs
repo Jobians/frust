@@ -2,31 +2,26 @@
 //!
 //! # Contract
 //!
-//! - **Controlled and non-reactive.** The caller owns the text, the thought
-//!   disclosure state (`.thought_open(..)` and `.on_thought_toggle(..)` work
-//!   like `crate::accordion`: a press is reported, never self-applied) and
-//!   the transcript; the row holds no signals.
+//! - **Controlled and non-reactive.** The caller owns the text and the
+//!   thought's open state (`.thought_open(..)` and `.on_thought_toggle(..)`
+//!   work like `crate::accordion`: a press is reported, never self-applied).
 //! - **User.** The text as plain selectable text, never parsed as markdown,
-//!   wrapped anywhere, in a tinted bubble aligned to the trailing side. On a
-//!   viewport of [`WIDE_VIEWPORT`] or more the bubble is at most
-//!   [`WIDE_FRACTION`] of the width.
+//!   wrapped anywhere, in a tinted bubble on the trailing side, at most
+//!   [`WIDE_FRACTION`] of a viewport of [`WIDE_VIEWPORT`] or more.
 //! - **Assistant.** [`markdown`] at full width with no bubble;
 //!   `.streaming(..)` is forwarded to it.
-//! - **Thought.** One muted line while collapsed (a label, then the first
-//!   line of the text ellipsized) with a chevron; open, the text as dimmed
-//!   markdown. The collapsed row's height never depends on the text, so a
-//!   streaming thought does not move the transcript.
-//! - **Copy.** With `.on_copy(..)` an assistant or user row shows a copy
-//!   control that is always visible (no hover). A press writes the clipboard
-//!   with the source text, then calls back; while `.streaming(true)` the
-//!   control stays in place but inert.
-//! - **Rebuilds.** An equal view changes nothing; an unchanged row in a long
-//!   transcript costs no re-parse and no re-shape when a later row streams.
-//! - **Width.** The row is as wide as the width it is given, never wider;
+//! - **Thought.** One muted line while closed (a label, then the first line
+//!   ellipsized) with a chevron; open, the text as dimmed markdown. The
+//!   closed row's height never depends on the text.
+//! - **Copy.** With `.on_copy(..)` a user or assistant row shows an always
+//!   visible copy control: a press writes the clipboard with the source
+//!   text, then calls back; while `.streaming(true)` it stays put but inert.
+//! - **Rebuilds.** An equal view changes nothing; an unchanged row costs no
+//!   re-parse and no re-shape when a later row streams.
+//! - **Width.** The row is as wide as it is given, never wider;
 //!   `.max_width(..)` narrows the content on a tablet.
 
 use std::rc::Rc;
-use std::time::Duration;
 
 use frust::FrameTime;
 use frust::accesskit::Role;
@@ -59,25 +54,15 @@ const COPY_H: f64 = 28.0;
 /// Shortest thought header, for the same reason.
 const HEADER_MIN_H: f64 = 28.0;
 /// Body text size: the Glyph `body` token (as in the markdown renderer).
-const BODY_SIZE: f32 = 13.0;
+const BODY_SIZE: f32 = style::BODY_FONT_SIZE;
 /// Width of the thought chevron.
 const CHEVRON_W: f64 = 5.0;
 /// Height of the thought chevron.
 const CHEVRON_H: f64 = 9.0;
 /// Space between the chevron, the label and the summary.
-const HEADER_GAP: f64 = 8.0;
+const HEADER_GAP: f64 = style::BLOCK_GAP;
 /// Alpha an open thought's body is composited at, to read as dimmer.
 const THOUGHT_ALPHA: f32 = 0.72;
-/// How long the copy control reads "Copied".
-const COPIED_FOR: Duration = Duration::from_millis(1500);
-/// Width used when the incoming constraints are unbounded.
-const FALLBACK_WIDTH: f64 = 480.0;
-
-const DARK: frust::ColorScheme = crate::tokens::color::dark();
-/// Unthemed bubble tint.
-const FALLBACK_BUBBLE: Color = DARK.surface_container_high;
-/// Unthemed active label text.
-const FALLBACK_TEXT: Color = DARK.on_surface;
 
 type OnLink<State> = Rc<dyn Fn(&mut State, &str)>;
 type OnToggle<State> = Rc<dyn Fn(&mut State)>;
@@ -95,7 +80,21 @@ pub struct MessageRowView<State: 'static> {
     on_toggle: Option<OnToggle<State>>,
 }
 
-/// One transcript row: `text` authored by `role`.
+impl<State: 'static> std::fmt::Debug for MessageRowView<State> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageRowView")
+            .field("role", &self.role)
+            .field("text", &self.text)
+            .field("streaming", &self.streaming)
+            .field("selectable", &self.selectable)
+            .field("thought_open", &self.thought_open)
+            .field("max_width", &self.max_width)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One transcript row: `text` authored by `role`. The caller owns the text
+/// and the thought's open state and passes them on every build.
 pub fn message_row<State: 'static>(
     role: ChatRole,
     text: impl Into<String>,
@@ -121,7 +120,9 @@ impl<State: 'static> MessageRowView<State> {
     }
 
     /// Run `on_link` with the app state and the exact URL of a safe link the
-    /// user taps in assistant or thought markdown. Nothing is opened here.
+    /// user taps in assistant or thought markdown. Nothing is opened here; the
+    /// URL is attacker-controlled and may differ from the visible text, so
+    /// show or confirm the destination before opening it.
     pub fn on_link(mut self, on_link: impl Fn(&mut State, &str) + 'static) -> Self {
         self.on_link = Some(Rc::new(on_link));
         self
@@ -285,12 +286,11 @@ impl MessageRowWidget {
     fn shape(&mut self, ctx: &mut LayoutCtx, content_w: f64) {
         let theme = Theme::from_layout_ctx(ctx);
         let family = style::mono_family(theme);
-        let active = theme.map_or(FALLBACK_TEXT, |t| t.scheme().on_surface);
-        let done = style::status_color(theme, super::model::ToolStatus::Completed);
+        let active = style::ink(theme);
+        let done = style::success(theme);
         let muted = style::muted(theme);
-        let mono = |color| {
-            TextStyle::new(style::LABEL_FONT_SIZE as f32, color).with_family(family.clone())
-        };
+        let mono =
+            |color| TextStyle::new(style::LABEL_FONT_SIZE, color).with_family(family.clone());
         let text = ctx.text_context::<TextContext>();
         let mut labels = Labels::default();
         if self.role == ChatRole::Thought {
@@ -300,7 +300,7 @@ impl MessageRowWidget {
             let room = content_w - used - style::PAD_SMALL;
             let first = first_line(&self.text);
             if !self.thought_open && !first.is_empty() && room > 1.0 {
-                let summary_style = TextStyle::new(style::LABEL_FONT_SIZE as f32, muted);
+                let summary_style = TextStyle::new(style::LABEL_FONT_SIZE, muted);
                 labels.summary = Some(text.layout_bounded(
                     first,
                     &summary_style,
@@ -312,11 +312,11 @@ impl MessageRowWidget {
             labels.thought = Some(label);
         }
         if self.shows_copy {
-            let copy = text.layout("Copy", &mono(active), None);
+            let copy = text.layout(style::COPY_TEXT, &mono(active), None);
             self.label_h = copy.size().height;
             labels.copy = Some(copy);
-            labels.copied = Some(text.layout("Copied", &mono(done), None));
-            labels.copy_off = Some(text.layout("Copy", &mono(muted), None));
+            labels.copied = Some(text.layout(style::COPIED_TEXT, &mono(done), None));
+            labels.copy_off = Some(text.layout(style::COPY_TEXT, &mono(muted), None));
         }
         self.labels = labels;
     }
@@ -429,11 +429,7 @@ fn first_line(text: &str) -> &str {
 
 impl Widget for MessageRowWidget {
     fn layout(&mut self, ctx: &mut LayoutCtx, bc: &BoxConstraints) -> Size {
-        self.width = if bc.max().width.is_finite() {
-            bc.max().width
-        } else {
-            FALLBACK_WIDTH
-        };
+        self.width = style::width_of(bc);
         let content_w = self.content_w();
         self.shape(ctx, content_w);
         self.header_h = 0.0;
@@ -488,7 +484,7 @@ impl Widget for MessageRowWidget {
         if self.copied {
             let now = ctx.frame_time();
             let since = *self.copied_at.get_or_insert(now);
-            if now.saturating_sub(since) >= COPIED_FOR {
+            if now.saturating_sub(since) >= style::COPIED_FOR {
                 self.copied = false;
                 self.copied_at = None;
             } else {
@@ -506,7 +502,7 @@ impl Widget for MessageRowWidget {
         };
         match self.role {
             ChatRole::User => {
-                let tint = theme.map_or(FALLBACK_BUBBLE, |t| t.scheme().surface_container_high);
+                let tint = style::surface_high(theme);
                 let b = self.bubble;
                 scene.fill_rounded_rect(
                     Point::new(o.x + b.x0, o.y + b.y0),
@@ -609,12 +605,7 @@ impl Widget for MessageRowWidget {
             |node| node.set_label(label),
             |ctx| {
                 let origin = ctx.origin();
-                let bounds = |r: Rect| frust::accesskit::Rect {
-                    x0: origin.x + r.x0,
-                    y0: origin.y + r.y0,
-                    x1: origin.x + r.x1,
-                    y1: origin.y + r.y1,
-                };
+                let bounds = |r: Rect| style::node_bounds(origin, r);
                 if self.role == ChatRole::Thought {
                     ctx.push_node(Role::Button, |node| {
                         node.set_label("Thought");

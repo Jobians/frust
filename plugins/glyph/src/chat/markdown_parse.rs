@@ -12,7 +12,7 @@
 //! Streaming: every prefix parses without panicking. An unclosed fence is a
 //! `CodeBlock { closed: false }` holding everything after it; half-written
 //! emphasis, links and table rows stay literal text. A block followed by
-//! another is final (see [`stable_prefix_len`]), with these exceptions:
+//! another is final (the renderer keeps it as is), with these exceptions:
 //! - while the source's last line is unterminated, the block before the last
 //!   can still change: `#x`, `***x` or `<divx` typed under a paragraph or list
 //!   is lazy continuation text, not the heading, rule or HTML block its first
@@ -27,17 +27,17 @@ use std::ops::Range;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
 
 /// Lists and block quotes nested deeper than this flatten to one text paragraph.
-pub const MAX_NESTING_DEPTH: usize = 10;
+pub(crate) const MAX_NESTING_DEPTH: usize = 10;
 /// Emphasis, strong, strikethrough and link spans nested deeper than this keep
 /// their text but drop the span (a dropped link appends ` (url)`).
-pub const MAX_INLINE_DEPTH: usize = 32;
+pub(crate) const MAX_INLINE_DEPTH: usize = 32;
 /// Table columns past this merge into the last column.
-pub const MAX_TABLE_COLUMNS: usize = 32;
+pub(crate) const MAX_TABLE_COLUMNS: usize = 32;
 
 /// One block of parsed markdown.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum MdBlock {
+pub(crate) enum MdBlock {
     /// A paragraph; also the literal text of a raw HTML block, one line per
     /// [`MdInline::HardBreak`].
     Paragraph(Vec<MdInline>),
@@ -83,7 +83,7 @@ pub enum MdBlock {
 
 /// One list item.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub struct MdListItem {
+pub(crate) struct MdListItem {
     /// `Some(checked)` for a task-list item, `None` otherwise.
     pub checked: Option<bool>,
     /// The item's content; text of a tight item is wrapped in a paragraph.
@@ -92,7 +92,7 @@ pub struct MdListItem {
 
 /// Horizontal alignment of a table column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MdAlignment {
+pub(crate) enum MdAlignment {
     /// No alignment given.
     None,
     /// `:--`
@@ -106,7 +106,7 @@ pub enum MdAlignment {
 /// Inline content of a paragraph, heading or table cell.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum MdInline {
+pub(crate) enum MdInline {
     /// Plain text, shown as is; raw HTML and images arrive here too.
     Text(String),
     /// `*emphasis*`
@@ -133,7 +133,7 @@ pub enum MdInline {
 }
 
 /// Parses untrusted markdown into blocks. Never panics, on any input or prefix.
-pub fn parse_markdown(source: &str) -> Vec<MdBlock> {
+pub(crate) fn parse_markdown(source: &str) -> Vec<MdBlock> {
     let options =
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut builder = Builder::new(source);
@@ -145,7 +145,8 @@ pub fn parse_markdown(source: &str) -> Vec<MdBlock> {
 
 /// Number of leading blocks equal in both slices: the blocks a renderer can keep
 /// when the source grows from the one `blocks_prev` was parsed from.
-pub fn stable_prefix_len(blocks_prev: &[MdBlock], blocks_next: &[MdBlock]) -> usize {
+#[cfg(test)]
+pub(crate) fn stable_prefix_len(blocks_prev: &[MdBlock], blocks_next: &[MdBlock]) -> usize {
     blocks_prev
         .iter()
         .zip(blocks_next)
