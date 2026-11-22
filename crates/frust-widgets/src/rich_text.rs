@@ -525,27 +525,30 @@ struct SpanGroup {
     spans: std::ops::Range<usize>,
 }
 
-/// `group_spans_by` on style equality alone.
-#[cfg(test)]
-fn group_spans<'a>(
-    contents: impl ExactSizeIterator<Item = &'a str>,
-    styles: &[TextStyle],
-    limit: usize,
-) -> Vec<SpanGroup> {
-    group_spans_by(contents, |a, b| styles[a] == styles[b], limit)
+/// What decides whether two adjacent spans may be shaped as one group: equal
+/// effective style, background and link.
+struct GroupKey<'a> {
+    style: &'a TextStyle,
+    span: &'a SpanView,
+}
+
+impl PartialEq for GroupKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.style == other.style && self.span.same_marks(other.span)
+    }
 }
 
 /// Groups the non-empty spans (`contents`) for shaping: empty spans are
-/// dropped, adjacent spans `alike(a, b)` merge (the widget asks for equal
-/// effective style and equal background and link), and past `limit` groups
+/// dropped, adjacent spans with equal `keys` merge (the widget keys on
+/// effective style, background and link), and past `limit` groups
 /// the excess folds into the last kept one (its text takes that group's
 /// style) instead of overflowing the shaper's span index.
 ///
 /// Text with no non-empty span keeps its first span so the empty layout is
 /// still sized by that span's style.
-fn group_spans_by<'a>(
+fn group_spans<'a, K: PartialEq>(
     contents: impl ExactSizeIterator<Item = &'a str>,
-    alike: impl Fn(usize, usize) -> bool,
+    keys: &[K],
     limit: usize,
 ) -> Vec<SpanGroup> {
     let mut groups: Vec<SpanGroup> = Vec::new();
@@ -556,7 +559,7 @@ fn group_spans_by<'a>(
         }
         let full = groups.len() >= limit;
         match groups.last_mut() {
-            Some(last) if alike(last.style, index) => last.spans.end = index + 1,
+            Some(last) if keys[last.style] == keys[index] => last.spans.end = index + 1,
             Some(last) if full => last.spans.end = index + 1,
             _ => groups.push(SpanGroup {
                 style: index,
@@ -590,9 +593,14 @@ impl Widget for RichTextWidget {
         }
 
         let view_spans = &self.view.spans;
-        let groups = group_spans_by(
+        let keys: Vec<GroupKey<'_>> = view_spans
+            .iter()
+            .zip(&all_styles)
+            .map(|(span, style)| GroupKey { style, span })
+            .collect();
+        let groups = group_spans(
             view_spans.iter().map(|s| s.content.as_str()),
-            |a, b| all_styles[a] == all_styles[b] && view_spans[a].same_marks(&view_spans[b]),
+            &keys,
             usize::from(u16::MAX),
         );
         let styles: Vec<TextStyle> = groups.iter().map(|g| all_styles[g.style].clone()).collect();
@@ -769,21 +777,26 @@ impl Widget for RichTextWidget {
 }
 
 /// Encodes group index `group` as a decoration colour the probe layout
-/// hands back unchanged on its line-through rects.
+/// hands back unchanged on its line-through rects. Zero marks a group that
+/// is not tagged (it still gets a rect, so every line with text has one).
 fn group_tag(group: usize) -> Color {
-    Color::new([group as f32, 0.0, 0.0, 1.0])
+    Color::new([(group + 1) as f32, 0.0, 0.0, 1.0])
 }
 
 /// The line fragments of every tagged group (`tags[g]` names its first
 /// span), in line order, for `layout`: the layout of `spans` at
 /// `max_width`, capped by `max_lines` and `overflow`.
 ///
-/// A probe re-lays `spans` with every tagged group struck through in its
+/// A probe re-lays `spans` with every group struck through in its
 /// [`group_tag`], so the line-through rects give each group's pen extent
-/// per line; the line boxes are the heights of `spans` capped at `k` lines
-/// (breaking is greedy, so the first `k` lines are unchanged), measured only
-/// as far down as a fragment needs. Touching pieces of one group on a line
-/// (a face change inside it) merge.
+/// per line. The rects arrive line by line, so when they fall into exactly
+/// `layout.line_count()` bands (every line has text) a rect's band is its
+/// line with no further layout. Otherwise (blank lines, whitespace-only
+/// lines) each rect's line is bisected over line tops. Either way the line
+/// boxes are the heights of `spans` capped at `k` lines (breaking is greedy,
+/// so the first `k` lines are unchanged), measured only at the boundaries a
+/// marked fragment needs, never for unmarked lines above it. Touching pieces
+/// of one group on a line (a face change inside it) merge.
 fn marked_fragments(
     text_ctx: &mut TextContext,
     spans: &[TextSpan<'_>],
@@ -798,14 +811,10 @@ fn marked_fragments(
     }
     let probe_styles: Vec<TextStyle> = spans
         .iter()
-        .zip(tags)
         .enumerate()
-        .map(|(group, (span, tag))| {
+        .map(|(group, span)| {
             let mut style = span.style.clone();
-            style.decoration = match tag {
-                Some(_) => TextDecoration::line_through().with_color(group_tag(group)),
-                None => TextDecoration::none(),
-            };
+            style.decoration = TextDecoration::line_through().with_color(group_tag(group));
             style
         })
         .collect();
@@ -818,49 +827,89 @@ fn marked_fragments(
 
     let lines = layout.line_count();
     let height = layout.size().height;
-    let mut tops = vec![0.0];
+    let mut tops: std::collections::BTreeMap<usize, f64> = std::collections::BTreeMap::new();
     let mut top_of = |line: usize| -> f64 {
-        while tops.len() <= line {
-            let k = tops.len();
-            let top = if k >= lines {
-                height
-            } else {
-                text_ctx
-                    .layout_rich_bounded(spans, max_width, Some(k), TextOverflow::Clip)
-                    .size()
-                    .height
-            };
-            tops.push(top);
+        if line == 0 {
+            return 0.0;
         }
-        tops[line]
+        if line >= lines {
+            return height;
+        }
+        *tops.entry(line).or_insert_with(|| {
+            text_ctx
+                .layout_rich_bounded(spans, max_width, Some(line), TextOverflow::Clip)
+                .size()
+                .height
+        })
     };
+
+    // (group, rect) of every line-through rect, in line order.
+    let rects: Vec<(usize, Rect)> = probe
+        .decoration_rects(Point::ZERO)
+        .into_iter()
+        .filter(|d| d.kind == DecorationKind::LineThrough)
+        .filter_map(|d| {
+            let tag = d.color.components[0];
+            (tag >= 1.0).then(|| ((tag as usize) - 1, d.rect))
+        })
+        .collect();
+
+    // Band the rects: a new band starts when a rect sits more than half an
+    // average line below everything in the current one.
+    let tolerance = height / lines.max(1) as f64 / 2.0;
+    let mut bands: Vec<usize> = Vec::with_capacity(rects.len());
+    let mut band_max = f64::NEG_INFINITY;
+    let mut band = 0usize;
+    for (index, (_, rect)) in rects.iter().enumerate() {
+        let mid = (rect.y0 + rect.y1) / 2.0;
+        if index > 0 && mid > band_max + tolerance {
+            band += 1;
+            band_max = mid;
+        } else {
+            band_max = band_max.max(mid);
+        }
+        bands.push(band);
+    }
+    let banded = !rects.is_empty() && band + 1 == lines;
 
     let mut out: Vec<(usize, Fragment)> = Vec::new();
     let mut line = 0;
-    for d in probe.decoration_rects(Point::ZERO) {
-        let group = d.color.components[0];
-        let Some(span) = (d.kind == DecorationKind::LineThrough && group >= 0.0)
-            .then(|| tags.get(group as usize).copied().flatten())
-            .flatten()
-        else {
+    for (index, (group, rect)) in rects.iter().enumerate() {
+        let Some(span) = tags.get(*group).copied().flatten() else {
             continue;
         };
-        let mid = (d.rect.y0 + d.rect.y1) / 2.0;
-        while line + 1 < lines && top_of(line + 1) <= mid {
-            line += 1;
+        if banded {
+            line = bands[index];
+        } else {
+            let mid = (rect.y0 + rect.y1) / 2.0;
+            // The last line in `line..lines` whose top is at or above `mid`.
+            let (mut lo, mut hi) = (line, lines - 1);
+            while lo < hi {
+                let m = (lo + hi).div_ceil(2);
+                if top_of(m) <= mid {
+                    lo = m;
+                } else {
+                    hi = m - 1;
+                }
+            }
+            line = lo;
         }
-        let touches = |f: &Fragment| {
-            (d.rect.x0 - f.rect.x1).abs() < 0.5 || (f.rect.x0 - d.rect.x1).abs() < 0.5
-        };
+        let touches =
+            |f: &Fragment| (rect.x0 - f.rect.x1).abs() < 0.5 || (f.rect.x0 - rect.x1).abs() < 0.5;
         match out.last_mut() {
             Some((on, f)) if *on == line && f.span == span && touches(f) => {
-                f.rect.x0 = f.rect.x0.min(d.rect.x0);
-                f.rect.x1 = f.rect.x1.max(d.rect.x1);
+                f.rect.x0 = f.rect.x0.min(rect.x0);
+                f.rect.x1 = f.rect.x1.max(rect.x1);
             }
             _ => {
                 let (y0, y1) = (top_of(line), top_of(line + 1));
-                let rect = Rect::new(d.rect.x0, y0, d.rect.x1, y1);
-                out.push((line, Fragment { span, rect }));
+                out.push((
+                    line,
+                    Fragment {
+                        span,
+                        rect: Rect::new(rect.x0, y0, rect.x1, y1),
+                    },
+                ));
             }
         }
     }
@@ -1477,5 +1526,73 @@ mod tests {
             "having a callback is part of the view"
         );
         assert_ne!(span("x").background(grey()), span("x"));
+    }
+
+    /// The shape cache's events (shapes, re-breaks and hits): one per
+    /// layout of any cap, so its delta counts the layouts a call made.
+    fn layout_events(tcx: &TextContext) -> u64 {
+        let stats = tcx.shape_cache_stats();
+        stats.shapes + stats.line_breaks + stats.hits
+    }
+
+    /// `lines` one-word lines at 40 px wide, with `marked` giving the line
+    /// indices whose word is a link. Returns the widget, its height and the
+    /// layouts the widget's first layout made.
+    fn tall_paragraph(lines: usize, marked: &[usize]) -> (RichTextWidget, f64, u64) {
+        let _slot = crate::test_support::LocaleSlotGuard::hold();
+        let mut tcx = TextContext::new();
+        let spans: Vec<SpanView> = (0..lines)
+            .map(|i| {
+                let word = span(if i == 0 {
+                    "word000".to_owned()
+                } else {
+                    format!("\nword{i:03}")
+                });
+                if marked.contains(&i) {
+                    word.link("x")
+                } else {
+                    word
+                }
+            })
+            .collect();
+        let view = rich_text(spans);
+        let mut widget = View::<()>::build(&view, &mut BuildCtx::new(&mut 0u64));
+        let before = layout_events(&tcx);
+        let size = layout_widget(&mut widget, None, 300.0, &mut tcx);
+        (widget, size.height, layout_events(&tcx) - before)
+    }
+
+    #[test]
+    fn measuring_a_link_on_the_last_line_does_not_scale_with_the_lines_above() {
+        let (small, _, small_layouts) = tall_paragraph(40, &[39]);
+        let (large, _, large_layouts) = tall_paragraph(90, &[89]);
+        assert_eq!(small.fragments.len(), 1);
+        assert_eq!(large.fragments.len(), 1);
+        // The fragment is the last of at least 40 line boxes.
+        let f = small.fragments[0].rect;
+        assert!(f.y1 / f.height() >= 39.5, "{f:?}");
+        let f = large.fragments[0].rect;
+        assert!(f.y1 / f.height() >= 89.5, "{f:?}");
+        assert_eq!(
+            small_layouts, large_layouts,
+            "extra layouts must not grow with the unmarked lines above"
+        );
+        assert!(small_layouts <= 6, "{small_layouts} layouts");
+    }
+
+    #[test]
+    fn measuring_marks_on_two_adjacent_lines_is_bounded() {
+        let (small, _, small_layouts) = tall_paragraph(40, &[20, 21]);
+        let (large, _, large_layouts) = tall_paragraph(90, &[60, 61]);
+        assert_eq!(small.fragments.len(), 2);
+        assert_eq!(large.fragments.len(), 2);
+        let (a, b) = (small.fragments[0].rect, small.fragments[1].rect);
+        assert!(
+            (a.y1 - b.y0).abs() < 0.01,
+            "adjacent line boxes share an edge"
+        );
+        assert!(a.y0 > 0.0 && b.y1 > b.y0);
+        assert_eq!(small_layouts, large_layouts);
+        assert!(small_layouts <= 7, "{small_layouts} layouts");
     }
 }
