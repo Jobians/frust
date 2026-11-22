@@ -78,8 +78,10 @@ use crate::layout::{LineTable, Paragraph, lay_out};
 use crate::shape::Shaped;
 use crate::style::TextStyle;
 use compose::Composition;
-use cursor::{Affinity, Cursor, EditLayout};
-use selection::Selection;
+// Shared with `crate::layout::geometry`, which answers the same caret,
+// hit-test and selection questions over a read-only `TextLayout`.
+pub(crate) use cursor::{Affinity, Cursor, EditLayout};
+pub(crate) use selection::Selection;
 
 /// A single editing command applied to a [`TextEditor`].
 ///
