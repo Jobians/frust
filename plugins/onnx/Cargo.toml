@@ -31,7 +31,13 @@ ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", 
 [target.'cfg(all(target_os = "windows", target_env = "msvc", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17", "directml"] }
 
-# PLACEHOLDER, not a packaging decision: Android, iOS and every target without a prebuilt row (Intel
+# arm64 Android: ONNX Runtime 1.31.0 linked statically into the app's cdylib from the only prebuilt
+# row (`nnapi`, no XNNPACK); the feature selects that row and registers no provider. The archive
+# needs the NDK's libc++_shared.so in the APK: see README "Android packaging".
+[target.'cfg(all(target_os = "android", target_arch = "aarch64"))'.dependencies]
+ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17", "nnapi"] }
+
+# PLACEHOLDER, not a packaging decision: iOS, Android other than arm64 and every other target (Intel
 # macOS included) load the ONNX Runtime library at run time. Mirrors `src/runtime.rs`' link cfg.
-[target.'cfg(not(any(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "macos", target_arch = "aarch64"), all(target_os = "windows", target_env = "msvc", any(target_arch = "x86_64", target_arch = "aarch64")))))'.dependencies]
+[target.'cfg(not(any(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "macos", target_arch = "aarch64"), all(target_os = "windows", target_env = "msvc", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "android", target_arch = "aarch64"))))'.dependencies]
 ort = { workspace = true, features = ["std", "load-dynamic", "api-17"] }

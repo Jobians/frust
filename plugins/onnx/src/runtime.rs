@@ -67,7 +67,8 @@ pub(crate) fn environment() -> Result<&'static Environment, OnnxError> {
         target_os = "windows",
         target_env = "msvc",
         any(target_arch = "x86_64", target_arch = "aarch64")
-    )
+    ),
+    all(target_os = "android", target_arch = "aarch64")
 ))]
 mod link {
     use super::*;
@@ -90,7 +91,8 @@ mod link {
         target_os = "windows",
         target_env = "msvc",
         any(target_arch = "x86_64", target_arch = "aarch64")
-    )
+    ),
+    all(target_os = "android", target_arch = "aarch64")
 )))]
 mod link {
     use super::*;

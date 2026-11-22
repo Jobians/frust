@@ -11,10 +11,12 @@
 //!
 //! # Linking
 //!
-//! On Linux (glibc, x86_64/aarch64), Apple-silicon macOS and Windows (MSVC) the runtime is linked
-//! statically from the prebuilt archive `ort` downloads at build time. Every other target, Android
-//! and iOS included, loads the runtime library at run time ([`LinkKind::Dynamic`]): the library
-//! named by `ORT_DYLIB_PATH`, else the platform's `onnxruntime` library on the loader path.
+//! On Linux (glibc, x86_64/aarch64), Apple-silicon macOS, Windows (MSVC) and arm64 Android the
+//! runtime is linked statically from the prebuilt archive `ort` downloads at build time; on Android
+//! the app must also package the NDK's `libc++_shared.so`, which that archive needs. Every other
+//! target, iOS and the other Android ABIs included, loads the runtime library at run time
+//! ([`LinkKind::Dynamic`]): the library named by `ORT_DYLIB_PATH`, else the platform's
+//! `onnxruntime` library on the loader path.
 //!
 //! # Example
 //!
