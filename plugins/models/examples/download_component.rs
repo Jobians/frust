@@ -1,7 +1,9 @@
 //! A model list with a download button and a progress line, in one `Component`.
 //!
 //! The component owns a `ModelList` and a `DownloadTracker`. `build` only reads their signals;
-//! the buttons write them through the handles. Run it inside a Frust app by passing
+//! the buttons write them through the handles. No handler waits on the network:
+//! `DownloadTracker::start_hub` fetches the repository listing on `frust::spawn_blocking` and
+//! reports a failure through the state signal. Run it inside a Frust app by passing
 //! `ModelsScreen` to `frust::app!`; here it only has to compile.
 
 use frust::{Component, Get, RwSignal, Set, View, button, column, text};
@@ -15,7 +17,7 @@ struct ScreenState {
     list: ModelList,
     tracker: DownloadTracker,
     hub: HubClient,
-    /// The last error from starting a download, shown under the buttons.
+    /// Why the last download could not start (another one still runs), shown under the buttons.
     problem: RwSignal<String>,
 }
 
@@ -63,14 +65,15 @@ impl Component for ModelsScreen {
         column()
             .child(models)
             .child(button("Download", |state: &mut ScreenState| {
-                // A model with its config and tokenizer, downloaded as one job.
-                let request = state.hub.request_for_main(
+                // A model with its config and tokenizer, downloaded as one job. The listing is
+                // fetched off the UI thread; a failure shows up as `DownloadState::Failed`.
+                let started = state.tracker.start_hub(
+                    &state.hub,
+                    state.list.store(),
                     "acme/tiny",
+                    "main",
                     &["model.onnx", "config.json", "tokenizer.json"],
                 );
-                let started = request.and_then(|request| {
-                    state.tracker.start(&state.hub, state.list.store(), request)
-                });
                 state
                     .problem
                     .set(started.err().map(|e| e.to_string()).unwrap_or_default());

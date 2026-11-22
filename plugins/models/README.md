@@ -62,35 +62,48 @@ the app has started rather than in a static initialiser.
 The default `hub` feature adds a blocking Hugging Face Hub client and a downloader. Build with
 `default-features = false` to keep only the store; that build has no HTTP or TLS dependencies.
 
+**Which calls block.** `HubClient::search`, `HubClient::files`, `HubClient::request_for`,
+`HubClient::request_for_main` and `DownloadHandle::wait` wait on the network or on a download.
+Call them on a worker thread (`frust::spawn_blocking` in an app), never in a component's event
+handler or `build`; on iOS and macOS a call on the main thread fails at once with
+`ModelsError::UiThread`. `Downloader::start`, `DownloadHandle::cancel`,
+`DownloadRequest::from_url` and `HubClient::resolve_url` return without waiting. In a component,
+`DownloadTracker::start_hub` (under "In a component") does the blocking part for you.
+
 ```rust,no_run
 use std::sync::Arc;
 
-use frust_models::{DownloadEvent, DownloadRequest, Downloader, HubClient, ModelId, ModelStore, SearchOptions};
+use frust_models::{DownloadEvent, DownloadRequest, Downloader, HubClient, ModelId, ModelStore, ModelsError, SearchOptions};
 
 let store = ModelStore::open()?;
 let hub = HubClient::new()?.with_token(std::env::var("HF_TOKEN").ok());
 
-let found = hub.search(&SearchOptions {
-    query: Some("tinyllama".into()),
-    filter: Some("gguf".into()),
-    ..SearchOptions::default()
-})?;
-println!("{} results", found.len());
+// The Hub calls block, so they run on a worker thread rather than the caller's.
+let worker = std::thread::spawn(move || -> Result<(), ModelsError> {
+    let found = hub.search(&SearchOptions {
+        query: Some("tinyllama".into()),
+        filter: Some("gguf".into()),
+        ..SearchOptions::default()
+    })?;
+    println!("{} results", found.len());
 
-// A Hub bundle: sizes and SHA-256 digests come from the repository listing.
-let request = hub.request_for("ggml-org/models", "main", &["tinyllamas/stories260K.gguf"])?;
-let handle = Downloader::start(&hub, &store, request, Arc::new(|event| match event {
-    DownloadEvent::Progress { bytes, total, .. } => println!("{bytes} of {total:?}"),
-    DownloadEvent::Done(models) => println!("stored {} files", models.len()),
-    DownloadEvent::Error(err) => eprintln!("download failed: {err}"),
-    _ => {}
-}))?;
-let models = handle.wait()?;
+    // A Hub bundle: sizes and SHA-256 digests come from the repository listing.
+    let request = hub.request_for("ggml-org/models", "main", &["tinyllamas/stories260K.gguf"])?;
+    let handle = Downloader::start(&hub, &store, request, Arc::new(|event| match event {
+        DownloadEvent::Progress { bytes, total, .. } => println!("{bytes} of {total:?}"),
+        DownloadEvent::Done(models) => println!("stored {} files", models.len()),
+        DownloadEvent::Error(err) => eprintln!("download failed: {err}"),
+        _ => {}
+    }))?;
+    let models = handle.wait()?;
+    println!("{} files ready", models.len());
+    Ok(())
+});
 
-// Any HTTPS URL, with a digest of your own.
+// Any HTTPS URL, with a digest of your own. Building this request does not touch the network.
 let id = ModelId::new("mirror", "tiny", "model.onnx")?;
 let request = DownloadRequest::from_url("https://example.com/model.onnx", id, Some("ab".repeat(32)), None)?;
-# let _ = (models, request);
+# let _ = (worker, request);
 # Ok::<(), frust_models::ModelsError>(())
 ```
 
@@ -108,8 +121,8 @@ let request = DownloadRequest::from_url("https://example.com/model.onnx", id, So
   counts summed over the whole bundle, `Verifying` per file, and exactly one of `Done`,
   `Cancelled` or `Error`. The sink runs on that thread: hand events to the UI and return.
   `DownloadHandle::wait` returns the same outcome; a cancelled job returns
-  `ModelsError::Cancelled`. Only one job at a time may target a given file
-  (`ModelsError::Busy`).
+  `ModelsError::Cancelled`; it blocks, so call it off the UI thread. Only one job at a time may
+  target a given file (`ModelsError::Busy`).
 - **Resume and verification.** A file already stored with the expected SHA-256 is skipped. An
   existing `.part` is hashed and the rest requested with `Range`; a server that ignores the
   range sends the whole file and the download restarts from zero. Each file is hashed while it
@@ -117,12 +130,16 @@ let request = DownloadRequest::from_url("https://example.com/model.onnx", id, So
   deletes the part and reports `HubError::SizeMismatch` or `HubError::Integrity`; a cancel or a
   network failure keeps it for the next attempt. When a later file of a bundle fails, the files
   before it stay stored. A manifest is marked `verified` only when the file had a published
-  digest to check.
+  digest to check. Only a download with a SHA-256 (a Hub file stored in LFS, or a `from_url`
+  request given one) is tamper-evident; without one, the size is the only check and the bytes
+  are only as trustworthy as the TLS connection that carried them.
 - **Tokens.** The token is sent as `Authorization: Bearer` only to the Hub origin (scheme, host
-  and port of the base URL) and is dropped on every redirect, so the CDN that serves the file
-  bytes never sees it. `HubClient`'s `Debug` output redacts it, and it is never logged. Gated or
-  private repositories answer `HubError::Unauthorized`, with `gated: true` when the terms still
-  need accepting on the Hub; a refused token is `HubError::Forbidden`.
+  and port of the base URL), on the first request and on any redirect hop that stays on that
+  origin, so the CDN that serves the file bytes never sees it. A token with a plain-`http://`
+  base URL off loopback is refused with `HubError::InsecureUrl` before any request.
+  `HubClient`'s `Debug` output redacts it, and it is never logged. Gated or private
+  repositories answer `HubError::Unauthorized`, with `gated: true` when the terms still need
+  accepting on the Hub; a refused token is `HubError::Forbidden`.
 - **Rate limits.** HTTP 429 is `HubError::RateLimited` with the server's `Retry-After`, when it
   gives one in seconds. Nothing retries automatically.
 - **Size limit.** `DownloadRequest::max_bytes` bounds the bundle's total size. It is checked
@@ -131,8 +148,12 @@ let request = DownloadRequest::from_url("https://example.com/model.onnx", id, So
   `HubError::TooLarge`.
 - **Network.** TLS is rustls on the ring provider with the bundled Mozilla roots on every
   target. Connecting times out after 30 s and a stalled response after 60 s without data; there
-  is no overall timeout, so large files can take as long as they need. At most 5 redirects are
-  followed.
+  is no overall timeout, so large files can take as long as they need.
+- **Redirects.** The client follows redirects itself, at most 5 (a sixth is
+  `HubError::TooManyRedirects`), and checks every hop before connecting to it: redirects must
+  stay on `https://`, and a hop to plain `http://` is `HubError::InsecureUrl` unless the first URL
+  and the hop are both on a loopback address. A listing's next page must be on the base URL's
+  scheme, host and port, or the call fails with `HubError::CrossOriginPage`.
 
 ## In a component
 
@@ -146,8 +167,17 @@ into signals a component's `build` reads.
 - `DownloadTracker::new()` runs one download at a time. `state()` is a
   `ReadSignal<DownloadState>` (`Idle`, `Running`, `Verifying`, `Done`, `Cancelled`,
   `Failed(String)`) and `progress()` a `ReadSignal<DownloadProgress>` with `bytes`, `total`,
-  `bytes_per_sec`, `file_index` and `files`. `start(&client, &store, request)` returns at once;
-  `cancel()` stops it at the next chunk and keeps the partial files.
+  `bytes_per_sec`, `file_index` and `files`.
+- `start_hub(&client, &store, repo, revision, paths)` is the call for an event handler: the
+  state is `Running` at once, the repository listing is fetched on `frust::spawn_blocking`, and
+  the download then runs on its own thread. A listing that fails or a missing path ends in
+  `Failed`. `start(&client, &store, request)` starts a request you already have, such as a
+  `DownloadRequest::from_url` one, and also returns at once. `cancel()` stops the download at
+  the next chunk, or before it starts if the listing is still being fetched, and keeps the
+  partial files.
+- For each download the state is `Running` first, then `Verifying` and `Running` may alternate
+  (at most one `Verifying` per file), then exactly one of `Done`, `Cancelled` or `Failed` comes
+  last. A `build` may miss a short state between frames; `on_state(observer)` sees every one.
 - `DownloadTracker::with_list(list)` links a list: the download thread rescans the store just
   before the state becomes `Done`, so a component that sees `Done` already sees the new models.
 - The code on the download thread only writes signals: it never reads one, never blocks on the
