@@ -1,0 +1,37 @@
+[package]
+name = "frust-onnx"
+version.workspace = true
+edition.workspace = true
+# Not the workspace MSRV: the exact-pinned `ort` (root Cargo.toml) requires Rust 1.92.
+rust-version = "1.92"
+license.workspace = true
+description = "ONNX model inference for Frust apps over ONNX Runtime: sessions from a model file or bytes, typed tensors, blocking runs."
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[features]
+default = []
+
+[dependencies]
+log = { workspace = true }
+thiserror = { workspace = true }
+
+# Each desktop row's feature set must equal one prebuilt row of ort-sys' `dist.tsv` exactly (no
+# `lax-feature-matching`): plain on Linux, `coreml` on Apple-silicon macOS, `directml` on Windows.
+# rustls only: native-tls/OpenSSL never enters the tree. `api-17` is the lowest level `ort` offers.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17"] }
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17", "coreml"] }
+
+[target.'cfg(all(target_os = "windows", target_env = "msvc", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17", "directml"] }
+
+# PLACEHOLDER, not a packaging decision: Android, iOS and every target without a prebuilt row (Intel
+# macOS included) load the ONNX Runtime library at run time. Mirrors `src/runtime.rs`' link cfg.
+[target.'cfg(not(any(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "macos", target_arch = "aarch64"), all(target_os = "windows", target_env = "msvc", any(target_arch = "x86_64", target_arch = "aarch64")))))'.dependencies]
+ort = { workspace = true, features = ["std", "load-dynamic", "api-17"] }
