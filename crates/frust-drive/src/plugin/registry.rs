@@ -1,4 +1,4 @@
-//! The static plugin registry (v1) — thirty entries mirroring `plugins/`:
+//! The static plugin registry (v1) — thirty-one entries mirroring `plugins/`:
 //! `shared-preferences` (dependency only), `secure-storage` (dependency plus
 //! an optional `biometric-gate` feature wiring in the plugin's own Android
 //! library module and the iOS plist key its README documents),
@@ -71,7 +71,10 @@
 //! (dependency, the plugin's own Android library module and the `PhotosUI`
 //! framework link; no permission or plist key in its base, and two optional
 //! features: `library` for album and asset browsing, and `save` for writing
-//! originals into the library), is described at `PHOTO_LIBRARY`.
+//! originals into the library), is described at `PHOTO_LIBRARY`. `models` is
+//! dependency only: an on-device model store and downloader needing no permission,
+//! Gradle module or plist key (the Hub downloads use the INTERNET permission the
+//! scaffold already declares).
 
 use std::borrow::Cow;
 
@@ -917,6 +920,23 @@ const DEVICE_INFO: PluginSpec = PluginSpec {
     ..PluginSpec::DEFAULT
 };
 
+/// `models`' single base contribution: a Cargo dependency only (a file store and an HTTPS
+/// downloader; no permission, Gradle module or plist key).
+const MODELS: PluginSpec = PluginSpec {
+    id: Cow::Borrowed("models"),
+    summary: Cow::Borrowed(
+        "On-device model store and resumable verified downloader (Hugging Face Hub or any \
+              HTTPS URL), with reactive handles for progress and a model list.",
+    ),
+    crate_dir: Cow::Borrowed("models"),
+    base: Cow::Borrowed(&[Contribution::CargoDep {
+        name: Cow::Borrowed("frust-models"),
+    }]),
+    optional_features: Cow::Borrowed(&[]),
+    requires_sibling: None,
+    ..PluginSpec::DEFAULT
+};
+
 /// `permissions`' feature contributions. Every feature turns on the matching
 /// cargo feature of `frust-permissions` and adds the app-side declarations
 /// the OS requires before it will show that permission's prompt.
@@ -1549,6 +1569,7 @@ pub fn known_plugins() -> Vec<PluginSpec> {
         PHOTO_LIBRARY,
         BACKGROUND_TASK,
         CHARTS,
+        MODELS,
     ]
 }
 
@@ -1569,7 +1590,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
-    fn registry_lists_the_thirty_v1_plugins() {
+    fn registry_lists_the_thirty_one_v1_plugins() {
         let plugins = known_plugins();
         let ids: Vec<&str> = plugins.iter().map(|p| &*p.id).collect();
         assert_eq!(
@@ -1605,8 +1626,22 @@ mod tests {
                 "photo-library",
                 "background-task",
                 "charts",
+                "models",
             ]
         );
+    }
+
+    /// `models` is one `CargoDep` on its own crate and nothing else.
+    #[test]
+    fn models_is_a_cargo_dep_and_nothing_else() {
+        let spec = find_plugin("models").unwrap();
+        assert_eq!(spec.crate_dir, "models");
+        assert!(spec.optional_features.is_empty());
+        assert_eq!(spec.requires_sibling, None);
+        assert!(matches!(
+            &*spec.base,
+            [Contribution::CargoDep { name }] if *name == "frust-models"
+        ));
     }
 
     /// No registry entry or feature states a platform floor, so adding any of

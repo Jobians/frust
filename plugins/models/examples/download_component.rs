@@ -1,0 +1,90 @@
+//! A model list with a download button and a progress line, in one `Component`.
+//!
+//! The component owns a `ModelList` and a `DownloadTracker`. `build` only reads their signals;
+//! the buttons write them through the handles. Run it inside a Frust app by passing
+//! `ModelsScreen` to `frust::app!`; here it only has to compile.
+
+use frust::{Component, Get, RwSignal, Set, View, button, column, text};
+use frust_models::api::{DownloadState, DownloadTracker, ModelList};
+use frust_models::{HubClient, ModelStore};
+
+#[derive(Default)]
+struct ModelsScreen;
+
+struct ScreenState {
+    list: ModelList,
+    tracker: DownloadTracker,
+    hub: HubClient,
+    /// The last error from starting a download, shown under the buttons.
+    problem: RwSignal<String>,
+}
+
+impl Component for ModelsScreen {
+    type State = ScreenState;
+
+    fn init(&self) -> ScreenState {
+        let store = ModelStore::open().expect("the app data directory is available");
+        let list = ModelList::new(store);
+        list.refresh();
+        ScreenState {
+            tracker: DownloadTracker::new().with_list(list.clone()),
+            list,
+            hub: HubClient::new()
+                .expect("the TLS configuration builds")
+                .with_token(std::env::var("HF_TOKEN").ok()),
+            problem: RwSignal::new(String::new()),
+        }
+    }
+
+    fn build(&self, state: &mut ScreenState) -> impl View<ScreenState> {
+        let progress = state.tracker.progress().get();
+        let line = match state.tracker.state().get() {
+            DownloadState::Idle => "No download".to_owned(),
+            DownloadState::Running => match progress.total {
+                Some(total) => format!(
+                    "File {} of {}: {} of {total} bytes",
+                    progress.file_index + 1,
+                    progress.files,
+                    progress.bytes
+                ),
+                None => format!("{} bytes", progress.bytes),
+            },
+            DownloadState::Verifying => "Checking the file".to_owned(),
+            DownloadState::Done => "Done".to_owned(),
+            DownloadState::Cancelled => "Cancelled; starting again resumes".to_owned(),
+            DownloadState::Failed(message) => format!("Failed: {message}"),
+        };
+
+        let mut models = column();
+        for model in state.list.models().get() {
+            models = models.child(text(format!("{} ({} bytes)", model.id, model.size_bytes)));
+        }
+
+        column()
+            .child(models)
+            .child(button("Download", |state: &mut ScreenState| {
+                // A model with its config and tokenizer, downloaded as one job.
+                let request = state.hub.request_for_main(
+                    "acme/tiny",
+                    &["model.onnx", "config.json", "tokenizer.json"],
+                );
+                let started = request.and_then(|request| {
+                    state.tracker.start(&state.hub, state.list.store(), request)
+                });
+                state
+                    .problem
+                    .set(started.err().map(|e| e.to_string()).unwrap_or_default());
+            }))
+            .child(button("Cancel", |state: &mut ScreenState| {
+                state.tracker.cancel();
+            }))
+            .child(text(line))
+            .child(text(state.problem.get()))
+    }
+}
+
+fn main() {
+    // The example is compiled to prove the API shape; a real app starts it with
+    // `frust::app!(ModelsScreen);`.
+    let _ = ModelsScreen;
+}

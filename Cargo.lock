@@ -2591,6 +2591,8 @@ name = "frust-models"
 version = "0.6.6"
 dependencies = [
  "frust-paths",
+ "frust-reactive",
+ "frust-ui",
  "log",
  "objc2 0.6.4",
  "objc2-foundation 0.3.2",

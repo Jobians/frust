@@ -5,6 +5,21 @@ directory, keeps a sidecar manifest beside each, and lists, imports and removes 
 inference and knows no model format: runtime plugins and apps ask it for a path and take it from
 there.
 
+## Add it
+
+```
+frust plugin add models
+```
+
+or add the dependency yourself: `frust-models = "0.6"`. It needs no permission, Gradle module or
+plist key beyond the `INTERNET` permission every scaffolded app already declares. Features:
+
+- `hub` (default): the Hub client and the downloader.
+- `frust-api` (default): the reactive handles described under "In a component". Turn it off
+  with `default-features = false` (adding `features = ["hub"]` to keep the downloader) for a build with no `frust-ui` in its graph.
+
+## Quick start
+
 ```rust,no_run
 use frust_models::{ModelId, ModelStore};
 
@@ -118,3 +133,35 @@ let request = DownloadRequest::from_url("https://example.com/model.onnx", id, So
   target. Connecting times out after 30 s and a stalled response after 60 s without data; there
   is no overall timeout, so large files can take as long as they need. At most 5 redirects are
   followed.
+
+## In a component
+
+With the default `frust-api` feature, `frust_models::api` turns the store and the downloader
+into signals a component's `build` reads.
+
+- `ModelList::new(store)` holds the stored models. It starts empty; call `refresh()` once (for
+  example in `init`). `refresh()` and `remove(id)` do their disk work on `frust::spawn_blocking`
+  and publish the new listing, so they need the reactive runtime a running app has.
+  `models()` is a `ReadSignal<Vec<LocalModel>>`.
+- `DownloadTracker::new()` runs one download at a time. `state()` is a
+  `ReadSignal<DownloadState>` (`Idle`, `Running`, `Verifying`, `Done`, `Cancelled`,
+  `Failed(String)`) and `progress()` a `ReadSignal<DownloadProgress>` with `bytes`, `total`,
+  `bytes_per_sec`, `file_index` and `files`. `start(&client, &store, request)` returns at once;
+  `cancel()` stops it at the next chunk and keeps the partial files.
+- `DownloadTracker::with_list(list)` links a list: the download thread rescans the store just
+  before the state becomes `Done`, so a component that sees `Done` already sees the new models.
+- The code on the download thread only writes signals: it never reads one, never blocks on the
+  UI and never calls back into the downloader. Dropping the tracker does not cancel the
+  download; call `cancel()` first.
+
+`examples/download_component.rs` shows the whole shape in one `Component`: a list of stored
+models, a download button, a cancel button and a progress line. It compiles under
+`cargo test -p frust-models --examples`.
+
+## Testing
+
+`cargo test -p frust-models` runs everything against an in-process loopback server that stands
+in for the Hub and its CDN (`tests/support`); nothing touches the network. Tests that need the
+reactive runtime call `frust_reactive::ReactiveRuntime::init` first, which starts the blocking
+pool `spawn_blocking` uses and opens no GPU device. Point a store at a scratch directory with
+`ModelStore::with_root`.
