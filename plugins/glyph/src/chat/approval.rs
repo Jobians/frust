@@ -23,6 +23,7 @@
 //!   live timer in ten-second steps; the outcome a status node.
 
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use frust::authoring::text::{
@@ -76,8 +77,7 @@ const SPOKEN_STEP: u64 = 10;
 pub struct ApprovalDeadline {
     start: Instant,
     total: Duration,
-    #[cfg(test)]
-    clock: Option<TestClock>,
+    clock: Clock,
 }
 
 impl ApprovalDeadline {
@@ -85,11 +85,15 @@ impl ApprovalDeadline {
     /// arrives and keep the value in app state; calling it from a view
     /// function restarts the countdown on every rebuild.
     pub fn after(remaining: Duration) -> Self {
+        Self::with_clock(remaining, Clock::default())
+    }
+
+    /// A deadline `remaining` from `clock`'s now, counted on that clock.
+    pub(crate) fn with_clock(remaining: Duration, clock: Clock) -> Self {
         Self {
-            start: Instant::now(),
+            start: clock.now(),
             total: remaining,
-            #[cfg(test)]
-            clock: None,
+            clock,
         }
     }
 
@@ -100,7 +104,7 @@ impl ApprovalDeadline {
 
     /// The time left now; zero once passed.
     pub fn remaining(&self) -> Duration {
-        let elapsed = self.now().saturating_duration_since(self.start);
+        let elapsed = self.clock.now().saturating_duration_since(self.start);
         self.total.saturating_sub(elapsed)
     }
 
@@ -111,48 +115,36 @@ impl ApprovalDeadline {
         }
         (remaining.as_secs_f64() / self.total.as_secs_f64()).clamp(0.0, 1.0)
     }
+}
 
+/// The monotonic clock a deadline reads: `web_time::Instant::now` by default,
+/// or a function a test moves by hand. Equal only to its own clones.
+#[derive(Clone, Default)]
+pub(crate) struct Clock(Option<Arc<dyn Fn() -> Instant + Send + Sync>>);
+
+impl Clock {
     fn now(&self) -> Instant {
-        #[cfg(test)]
-        if let Some(clock) = &self.clock {
-            return clock.now();
-        }
-        Instant::now()
+        self.0.as_ref().map_or_else(Instant::now, |now| now())
     }
 }
 
-/// A clock the tests move by hand; equal only to its own clones.
-#[cfg(test)]
-#[derive(Clone, Debug)]
-struct TestClock(Rc<std::cell::Cell<Instant>>);
-
-#[cfg(test)]
-impl TestClock {
-    fn new() -> Self {
-        Self(Rc::new(std::cell::Cell::new(Instant::now())))
-    }
-
-    fn now(&self) -> Instant {
-        self.0.get()
-    }
-
-    fn advance(&self, by: Duration) {
-        self.0.set(self.0.get() + by);
-    }
-
-    fn deadline(&self, remaining: Duration) -> ApprovalDeadline {
-        ApprovalDeadline {
-            start: self.now(),
-            total: remaining,
-            clock: Some(self.clone()),
-        }
-    }
-}
-
-#[cfg(test)]
-impl PartialEq for TestClock {
+impl PartialEq for Clock {
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        match (&self.0, &other.0) {
+            (None, None) => true,
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Clock(manual)"
+        } else {
+            "Clock(monotonic)"
+        })
     }
 }
 
@@ -1034,6 +1026,51 @@ mod tests {
     use std::any::Any;
 
     const SECS_30: Duration = Duration::from_secs(30);
+
+    /// A clock the tests move by hand; deadlines it makes count on it.
+    #[derive(Clone)]
+    struct TestClock(Arc<std::sync::Mutex<Instant>>);
+
+    impl TestClock {
+        fn new() -> Self {
+            Self(Arc::new(std::sync::Mutex::new(Instant::now())))
+        }
+
+        fn advance(&self, by: Duration) {
+            let mut now = self.0.lock().expect("test clock");
+            *now += by;
+        }
+
+        fn deadline(&self, remaining: Duration) -> ApprovalDeadline {
+            let cell = Arc::clone(&self.0);
+            let clock = Clock(Some(Arc::new(move || *cell.lock().expect("test clock"))));
+            ApprovalDeadline::with_clock(remaining, clock)
+        }
+    }
+
+    #[test]
+    fn the_real_clock_counts_down_and_a_zero_deadline_expires_the_card() {
+        fn shared<T: Send + Sync>(_: &T) {}
+        let d = ApprovalDeadline::after(SECS_30);
+        shared(&d);
+        let left = d.remaining();
+        assert!(
+            left <= SECS_30 && left > SECS_30 - Duration::from_secs(5),
+            "{left:?}"
+        );
+        assert_eq!(d.clone(), d);
+        assert_eq!(
+            ApprovalDeadline::after(Duration::ZERO).remaining(),
+            Duration::ZERO
+        );
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(2)).expires(ApprovalDeadline::after(Duration::ZERO)));
+        rig.frame();
+        let (label, _) = rig.node(Role::Status).expect("expired shown");
+        assert_eq!(label, "Expired");
+        assert!(rig.buttons().is_empty());
+        assert!(!rig.frame().needs_frame, "no frames once expired");
+    }
 
     #[derive(Default)]
     struct App {
