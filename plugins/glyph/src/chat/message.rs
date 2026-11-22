@@ -12,7 +12,8 @@
 //!   `.streaming(..)` is forwarded to it.
 //! - **Thought.** One muted line while closed (a label, then the first line
 //!   ellipsized) with a chevron; open, the text as dimmed markdown. The
-//!   closed row's height never depends on the text.
+//!   closed height never depends on the text, and the header is a live
+//!   toggle only with `.on_thought_toggle(..)`.
 //! - **Copy.** With `.on_copy(..)` a user or assistant row shows an always
 //!   visible copy control: a press writes the clipboard with the source
 //!   text, then calls back; while `.streaming(true)` it stays put but inert.
@@ -260,7 +261,8 @@ impl MessageRowWidget {
 
     fn hit(&self, p: Point) -> Option<Target> {
         if self.role == ChatRole::Thought {
-            return self.toggle_rect().contains(p).then_some(Target::Toggle);
+            let live = self.on_toggle.is_some() && self.toggle_rect().contains(p);
+            return live.then_some(Target::Toggle);
         }
         (self.copy_live() && self.copy_rect.contains(p)).then_some(Target::Copy)
     }
@@ -610,7 +612,11 @@ impl Widget for MessageRowWidget {
                     ctx.push_node(Role::Button, |node| {
                         node.set_label("Thought");
                         node.set_expanded(self.thought_open);
-                        node.add_action(Action::Click);
+                        if self.on_toggle.is_some() {
+                            node.add_action(Action::Click);
+                        } else {
+                            node.set_disabled();
+                        }
                         node.set_bounds(bounds(self.toggle_rect()));
                     });
                 }
@@ -622,6 +628,8 @@ impl Widget for MessageRowWidget {
                         node.set_label("Copy message");
                         if self.copy_live() {
                             node.add_action(Action::Click);
+                        } else {
+                            node.set_disabled();
                         }
                         node.set_bounds(bounds(self.copy_rect));
                     });
@@ -927,6 +935,47 @@ mod tests {
                     .iter()
                     .any(|(_, n)| n.label() == Some("Copy message"))
             );
+        }
+    }
+
+    #[test]
+    fn inert_controls_take_no_press_and_report_no_click() {
+        let button = |rig: &Rig, label: &str| {
+            let update = rig.root.semantics();
+            let (_, n) = update
+                .nodes
+                .iter()
+                .find(|(_, n)| n.role() == Role::Button && n.label() == Some(label))
+                .unwrap_or_else(|| panic!("no {label} button"));
+            (
+                n.supports_action(Action::Click),
+                n.is_disabled(),
+                n.bounds(),
+            )
+        };
+        let mut rig = Rig::new(true, 400.0);
+        rig.show(|_| message_row(ChatRole::Thought, "thinking"));
+        let (click, disabled, bounds) = button(&rig, "Thought");
+        assert_eq!((click, disabled), (false, true), "no toggle, no click");
+        let b = bounds.expect("bounds");
+        let header = Point::new((b.x0 + b.x1) / 2.0, (b.y0 + b.y1) / 2.0);
+        rig.click(header);
+        rig.show(|_| {
+            message_row(ChatRole::Thought, "thinking")
+                .on_thought_toggle(|app: &mut App| app.toggles += 1)
+        });
+        assert_eq!(button(&rig, "Thought").0, true);
+        rig.click(header);
+        assert_eq!(rig.app.toggles, 1, "the header fires once it is live");
+
+        for (streaming, live) in [(true, false), (false, true)] {
+            rig.show(|_| {
+                message_row(ChatRole::Assistant, "hi")
+                    .streaming(streaming)
+                    .on_copy(|_: &mut App, _| {})
+            });
+            let (click, disabled, _) = button(&rig, "Copy message");
+            assert_eq!((click, disabled), (live, !live), "streaming {streaming}");
         }
     }
 
