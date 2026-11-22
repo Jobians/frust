@@ -16,6 +16,6 @@ kurbo = { workspace = true }
 peniko = { workspace = true }
 frust-material = { path = "../../plugins/material" }
 frust-cupertino = { path = "../../plugins/cupertino" }
-frust-glyph = { path = "../../plugins/glyph" }
+frust-glyph = { path = "../../plugins/glyph", features = ["chat"] }
 frust-shadcn = { path = "../../plugins/shadcn" }
 frust-beui = { path = "../../plugins/beui" }
