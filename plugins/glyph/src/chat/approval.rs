@@ -5,22 +5,22 @@
 //!
 //! - **Controlled and non-reactive.** The caller owns the [`ApprovalState`]
 //!   and `.busy(..)`; a tap reports the option's id through `.on_select(..)`
-//!   and then disables the options until the caller changes either, so a
-//!   double tap fires once.
-//! - **Options** keep the given order inside two groups: the allow kinds
-//!   first (filled, the accent role), then the reject kinds (outlined, quiet).
-//!   Each is a full-width button at least [`MIN_TARGET`] px high whose label
-//!   wraps to two lines, then elides; the "always" kinds carry a text tag.
+//!   and then disables the options until the caller changes either, or the
+//!   request itself (title, detail, options or deadline), so a double tap
+//!   fires once and a new request in the same slot starts fresh. A press
+//!   only fires against the request it began on.
+//! - **Options**: allow kinds first (filled), then reject kinds (outlined),
+//!   each group in the given order; full-width buttons at least
+//!   [`MIN_TARGET`] px high, label wrapping to two lines then eliding.
 //! - **Countdown.** `.expires(..)` takes an [`ApprovalDeadline`] made once per
-//!   request. While pending, the seconds text changes at most once a second
-//!   (one relayout each) and a thin bar drains on paced frames; at zero the
-//!   options disable and the expired presentation shows until the caller
-//!   sets [`ApprovalState::Expired`]. Nothing requests frames once resolved.
-//! - **Resolved states** show one outcome line with a text mark (never
-//!   colour alone) and the chosen label when `.selected(..)` names an option.
-//! - **Semantics.** A labelled group; each option a button with its label
-//!   and kind; the countdown a live timer value in ten-second steps; the
-//!   outcome a status node.
+//!   request; at zero the options disable. Nothing requests frames once resolved.
+//! - **Untrusted text.** Control, bidi and zero-width characters in the title,
+//!   detail and labels are shown as `?`; option ids are never altered.
+//! - **Long detail.** Past [`DETAIL_MAX_LINES`] the block scrolls and a fixed
+//!   note says more exists. Known limit (owner decision): the options stay
+//!   active whether or not the rest was scrolled into view.
+//! - **Semantics.** A labelled group; each option a button; the countdown a
+//!   live timer in ten-second steps; the outcome a status node.
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -51,6 +51,8 @@ const TITLE_FONT_SIZE: f32 = 14.0;
 const OPTION_FONT_SIZE: f32 = 13.0;
 /// Lines of detail shown before the block scrolls.
 const DETAIL_MAX_LINES: f64 = 6.0;
+/// The always-present note under a detail that scrolls.
+const OVERFLOW_NOTE: &str = "More lines below, scroll to read";
 const LABEL_MAX_LINES: usize = 2;
 const HINT_MAX_LINES: usize = 3;
 const BUTTON_PAD_X: f64 = 12.0;
@@ -70,8 +72,13 @@ const SPOKEN_STEP: u64 = 10;
 const DARK: ColorScheme = crate::tokens::color::dark();
 
 /// When an approval request stops waiting: made once, from the time left,
-/// when the request arrives, so a rebuild with an equal value keeps counting
-/// from the same instant. Monotonic (`web_time::Instant`), never wall-clock.
+/// when the request arrives, and stored in app state, so a rebuild with an
+/// equal value keeps counting from the same instant. Monotonic
+/// (`web_time::Instant`), never wall-clock.
+///
+/// Equality compares the creation instant: a deadline built inside a view
+/// function differs on every rebuild, so the countdown restarts each time
+/// and the card never expires.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ApprovalDeadline {
     start: Instant,
@@ -81,7 +88,9 @@ pub struct ApprovalDeadline {
 }
 
 impl ApprovalDeadline {
-    /// A deadline `remaining` from now.
+    /// A deadline `remaining` from now. Call it once when the request
+    /// arrives and keep the value in app state; calling it from a view
+    /// function restarts the countdown on every rebuild.
     pub fn after(remaining: Duration) -> Self {
         Self {
             start: Instant::now(),
@@ -174,6 +183,24 @@ fn spoken_remaining(remaining: Duration) -> String {
     format!("about {step} seconds left")
 }
 
+/// `text` as displayed: control, bidi and zero-width characters (newline and
+/// tab kept) become a visible `?`.
+fn display_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            let hidden = (c.is_control() && c != '\n' && c != '\t')
+                || matches!(
+                    c,
+                    '\u{202A}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{200B}'..='\u{200F}'
+                        | '\u{FEFF}'
+                );
+            if hidden { '?' } else { c }
+        })
+        .collect()
+}
+
 /// What a kind is called to assistive technology.
 fn kind_words(kind: ApprovalOptionKind) -> &'static str {
     match kind {
@@ -229,7 +256,7 @@ impl Spec {
             .as_deref()
             .and_then(|id| self.options.iter().find(|o| o.id == id));
         match chosen {
-            Some(o) => format!("{word}: {}", o.label),
+            Some(o) => format!("{word}: {}", display_text(&o.label)),
             None => word.to_owned(),
         }
     }
@@ -278,7 +305,8 @@ impl<State: 'static> ApprovalCardView<State> {
         self
     }
 
-    /// Count down to `deadline` while pending.
+    /// Count down to `deadline` while pending. Pass the same stored value
+    /// on every rebuild; a deadline made afresh each time never expires.
     pub fn expires(mut self, deadline: ApprovalDeadline) -> Self {
         self.spec.deadline = Some(deadline);
         self
@@ -311,7 +339,7 @@ impl<State: 'static> ApprovalCardView<State> {
     }
 
     fn title_view(&self) -> TextView {
-        text(self.title.as_str())
+        text(display_text(&self.title))
             .size(TITLE_FONT_SIZE)
             .weight(FontWeight::SEMI_BOLD)
             .overflow_wrap(OverflowWrap::Anywhere)
@@ -320,7 +348,7 @@ impl<State: 'static> ApprovalCardView<State> {
 
 fn detail_view<State: 'static>(detail: &str) -> ScrollView<State> {
     scroll_view(
-        text(detail)
+        text(display_text(detail))
             .size(style::CODE_FONT_SIZE as f32)
             .themed_mono_family()
             .overflow_wrap(OverflowWrap::Anywhere),
@@ -415,6 +443,8 @@ pub struct ApprovalCardWidget {
     buttons: Vec<OptionButton>,
     outcome: Option<(TextLayout, Point)>,
     hint: Option<(TextLayout, Point)>,
+    /// The note shown while the detail scrolls, and its size.
+    overflow: Option<(TextLayout, Point)>,
     shown_secs: Option<u64>,
     /// A select fired; options stay off until state or busy changes.
     answered: bool,
@@ -508,7 +538,7 @@ impl ApprovalCardWidget {
                 .map_or(0.0, |t| t.size().width + style::PAD_SMALL);
             let label_w = (inner - BUTTON_PAD_X * 2.0 - tag_w).max(1.0);
             let label = text.layout_bounded(
-                &option.label,
+                &display_text(&option.label),
                 label_style,
                 Some(label_w as f32),
                 Some(LABEL_MAX_LINES),
@@ -709,7 +739,7 @@ impl<State: 'static> View<State> for ApprovalCardView<State> {
     fn build(&self, ctx: &mut BuildCtx<'_>) -> ApprovalCardWidget {
         ApprovalCardWidget {
             spec: self.spec.clone(),
-            title: self.title.clone(),
+            title: display_text(&self.title),
             on_select: self.on_select.as_ref().map(erase_callback_arg),
             title_pod: build_child::<State, _>(&self.title_view(), ctx),
             detail: self
@@ -724,6 +754,7 @@ impl<State: 'static> View<State> for ApprovalCardView<State> {
             buttons: Vec::new(),
             outcome: None,
             hint: None,
+            overflow: None,
             shown_secs: None,
             answered: false,
             timed_out: false,
@@ -741,7 +772,7 @@ impl<State: 'static> View<State> for ApprovalCardView<State> {
         let mut flags = ChangeFlags::NONE;
         element.on_select = self.on_select.as_ref().map(erase_callback_arg);
         if prev.title != self.title {
-            element.title = self.title.clone();
+            element.title = display_text(&self.title);
             flags |= rebuild_child::<State, _>(
                 &prev.title_view(),
                 &self.title_view(),
@@ -773,11 +804,22 @@ impl<State: 'static> View<State> for ApprovalCardView<State> {
             _ => {}
         }
         let (old, new) = (&prev.spec, &self.spec);
+        let new_request = prev.title != self.title
+            || prev.detail != self.detail
+            || old.options != new.options
+            || old.deadline != new.deadline;
+        if new_request {
+            element.answered = false;
+            element.timed_out = false;
+            element.pressed = None;
+            element.captured = None;
+            flags |= ChangeFlags::PAINT;
+        }
         if old != new || prev.on_select.is_some() != self.on_select.is_some() {
             if old.state != new.state || old.busy != new.busy {
                 element.answered = false;
             }
-            if old.state != new.state || old.deadline != new.deadline {
+            if old.state != new.state {
                 element.timed_out = false;
             }
             element.spec = new.clone();
@@ -823,12 +865,14 @@ impl Widget for ApprovalCardWidget {
         self.title_pod.set_origin(Point::new(style::PAD, y));
         y += title.height;
 
+        self.overflow = None;
         if let Some(detail) = self.detail.as_mut() {
             y += style::BLOCK_GAP;
             let text_w = (inner - style::PAD_SMALL * 2.0).max(0.0);
             let cap = line_h * DETAIL_MAX_LINES;
             let mut h = detail.layout_child(ctx, &loose(text_w)).height;
-            if h > cap + 0.5 {
+            let overflows = h > cap + 0.5;
+            if overflows {
                 h = detail
                     .layout_child(ctx, &BoxConstraints::tight(Size::new(text_w, cap)))
                     .height;
@@ -844,6 +888,19 @@ impl Widget for ApprovalCardWidget {
                 y + h + style::PAD_SMALL * 2.0,
             );
             y = self.detail_rect.y1;
+            if overflows {
+                let note = ctx.text_context::<TextContext>().layout_bounded(
+                    OVERFLOW_NOTE,
+                    &ts.muted,
+                    Some(inner as f32),
+                    Some(2),
+                    TextOverflow::Ellipsis,
+                );
+                y += style::ROW_GAP;
+                let at = Point::new(style::PAD, y);
+                y += note.size().height;
+                self.overflow = Some((note, at));
+            }
         }
 
         self.check_deadline();
@@ -888,7 +945,10 @@ impl Widget for ApprovalCardWidget {
         if self.spec.busy && self.shown_state().is_pending() {
             self.loader.paint_child(ctx, scene);
         }
-        for (layout, at) in [&self.outcome, &self.hint].into_iter().flatten() {
+        for (layout, at) in [&self.outcome, &self.hint, &self.overflow]
+            .into_iter()
+            .flatten()
+        {
             paint_layout(layout, Point::new(o.x + at.x, o.y + at.y), scene);
         }
         outline(scene, o, size, style::RADIUS, pal.border);
@@ -964,6 +1024,13 @@ impl Widget for ApprovalCardWidget {
                     x1: origin.x + r.x1,
                     y1: origin.y + r.y1,
                 };
+                if let Some((note, at)) = &self.overflow {
+                    let r = Rect::from_origin_size(*at, note.size());
+                    ctx.push_node(Role::Label, |node| {
+                        node.set_label(OVERFLOW_NOTE);
+                        node.set_bounds(bounds(r));
+                    });
+                }
                 let state = self.shown_state();
                 if !state.is_pending() {
                     let mut text = self.spec.outcome(state);
@@ -997,7 +1064,7 @@ impl Widget for ApprovalCardWidget {
                 for b in &self.buttons {
                     let option = &self.spec.options[b.option];
                     ctx.push_node(Role::Button, |node| {
-                        node.set_label(option.label.as_str());
+                        node.set_label(display_text(&option.label));
                         node.set_description(kind_words(option.kind));
                         node.set_bounds(bounds(b.rect));
                         if live {
@@ -1131,6 +1198,33 @@ mod tests {
                         n.value().unwrap_or_default().to_owned(),
                     )
                 })
+        }
+
+        fn pointer(&mut self, phase: PointerPhase, at: Point) {
+            let e = InputEvent::Pointer(PointerEvent {
+                phase,
+                position: at,
+                button: PointerButton::Primary,
+            });
+            self.root.event(&mut self.app, &e);
+        }
+
+        /// Every label and value the semantics tree carries, joined.
+        fn all_text(&self) -> String {
+            let update = self.root.semantics();
+            let mut out = String::new();
+            for (_, n) in &update.nodes {
+                out += n.label().unwrap_or_default();
+                out += "|";
+                out += n.value().unwrap_or_default();
+                out += "|";
+            }
+            out
+        }
+
+        fn has_label(&self, label: &str) -> bool {
+            let update = self.root.semantics();
+            update.nodes.iter().any(|(_, n)| n.label() == Some(label))
         }
 
         fn tap(&mut self, at: Point) {
@@ -1597,5 +1691,155 @@ mod tests {
             );
             rig.frame();
         }
+    }
+
+    fn lines(n: usize) -> String {
+        vec!["line"; n].join("\n")
+    }
+
+    /// Answer request A, then show `next`; the new request's first option
+    /// must be live and a tap must fire its id.
+    fn answered_then(next: ApprovalCardView<App>, want: &str) {
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(2)).detail("a"));
+        rig.tap(rig.buttons()[0].2.center());
+        assert_eq!(rig.app.picked, ["o0"]);
+        rig.show(next);
+        let buttons = rig.buttons();
+        assert!(buttons.iter().all(|b| !b.3), "the new request is live");
+        rig.tap(buttons[0].2.center());
+        assert_eq!(rig.app.picked, ["o0", want]);
+    }
+
+    fn fresh_options() -> Vec<ApprovalOption> {
+        vec![
+            opt("n0", ApprovalOptionKind::AllowOnce),
+            opt("n1", ApprovalOptionKind::RejectOnce),
+        ]
+    }
+
+    #[test]
+    fn a_new_request_after_an_answered_one_is_live() {
+        answered_then(card(fresh_options()).detail("a"), "n0");
+        answered_then(
+            approval_card("Another question?", options(2))
+                .detail("a")
+                .on_select(|app: &mut App, id| app.picked.push(id.to_owned())),
+            "o0",
+        );
+        answered_then(card(options(2)).detail("b"), "o0");
+        let clock = TestClock::new();
+        answered_then(
+            card(options(2))
+                .detail("a")
+                .expires(clock.deadline(SECS_30)),
+            "o0",
+        );
+    }
+
+    #[test]
+    fn a_new_request_after_an_answered_one_offers_click() {
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(2)));
+        rig.tap(rig.buttons()[0].2.center());
+        rig.show(card(fresh_options()));
+        let update = rig.root.semantics();
+        let clicks = update
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.role() == Role::Button)
+            .filter(|(_, n)| n.supports_action(Action::Click))
+            .count();
+        assert_eq!(clicks, 2);
+    }
+
+    #[test]
+    fn a_press_does_not_survive_a_different_request() {
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(2)));
+        let at = rig.buttons()[0].2.center();
+        rig.pointer(PointerPhase::Down, at);
+        rig.show(card(fresh_options()));
+        rig.pointer(PointerPhase::Up, rig.buttons()[0].2.center());
+        assert!(rig.app.picked.is_empty(), "nothing fires");
+    }
+
+    #[test]
+    fn a_press_survives_a_rebuild_with_an_equal_request() {
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(2)));
+        let at = rig.buttons()[0].2.center();
+        rig.pointer(PointerPhase::Down, at);
+        rig.show(card(options(2)));
+        rig.pointer(PointerPhase::Up, at);
+        assert_eq!(rig.app.picked, ["o0"]);
+    }
+
+    #[test]
+    fn a_detail_past_the_cap_shows_the_overflow_note() {
+        let mut heights = Vec::new();
+        for (n, expect) in [(1, false), (6, false), (7, true), (40, true)] {
+            let mut rig = Rig::new(true, 360.0);
+            rig.show(card(options(1)).detail(lines(n)));
+            assert_eq!(rig.has_label(OVERFLOW_NOTE), expect, "{n} lines");
+            heights.push(rig.card().height());
+        }
+        assert!(heights[2] > heights[1], "the note takes room");
+        assert!((heights[2] - heights[3]).abs() < 0.5, "a constant note");
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(1)));
+        assert!(!rig.has_label(OVERFLOW_NOTE));
+    }
+
+    #[test]
+    fn displayed_text_replaces_hidden_characters_with_a_question_mark() {
+        let raw = "x\u{202E}a\u{2066}b\u{200B}c\u{0007}d\u{0085}e\u{FEFF}f";
+        assert_eq!(display_text(raw), "x?a?b?c?d?e?f");
+        assert_eq!(display_text("a\tb\nc"), "a\tb\nc");
+        let id = "id\u{202E}1";
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(
+            approval_card(
+                format!("T{raw}"),
+                vec![ApprovalOption {
+                    id: id.into(),
+                    label: format!("L{raw}"),
+                    kind: ApprovalOptionKind::AllowOnce,
+                }],
+            )
+            .detail(format!("D\ta\n{raw}"))
+            .on_select(|app: &mut App, id| app.picked.push(id.to_owned())),
+        );
+        let text = rig.all_text();
+        for c in ['\u{202E}', '\u{2066}', '\u{200B}', '\u{0007}', '\u{0085}'] {
+            assert!(!text.contains(c), "{c:?} shown");
+        }
+        assert!(rig.has_label("Tx?a?b?c?d?e?f"));
+        assert!(rig.has_label("Lx?a?b?c?d?e?f"));
+        rig.tap(rig.buttons()[0].2.center());
+        assert_eq!(rig.app.picked, [id]);
+    }
+
+    #[test]
+    fn a_deadline_made_afresh_on_every_rebuild_restarts_the_countdown() {
+        let clock = TestClock::new();
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(2)).expires(clock.deadline(SECS_30)));
+        clock.advance(Duration::from_secs(10));
+        let stored = clock.deadline(SECS_30);
+        clock.advance(Duration::from_secs(10));
+        rig.show(card(options(2)).expires(stored));
+        let kept = bar_share(&mut rig);
+        clock.advance(Duration::from_secs(5));
+        rig.show(card(options(2)).expires(clock.deadline(SECS_30)));
+        assert!(kept < 1.0, "a stored deadline keeps counting");
+        assert!((bar_share(&mut rig) - 1.0).abs() < 1e-3, "restarted");
+        let first = clock.deadline(SECS_30);
+        clock.advance(Duration::from_millis(1));
+        assert_ne!(
+            clock.deadline(SECS_30),
+            first,
+            "a fresh deadline is unequal"
+        );
     }
 }
