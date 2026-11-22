@@ -105,6 +105,20 @@ impl EditLayout {
     /// (`shaped` may cover more: an empty text is shaped as one sizing space,
     /// which yields no unit).
     pub(crate) fn new(text_len: usize, shaped: &Shaped, table: &LineTable) -> Self {
+        Self::with_ellipsis(text_len, shaped, None, table)
+    }
+
+    /// [`Self::new`] for a table that may end a capped line in `ellipsis`
+    /// (the separately shaped ellipsis its [`Source::Ellipsis`] items read):
+    /// the ellipsis yields no unit, but its advance moves the pen, so the
+    /// units after it on screen (a right-to-left line's text) keep their
+    /// place.
+    pub(crate) fn with_ellipsis(
+        text_len: usize,
+        shaped: &Shaped,
+        ellipsis: Option<&Shaped>,
+        table: &LineTable,
+    ) -> Self {
         let byte_of = |char_index: u32| {
             shaped
                 .chars
@@ -118,7 +132,26 @@ impl EditLayout {
             let first_unit = units.len();
             let mut pen = line.metrics.offset;
             for item in &table.items[line.items.clone()] {
-                if item.source != Source::Text || item.clusters.is_empty() {
+                if item.clusters.is_empty() {
+                    continue;
+                }
+                if item.source != Source::Text {
+                    // The glyph emitter's advance: the glyphs', or the
+                    // cluster's own for a glyphless one.
+                    if let Some(ellipsis) = ellipsis {
+                        pen += ellipsis.clusters[item.clusters.clone()]
+                            .iter()
+                            .map(|c| {
+                                let glyphs = &ellipsis.glyphs
+                                    [c.glyphs.start as usize..c.glyphs.end as usize];
+                                if glyphs.is_empty() {
+                                    c.advance
+                                } else {
+                                    glyphs.iter().map(|g| g.advance).sum()
+                                }
+                            })
+                            .sum::<f32>();
+                    }
                     continue;
                 }
                 let run = &shaped.runs[item.run];
@@ -189,7 +222,15 @@ impl EditLayout {
                 text: line.text.start.min(text_len)..line.text.end.min(text_len),
                 advance: units[line_units.clone()].iter().map(|u| u.advance).sum(),
                 units: line_units,
-                offset: m.offset,
+                // Past an ellipsis drawn at the line's left (a right-to-left
+                // line's end), the units start where the ellipsis ends: the
+                // ellipsis sits at a visual edge, so the units stay contiguous
+                // from there. Without one, the first unit starts at the
+                // aligned offset itself.
+                offset: match (ellipsis, units.get(first_unit)) {
+                    (Some(_), Some(first)) => first.x,
+                    _ => m.offset,
+                },
                 ascent: m.ascent,
                 descent: m.descent,
                 top,

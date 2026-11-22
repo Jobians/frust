@@ -21,12 +21,13 @@
 mod align;
 mod r#break;
 mod decoration;
+mod geometry;
 mod metrics;
 mod reorder;
 mod truncate;
 
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use kurbo::{Point, Size};
 
@@ -37,6 +38,7 @@ use crate::shape::{Shaped, ShapedCluster, ShapedRun};
 use crate::style::{OverflowWrap, TextStyle};
 use r#break::{BreakReason, BrokenLine, break_lines};
 pub use decoration::{DecorationKind, DecorationRect};
+pub use geometry::{TextAffinity, TextPosition};
 pub(crate) use metrics::LineMetrics;
 pub(crate) use truncate::ELLIPSIS;
 
@@ -420,6 +422,10 @@ pub struct TextLayout {
     /// so one rebuilt every paint reuses it too. The memo carries the
     /// context's `.notdef` counter, which only the filling walk adds to.
     base_runs: RunMemo,
+    /// The caret model behind the read-only geometry queries
+    /// ([`Self::range_rects`] and its neighbours in `geometry`), built on the
+    /// first one and kept for the layout's life.
+    geometry: OnceLock<geometry::Geometry>,
 }
 
 impl TextLayout {
@@ -459,6 +465,7 @@ impl TextLayout {
             size,
             truncation: Truncation::default(),
             base_runs,
+            geometry: OnceLock::new(),
         }
     }
 

@@ -15,10 +15,10 @@
 //! taking it over cancels it. Each link is a `Role::Link` child of the
 //! paragraph node, with no focus stop of its own.
 //!
-//! `frust-text` publishes no per-range geometry, so fragments come from a
-//! probe layout striking each marked group through in a colour encoding its
-//! index (decoration never changes shaping or breaking), on line boxes
-//! measured as the layout's height capped at each line count.
+//! Fragments come from the laid-out paragraph's own geometry
+//! ([`TextLayout::range_rects`] over each marked group's byte range, newlines
+//! left out), set on the line boxes of [`TextLayout::line_bounds`]: no second
+//! layout is made for them.
 
 use std::any::TypeId;
 use std::ops::Range;
@@ -31,8 +31,8 @@ use frust_core::{
     TextInspect, View, Widget,
 };
 use frust_text::{
-    DecorationKind, FontFamily, FontStyle, FontWeight, LocaleStamp, OverflowWrap, TextAlign,
-    TextContext, TextDecoration, TextLayout, TextOverflow, TextSpan, TextStyle,
+    FontFamily, FontStyle, FontWeight, LocaleStamp, OverflowWrap, TextAlign, TextContext,
+    TextDecoration, TextLayout, TextOverflow, TextSpan, TextStyle,
 };
 use frust_theme::{ColorScheme, ShapeScale, SurfaceRole, Theme};
 use kurbo::{Point, Rect, Size};
@@ -625,21 +625,21 @@ impl Widget for RichTextWidget {
             self.view.max_lines,
             self.view.overflow,
         );
-        let tags: Vec<Option<usize>> = groups
+        let joined: String = texts.concat();
+        let mut start = 0;
+        let marked: Vec<(Range<usize>, usize)> = groups
             .iter()
-            .map(|g| self.view.spans[g.style].is_marked().then_some(g.style))
+            .zip(&texts)
+            .filter_map(|(g, text)| {
+                let range = start..start + text.len();
+                start = range.end;
+                self.view.spans[g.style]
+                    .is_marked()
+                    .then_some((range, g.style))
+            })
             .collect();
-        let fragments = marked_fragments(
-            text_ctx,
-            &spans,
-            &tags,
-            &layout,
-            max_width,
-            self.view.max_lines,
-            self.view.overflow,
-        );
+        let fragments = marked_fragments(&layout, &joined, &marked);
         let size = bc.constrain(layout.size());
-        let joined: String = self.view.spans.iter().map(|s| s.content.as_str()).collect();
         self.inspect = Some(text_inspect(&joined, &layout, self.view.max_lines));
         self.layout = Some(layout);
         self.fragments = fragments;
@@ -776,144 +776,69 @@ impl Widget for RichTextWidget {
     }
 }
 
-/// Encodes group index `group` as a decoration colour the probe layout
-/// hands back unchanged on its line-through rects. Zero marks a group that
-/// is not tagged (it still gets a rect, so every line with text has one).
-fn group_tag(group: usize) -> Color {
-    Color::new([(group + 1) as f32, 0.0, 0.0, 1.0])
-}
-
-/// The line fragments of every tagged group (`tags[g]` names its first
-/// span), in line order, for `layout`: the layout of `spans` at
-/// `max_width`, capped by `max_lines` and `overflow`.
+/// The line fragments of every marked group (`marked` holds each one's byte
+/// range in `text`, the layout's source, and its first span), sorted by line
+/// and then left edge.
 ///
-/// A probe re-lays `spans` with every group struck through in its
-/// [`group_tag`], so the line-through rects give each group's pen extent
-/// per line. The rects arrive line by line, so when they fall into exactly
-/// `layout.line_count()` bands (every line has text) a rect's band is its
-/// line with no further layout. Otherwise (blank lines, whitespace-only
-/// lines) each rect's line is bisected over line tops. Either way the line
-/// boxes are the heights of `spans` capped at `k` lines (breaking is greedy,
-/// so the first `k` lines are unchanged), measured only at the boundaries a
-/// marked fragment needs, never for unmarked lines above it. Touching pieces
-/// of one group on a line (a face change inside it) merge.
+/// A group's fragments are the [`TextLayout::range_rects`] of its range with
+/// every newline left out (a newline draws nothing, so it gets no fill and no
+/// hit area), each widened to its line's box ([`TextLayout::line_bounds`]) so
+/// the fills of consecutive lines meet. Text a `max_lines` cut dropped has no
+/// fragment.
 fn marked_fragments(
-    text_ctx: &mut TextContext,
-    spans: &[TextSpan<'_>],
-    tags: &[Option<usize>],
     layout: &TextLayout,
-    max_width: Option<f32>,
-    max_lines: Option<usize>,
-    overflow: TextOverflow,
+    text: &str,
+    marked: &[(Range<usize>, usize)],
 ) -> Vec<Fragment> {
-    if tags.iter().all(Option::is_none) {
-        return Vec::new();
-    }
-    let probe_styles: Vec<TextStyle> = spans
-        .iter()
-        .enumerate()
-        .map(|(group, span)| {
-            let mut style = span.style.clone();
-            style.decoration = TextDecoration::line_through().with_color(group_tag(group));
-            style
-        })
-        .collect();
-    let probe_spans: Vec<TextSpan<'_>> = spans
-        .iter()
-        .zip(&probe_styles)
-        .map(|(span, style)| TextSpan::new(span.text, style))
-        .collect();
-    let probe = text_ctx.layout_rich_bounded(&probe_spans, max_width, max_lines, overflow);
-
-    let lines = layout.line_count();
-    let height = layout.size().height;
-    let mut tops: std::collections::BTreeMap<usize, f64> = std::collections::BTreeMap::new();
-    let mut top_of = |line: usize| -> f64 {
-        if line == 0 {
-            return 0.0;
-        }
-        if line >= lines {
-            return height;
-        }
-        *tops.entry(line).or_insert_with(|| {
-            text_ctx
-                .layout_rich_bounded(spans, max_width, Some(line), TextOverflow::Clip)
-                .size()
-                .height
-        })
-    };
-
-    // (group, rect) of every line-through rect, in line order.
-    let rects: Vec<(usize, Rect)> = probe
-        .decoration_rects(Point::ZERO)
-        .into_iter()
-        .filter(|d| d.kind == DecorationKind::LineThrough)
-        .filter_map(|d| {
-            let tag = d.color.components[0];
-            (tag >= 1.0).then(|| ((tag as usize) - 1, d.rect))
-        })
-        .collect();
-
-    // Band the rects: a new band starts when a rect sits more than half an
-    // average line below everything in the current one.
-    let tolerance = height / lines.max(1) as f64 / 2.0;
-    let mut bands: Vec<usize> = Vec::with_capacity(rects.len());
-    let mut band_max = f64::NEG_INFINITY;
-    let mut band = 0usize;
-    for (index, (_, rect)) in rects.iter().enumerate() {
-        let mid = (rect.y0 + rect.y1) / 2.0;
-        if index > 0 && mid > band_max + tolerance {
-            band += 1;
-            band_max = mid;
-        } else {
-            band_max = band_max.max(mid);
-        }
-        bands.push(band);
-    }
-    let banded = !rects.is_empty() && band + 1 == lines;
-
     let mut out: Vec<(usize, Fragment)> = Vec::new();
-    let mut line = 0;
-    for (index, (group, rect)) in rects.iter().enumerate() {
-        let Some(span) = tags.get(*group).copied().flatten() else {
-            continue;
-        };
-        if banded {
-            line = bands[index];
-        } else {
-            let mid = (rect.y0 + rect.y1) / 2.0;
-            // The last line in `line..lines` whose top is at or above `mid`.
-            let (mut lo, mut hi) = (line, lines - 1);
-            while lo < hi {
-                let m = (lo + hi).div_ceil(2);
-                if top_of(m) <= mid {
-                    lo = m;
-                } else {
-                    hi = m - 1;
-                }
-            }
-            line = lo;
-        }
-        let touches =
-            |f: &Fragment| (rect.x0 - f.rect.x1).abs() < 0.5 || (f.rect.x0 - rect.x1).abs() < 0.5;
-        match out.last_mut() {
-            Some((on, f)) if *on == line && f.span == span && touches(f) => {
-                f.rect.x0 = f.rect.x0.min(rect.x0);
-                f.rect.x1 = f.rect.x1.max(rect.x1);
-            }
-            _ => {
-                let (y0, y1) = (top_of(line), top_of(line + 1));
+    for (range, span) in marked {
+        let mut piece = range.start;
+        let ends = text[range.clone()]
+            .char_indices()
+            .filter(|(_, c)| is_newline(*c))
+            .map(|(at, c)| (range.start + at, c.len_utf8()))
+            .chain([(range.end, 0)]);
+        for (end, len) in ends {
+            for rect in layout.range_rects(piece..end) {
+                let line = line_at(layout, (rect.y0 + rect.y1) / 2.0);
+                let (y0, y1) = layout.line_bounds(line).unwrap_or((rect.y0, rect.y1));
                 out.push((
                     line,
                     Fragment {
-                        span,
+                        span: *span,
                         rect: Rect::new(rect.x0, y0, rect.x1, y1),
                     },
                 ));
             }
+            piece = end + len;
         }
     }
+    out.sort_by(|(la, a), (lb, b)| la.cmp(lb).then(a.rect.x0.total_cmp(&b.rect.x0)));
     out.into_iter().map(|(_, f)| f).collect()
+}
+
+/// Whether `c` is a hard line break the line breaker ends a line at.
+fn is_newline(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r' | '\u{0B}' | '\u{0C}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+/// The line of `layout` whose box holds `y`: the last line whose top is at or
+/// above it.
+fn line_at(layout: &TextLayout, y: f64) -> usize {
+    let lines = layout.line_count();
+    let (mut lo, mut hi) = (0, lines.saturating_sub(1));
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if layout.line_bounds(mid).is_some_and(|(top, _)| top <= y) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
 }
 
 #[cfg(test)]
