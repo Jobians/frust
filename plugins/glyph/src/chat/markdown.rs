@@ -6,22 +6,20 @@
 //! - **Controlled and non-reactive.** The caller owns the source text and
 //!   re-builds the view as it grows; nothing here opens a URL, loads an image
 //!   or interprets HTML. A safe link is reported through `.on_link(..)`; an
-//!   unsafe one is plain text followed by its URL in parentheses.
+//!   unsafe one, or one whose label is an http(s) URL of another host, is
+//!   plain text then its URL in parentheses. Hidden characters in a label or
+//!   a shown URL read as `?`.
 //! - **One widget per block.** Every top-level block is its own child, keyed
-//!   by position. On a rebuild a block whose model (and streaming role) is
-//!   unchanged keeps its widget: it is not re-rendered, re-shaped or laid out
-//!   again, so a message can grow chunk by chunk cheaply.
-//! - **Parsing.** The source is parsed when it differs from the previous
-//!   view's, never for an equal one. Each change re-parses the whole source,
-//!   so a caller streaming text should coalesce chunks to at most one update
-//!   per frame.
-//! - **Streaming.** `.streaming(true)` draws a dots row under the last block
-//!   (earlier blocks keep their height), marks an unclosed code fence as
-//!   streaming and lets a trailing table keep its column widths.
+//!   by position; a block whose model (and streaming role) is unchanged keeps
+//!   its widget across a rebuild: no re-render, re-shape or layout.
+//! - **Parsing.** Only a changed source is parsed, and each change re-parses
+//!   the whole of it: coalesce streamed chunks to one update per frame.
+//! - **Streaming.** `.streaming(true)` draws a dots row under the last block,
+//!   marks an unclosed code fence as streaming and lets a trailing table keep
+//!   its column widths.
 //! - **Selection.** With `.selectable(true)`, the default, every paragraph,
 //!   heading, list item and quote paragraph is its own selectable
-//!   `rich_text`: a selection stays inside one block. Table cells are not
-//!   selectable, so a mouse drag on a table scrolls it.
+//!   `rich_text`: a selection stays inside one block. Table cells are not.
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -40,7 +38,7 @@ use frust::{
 };
 
 use super::code_block::code_block;
-use super::markdown_parse::{MdBlock, MdInline, MdListItem, parse_markdown};
+use super::markdown_parse::{MdBlock, MdInline, MdListItem, parse_markdown, plain_text};
 use super::style;
 use super::table::table;
 
@@ -189,7 +187,11 @@ fn is_live(block: &MdBlock) -> bool {
 
 fn has_safe_link(inlines: &[MdInline]) -> bool {
     inlines.iter().any(|inline| match inline {
-        MdInline::Link { safe: true, .. } => true,
+        MdInline::Link {
+            url,
+            safe: true,
+            content,
+        } if tappable(url, content) => true,
         MdInline::Link { content, .. }
         | MdInline::Emphasis(content)
         | MdInline::Strong(content)
@@ -198,11 +200,40 @@ fn has_safe_link(inlines: &[MdInline]) -> bool {
     })
 }
 
-/// An unsafe URL as shown: control characters become `?`.
+/// An unsafe URL as shown: control, bidi and zero-width characters become
+/// `?` (a URL has no line breaks or tabs to keep).
 fn shown_url(url: &str) -> String {
-    url.chars()
+    style::display_text(url)
+        .chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()
+}
+
+/// The host of an `http(s)://` URL, lowercased: `None` for anything else.
+fn http_host(text: &str) -> Option<String> {
+    let text = text.trim();
+    let rest = ["http://", "https://"].iter().find_map(|scheme| {
+        let head = text.get(..scheme.len())?;
+        head.eq_ignore_ascii_case(scheme)
+            .then(|| &text[scheme.len()..])
+    })?;
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = match host_port.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host_port.split(':').next().unwrap_or_default(),
+    };
+    let host = host.trim_end_matches('.').to_lowercase();
+    (!host.is_empty()).then_some(host)
+}
+
+/// Whether a safe link may be tapped: unless its label itself reads as an
+/// http(s) URL naming another host than the destination, which would show
+/// the user one site and open another.
+fn tappable(url: &str, content: &[MdInline]) -> bool {
+    let mut label = String::new();
+    plain_text(content, &mut label);
+    http_host(&label).is_none_or(|shown| http_host(url) == Some(shown))
 }
 
 /// Everything a top-level block's views depend on besides its model.
@@ -249,6 +280,8 @@ struct Look {
     italic: bool,
     bold: bool,
     strike: bool,
+    /// Inside a link's label: hidden characters are shown as `?`.
+    label: bool,
 }
 
 fn styled(
@@ -262,6 +295,12 @@ fn styled(
         FontWeight::BOLD
     } else {
         FontWeight::REGULAR
+    };
+    let text: String = text.into();
+    let text = if look.label {
+        style::display_text(&text)
+    } else {
+        text
     };
     let mut s = span(text).size(base.size).weight(weight);
     s = if code {
@@ -319,8 +358,18 @@ fn push_spans(
                 url,
                 safe: true,
                 content,
-            } => push_spans(content, base, look, Some(url), out),
+            } if tappable(url, content) => {
+                let look = Look {
+                    label: true,
+                    ..look
+                };
+                push_spans(content, base, look, Some(url), out);
+            }
             MdInline::Link { url, content, .. } => {
+                let look = Look {
+                    label: true,
+                    ..look
+                };
                 push_spans(content, base, look, link, out);
                 let muted = Base {
                     role: ThemeTextColor::OnSurfaceVariant,
@@ -1361,6 +1410,50 @@ mod tests {
                 assert_eq!(shown, "ctl (?https://example.com/b) tail");
             }
         }
+    }
+
+    #[test]
+    fn link_labels_and_shown_urls_show_hidden_characters() {
+        let mut rig = Rig::new(true, 400.0);
+        rig.show(|_| {
+            markdown("[a\u{202E}b\u{200B}c\u{2066}d\u{FEFF}e](https://x.example/) and [f](<javascript:\u{202D}g\u{200F}>)")
+                .on_link(|app: &mut App, url| app.links.push(url.to_owned()))
+        });
+        assert_eq!(rig.texts()[0].0, "a?b?c?d?e and f (javascript:?g?)");
+        assert_eq!(shown_url("x\u{2069}\n\u{200C}y"), "x???y");
+        let rect = rig.text_rect("a?b");
+        rig.click(Point::new(rect.x0 + 6.0, rect.y0 + 6.0));
+        assert_eq!(
+            rig.app.links,
+            ["https://x.example/".to_owned()],
+            "still tappable"
+        );
+    }
+
+    #[test]
+    fn a_label_naming_another_host_is_not_tappable() {
+        let source = "[https://bank.example/login](https://evil.example/) tail";
+        let mut rig = Rig::new(true, 400.0);
+        rig.show(|_| markdown(source).on_link(|app: &mut App, url| app.links.push(url.to_owned())));
+        assert_eq!(
+            rig.texts()[0].0,
+            "https://bank.example/login (https://evil.example/) tail"
+        );
+        let rect = rig.text_rect("https://bank");
+        rig.click(Point::new(rect.x0 + 6.0, rect.y0 + 6.0));
+        assert!(rig.app.links.is_empty());
+        let update = rig.root.semantics();
+        assert!(!update.nodes.iter().any(|(_, n)| n.role() == Role::Link));
+
+        let same = "[HTTPS://Docs.Example:443/](https://user@docs.example/a) tail";
+        let mut rig = Rig::new(true, 400.0);
+        rig.show(|_| markdown(same).on_link(|app: &mut App, url| app.links.push(url.to_owned())));
+        let rect = rig.text_rect("HTTPS://Docs");
+        rig.click(Point::new(rect.x0 + 6.0, rect.y0 + 6.0));
+        assert_eq!(rig.app.links, ["https://user@docs.example/a".to_owned()]);
+        assert_eq!(http_host("http://[::1]:80/x").as_deref(), Some("::1"));
+        assert_eq!(http_host("docs.example"), None, "a bare name is not a URL");
+        assert_eq!(http_host("mailto:a@b"), None);
     }
 
     #[test]

@@ -874,7 +874,8 @@ fn push_inline(children: &mut Vec<MdInline>, inline: MdInline) {
     }
 }
 
-fn plain_text(inlines: &[MdInline], out: &mut String) {
+/// Appends the visible text of `inlines` to `out`, breaks as spaces.
+pub(crate) fn plain_text(inlines: &[MdInline], out: &mut String) {
     for inline in inlines {
         match inline {
             MdInline::Text(text) | MdInline::Code(text) => out.push_str(text),
