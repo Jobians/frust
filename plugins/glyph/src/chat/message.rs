@@ -964,7 +964,7 @@ mod tests {
             message_row(ChatRole::Thought, "thinking")
                 .on_thought_toggle(|app: &mut App| app.toggles += 1)
         });
-        assert_eq!(button(&rig, "Thought").0, true);
+        assert!(button(&rig, "Thought").0, "a toggle makes the header live");
         rig.click(header);
         assert_eq!(rig.app.toggles, 1, "the header fires once it is live");
 
