@@ -70,7 +70,7 @@ fn layout_including_nested_path() {
     );
     assert_eq!(
         store.manifest_path_for(&nested),
-        root.join("acme/tiny/onnx/model.onnx.json")
+        root.join("acme/tiny/onnx/model.onnx.frust-meta.json")
     );
     assert_eq!(nested.to_string(), "acme/tiny/onnx/model.onnx");
     assert_eq!(nested.repo_id(), "acme/tiny");
@@ -229,7 +229,7 @@ fn model_id_rejects_bad_input() {
         ("a", "b", ".hidden"),
         ("a", "b", "dir/.hidden"),
         ("a", "b", "m.bin.part"),
-        ("a", "b", "m.bin.json"),
+        ("a", "b", "m.bin.frust-meta.json"),
         ("a", "b", "x\\y"),
         ("a", "b", "c:d"),
         ("a", "b", "x\0y"),
@@ -261,4 +261,48 @@ fn model_id_serde_is_a_string() {
     assert_eq!(json, "\"acme/tiny/onnx/model.onnx\"");
     assert_eq!(serde_json::from_str::<ModelId>(&json).unwrap(), model);
     assert!(serde_json::from_str::<ModelId>("\"a/b/../c\"").is_err());
+}
+
+#[test]
+fn json_model_files_are_models_not_sidecars() {
+    let tmp = Temp::new();
+    let store = tmp.store();
+    let src = tmp.0.join("src.json");
+    fs::write(&src, b"{}").unwrap();
+    let ids = [
+        ModelId::hub("a/b", "tokenizer.json").unwrap(),
+        ModelId::hub("a/b", "onnx/config.json").unwrap(),
+        id("a", "b", "x.json"),
+    ];
+    for model in &ids {
+        store.import(&src, model, None).unwrap();
+    }
+    // A sidecar and its model sit side by side when the model is named `x.json`.
+    let x = &ids[2];
+    assert!(store.path_for(x).is_file());
+    assert!(store.manifest_path_for(x).is_file());
+    assert_ne!(store.path_for(x), store.manifest_path_for(x));
+
+    let listed = store.list();
+    assert_eq!(listed.len(), 3);
+    for model in &listed {
+        assert!(model.manifest.is_some(), "{} lacks a manifest", model.id);
+    }
+    assert!(store.in_progress().is_empty());
+
+    for model in &ids {
+        fs::write(store.part_path_for(model), b"zz").unwrap();
+        store.remove(model).unwrap();
+        assert!(!store.path_for(model).exists());
+        assert!(!store.part_path_for(model).exists());
+        assert!(!store.manifest_path_for(model).exists());
+    }
+    assert!(store.list().is_empty());
+}
+
+#[test]
+fn sidecar_suffixes_are_rejected() {
+    for path in ["tokenizer.json.frust-meta.json", "onnx/m.bin.part"] {
+        assert!(ModelId::hub("a/b", path).is_err(), "{path}");
+    }
 }

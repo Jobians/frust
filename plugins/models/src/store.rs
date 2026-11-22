@@ -11,7 +11,7 @@ use crate::error::ModelsError;
 use crate::id::ModelId;
 
 const PART_SUFFIX: &str = ".part";
-const MANIFEST_SUFFIX: &str = ".json";
+const MANIFEST_SUFFIX: &str = ".frust-meta.json";
 
 /// Where a stored file came from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

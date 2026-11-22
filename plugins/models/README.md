@@ -27,11 +27,11 @@ Two sidecars sit next to each file:
 
 - `<file>.part` is a download in progress. `ModelStore::in_progress` reports its size so a
   download can resume. Finishing renames it to the final name.
-- `<file>.json` is the manifest: source (Hub repo and revision, URL, or local import), size,
+- `<file>.frust-meta.json` is the manifest: source (Hub repo and revision, URL, or local import), size,
   optional SHA-256, store time, licence and whether the content was verified. A manifest that
   cannot be parsed is logged and treated as absent.
 
-Identifier components may not be empty, start with a dot, end in `.part` or `.json`, or contain
+Identifier components may not be empty, start with a dot, end in `.part` or `.frust-meta.json`, or contain
 `\`, `:` or control characters, so no identifier can name a sidecar or leave the root.
 
 On iOS and macOS the root and every finished file are excluded from device backups, since models

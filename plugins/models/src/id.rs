@@ -32,7 +32,7 @@ fn check_component(whole: &str, part: &str) -> Result<(), ModelsError> {
     if part == "." || part == ".." || part.starts_with('.') {
         return Err(invalid(whole, "component must not start with a dot"));
     }
-    if part.ends_with(".part") || part.ends_with(".json") {
+    if part.ends_with(".part") || part.ends_with(".frust-meta.json") {
         return Err(invalid(whole, "component uses a reserved suffix"));
     }
     if part
