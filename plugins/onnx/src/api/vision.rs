@@ -100,7 +100,18 @@ struct Shared {
     depth: RwSignal<Option<Arc<Plane>>>,
     /// Each task's last completed run, in [`slot`] order.
     runs: [RwSignal<Option<VisionRun>>; TASKS],
+    /// Read handles made once beside the writable signals, so an accessor allocates nothing.
+    reads: Reads,
     inner: Mutex<Inner>,
+}
+
+/// The read side of [`Shared`]'s signals.
+struct Reads {
+    status: ReadSignal<VisionStatus>,
+    mask: ReadSignal<Option<Arc<Plane>>>,
+    faces: ReadSignal<Arc<Vec<Face>>>,
+    depth: ReadSignal<Option<Arc<Plane>>>,
+    runs: [ReadSignal<Option<VisionRun>>; TASKS],
 }
 
 /// The vision tasks for a component: requests from event handlers, results and status as
@@ -171,14 +182,27 @@ impl VisionHandle {
     }
 
     fn with_backend(backend: Backend) -> Self {
+        let status = RwSignal::new(VisionStatus::Idle);
+        let mask = RwSignal::new(None);
+        let faces = RwSignal::new(Arc::new(Vec::new()));
+        let depth = RwSignal::new(None);
+        let runs: [RwSignal<Option<VisionRun>>; TASKS] = [(); TASKS].map(|()| RwSignal::new(None));
+        let reads = Reads {
+            status: status.read_only(),
+            mask: mask.read_only(),
+            faces: faces.read_only(),
+            depth: depth.read_only(),
+            runs: runs.map(|run| run.read_only()),
+        };
         Self {
             shared: Arc::new(Shared {
                 backend,
-                status: RwSignal::new(VisionStatus::Idle),
-                mask: RwSignal::new(None),
-                faces: RwSignal::new(Arc::new(Vec::new())),
-                depth: RwSignal::new(None),
-                runs: [(); TASKS].map(|()| RwSignal::new(None)),
+                status,
+                mask,
+                faces,
+                depth,
+                runs,
+                reads,
                 inner: Mutex::new(Inner::default()),
             }),
         }
@@ -194,33 +218,35 @@ impl VisionHandle {
         self
     }
 
-    /// What the handle is doing.
+    /// What the handle is doing. This and the result accessors below ([`mask`](Self::mask),
+    /// [`faces`](Self::faces), [`depth`](Self::depth), [`last_run`](Self::last_run)) return the
+    /// same signal on every call and are cheap to call from `build`.
     pub fn status(&self) -> ReadSignal<VisionStatus> {
-        self.shared.status.read_only()
+        self.shared.reads.status
     }
 
     /// The newest subject mask ([`VisionModels::segment_subject`]), `None` until one is ready.
     pub fn mask(&self) -> ReadSignal<Option<Arc<Plane>>> {
-        self.shared.mask.read_only()
+        self.shared.reads.mask
     }
 
     /// The newest face list ([`VisionModels::detect_faces`]), highest score first; empty until
     /// one is ready, and empty for an image without faces.
     pub fn faces(&self) -> ReadSignal<Arc<Vec<Face>>> {
-        self.shared.faces.read_only()
+        self.shared.reads.faces
     }
 
     /// The newest depth map ([`VisionModels::estimate_depth`]), near is 1; `None` until one is
     /// ready.
     pub fn depth(&self) -> ReadSignal<Option<Arc<Plane>>> {
-        self.shared.depth.read_only()
+        self.shared.reads.depth
     }
 
     /// `task`'s last completed run: the provider that ran it and how long it took, `None` until
     /// one has published its result. Written with the result, before the status turns
     /// [`Idle`](VisionStatus::Idle).
     pub fn last_run(&self, task: VisionTask) -> ReadSignal<Option<VisionRun>> {
-        self.shared.runs[slot(task)].read_only()
+        self.shared.reads.runs[slot(task)]
     }
 
     /// The catalog models still to download ([`VisionModels::missing`]). Reads the store's
@@ -407,5 +433,40 @@ impl Shared {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accessors_return_the_same_signal_on_every_call() {
+        let handle =
+            VisionHandle::with_runner(|_, _| Err(OnnxError::ModelMissing { key: "none".into() }));
+        let (status, mask, faces, depth) = (
+            handle.status(),
+            handle.mask(),
+            handle.faces(),
+            handle.depth(),
+        );
+        let runs: Vec<_> = [
+            VisionTask::Segmentation,
+            VisionTask::FaceDetection,
+            VisionTask::Depth,
+        ]
+        .into_iter()
+        .map(|task| (task, handle.last_run(task)))
+        .collect();
+        for _ in 0..1000 {
+            assert!(handle.status() == status);
+            assert!(handle.mask() == mask);
+            assert!(handle.faces() == faces);
+            assert!(handle.depth() == depth);
+            for (task, run) in &runs {
+                assert!(handle.last_run(*task) == *run);
+            }
+        }
+        assert!(handle.clone().status() == status);
     }
 }

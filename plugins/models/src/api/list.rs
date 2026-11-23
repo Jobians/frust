@@ -21,6 +21,8 @@ use crate::store::{LocalModel, ModelStore};
 pub struct ModelList {
     store: ModelStore,
     models: RwSignal<Vec<LocalModel>>,
+    /// The read handle, made once beside `models` so the accessor allocates nothing.
+    models_read: ReadSignal<Vec<LocalModel>>,
     /// The newest refresh ticket applied so far.
     applied: Arc<Mutex<u64>>,
     /// The last ticket handed out.
@@ -38,17 +40,20 @@ impl std::fmt::Debug for ModelList {
 impl ModelList {
     /// A list over `store`, empty until the first [`refresh`](Self::refresh).
     pub fn new(store: ModelStore) -> Self {
+        let models = RwSignal::new(Vec::new());
         Self {
             store,
-            models: RwSignal::new(Vec::new()),
+            models,
+            models_read: models.read_only(),
             applied: Arc::default(),
             issued: Arc::default(),
         }
     }
 
-    /// The stored models, in the store's listing order.
+    /// The stored models, in the store's listing order. Every call returns the same signal and
+    /// is cheap to call from `build`.
     pub fn models(&self) -> ReadSignal<Vec<LocalModel>> {
-        self.models.read_only()
+        self.models_read
     }
 
     /// The store this list reads.
@@ -87,5 +92,22 @@ impl ModelList {
             *applied = ticket;
             self.models.set(scan);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_returns_the_same_signal_on_every_call() {
+        let list = ModelList::new(
+            ModelStore::with_root(std::env::temp_dir().join("frust-models-list")).unwrap(),
+        );
+        let first = list.models();
+        for _ in 0..1000 {
+            assert!(list.models() == first);
+        }
+        assert!(list.clone().models() == first);
     }
 }
