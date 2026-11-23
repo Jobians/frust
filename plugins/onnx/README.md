@@ -277,7 +277,51 @@ the app's `/sdcard/Android/data/<application id>/files/`, not bundled):
 The second device row is owed; the host table in [Sessions and accelerators](#2-sessions-and-accelerators)
 predicts the growth falling by about a third.
 
-## 7. License
+## 7. Image helpers
+
+`frust_onnx::image` (no extra dependency, single-threaded) turns pixels into model inputs and
+back:
+
+- `RgbaView::new(width, height, &pixels)` checks an RGBA8 buffer (non-zero sides, exactly
+  `width * height * 4` bytes).
+- `to_nchw_f32(view, out_w, out_h, norm, order)` resizes bilinearly (half-pixel centres, clamped
+  borders) and returns a `[1, 3, out_h, out_w]` f32 tensor. `Normalization` computes
+  `(byte * scale - mean) / std` per channel: `IMAGENET`, `UNIT` (0..1) and `RAW_255` (no scaling)
+  are provided. `ChannelOrder::Rgb` or `Bgr` picks the plane order. Alpha is ignored.
+- `resize_plane` resizes a single-channel `f32` plane bilinearly; `normalize_plane` min-max
+  scales it to 0..1 in place (a constant plane becomes zeros); `Plane::to_rgba8_gray` makes
+  display bytes.
+
+```rust
+use frust_onnx::{ChannelOrder, Normalization, RgbaView, to_nchw_f32};
+
+let pixels = vec![255u8; 64 * 48 * 4];
+let view = RgbaView::new(64, 48, &pixels)?;
+let input = to_nchw_f32(view, 320, 320, Normalization::IMAGENET, ChannelOrder::Rgb)?;
+assert_eq!(input.shape(), &[1, 3, 320, 320]);
+# Ok::<(), frust_onnx::OnnxError>(())
+```
+
+## 8. Vision catalog
+
+The default `catalog` feature adds `frust_onnx::catalog`, a short list of vision models that
+download through `frust-models` with a pinned source, byte size and SHA-256 (the feature is the
+only thing that brings `frust-models` into the tree; `--no-default-features` leaves it out).
+`VISION_CATALOG` holds the rows, `by_key` and `for_task` look them up, and
+`VisionModel::download_request()` builds a verified `DownloadRequest`.
+
+| Key | Model | Task | Size | Licence | Source | Input |
+|-----|-------|------|------|---------|--------|-------|
+| `u2netp` | U2-NetP | Segmentation | 4,574,861 B | Apache-2.0 | rembg release `v0.0.0`, `u2netp.onnx` | 320x320 |
+| `yunet` | YuNet 2023mar | Face detection | 232,589 B | MIT | opencv_zoo commit `f12e1279`, `models/face_detection_yunet/` | 640x640 |
+| `depth-anything-v2-small` | Depth Anything V2 Small (quantized) | Depth | 27,258,801 B | Apache-2.0 | Hub `onnx-community/depth-anything-v2-small` at `4472b736`, `onnx/model_quantized.onnx` | 518x518 |
+
+The Base and Large depth models are CC-BY-NC and are deliberately not listed. The ignored test
+`cargo test -p frust-onnx --test catalog -- --ignored` downloads every row (about 32 MB) and
+fails when a pin has drifted. Call `download_request` and start the download from a worker
+thread, as `frust-models` describes.
+
+## 9. License
 
 The crate is MIT OR Apache-2.0. A binary that ships it ships ONNX Runtime (MIT, Microsoft) and
 the third-party components ONNX Runtime contains: see [`NOTICE`](NOTICE).

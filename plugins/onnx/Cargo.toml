@@ -13,11 +13,15 @@ categories.workspace = true
 readme = "README.md"
 
 [features]
-default = []
+# `catalog`: the curated vision model list (src/catalog.rs), which pulls in frust-models.
+default = ["catalog"]
+catalog = ["dep:frust-models"]
 
 [dependencies]
 log = { workspace = true }
 thiserror = { workspace = true }
+# The downloader only: `hub` keeps `frust-ui` out of the tree.
+frust-models = { path = "../models", version = "0.6.6", default-features = false, features = ["hub"], optional = true }
 
 # Each desktop row's feature set must equal one prebuilt row of ort-sys' `dist.tsv` exactly (no
 # `lax-feature-matching`): plain on Linux, `coreml` on Apple-silicon macOS, `directml` on Windows.
