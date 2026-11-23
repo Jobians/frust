@@ -55,8 +55,8 @@ The module documentation of `src/chat/mod.rs` holds the contract. `tests/chat_ap
 transcript (message, tool-call, plan, approval and notice rows above a composer), and the catalog's
 **Agent chat** page ([`examples/glyph-catalog`](../../examples/glyph-catalog)) plays a scripted turn
 through every component. Known limits are in the `glyph-chat-*` entries of
-[`docs/LIMITATIONS.md`](../../docs/LIMITATIONS.md). The family has headless tests and one recorded Android walk of the
-catalog page; no iPhone, macOS or screen-reader run is recorded.
+[`docs/LIMITATIONS.md`](../../docs/LIMITATIONS.md). The family has headless tests and recorded Android walks of the
+catalog page on two phones; no iPhone, macOS or screen-reader run is recorded.
 
 Documentation and project home: <https://frust.dev>. Source: <https://github.com/frust-rs/frust>.
 
