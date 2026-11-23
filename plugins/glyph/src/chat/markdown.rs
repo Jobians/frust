@@ -321,10 +321,7 @@ fn styled(
         s.themed_family(base.family)
     };
     s = match link {
-        Some(url) => s
-            .themed_role(ThemeTextColor::OnPrimaryContainer)
-            .underline()
-            .link(url),
+        Some(url) => s.themed_role(style::LINK_ROLE).underline().link(url),
         None => s.themed_role(base.role),
     };
     if look.italic {

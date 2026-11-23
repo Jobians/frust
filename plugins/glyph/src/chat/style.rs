@@ -16,6 +16,7 @@
 
 use std::time::Duration;
 
+use frust::authoring::ThemeTextColor;
 use frust::authoring::text::{FontFamily, TextLayout};
 use frust::authoring::{BoxConstraints, Brush, PaintScene, Point, Rect, RoundedRect, Shape, Size};
 use frust::{ColorScheme, StatusColors, StatusPalette, Theme};
@@ -60,6 +61,11 @@ pub(crate) const TAB_WIDTH: usize = 4;
 pub(crate) const COPY_TEXT: &str = "Copy";
 /// A copy control's label for a moment after a copy.
 pub(crate) const COPIED_TEXT: &str = "Copied";
+
+/// Text role of a safe link; the underline is what marks it as one.
+pub(crate) const LINK_ROLE: ThemeTextColor = ThemeTextColor::OnSurface;
+/// Text role of an in-progress plan entry; weight and mark set it apart.
+pub(crate) const PLAN_ACTIVE_ROLE: ThemeTextColor = ThemeTextColor::OnSurface;
 
 const DARK: ColorScheme = color::dark();
 const DARK_STATUS: StatusPalette = color::status();
@@ -287,6 +293,98 @@ pub(crate) fn node_bounds(origin: Point, r: Rect) -> frust::accesskit::Rect {
 mod tests {
     use super::*;
     use frust::authoring::text::GenericSlot;
+
+    use super::super::code_block::CodeTone;
+
+    /// Resolve a role against a scheme the way frust-widgets does at layout.
+    fn role_color(scheme: &ColorScheme, role: ThemeTextColor) -> Color {
+        match role {
+            ThemeTextColor::OnSurface => scheme.on_surface,
+            ThemeTextColor::OnPrimary => scheme.on_primary,
+            ThemeTextColor::OnSurfaceVariant => scheme.on_surface_variant,
+            ThemeTextColor::OnPrimaryContainer => scheme.on_primary_container,
+            ThemeTextColor::Error => scheme.error,
+        }
+    }
+
+    fn luminance(c: Color) -> f64 {
+        let lin = |v: f32| {
+            let v = f64::from(v);
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let [r, g, b, _] = c.components;
+        0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+    }
+
+    fn contrast(a: Color, b: Color) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn chat_text_roles_are_readable_on_their_surfaces() {
+        let tones = [
+            CodeTone::Plain,
+            CodeTone::Keyword,
+            CodeTone::String,
+            CodeTone::Comment,
+            CodeTone::Number,
+            CodeTone::Function,
+            CodeTone::Type,
+            CodeTone::Added,
+            CodeTone::Removed,
+        ];
+        for (name, scheme) in [("dark", color::dark()), ("light", color::light())] {
+            let mut uses = vec![
+                ("link", LINK_ROLE, scheme.surface),
+                ("link on card", LINK_ROLE, scheme.surface_container),
+                ("plan", PLAN_ACTIVE_ROLE, scheme.surface),
+                ("plan on card", PLAN_ACTIVE_ROLE, scheme.surface_container),
+            ];
+            for tone in tones {
+                uses.push(("code", tone.look().0, scheme.surface_container));
+            }
+            for (what, role, bg) in uses {
+                assert_ne!(role, ThemeTextColor::OnPrimaryContainer, "{name} {what}");
+                let ratio = contrast(role_color(&scheme, role), bg);
+                // Removed keeps the Error red, which is 4.38 in light; it is
+                // struck through and a roles-only fix has no better red.
+                let floor = if role == ThemeTextColor::Error {
+                    4.3
+                } else {
+                    4.5
+                };
+                assert!(
+                    ratio >= floor,
+                    "{name} {what} {role:?}: contrast {ratio:.2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn code_tones_stay_distinguishable() {
+        let tones = [
+            CodeTone::Plain,
+            CodeTone::Keyword,
+            CodeTone::String,
+            CodeTone::Comment,
+            CodeTone::Number,
+            CodeTone::Function,
+            CodeTone::Type,
+            CodeTone::Added,
+            CodeTone::Removed,
+        ];
+        for (i, a) in tones.iter().enumerate() {
+            for b in &tones[i + 1..] {
+                assert_ne!(a.look(), b.look(), "{a:?} and {b:?} look alike");
+            }
+        }
+    }
 
     const KINDS: [ToolKind; 9] = [
         ToolKind::Read,

@@ -70,18 +70,18 @@ pub enum CodeTone {
 
 impl CodeTone {
     /// The role, weight, italic and strike-through a tone is drawn with.
-    fn look(self) -> (ThemeTextColor, FontWeight, bool, bool) {
-        use ThemeTextColor::{Error, OnPrimaryContainer, OnSurface, OnSurfaceVariant};
+    pub(crate) fn look(self) -> (ThemeTextColor, FontWeight, bool, bool) {
+        use ThemeTextColor::{Error, OnSurface, OnSurfaceVariant};
         let w = FontWeight::REGULAR;
         match self {
             Self::Plain => (OnSurface, w, false, false),
-            Self::Keyword => (OnPrimaryContainer, FontWeight::SEMI_BOLD, false, false),
-            Self::String => (OnPrimaryContainer, w, false, false),
+            Self::Keyword => (OnSurface, FontWeight::SEMI_BOLD, false, false),
+            Self::String => (OnSurface, FontWeight::MEDIUM, false, false),
             Self::Comment => (OnSurfaceVariant, w, true, false),
             Self::Number => (OnSurfaceVariant, w, false, false),
-            Self::Function => (OnSurface, FontWeight::SEMI_BOLD, false, false),
+            Self::Function => (OnSurfaceVariant, FontWeight::SEMI_BOLD, false, false),
             Self::Type => (OnSurface, w, true, false),
-            Self::Added => (OnPrimaryContainer, FontWeight::BOLD, false, false),
+            Self::Added => (OnSurface, FontWeight::BOLD, false, false),
             Self::Removed => (Error, w, false, true),
         }
     }

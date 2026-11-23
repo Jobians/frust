@@ -8701,9 +8701,9 @@ gestures, the handles, the soft keyboard interplay or the live edge under a real
 
 ---
 
-### `glyph-chat-linux-headless-only` — the chat family has headless tests and one Android walk; no iPhone, macOS or screen-reader run
+### `glyph-chat-linux-headless-only` — the chat family has headless tests and two Android walks; no iPhone, macOS or screen-reader run
 
-**Observed**: every `frust_glyph::chat` component is covered by headless tests run on Linux, and the catalog's Agent chat page was walked once on a Pixel 5 (Android 14) with synthetic taps, judged from screenshots and screen recordings. No recorded run exists on an iPhone or on macOS, with a screen reader, or measuring the frame cost of a long stream; on Android a wide table, diff collapse, selection in a code block, the composer's line cap and IME composition were not exercised.
+**Observed**: every `frust_glyph::chat` component is covered by headless tests run on Linux, and the catalog's Agent chat page was walked on a Pixel 5 (Android 14) and a OnePlus 9 (Android 15) with synthetic taps, judged from screenshots and screen recordings. No recorded run exists on an iPhone or on macOS, with a screen reader, or measuring the frame cost of a long stream; on Android a wide table, diff collapse, the composer's line cap and IME composition were not exercised.
 
 **Applies to**: iOS and macOS hosts; assistive technology and real frame pacing on every host.
 
