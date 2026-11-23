@@ -41,7 +41,7 @@ mod usage;
 // The widget structs stay `pub` inside these private modules (a public
 // view's `Element` cannot name a crate-private type) and are not listed
 // here, so no path outside the crate reaches them.
-pub use approval::{ApprovalCardView, ApprovalDeadline, approval_card};
+pub use approval::{ApprovalCardView, ApprovalDeadline, ApprovalSelection, approval_card};
 pub use code_block::{CodeBlockView, CodeSpan, CodeTone, code_block};
 pub use composer::{ComposerView, composer};
 pub use diff::{

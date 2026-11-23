@@ -38,10 +38,10 @@ use kurbo::Size;
 
 use frust_core::{AnyView, View};
 use frust_glyph::chat::{
-    ApprovalOption, ApprovalOptionKind, ApprovalState, ChatRole, CodeSpan, CodeTone, DiffInput,
-    NoticeTone, PlanEntry, PlanEntryStatus, ToolContent, ToolKind, ToolStatus, UsageLabel,
-    approval_card, code_block, composer, diff_view, message_row, message_scroller, notice_row,
-    plan_block, tool_call, usage_meter,
+    ApprovalOption, ApprovalOptionKind, ApprovalSelection, ApprovalState, ChatRole, CodeSpan,
+    CodeTone, DiffInput, NoticeTone, PlanEntry, PlanEntryStatus, ToolContent, ToolKind, ToolStatus,
+    UsageLabel, approval_card, code_block, composer, diff_view, message_row, message_scroller,
+    notice_row, plan_block, tool_call, usage_meter,
 };
 use frust_glyph::{
     AlertVariant, BadgeVariant, PaletteItem, StatDelta, TermLine, ToastVariant, accordion, alert,
@@ -752,22 +752,25 @@ fn chat_approval_case() -> impl View<()> {
         vec![
             AnyView::new(
                 approval_card("Run a shell command?", options())
+                    .request_id("req-fmt-2")
                     .detail("cargo fmt --all")
-                    .on_select(|_: &mut (), _id: &str| {}),
+                    .on_select(|_: &mut (), _: &ApprovalSelection| {}),
             ),
             AnyView::new(
                 approval_card("Run a shell command?", options())
+                    .request_id("req-fmt-1")
                     .detail("cargo fmt --all")
                     .state(ApprovalState::Allowed)
                     .selected("allow")
-                    .on_select(|_: &mut (), _id: &str| {}),
+                    .on_select(|_: &mut (), _: &ApprovalSelection| {}),
             ),
             AnyView::new(
                 approval_card("Delete build output?", options())
+                    .request_id("req-clean")
                     .detail("rm -rf target/debug")
                     .state(ApprovalState::Expired)
                     .expired_hint("Ask the agent to try again.")
-                    .on_select(|_: &mut (), _id: &str| {}),
+                    .on_select(|_: &mut (), _: &ApprovalSelection| {}),
             ),
         ],
     )

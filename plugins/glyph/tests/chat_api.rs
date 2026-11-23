@@ -11,18 +11,22 @@ use std::time::Duration;
 
 use frust::FrameTime;
 use frust::authoring::text::TextContext;
-use frust::authoring::{AnyView, DiscardScene, Role, Size, View, any};
+use frust::authoring::{
+    AnyView, DiscardScene, InputEvent, Point, PointerButton, PointerEvent, PointerPhase, Role,
+    Size, View, any,
+};
 use frust::{ChildKey, EdgeInsets, EitherOf5, ScrollController, column, flexible, text};
 use frust_core::RenderRoot;
 use frust_glyph::chat::{
-    ApprovalCardView, ApprovalDeadline, ApprovalOption, ApprovalOptionKind, ApprovalState,
-    ChatRole, CodeBlockView, CodeSpan, CodeTone, ComposerView, DEFAULT_ESTIMATED_ROW_EXTENT,
-    DIFF_DEFAULT_COLLAPSE_ABOVE, DIFF_DEFAULT_CONTEXT, DIFF_MAX_BYTES, DIFF_MAX_LINES, DiffHunk,
-    DiffInput, DiffLine, DiffLineKind, DiffModel, DiffView, MARKDOWN_MAX_SOURCE_BYTES,
-    MarkdownView, MessageRowView, MessageScrollerView, NoticeRowView, NoticeTone, PlanBlockView,
-    PlanEntry, PlanEntryStatus, ToolCallView, ToolContent, ToolKind, ToolStatus, UsageLabel,
-    UsageMeterView, approval_card, code_block, composer, compute_diff, diff_view, markdown,
-    message_row, message_scroller, notice_row, plan_block, tool_call, usage_meter,
+    ApprovalCardView, ApprovalDeadline, ApprovalOption, ApprovalOptionKind, ApprovalSelection,
+    ApprovalState, ChatRole, CodeBlockView, CodeSpan, CodeTone, ComposerView,
+    DEFAULT_ESTIMATED_ROW_EXTENT, DIFF_DEFAULT_COLLAPSE_ABOVE, DIFF_DEFAULT_CONTEXT,
+    DIFF_MAX_BYTES, DIFF_MAX_LINES, DiffHunk, DiffInput, DiffLine, DiffLineKind, DiffModel,
+    DiffView, MARKDOWN_MAX_SOURCE_BYTES, MarkdownView, MessageRowView, MessageScrollerView,
+    NoticeRowView, NoticeTone, PlanBlockView, PlanEntry, PlanEntryStatus, ToolCallView,
+    ToolContent, ToolKind, ToolStatus, UsageLabel, UsageMeterView, approval_card, code_block,
+    composer, compute_diff, diff_view, markdown, message_row, message_scroller, notice_row,
+    plan_block, tool_call, usage_meter,
 };
 
 /// Compiles only for a `View` that is also `Debug`.
@@ -48,10 +52,13 @@ fn edit() -> DiffInput {
 fn every_builder_and_builder_method_is_reachable() {
     let card: ApprovalCardView<()> =
         approval_card("Run it?", vec![option("y", ApprovalOptionKind::AllowOnce)])
+            .request_id("req-1")
             .detail("ls -la")
             .state(ApprovalState::Pending)
             .expires(ApprovalDeadline::after(Duration::from_secs(30)))
-            .on_select(|_: &mut (), _id: &str| {})
+            .on_select(|_: &mut (), selection: &ApprovalSelection| {
+                let _: (&Option<String>, &String) = (&selection.request_id, &selection.option_id);
+            })
             .selected("y")
             .busy(false)
             .expired_hint("Ask again");
@@ -190,6 +197,7 @@ fn the_data_types_and_constants_are_reachable() {
     debug::<(
         ApprovalDeadline,
         ApprovalOption,
+        ApprovalSelection,
         CodeSpan,
         DiffModel,
         DiffInput,
@@ -215,7 +223,7 @@ struct Chat {
     transcript: Rc<Vec<(u64, Entry)>>,
     draft: String,
     sent: Vec<String>,
-    answers: Vec<String>,
+    answers: Vec<ApprovalSelection>,
     at_end: bool,
 }
 
@@ -226,7 +234,7 @@ impl Chat {
         let rows = message_scroller(
             transcript.len(),
             move |i| ChildKey::new(keys[i].0),
-            move |i| Self::row(&transcript[i].1),
+            move |i| Self::row(transcript[i].0, &transcript[i].1),
         )
         .at_end(self.at_end)
         .on_at_end_change(|chat: &mut Chat, at_end| chat.at_end = at_end)
@@ -237,16 +245,21 @@ impl Chat {
         column().push(flexible(1, rows)).child(input)
     }
 
-    fn row(entry: &Entry) -> impl View<Chat> + use<> {
+    fn row(id: u64, entry: &Entry) -> impl View<Chat> + use<> {
         match entry {
             Entry::Message(role, text) => EitherOf5::A(message_row(*role, text.as_str())),
             Entry::Tool(kind, title, status) => {
                 EitherOf5::B(tool_call(*kind, title.as_str(), *status).content("ok"))
             }
             Entry::Plan(entries) => EitherOf5::C(plan_block(entries.clone())),
+            // The row's stable id names the request, so a later request in
+            // the same slot starts fresh and each answer says which it was.
             Entry::Approval(title, options) => EitherOf5::D(
                 approval_card(title.as_str(), options.clone())
-                    .on_select(|chat: &mut Chat, id: &str| chat.answers.push(id.to_owned())),
+                    .request_id(id.to_string())
+                    .on_select(|chat: &mut Chat, selection: &ApprovalSelection| {
+                        chat.answers.push(selection.clone())
+                    }),
             ),
             Entry::Notice(text) => EitherOf5::E(notice_row(text.as_str()).working(true)),
         }
@@ -329,4 +342,25 @@ fn a_transcript_of_every_row_kind_composes_above_the_composer() {
         }
     }
     assert!(chat.sent.is_empty() && chat.answers.is_empty());
+
+    let allow = update
+        .nodes
+        .iter()
+        .find(|(_, n)| n.role() == Role::Button && n.label() == Some("allow label"))
+        .and_then(|(_, n)| n.bounds())
+        .expect("the allow option has bounds");
+    let at = Point::new((allow.x0 + allow.x1) / 2.0, (allow.y0 + allow.y1) / 2.0);
+    for phase in [PointerPhase::Down, PointerPhase::Up] {
+        let event = InputEvent::Pointer(PointerEvent {
+            phase,
+            position: at,
+            button: PointerButton::Primary,
+        });
+        root.event(&mut chat, &event);
+    }
+    let [answer] = chat.answers.as_slice() else {
+        panic!("one answer, got {:?}", chat.answers);
+    };
+    assert_eq!(answer.request_id.as_deref(), Some("5"), "the row's id");
+    assert_eq!(answer.option_id, "allow");
 }
