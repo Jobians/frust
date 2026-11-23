@@ -9751,7 +9751,7 @@ viewport-top row, so the gap does not apply while it is stuck.
 
 ### `onnx-android-cpu-only` — ONNX on Android runs on the CPU only
 
-**Observed**: the Android archive contains an NNAPI provider but `frust-onnx` registers neither NNAPI nor QNN, and XNNPACK is compiled into no build. `Accelerator::Auto` is CoreML on Apple and the CPU elsewhere. Measured on an Android 15 phone (release, CPU): subject mask 519 ms, faces 58 ms, depth 930 ms warm median, 458 MB resident with all three models loaded.
+**Observed**: the Android archive contains an NNAPI provider but `frust-onnx` registers neither NNAPI nor QNN, and XNNPACK is compiled into no build. `Accelerator::Auto` is CoreML on Apple for models whose inputs are all static in shape, and the CPU elsewhere. Measured on an Android 15 phone (release, CPU): subject mask 519 ms, faces 58 ms, depth 930 ms warm median, 458 MB resident with all three models loaded.
 
 **Applies to**: Android, and every desktop target (CPU only).
 

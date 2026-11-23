@@ -33,7 +33,7 @@ READMEs, [plugins/models/README.md](../plugins/models/README.md) and
 | Module | Responsibility |
 |--------|-----------------|
 | `session`, `tensor`, `runtime` | `Session` from a file or bytes, its named inputs and outputs, typed tensors (f32, u8, i64) checked against the model before the runtime sees them, `run_blocking`; one process-wide ONNX Runtime environment created on first use, its failure cached; `runtime_info` reports the release and the link kind |
-| `accelerator` | `Accelerator` policy and the `Provider` a session really runs on: CoreML on Apple targets by default, the CPU elsewhere, a CPU fall back unless `strict_accelerator` |
+| `accelerator` | `Accelerator` policy and the `Provider` a session really runs on: on Apple targets `Auto` is CoreML only for a model whose inputs are all static in shape (read by a metadata-only probe load) and the CPU otherwise; the CPU elsewhere; a CPU fall back unless `strict_accelerator` |
 | `worker` | `Session::run`: one `frust-onnx-run` thread per session, runs queued in order, cancel through ONNX Runtime's terminate flag, exactly one `RunEvent` per run |
 | `cache` | `SessionCache`: a bounded LRU of loaded sessions keyed by model path and `SessionOptions`, shared loads, eviction on demand |
 | `image` | RGBA views to normalised NCHW tensors and result planes back to display sizes; no image-codec dependency |
@@ -52,11 +52,12 @@ packaging, iOS packaging).
 | Target | `frust-onnx` runtime | What has run |
 |--------|----------------------|--------------|
 | Linux (glibc, x86_64/aarch64) | static, plain archive | host tests of both crates; the example's Linux desktop leg is not run |
-| Apple-silicon macOS | static, `coreml` archive | never built (`onnx-macos-windows-unverified`); CoreML never run (`onnx-coreml-unverified`) |
+| Apple-silicon macOS | static, `coreml` archive | built and run on an Apple M4; CoreML has run (`onnx-coreml-unverified`) |
 | Windows (MSVC) | static, `directml` archive (DirectML not registered) | never built (`onnx-macos-windows-unverified`) |
 | Android arm64-v8a | static, `nnapi` archive (NNAPI not registered: CPU only), plus the NDK's `libc++_shared.so` in the APK | the example's Android release leg passed on a phone (`onnx-android-cpu-only`, `onnx-android-binary-size`) |
 | Android x86_64, armeabi-v7a | run-time loading, none shipped | compiles only (`onnx-android-arm64-only`) |
-| iOS, Intel macOS | run-time loading, none shipped | iOS type-checked and the example built, nothing run; iOS packaging is not settled (`onnx-ios-packaging-missing`); Intel macOS not built (`onnx-no-intel-mac-or-x86-ios-sim`) |
+| iOS arm64 device and arm64 Simulator | static, `coreml` archive; the app's link adds `-lc++`, CoreML and Foundation; iOS 15.1 or later | CoreML has run on an iPhone (`onnx-ios-arm64-from-15-1`) |
+| x86_64 Simulator, Mac Catalyst, Intel macOS | run-time loading, none shipped | Intel macOS not built (`onnx-no-intel-mac-or-x86-ios-sim`) |
 
 `frust-models` is pure Rust on every target; its only platform code is the Apple backup exclusion
 and the UI-thread checks (Android Looper, Apple main thread). On Android a release build needs
@@ -145,7 +146,7 @@ app ──► frust (facade)
   runtime is linked into the app's own `.so`, so the plugin has no Gradle module; its registry
   entry contributes `AndroidLibcxxShared`, which makes the scaffold's `cargoNdkBuild` package the
   NDK's `libc++_shared.so` the archive needs (`onnx-hot-run-libcxx-shared` covers `frust run
-  --hot`). iOS has no route yet, so the `onnx` entry makes no iOS edit. The convention every
+  --hot`). On arm64 iOS the runtime is linked statically too; the entry contributes `-lc++` (`IosLibrary`) and the CoreML and Foundation `IosFramework` links, and requires iOS 15.1. The convention every
   plugin shipping a native runtime follows is in
   [PLUGINS_CODE_STANDARDS.md](PLUGINS_CODE_STANDARDS.md)'s Plugin Conventions.
 - **Build-time fetch.** The first build on a machine downloads the prebuilt archive for the

@@ -51,10 +51,11 @@ frust build apk --target-platform android-arm64
   the line in the main manifest every release download fails (`Operation not permitted`).
   `frust plugin add models` and `frust plugin add onnx` write that line to the main manifest
   for a new project, so a project created that way has it without a hand edit.
-- **iOS**: builds, but does not run the models yet. `frust-onnx` loads ONNX Runtime at run
-  time on iOS and the app ships none (`frust plugin add onnx` makes no iOS edit until the iOS
-  link gate settles it), so every task fails at session creation with `OnnxError::Runtime`,
-  shown as a Failed status line. Downloads, the picker and the rest of the UI work.
+- **iOS**: `frust-onnx` links ONNX Runtime statically on an arm64 device and the arm64
+  Simulator, and `frust plugin add onnx` adds the link lines and requires iOS 15.1. This example
+  has not been walked on an iPhone yet. The x86_64 Simulator loads the runtime at run time and
+  ships none, so every task there fails at session creation with `OnnxError::Runtime`, shown as
+  a Failed status line.
 
 The models are stored under the app data directory (`<data_dir>/frust-models`); Delete removes
 a model, its partial download and its manifest.
@@ -142,7 +143,7 @@ to not installed and the storage line drops.
 | Device | OS | Packaging | 1 | 2 | 3 | 4 | 5 | 6: median warm ms (CPU) | 7 | 8 | 9 | Peak memory | App size |
 |--------|----|-----------|---|---|---|---|---|-------------------------|---|---|---|-------------|----------|
 | OnePlus 9 (LE2115, arm64) | Android 15 | ONNX Runtime 1.31.0 static in `libonnxvision.so` + `libc++_shared.so` | pass | pass | pass (connection lost by stopping the server) | pass | pass (4032x3024 JPEG, decoded at 2048x1536) | mask 519 / 522, faces 58 / 57, depth 930 / 947 (sample / photo); first runs with load 597, 69, 1,157 | pass (same process, the run completed, 1,649 ms) | pass | pass (32.1 MB to 27.5 MB) | 458 MB fresh with all three sessions; 499 MB after 30 runs | APK 33,366,987 B (app `.so` 31,780,904 B, `libc++_shared.so` 1,253,544 B) |
-| iPhone | iOS | run-time loading, no ONNX Runtime shipped | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run |
+| iPhone | iOS | static, `coreml` archive | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run |
 | Mac (Apple silicon) | macOS | static, `coreml` archive | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run |
 | Linux desktop | glibc x86_64 | static, plain archive | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run |
 
