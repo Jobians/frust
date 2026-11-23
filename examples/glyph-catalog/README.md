@@ -285,7 +285,20 @@ composition for app authors.
 | Composer (send and stop) | ✓ |
 | Large transcript (5,000 rows) | ✓ — **Load 5,000 rows** |
 
-Its headless tests are `tests/agent_chat.rs`; the section has no recorded device run.
+Its headless tests are `tests/agent_chat.rs`.
+
+Gate run 2026-11-23, Android only: Pixel 5 (Android 14) over adb, debug build, driven with synthetic
+taps and judged from screenshots and screen recordings. Passed: the transcript holds the live edge
+through a streamed turn; a scroll up releases it and the jump control or a scroll back returns to
+the end; every markdown block kind renders, with the unsafe link, raw HTML and image as text; the
+code block scrolls sideways, copies to the system clipboard and passes a vertical drag to the
+transcript; long-press selects a word with handles and a Copy / Select all bar, and Copy reaches the
+clipboard; tool calls and the plan advance; the approval card counts down to Expired and a double
+tap answers once; the keyboard raises the composer with the end still in view and a typed prompt
+sends; the 5,000-row transcript opens at its last row and returns to it; light theme and rotation.
+Failed: a safe link's label is near-invisible in the dark theme. Not run: a screen reader, frame
+times, a table wider than the viewport, diff collapse, selection in a code block, the composer's
+line cap, IME composition and Stop. No iPhone or macOS run is recorded.
 
 ### Components the reference inventory listed as "no direct Frust widget"
 
