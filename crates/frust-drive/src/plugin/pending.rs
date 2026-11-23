@@ -90,7 +90,8 @@ impl PendingContribution {
 /// report order, computed without writing anything. Each is judged by the
 /// predicate its applier skips by: the dependency line, the Cargo feature,
 /// the `uses-permission`, the `Info.plist` `<key>`, both Gradle include
-/// lines, the repository url, the `FrustAppTheme` parent (or an activity
+/// lines, the repository url, the `libc++_shared.so` property (read by the
+/// build script and set in `gradle.properties`), the `FrustAppTheme` parent (or an activity
 /// theme that is already an accepted Material one), all six pbxproj package sites, the framework
 /// in every `OTHER_LDFLAGS` list, a manifest-described plugin's `ios/<package>`
 /// link in the root `.gitignore` (when the app has one), and an entitlement's key in every file the
@@ -149,6 +150,7 @@ fn platform_dir(contribution: &Contribution) -> Option<&'static str> {
         Contribution::ManifestPermission { .. }
         | Contribution::GradleModule { .. }
         | Contribution::MavenRepository { .. }
+        | Contribution::AndroidLibcxxShared
         | Contribution::AndroidThemeParent { .. } => Some("android"),
         Contribution::PlistEntry { .. }
         | Contribution::PlistArrayEntry { .. }
@@ -235,6 +237,7 @@ fn is_pending(
         Contribution::MavenRepository { url, .. } => {
             apply::maven_repository_present(&read(root, apply::SETTINGS_GRADLE_REL)?, url)
         }
+        Contribution::AndroidLibcxxShared => apply::libcxx_shared_present(root)?,
         Contribution::AndroidThemeParent { parent } => {
             apply::android_theme_parent(root, parent)? == apply::ThemeParent::Satisfied
         }
@@ -297,6 +300,14 @@ fn check_anchors(
             }
             Contribution::MavenRepository { .. } => {
                 require(apply::SETTINGS_GRADLE_REL, apply::REPOSITORIES_ANCHOR)?;
+            }
+            Contribution::AndroidLibcxxShared => {
+                if !apply::libcxx_shared_reader_present(&read(
+                    project_root,
+                    apply::APP_BUILD_GRADLE_REL,
+                )?) {
+                    return Err(apply::missing_libcxx_shared_reader());
+                }
             }
             // Pending means rewritable or unthemed; only the second refuses.
             Contribution::AndroidThemeParent { parent }
@@ -1709,6 +1720,67 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// `pending_contributions` and the applier agree on the shared C++
+    /// runtime: pending on a fresh scaffold (its template ships the property
+    /// off), not once added, and pending but refused by the pre-write check on
+    /// an app whose build script never reads the property.
+    #[test]
+    fn the_shared_cxx_runtime_is_pending_exactly_when_its_add_would_write_or_refuse() {
+        let root = temp_root("libcxx");
+        let entry = CatalogEntry::built_in(crate::plugin::PluginSpec {
+            id: Cow::Borrowed("acme-native"),
+            crate_dir: Cow::Borrowed("acme-native"),
+            base: Cow::Owned(vec![Contribution::AndroidLibcxxShared]),
+            ..crate::plugin::PluginSpec::DEFAULT
+        });
+        let add = |app: &Path| apply::add_entry_with(&StubLocator::new(), app, &entry, &[]);
+
+        let fresh = scaffold_app(&root.join("fresh"));
+        let pending = pending_contributions(&fresh, &entry, &[]).unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        check_anchors(&fresh, &pending).unwrap();
+        assert_eq!(add(&fresh).unwrap().items[0].outcome, AddOutcome::Applied);
+        assert!(
+            pending_contributions(&fresh, &entry, &[])
+                .unwrap()
+                .is_empty()
+        );
+        let before = snapshot(&fresh);
+        assert_eq!(
+            add(&fresh).unwrap().items[0].outcome,
+            AddOutcome::AlreadyPresent
+        );
+        assert_eq!(snapshot(&fresh), before);
+
+        // A property set by hand does nothing while the build script ignores it.
+        let old = scaffold_app(&root.join("old"));
+        let build = read(&old, apply::APP_BUILD_GRADLE_REL)
+            .lines()
+            .filter(|line| !line.contains("inkLibcxxShared"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(old.join(apply::APP_BUILD_GRADLE_REL), build).unwrap();
+        fs::write(
+            old.join(apply::GRADLE_PROPERTIES_REL),
+            "frust.cargoNdk.linkLibcxxShared=true\n",
+        )
+        .unwrap();
+        let pending = pending_contributions(&old, &entry, &[]).unwrap();
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert!(matches!(
+            check_anchors(&old, &pending),
+            Err(PluginAddError::MalformedProjectFile(msg)) if msg.contains("--link-libcxx-shared")
+        ));
+        let before = snapshot(&old);
+        assert!(matches!(
+            add(&old),
+            Err(PluginAddError::MalformedProjectFile(_))
+        ));
+        assert_eq!(snapshot(&old), before);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Every theme shape the rule distinguishes, judged by
     /// `pending_contributions`, the pre-write check and the add itself: they
     /// agree on each, and only a rewritable parent changes `themes.xml`.
@@ -1856,6 +1928,21 @@ mod tests {
                 }
             }
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_shared_cxx_runtime_is_never_pending_without_android() {
+        let root = temp_root("libcxx-no-android");
+        let app = scaffold_app(&root);
+        fs::remove_dir_all(app.join("android")).unwrap();
+        let entry = CatalogEntry::built_in(crate::plugin::PluginSpec {
+            id: Cow::Borrowed("acme-native"),
+            crate_dir: Cow::Borrowed("acme-native"),
+            base: Cow::Owned(vec![Contribution::AndroidLibcxxShared]),
+            ..crate::plugin::PluginSpec::DEFAULT
+        });
+        assert!(pending_contributions(&app, &entry, &[]).unwrap().is_empty());
         let _ = fs::remove_dir_all(&root);
     }
 

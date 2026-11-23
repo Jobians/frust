@@ -30,6 +30,11 @@ pub(super) const APP_BUILD_GRADLE_REL: &str = "android/app/build.gradle.kts";
 pub(super) const PBXPROJ_REL: &str = "ios/Runner.xcodeproj/project.pbxproj";
 pub(super) const LIB_RS_REL: &str = "src/lib.rs";
 pub(super) const THEMES_REL: &str = "android/app/src/main/res/values/themes.xml";
+pub(super) const GRADLE_PROPERTIES_REL: &str = platform_wiring::GRADLE_PROPERTIES;
+
+/// The Gradle property the app template's `cargoNdkBuild` task reads to pass
+/// `cargo ndk --link-libcxx-shared` ([`Contribution::AndroidLibcxxShared`]).
+pub(super) const LIBCXX_SHARED_PROPERTY: &str = "frust.cargoNdk.linkLibcxxShared";
 
 /// The app-owned activity style the app template defines in [`THEMES_REL`]
 /// and names in its manifest ([`Contribution::AndroidThemeParent`]).
@@ -227,8 +232,9 @@ pub(super) struct PreparedAdd<'e> {
 
 /// Every check an add of `entry` with `features` makes before it writes
 /// anything — the requested features, the Cargo line it would write, the
-/// platform floors, the native-path rule, the iOS entitlement plan and the
-/// Maven repository marker — shared by [`add_plugin_from_with`] and
+/// platform floors, the native-path rule, the iOS entitlement plan, the
+/// Maven repository marker and the build script's `libc++_shared.so`
+/// property — shared by [`add_plugin_from_with`] and
 /// [`super::sync_plugins`], which runs it for every plugin before the first
 /// write. Reads, never writes.
 pub(super) fn prepare_add<'e>(
@@ -310,6 +316,20 @@ pub(super) fn prepare_add<'e>(
                 return Err(missing_repositories_marker());
             }
         }
+    }
+
+    // The shared C++ runtime is packaged only by a `cargoNdkBuild` task that
+    // reads its property; a build script that predates it is refused before
+    // the first write. A project without the build script is left to the
+    // applier, as for a Maven repository.
+    if contributions
+        .iter()
+        .any(|c| matches!(c, Contribution::AndroidLibcxxShared))
+        && project_root.join(ANDROID_DIR_REL).is_dir()
+        && let Ok(build) = fs::read_to_string(project_root.join(APP_BUILD_GRADLE_REL))
+        && !libcxx_shared_reader_present(&build)
+    {
+        return Err(missing_libcxx_shared_reader());
     }
 
     // A theme parent needs an activity that uses the app-owned style (or a
@@ -863,6 +883,7 @@ fn apply_contribution(
             groups,
             comment,
         } => apply_maven_repository(project_root, url, groups, comment),
+        Contribution::AndroidLibcxxShared => apply_android_libcxx_shared(project_root),
         Contribution::AndroidThemeParent { parent } => {
             apply_android_theme_parent(project_root, &resolution.spec.id, parent)
         }
@@ -2024,6 +2045,119 @@ fn apply_maven_repository(
 /// Whether `settings.gradle.kts` text `src` already names repository `url`.
 pub(super) fn maven_repository_present(src: &str, url: &str) -> bool {
     src.contains(&format!("uri(\"{}\")", kotlin_string_escape(url)))
+}
+
+/// The line [`missing_libcxx_shared_reader`] asks a project generated before
+/// the template read [`LIBCXX_SHARED_PROPERTY`] to add to its
+/// `cargoNdkBuild` command line, right after `add("ndk")`. It reads the
+/// value as the template's `toBoolean()` and [`libcxx_shared_property_set`]
+/// do: `true` in any letter case, surrounding whitespace ignored.
+const LIBCXX_SHARED_READER_LINE: &str = "if ((project.findProperty(\"frust.cargoNdk.linkLibcxxShared\") as String?)?.trim().equals(\"true\", ignoreCase = true)) add(\"--link-libcxx-shared\")";
+
+/// Whether `app/build.gradle.kts` text `src` reads [`LIBCXX_SHARED_PROPERTY`]
+/// outside a comment — what makes setting the property do anything.
+pub(super) fn libcxx_shared_reader_present(src: &str) -> bool {
+    crate::android_build::tasks::reads_property(src, LIBCXX_SHARED_PROPERTY)
+}
+
+/// The error for a build script that predates [`LIBCXX_SHARED_PROPERTY`],
+/// quoting the exact line to add and where.
+pub(super) fn missing_libcxx_shared_reader() -> PluginAddError {
+    PluginAddError::MalformedProjectFile(format!(
+        "{APP_BUILD_GRADLE_REL}: the `cargoNdkBuild` task does not read \
+         `{LIBCXX_SHARED_PROPERTY}`, so `libc++_shared.so` would not be packaged; add the line \
+         `{LIBCXX_SHARED_READER_LINE}` right after `add(\"ndk\")` in its command line, then \
+         re-run"
+    ))
+}
+
+/// The range of the last line of `gradle.properties` text `src` that assigns
+/// [`LIBCXX_SHARED_PROPERTY`] (the last assignment wins), from the key to the
+/// line's ending (leading whitespace and the ending excluded), and the value
+/// it assigns. Comment lines (`#`, `!`) are skipped;
+/// the key ends at `=`, `:` or whitespace, as Java properties read it.
+fn libcxx_shared_assignment(src: &str) -> Option<(Range<usize>, &str)> {
+    let mut found = None;
+    let mut start = 0;
+    for line in src.split_inclusive('\n') {
+        let end = start + line.trim_end_matches(['\r', '\n']).len();
+        let text = &src[start..end];
+        let code = text.trim_start();
+        if !code.starts_with(['#', '!'])
+            && let Some(rest) = code.strip_prefix(LIBCXX_SHARED_PROPERTY)
+            && (rest.is_empty() || rest.starts_with(['=', ':', ' ', '\t']))
+        {
+            let rest = rest.trim_start_matches([' ', '\t']);
+            let value = rest.strip_prefix(['=', ':']).unwrap_or(rest).trim();
+            found = Some((end - code.len()..end, value));
+        }
+        start += line.len();
+    }
+    found
+}
+
+/// Whether `gradle.properties` text `src` sets [`LIBCXX_SHARED_PROPERTY`] to
+/// a value the template's `toBoolean()` reads as true.
+pub(super) fn libcxx_shared_property_set(src: &str) -> bool {
+    libcxx_shared_assignment(src).is_some_and(|(_, value)| value.eq_ignore_ascii_case("true"))
+}
+
+/// Whether the project packages `libc++_shared.so`: its build script reads
+/// the property and its `gradle.properties` sets it. Both files are required.
+/// A project without an `android/` directory has nothing to package, so the
+/// contribution is satisfied there.
+pub(super) fn libcxx_shared_present(project_root: &Path) -> Result<bool, PluginAddError> {
+    if !project_root.join(ANDROID_DIR_REL).is_dir() {
+        return Ok(true);
+    }
+    let build = read_required(
+        &project_root.join(APP_BUILD_GRADLE_REL),
+        APP_BUILD_GRADLE_REL,
+    )?;
+    let properties = read_required(
+        &project_root.join(GRADLE_PROPERTIES_REL),
+        GRADLE_PROPERTIES_REL,
+    )?;
+    Ok(libcxx_shared_reader_present(&build) && libcxx_shared_property_set(&properties))
+}
+
+/// [`Contribution::AndroidLibcxxShared`]: `frust.cargoNdk.linkLibcxxShared=true`
+/// in `android/gradle.properties`, rewriting the line that sets it to another
+/// value or appending one. Refused, with nothing written, when the build
+/// script does not read the property.
+fn apply_android_libcxx_shared(project_root: &Path) -> Result<AddOutcome, PluginAddError> {
+    if !project_root.join(ANDROID_DIR_REL).is_dir() {
+        return Ok(AddOutcome::AlreadyPresent);
+    }
+    let build = read_required(
+        &project_root.join(APP_BUILD_GRADLE_REL),
+        APP_BUILD_GRADLE_REL,
+    )?;
+    if !libcxx_shared_reader_present(&build) {
+        return Err(missing_libcxx_shared_reader());
+    }
+    let path = project_root.join(GRADLE_PROPERTIES_REL);
+    let src = read_required(&path, GRADLE_PROPERTIES_REL)?;
+    if libcxx_shared_property_set(&src) {
+        return Ok(AddOutcome::AlreadyPresent);
+    }
+    let line = format!("{LIBCXX_SHARED_PROPERTY}=true");
+    let out = match libcxx_shared_assignment(&src) {
+        Some((range, _)) => format!("{}{line}{}", &src[..range.start], &src[range.end..]),
+        None => {
+            let separator = if src.is_empty() || src.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            format!(
+                "{src}{separator}# Added by `frust` Add Plugin: package the NDK's libc++_shared.so \
+                 (see app/build.gradle.kts).\n{line}\n"
+            )
+        }
+    };
+    write_file(&path, GRADLE_PROPERTIES_REL, &out)?;
+    Ok(AddOutcome::Applied)
 }
 
 /// Where an app stands against a [`Contribution::AndroidThemeParent`] — the
@@ -6665,6 +6799,270 @@ mod tests {
             "{after}"
         );
         assert!(after.contains("includeGroup(\"g\\\"h\")"), "{after}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // `Contribution::AndroidLibcxxShared`
+    // -----------------------------------------------------------------------
+
+    const LIBCXX_TRUE: &str = "frust.cargoNdk.linkLibcxxShared=true";
+
+    fn read_gradle_properties(root: &Path) -> String {
+        fs::read_to_string(root.join(GRADLE_PROPERTIES_REL)).unwrap()
+    }
+
+    #[test]
+    fn a_fresh_project_reads_the_property_and_ships_it_off() {
+        let root = scaffold_project("libcxx-template");
+        let build = fs::read_to_string(root.join(APP_BUILD_GRADLE_REL)).unwrap();
+        assert!(libcxx_shared_reader_present(&build));
+        assert!(
+            build.contains("if (linkLibcxxShared) add(\"--link-libcxx-shared\")"),
+            "{build}"
+        );
+        let properties = read_gradle_properties(&root);
+        assert_eq!(
+            libcxx_shared_assignment(&properties).map(|(_, value)| value),
+            Some("false"),
+            "{properties}"
+        );
+        assert!(!libcxx_shared_present(&root).unwrap());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adding_onnx_turns_the_property_on_once() {
+        let root = scaffold_project("libcxx-onnx");
+        let before = read_gradle_properties(&root);
+        let report = add_plugin(&root, "onnx", &[]).unwrap();
+        assert_eq!(
+            report
+                .items
+                .iter()
+                .map(|i| (i.description.as_str(), i.outcome))
+                .collect::<Vec<_>>(),
+            [
+                ("Cargo.toml dependency `frust-onnx`", AddOutcome::Applied),
+                (
+                    "Android `libc++_shared.so` in the APK (`frust.cargoNdk.linkLibcxxShared`)",
+                    AddOutcome::Applied
+                ),
+            ]
+        );
+        let after = read_gradle_properties(&root);
+        // The template's `false` line is rewritten in place; nothing else moves.
+        assert_eq!(
+            after,
+            before.replace("frust.cargoNdk.linkLibcxxShared=false", LIBCXX_TRUE)
+        );
+        assert_eq!(after.matches("linkLibcxxShared").count(), 1, "{after}");
+        assert!(libcxx_shared_present(&root).unwrap());
+
+        let tree = snapshot_tree(&root);
+        let again = add_plugin(&root, "onnx", &[]).unwrap();
+        assert!(
+            again
+                .items
+                .iter()
+                .all(|i| i.outcome == AddOutcome::AlreadyPresent),
+            "{again:?}"
+        );
+        assert_eq!(snapshot_tree(&root), tree);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_property_line_is_appended_and_any_true_spelling_is_present() {
+        let root = scaffold_project("libcxx-append");
+        let path = root.join(GRADLE_PROPERTIES_REL);
+        let without = "org.gradle.jvmargs=-Xmx2048m\nandroid.useAndroidX=true";
+        fs::write(&path, without).unwrap();
+        assert_eq!(
+            apply_android_libcxx_shared(&root).unwrap(),
+            AddOutcome::Applied
+        );
+        let after = read_gradle_properties(&root);
+        assert!(after.starts_with(&format!("{without}\n# ")), "{after}");
+        assert!(after.ends_with(&format!("\n{LIBCXX_TRUE}\n")), "{after}");
+        assert_eq!(
+            apply_android_libcxx_shared(&root).unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        assert_eq!(read_gradle_properties(&root), after);
+
+        // Java-properties separators and a case-insensitive `true` all count;
+        // the last assignment wins, and a commented line is no assignment.
+        for (text, set) in [
+            ("frust.cargoNdk.linkLibcxxShared = TRUE\n", true),
+            ("frust.cargoNdk.linkLibcxxShared: true\r\n", true),
+            ("frust.cargoNdk.linkLibcxxShared true\n", true),
+            (
+                "frust.cargoNdk.linkLibcxxShared=true\nfrust.cargoNdk.linkLibcxxShared=false\n",
+                false,
+            ),
+            ("# frust.cargoNdk.linkLibcxxShared=true\n", false),
+            ("frust.cargoNdk.linkLibcxxSharedX=true\n", false),
+        ] {
+            assert_eq!(libcxx_shared_property_set(text), set, "{text:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_property_set_to_another_value_is_rewritten_in_place() {
+        let root = scaffold_project("libcxx-rewrite");
+        let path = root.join(GRADLE_PROPERTIES_REL);
+        fs::write(
+            &path,
+            "a=1\r\n  frust.cargoNdk.linkLibcxxShared : no\r\nb=2\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            apply_android_libcxx_shared(&root).unwrap(),
+            AddOutcome::Applied
+        );
+        assert_eq!(
+            read_gradle_properties(&root),
+            format!("a=1\r\n  {LIBCXX_TRUE}\r\nb=2\r\n")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adding_onnx_to_an_app_without_android_writes_only_the_dependency() {
+        let dest = unique_temp_dir("libcxx-no-android");
+        let platforms: Vec<_> = scaffold::ScaffoldPlatform::DEFAULT
+            .iter()
+            .copied()
+            .filter(|p| *p != scaffold::ScaffoldPlatform::Android)
+            .collect();
+        scaffold::generate_with_platforms(&dest, &test_context(), None, false, None, &platforms)
+            .unwrap();
+        assert!(!dest.join(ANDROID_DIR_REL).exists());
+        let before = snapshot_tree(&dest);
+
+        let report = add_plugin(&dest, "onnx", &[]).unwrap();
+        assert_eq!(
+            report
+                .items
+                .iter()
+                .map(|i| (i.description.as_str(), i.outcome))
+                .collect::<Vec<_>>(),
+            [
+                ("Cargo.toml dependency `frust-onnx`", AddOutcome::Applied),
+                (
+                    "Android `libc++_shared.so` in the APK (`frust.cargoNdk.linkLibcxxShared`)",
+                    AddOutcome::AlreadyPresent
+                ),
+            ]
+        );
+        let after = snapshot_tree(&dest);
+        let changed: Vec<&String> = after
+            .keys()
+            .filter(|k| before.get(*k) != after.get(*k))
+            .collect();
+        assert_eq!(changed, [CARGO_TOML_REL], "{changed:?}");
+        assert_eq!(before.len(), after.len());
+        assert!(!dest.join(ANDROID_DIR_REL).exists());
+        assert!(libcxx_shared_present(&dest).unwrap());
+
+        let catalog = PluginCatalog::built_in();
+        let statuses = crate::plugin::plugin_statuses(&dest, &catalog).unwrap();
+        let (_, status) = statuses
+            .iter()
+            .find(|(entry, _)| &*entry.spec.id == "onnx")
+            .unwrap();
+        assert!(
+            matches!(status, crate::plugin::PluginStatus::Added),
+            "{status:?}"
+        );
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn the_quoted_reader_line_and_the_presence_check_accept_the_same_values() {
+        // The template and the quoted fix line both read the property as
+        // Kotlin's `toBoolean()` does: `true` in any letter case, trimmed.
+        assert!(
+            LIBCXX_SHARED_READER_LINE.contains("equals(\"true\", ignoreCase = true)"),
+            "{LIBCXX_SHARED_READER_LINE}"
+        );
+        assert!(libcxx_shared_reader_present(LIBCXX_SHARED_READER_LINE));
+        for value in ["true", "TRUE", "True", " true ", "tRuE"] {
+            assert!(
+                libcxx_shared_property_set(&format!("{LIBCXX_SHARED_PROPERTY}={value}\n")),
+                "{value:?}"
+            );
+        }
+        for value in ["false", "yes", "1", "", "truee"] {
+            assert!(
+                !libcxx_shared_property_set(&format!("{LIBCXX_SHARED_PROPERTY}={value}\n")),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_build_script_that_predates_the_property_is_refused_before_any_write() {
+        let root = scaffold_project("libcxx-old-template");
+        let build_path = root.join(APP_BUILD_GRADLE_REL);
+        let old = fs::read_to_string(&build_path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.contains("inkLibcxxShared"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&build_path, &old).unwrap();
+        let properties_path = root.join(GRADLE_PROPERTIES_REL);
+        fs::write(&properties_path, "android.useAndroidX=true\n").unwrap();
+        let tree = snapshot_tree(&root);
+
+        let err = add_plugin(&root, "onnx", &[]).unwrap_err();
+        match &err {
+            PluginAddError::MalformedProjectFile(msg) => {
+                assert!(msg.starts_with(APP_BUILD_GRADLE_REL), "{msg}");
+                assert!(msg.contains(LIBCXX_SHARED_READER_LINE), "{msg}");
+                assert!(msg.contains("after `add(\"ndk\")`"), "{msg}");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        assert_eq!(snapshot_tree(&root), tree, "nothing may be written");
+
+        // The line the error quotes is enough: once it is in place, the add
+        // goes through.
+        let fixed = old.replacen(
+            "add(\"ndk\")",
+            &format!("add(\"ndk\")\n            {LIBCXX_SHARED_READER_LINE}"),
+            1,
+        );
+        assert_ne!(fixed, old);
+        fs::write(&build_path, fixed).unwrap();
+        let report = add_plugin(&root, "onnx", &[]).unwrap();
+        assert!(
+            report
+                .items
+                .iter()
+                .all(|i| i.outcome == AddOutcome::Applied),
+            "{report:?}"
+        );
+        assert!(libcxx_shared_present(&root).unwrap());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_shared_cxx_runtime_needs_both_android_files() {
+        let root = scaffold_project("libcxx-missing-files");
+        fs::remove_file(root.join(GRADLE_PROPERTIES_REL)).unwrap();
+        assert!(matches!(
+            apply_android_libcxx_shared(&root),
+            Err(PluginAddError::MissingProjectFile(rel)) if rel == GRADLE_PROPERTIES_REL
+        ));
+        fs::remove_file(root.join(APP_BUILD_GRADLE_REL)).unwrap();
+        assert!(matches!(
+            apply_android_libcxx_shared(&root),
+            Err(PluginAddError::MissingProjectFile(rel)) if rel == APP_BUILD_GRADLE_REL
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 

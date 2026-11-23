@@ -1,0 +1,66 @@
+[package]
+name = "frust-onnx"
+version.workspace = true
+edition.workspace = true
+# Not the workspace MSRV: the exact-pinned `ort` (root Cargo.toml) requires Rust 1.92.
+rust-version = "1.92"
+license.workspace = true
+description = "ONNX model inference for Frust apps over ONNX Runtime: sessions from a model file or bytes, typed tensors, blocking runs."
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[features]
+# `catalog`: the curated vision model list (src/catalog.rs), which pulls in frust-models.
+# `vision`: the segmentation, face and depth tasks over it (src/vision/).
+# `frust-api`: the reactive handles (src/api/), the only code that names `frust`.
+default = ["catalog", "vision", "frust-api"]
+catalog = ["dep:frust-models"]
+vision = ["catalog"]
+frust-api = ["dep:frust"]
+
+[[example]]
+name = "vision_component"
+required-features = ["frust-api", "vision"]
+
+[dependencies]
+log = { workspace = true }
+thiserror = { workspace = true }
+# The downloader only: `hub` keeps `frust-ui` out of the tree.
+frust-models = { path = "../models", version = "0.6.6", default-features = false, features = ["hub"], optional = true }
+# Published as frust-ui, imported as frust: crates.io `frust` belongs to another project.
+frust = { package = "frust-ui", path = "../../crates/frust", version = "0.6.6", default-features = false, optional = true }
+
+# Each desktop row's feature set must equal one prebuilt row of ort-sys' `dist.tsv` exactly (no
+# `lax-feature-matching`): plain on Linux, `coreml` on Apple-silicon macOS, `directml` on Windows.
+# rustls only: native-tls/OpenSSL never enters the tree. `api-17` is the lowest level `ort` offers.
+[target.'cfg(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17"] }
+
+# `coreml` registers the CoreML provider the prebuilt macOS archive contains (see src/accelerator.rs).
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17", "coreml"] }
+
+[target.'cfg(all(target_os = "windows", target_env = "msvc", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17", "directml"] }
+
+# arm64 Android: ONNX Runtime 1.31.0 linked statically from the only prebuilt row (`nnapi`, which
+# selects it and registers nothing). No row has XNNPACK, so `xnnpack` stays off: Android runs on the
+# CPU. The archive needs the NDK's libc++_shared.so in the APK: see README "Android packaging".
+[target.'cfg(all(target_os = "android", target_arch = "aarch64"))'.dependencies]
+ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17", "nnapi"] }
+
+# PLACEHOLDER, not a packaging decision: iOS, Intel macOS and every other target without a static row
+# load ONNX Runtime at run time; Apple's `coreml` uses CoreML if that library has it, else the CPU.
+[target.'cfg(all(target_vendor = "apple", not(all(target_os = "macos", target_arch = "aarch64"))))'.dependencies]
+ort = { workspace = true, features = ["std", "load-dynamic", "api-17", "coreml"] }
+
+# Mirrors `src/runtime.rs`' link cfg, Apple excluded (the row above).
+[target.'cfg(not(any(target_vendor = "apple", all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "android", target_arch = "aarch64"))))'.dependencies]
+ort = { workspace = true, features = ["std", "load-dynamic", "api-17"] }
+
+# CoreML's compiled-model cache directory.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+frust-paths = { workspace = true }

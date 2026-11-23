@@ -12,6 +12,7 @@
 //! gradle-module = { name = "frust-acme-ble", path = "platform/android" }
 //! permissions = ["android.permission.BLUETOOTH_CONNECT"]
 //! maven-repositories = [{ url = "https://maven.example.com", groups = ["com.example.acme"] }]
+//! link-libcxx-shared = true      # optional, default false: package libc++_shared.so
 //! [package.metadata.frust.plugin.ios]
 //! swift-package = { name = "FrustAcmeBle", path = "platform/ios" }
 //! frameworks = ["CoreBluetooth"]
@@ -44,7 +45,8 @@ const ROOT_KEY: &str = "package.metadata.frust.plugin";
 /// Checked: the id is kebab-case and the summary one non-empty line; a `path`
 /// is relative, has no `..`, and names a directory inside the package; a Maven
 /// url is http(s) with at least one group; `min-ios` is dotted integers;
-/// permission and framework names match `[A-Za-z0-9_.]+`; Gradle module and
+/// `link-libcxx-shared` is a bool; permission and framework names match
+/// `[A-Za-z0-9_.]+`; Gradle module and
 /// Swift package names match `[A-Za-z0-9_-]+`; plist and entitlement keys are
 /// non-empty; an entitlement is a bool, a string or an array of strings; a
 /// `cargo-feature` is one of the crate's features; and no key is unknown.
@@ -323,6 +325,8 @@ struct AndroidTable {
     permissions: Vec<String>,
     #[serde(default)]
     maven_repositories: Vec<MavenRepository>,
+    #[serde(default)]
+    link_libcxx_shared: bool,
 }
 
 #[derive(Deserialize)]
@@ -508,6 +512,9 @@ fn platform(
                 groups: owned_list(repository.groups),
                 comment: owned(comment),
             });
+        }
+        if table.link_libcxx_shared {
+            out.push(Contribution::AndroidLibcxxShared);
         }
     }
     if let Some(ios) = ios {
@@ -1094,6 +1101,55 @@ mod tests {
             "[package.metadata.frust.plugin.android]\nmaven-repositories = [{ url = \"https://maven.example.com\" }]\n",
             ".android",
         );
+    }
+
+    #[test]
+    fn link_libcxx_shared_true_packages_the_shared_cxx_runtime() {
+        let dir = temp_dir("libcxx");
+        let entry = parse(
+            &dir,
+            "[package.metadata.frust.plugin]\nid = \"acme-ble\"\nsummary = \"Acme\"\n\
+             [package.metadata.frust.plugin.android]\n\
+             permissions = [\"android.permission.BLUETOOTH_SCAN\"]\n\
+             link-libcxx-shared = true\n",
+        )
+        .unwrap();
+        assert_eq!(
+            &*entry.spec.base,
+            [
+                Contribution::CargoDep {
+                    name: s("frust-acme-ble")
+                },
+                Contribution::ManifestPermission {
+                    permission: s("android.permission.BLUETOOTH_SCAN")
+                },
+                Contribution::AndroidLibcxxShared,
+            ]
+        );
+        let off = parse(
+            &dir,
+            "[package.metadata.frust.plugin]\nid = \"acme-ble\"\nsummary = \"Acme\"\n\
+             [package.metadata.frust.plugin.android]\nlink-libcxx-shared = false\n",
+        )
+        .unwrap();
+        assert_eq!(
+            &*off.spec.base,
+            [Contribution::CargoDep {
+                name: s("frust-acme-ble")
+            }]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn link_libcxx_shared_must_be_a_bool() {
+        for (tag, value) in [("string", "\"true\""), ("integer", "1")] {
+            assert_rejected(
+                tag,
+                &format!("[package.metadata.frust.plugin.android]\nlink-libcxx-shared = {value}\n"),
+                ".android",
+            );
+        }
     }
 
     #[test]

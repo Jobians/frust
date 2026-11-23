@@ -135,8 +135,10 @@ let request = DownloadRequest::from_url("https://example.com/model.onnx", id, So
   are only as trustworthy as the TLS connection that carried them.
 - **Tokens.** The token is sent as `Authorization: Bearer` only to the Hub origin (scheme, host
   and port of the base URL), on the first request and on any redirect hop that stays on that
-  origin, so the CDN that serves the file bytes never sees it. A token with a plain-`http://`
-  base URL off loopback is refused with `HubError::InsecureUrl` before any request.
+  origin, so the CDN that serves the file bytes never sees it. A download whose first URL is not
+  on the Hub origin never carries the token, even when a redirect lands on the Hub. A token with
+  a plain-`http://` base URL off loopback is refused with `HubError::InsecureUrl` before any
+  request.
   `HubClient`'s `Debug` output redacts it, and it is never logged. Gated or private
   repositories answer `HubError::Unauthorized`, with `gated: true` when the terms still need
   accepting on the Hub; a refused token is `HubError::Forbidden`.

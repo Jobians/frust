@@ -113,6 +113,14 @@ val definesB64 = prop("frust.defines", "")
 // foul of the release env-drop Known Issue by construction.
 val cargoFeaturesB64 = prop("frust.cargoFeatures", "")
 
+// `frust.cargoNdk.linkLibcxxShared=true` (android/gradle.properties, or a `-P`)
+// makes cargo-ndk stage the NDK's `libc++_shared.so` beside the app's `.so`, for
+// a dependency built against the shared C++ runtime: without it the APK installs
+// and the app's library then fails to load. `frust plugin add` sets it for a
+// plugin that needs it; off by default, since the library adds about 1.25 MB per
+// ABI to the APK.
+val linkLibcxxShared = prop("frust.cargoNdk.linkLibcxxShared", "false").trim().toBoolean()
+
 // Single source for the Android floor: the `defaultConfig` minSdk and the NDK link
 // platform `cargoNdkBuild` passes to `cargo ndk --platform`, so the two cannot drift.
 val minSdkValue = 29
@@ -376,6 +384,7 @@ val cargoNdkBuild = tasks.register<Exec>("cargoNdkBuild") {
         buildList {
             add("cargo")
             add("ndk")
+            if (linkLibcxxShared) add("--link-libcxx-shared")
             add("--platform")
             add(minSdkValue.toString())
             addAll(cargoTargetArgs)
