@@ -405,7 +405,7 @@ host ignores the back press.
   `PluginOrigin` (`BuiltIn`, or `Manifest` with the package directory cargo resolved); a built-in id
   always wins over a discovered one, and a broken or ambiguous manifest skips that package with a
   warning, never a failure. A manifest declares the same kinds an out-of-tree plugin needs on
-  mobile: Gradle module, permissions, Maven repositories, the NDK's shared C++ runtime, Swift package, frameworks, plist keys,
+  mobile: Gradle module, permissions, Maven repositories, the NDK's shared C++ runtime, Swift package, frameworks, libraries, plist keys,
   entitlements, optional features. It cannot contribute a desktop-lane entry, an app-crate macro,
   a scaffold file or an Android theme parent, and trust rules bound its data ([PLUGINS_CODE_STANDARDS.md](PLUGINS_CODE_STANDARDS.md)).
   The schema is the `frust-drive` `plugin::manifest` module rustdoc; the worked example is

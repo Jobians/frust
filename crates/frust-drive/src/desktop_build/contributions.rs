@@ -120,6 +120,7 @@ fn applies_to(contribution: &Contribution, target: DesktopBundleTarget) -> bool 
         | Contribution::AndroidThemeParent { .. }
         | Contribution::SwiftPackageRef { .. }
         | Contribution::IosFramework { .. }
+        | Contribution::IosLibrary { .. }
         | Contribution::IosEntitlement { .. }
         | Contribution::AppCrateMacro { .. }
         | Contribution::CargoFeature { .. }

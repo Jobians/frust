@@ -9685,51 +9685,51 @@ viewport-top row, so the gap does not apply while it is stuck.
 
 ---
 
-### `onnx-ios-packaging-missing` — `frust-onnx` has no iOS packaging, so ONNX sessions fail on iOS
+### `onnx-ios-arm64-from-15-1` — `frust-onnx` runs on arm64 iOS devices and the arm64 Simulator only, from iOS 15.1, and little has run there
 
-**Observed**: on iOS the crate compiles but loads ONNX Runtime at run time and no library is shipped in the app, so creating a session returns `OnnxError::Runtime`. `frust plugin add onnx` makes no iOS edit. Nothing about iOS inference has been run.
+**Observed**: on `aarch64-apple-ios` and `aarch64-apple-ios-sim` ONNX Runtime 1.31.0 links statically into the app, and `frust plugin add onnx` adds the three Xcode link lines it needs (`-lc++`, `-framework CoreML`, `-framework Foundation`). The prebuilt archive is built for iOS 15.1, so the plugin requires a deployment target of 15.1 and refuses a 15.0 project; nothing has run on iOS 15.x. The x86_64 Simulator and Mac Catalyst have no prebuilt archive and load the runtime at run time (`onnx-no-intel-mac-or-x86-ios-sim`). Only U2-NetP has run on an iPhone (iPhone 13 mini, iOS 27.2); the face and depth tasks and `examples/onnx-vision` have not.
 
-**Applies to**: iOS devices and the simulator.
+**Applies to**: iOS apps that depend on `frust-onnx`, in particular those targeting iOS 15.0, the x86_64 Simulator or Mac Catalyst.
 
-**Workaround**: none; run vision features on other platforms, or ship a runtime library yourself and load it.
+**Workaround**: raise `IPHONEOS_DEPLOYMENT_TARGET` to 15.1 in every configuration; use an arm64 Simulator or a device.
 
-**Why accepted**: the iOS link and packaging route has not been settled.
+**Why accepted**: the pinned `ort` ships prebuilt archives for these two targets only, built for 15.1; the rest needs Apple-device time not yet spent.
 
-**Trigger for removal**: an iOS packaging route is built and gated on a device.
+**Trigger for removal**: the other vision tasks and the example run on an iPhone, and an iOS 15.x device or a lower-floor archive is gated.
 
-**Evidence**: `plugins/onnx/README.md` (iOS packaging); `examples/onnx-vision/README.md` (iOS).
-
----
-
-### `onnx-coreml-unverified` — the CoreML execution provider has never run on Apple hardware
-
-**Observed**: `Accelerator::Auto` resolves to CoreML on Apple targets, but that code path has been compiled only, never run on a Mac, iPhone or iPad. Whether a model runs on CoreML, falls back to the CPU, or fails there is unknown.
-
-**Applies to**: Apple-silicon macOS and iOS.
-
-**Workaround**: pass `Accelerator::Cpu` to take the CPU path.
-
-**Why accepted**: no Apple hardware ran the plugin.
-
-**Trigger for removal**: an Apple-hardware gate runs the CoreML path and records the result.
-
-**Evidence**: `plugins/onnx/src/accelerator.rs`; no Apple-hardware run exists.
+**Evidence**: `plugins/onnx/README.md` (iOS packaging); `crates/frust-drive/src/plugin/registry.rs` (`ONNX_BASE`, `min_ios`).
 
 ---
 
-### `onnx-macos-windows-unverified` — `frust-onnx` and `frust-models` have not been built or run on macOS or Windows
+### `onnx-coreml-unverified` — the CoreML execution provider has run on two Apple devices only, and `Auto` uses it for static input shapes only
 
-**Observed**: the macOS (Apple silicon) and Windows (MSVC) builds of both plugins and of `examples/onnx-vision` were never built or run; the Windows DirectML feature row is likewise unrun. The example's desktop legs on Linux, macOS and Windows have not been walked either; only its Android leg of the device gate passed.
+**Observed**: CoreML has run on an Apple M4 Mac and an iPhone 13 mini; no other Apple device and no iPad. On Apple targets `Accelerator::Auto` uses CoreML only for a model whose inputs are all fully static in shape, and the CPU for a model with any dynamic input dimension, because CoreML costs more there: on the M4, Depth Anything V2 Small (input `[?, 3, ?, ?]`) ran 232 ms at 473 MB on the CPU against 728 ms at about 5.2 GB on CoreML, while U2-NetP (static) ran 90 ms on the CPU against 75 ms on CoreML. An explicit `Accelerator::CoreMl` still forces CoreML on a dynamic-shape model.
 
-**Applies to**: macOS and Windows desktop apps using these plugins.
+**Applies to**: Apple-silicon macOS and iOS; dynamic-shape models there, such as the catalog's depth model.
+
+**Workaround**: pass `Accelerator::CoreMl` to try CoreML on a dynamic-shape model, or `Accelerator::Cpu` to stay on the CPU.
+
+**Why accepted**: the rule follows the only measurements taken; a dynamic-shape model on CoreML can take gigabytes.
+
+**Trigger for removal**: CoreML is measured on more devices and models and the rule is confirmed or changed.
+
+**Evidence**: `plugins/onnx/src/accelerator.rs` (`Accelerator::Auto`); `plugins/onnx/README.md` (Sessions and accelerators, iOS packaging).
+
+---
+
+### `onnx-macos-windows-unverified` — `frust-onnx` and `frust-models` have not been built or run on Windows
+
+**Observed**: on Apple-silicon macOS `frust-onnx` builds and runs (the Apple M4 measurements in `plugins/onnx/README.md`). The Windows (MSVC) builds of both plugins and of `examples/onnx-vision` were never built or run, and the Windows DirectML feature row is likewise unrun. The example's desktop legs on Linux, macOS and Windows have not been walked; only its Android leg of the device gate passed.
+
+**Applies to**: Windows desktop apps using these plugins, and the example's desktop legs.
 
 **Workaround**: none.
 
-**Why accepted**: no macOS or Windows machine ran them.
+**Why accepted**: no Windows machine ran them.
 
-**Trigger for removal**: a macOS and a Windows gate record a build and a run.
+**Trigger for removal**: a Windows gate records a build and a run, and the example's desktop legs are walked.
 
-**Evidence**: `plugins/onnx/Cargo.toml` target rows; the example's device gate covers Android only.
+**Evidence**: `plugins/onnx/Cargo.toml` target rows; `plugins/onnx/src/accelerator.rs` (the M4 measurements); the example's device gate covers Android only.
 
 ---
 
@@ -9751,7 +9751,7 @@ viewport-top row, so the gap does not apply while it is stuck.
 
 ### `onnx-android-cpu-only` — ONNX on Android runs on the CPU only
 
-**Observed**: the Android archive contains an NNAPI provider but `frust-onnx` registers neither NNAPI nor QNN, and XNNPACK is compiled into no build. `Accelerator::Auto` is CoreML on Apple and the CPU elsewhere. Measured on an Android 15 phone (release, CPU): subject mask 519 ms, faces 58 ms, depth 930 ms warm median, 458 MB resident with all three models loaded.
+**Observed**: the Android archive contains an NNAPI provider but `frust-onnx` registers neither NNAPI nor QNN, and XNNPACK is compiled into no build. `Accelerator::Auto` is CoreML on Apple for models whose inputs are all static in shape, and the CPU elsewhere. Measured on an Android 15 phone (release, CPU): subject mask 519 ms, faces 58 ms, depth 930 ms warm median, 458 MB resident with all three models loaded.
 
 **Applies to**: Android, and every desktop target (CPU only).
 

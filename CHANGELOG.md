@@ -548,17 +548,20 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 - `frust-onnx`: ONNX inference over ONNX Runtime 1.31.0 through `ort = "=2.0.0-rc.15"`, a frust-owned
   exact pin of a release candidate that needs Rust 1.92 (the workspace minimum stays 1.89). Sessions
   from a file or bytes, typed tensors, a per-session worker with cancel, a session cache and an
-  accelerator policy (`Auto` is CoreML on Apple and the CPU elsewhere); the CPU arena and memory
+  accelerator policy (on Apple, `Auto` is CoreML for a model whose inputs are all static in shape
+  and the CPU for any dynamic input dimension; the CPU elsewhere); the CPU arena and memory
   pattern are off by default. Vision tasks `segment_subject` (U2-NetP), `detect_faces` (YuNet) and
   `estimate_depth` (Depth Anything V2 Small), a catalog of three pinned models, and `VisionHandle`
   with `status`, `results` and `last_run`. Desktop builds fetch a prebuilt ONNX Runtime archive at
   build time (about 10.7 MB on Linux; `cargo --offline` fails the link). Android arm64 links it
-  statically (+20.4 MB APK); other Android ABIs ship no runtime. Measured on a OnePlus 9 (Android 15,
+  statically (+20.4 MB APK); other Android ABIs ship no runtime. arm64 iOS devices and the arm64
+  Simulator link it statically too (minimum iOS 15.1). Measured on a OnePlus 9 (Android 15,
   release, CPU): subject mask 519 ms, faces 58 ms, depth 930 ms warm median, 458 MB with the three
-  models loaded. Not done or not verified: iOS packaging (sessions fail at creation), CoreML on
-  Apple hardware, macOS and Windows builds, Intel macOS, face detection on a real face; see the
-  `onnx-*` entries in docs/LIMITATIONS.md. `frust plugin add onnx` (registry id `onnx`) adds the
-  dependency, the Gradle property and `android.permission.INTERNET`.
+  models loaded. Not done or not verified: the Windows build, Intel macOS, the x86_64 Simulator and
+  Mac Catalyst, anything on iOS 15, face detection on a real face; see the `onnx-*` entries in
+  docs/LIMITATIONS.md. `frust plugin add onnx` (registry id `onnx`) adds the dependency, the Gradle
+  property, `android.permission.INTERNET`, and `-lc++`, `-framework CoreML` and
+  `-framework Foundation` in every `OTHER_LDFLAGS` list of the iOS project.
 - `examples/onnx-vision`: a standalone app that downloads the catalog models and runs the three vision
   tasks on a sample or a picked photo. Its Android device leg passed (the download rows used a host
   mirror, not the internet); the iPhone, macOS and Linux desktop legs have not been run. It is in the
@@ -568,9 +571,20 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   property `frust.cargoNdk.linkLibcxxShared`, which the app template's `cargoNdkBuild` task turns
   into `cargo ndk --link-libcxx-shared` so the APK carries `libc++_shared.so`. `Contribution` is not
   `#[non_exhaustive]`, so an exhaustive `match` needs the new arm.
+- `frust-drive`: a new plugin contribution kind, `Contribution::IosLibrary` (manifest key
+  `libraries = ["c++"]` under `[package.metadata.frust.plugin.ios]`, names of `[A-Za-z0-9_+.-]+`).
+  It adds `-l<name>` to every `OTHER_LDFLAGS` list of the app's Xcode project, as
+  `Contribution::IosFramework` adds a framework. An exhaustive `match` needs the new arm.
 
 ### Changed
 
+- New apps target iOS 15.1 (15.0 before), the minimum of the ONNX Runtime archive `frust-onnx`
+  links. `frust plugin add onnx` requires 15.1 and tells a project still at 15.0 to raise its
+  deployment target; nothing is written until it does.
+- `Contribution::IosFramework` (and `IosLibrary`) count as already present in a project without an
+  `ios/` directory, so the iOS link lines no longer block an add there: an app without `ios/` can
+  add `onnx`, and one that has `android/` can add `auth-session` and the other plugins whose iOS
+  side is only link lines. A project with `ios/` but no `project.pbxproj` still fails.
 - The framework's Android pthread key use: each crate keeps its per-thread state in one struct, so
   the framework links 7 thread-local statics (57 before). On a OnePlus 9 (Android 15) the native-widgets
   demo links 33 in all (84 before) and ends a full walk with 82 pthread keys free (40 before).

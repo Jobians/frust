@@ -322,10 +322,37 @@ pub enum Contribution {
     /// (the flag in some configurations but not all) completes the rest and
     /// reports [`AddOutcome::Applied`]; only a project whose every
     /// `OTHER_LDFLAGS` list already carries the flag reports
-    /// [`AddOutcome::AlreadyPresent`].
+    /// [`AddOutcome::AlreadyPresent`]. A project without an `ios/` directory
+    /// has nothing to link, so the contribution is satisfied there
+    /// ([`AddOutcome::AlreadyPresent`], nothing written) — the way
+    /// [`Contribution::ManifestPermission`] is without `android/`; a project
+    /// with `ios/` but no `project.pbxproj` is still
+    /// [`PluginAddError::MissingProjectFile`].
     IosFramework {
         /// The framework's name as `-framework` takes it, e.g.
         /// `"AuthenticationServices"` — no `.framework` suffix.
+        name: Cow<'static, str>,
+    },
+    /// A library linked into the generated app's Runner target by name:
+    /// `"-l<name>",` appended to every `OTHER_LDFLAGS` list in
+    /// `ios/Runner.xcodeproj/project.pbxproj`, the `-l` counterpart of
+    /// [`Contribution::IosFramework`].
+    ///
+    /// For a plugin whose Rust side links a static native archive with a
+    /// system library dependency: a crate's link request reaches Cargo's own
+    /// link only, never the Xcode link of the app's staticlib (the reason
+    /// [`Contribution::IosFramework`] exists). `frust-onnx`'s ONNX Runtime
+    /// archive is C++ and needs `-lc++`.
+    ///
+    /// Exactly [`Contribution::IosFramework`]'s semantics: one contribution,
+    /// one file, one [`AddItem`]; a half-applied state completes the rest and
+    /// reports [`AddOutcome::Applied`]; only a project whose every
+    /// `OTHER_LDFLAGS` list already carries the flag reports
+    /// [`AddOutcome::AlreadyPresent`]; the whole edit is built in memory and
+    /// written once; a project without `ios/` is satisfied.
+    IosLibrary {
+        /// The library's name as `-l` takes it, e.g. `"c++"` — no `lib`
+        /// prefix and no suffix.
         name: Cow<'static, str>,
     },
     /// An entitlement requested on the generated app's iOS Runner target:
@@ -582,6 +609,9 @@ impl Contribution {
             Contribution::IosFramework { name } => {
                 format!("Xcode framework `{name}` (`OTHER_LDFLAGS`)")
             }
+            Contribution::IosLibrary { name } => {
+                format!("Xcode library `-l{name}` (`OTHER_LDFLAGS`)")
+            }
             Contribution::IosEntitlement { key, .. } => {
                 format!("iOS entitlement `{key}` (`CODE_SIGN_ENTITLEMENTS`)")
             }
@@ -762,10 +792,11 @@ pub enum PluginAddError {
     /// two hex digits, so 256 ids) — nothing is written.
     #[error("project file `{file}` has no free `…00NN` pbxproj object id left")]
     PbxIdSpaceExhausted { file: String },
-    /// A [`Contribution::SwiftPackageRef`]'s or [`Contribution::IosFramework`]'s
-    /// in-memory edit failed its own re-scan: one of the package's six sites
-    /// is missing or carries a mismatched id, or one `OTHER_LDFLAGS` list
-    /// still lacks the framework, so the file is left untouched rather than
+    /// A [`Contribution::SwiftPackageRef`]'s, [`Contribution::IosFramework`]'s
+    /// or [`Contribution::IosLibrary`]'s in-memory edit failed its own
+    /// re-scan: one of the package's six sites is missing or carries a
+    /// mismatched id, or one `OTHER_LDFLAGS` list still lacks the framework
+    /// or library, so the file is left untouched rather than
     /// written half-wired.
     #[error(
         "pbxproj wiring for `{package}` in `{file}` failed verification (site `{site}`); \
@@ -916,6 +947,24 @@ mod tests {
             }
             .describe(),
             "iOS entitlement `aps-environment` (`CODE_SIGN_ENTITLEMENTS`)"
+        );
+    }
+
+    #[test]
+    fn ios_link_describe_strings_name_the_flag_and_the_build_setting() {
+        assert_eq!(
+            Contribution::IosLibrary {
+                name: Cow::Borrowed("c++"),
+            }
+            .describe(),
+            "Xcode library `-lc++` (`OTHER_LDFLAGS`)"
+        );
+        assert_eq!(
+            Contribution::IosFramework {
+                name: Cow::Borrowed("CoreML"),
+            }
+            .describe(),
+            "Xcode framework `CoreML` (`OTHER_LDFLAGS`)"
         );
     }
 
