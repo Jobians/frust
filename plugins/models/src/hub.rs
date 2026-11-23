@@ -6,9 +6,10 @@
 //! Redirects are followed here rather than by the agent, so every hop passes the same checks
 //! as the first URL: it must be `https://`, or plain `http://` when the first URL was on a
 //! loopback address and the hop is too, and at most 5 hops are followed. The access token is
-//! attached to a hop only when its scheme, host and port are the base URL's, so a CDN never
-//! sees it, and a token is never sent to a plain-`http://` base URL off loopback. See the
-//! README's "Downloading" section.
+//! attached only to a request whose first URL has the base URL's scheme, host and port, and only
+//! on hops that have them too: a request that starts on a third-party server never carries it,
+//! even when a redirect lands on the Hub, and a CDN never sees it. A token is never sent to a
+//! plain-`http://` base URL off loopback. See the README's "Downloading" section.
 //!
 //! Every call here blocks. The public entry points refuse the platform UI thread with
 //! [`ModelsError::UiThread`] where the platform has one to refuse; see `refuse_ui_thread`.
@@ -395,8 +396,9 @@ impl HubClient {
     }
 
     /// Sends a GET to `url` and follows at most [`MAX_REDIRECTS`] redirects, checking each hop
-    /// before connecting to it. `Range` is sent on every hop when `range_from` is set; the
-    /// token only on hops to the base URL's origin.
+    /// before connecting to it. `Range` is sent on every hop when `range_from` is set. The
+    /// token is sent only when `url` itself is on the base URL's origin, and then only on hops
+    /// to that origin, so a redirect cannot pull the token off a third-party request.
     pub(crate) fn get(
         &self,
         url: &str,
@@ -407,12 +409,14 @@ impl HubClient {
             check_url(&self.base_url)?;
         }
         let first = Origin::parse(url).ok_or(HubError::InsecureUrl)?;
+        let bearer = self.token.is_some() && self.same_origin_as_base(url);
         let mut current = url.to_owned();
         let mut query = query;
         let mut hops = 0;
         loop {
             check_hop(&first, &current)?;
-            let response = self.send(&current, query, range_from)?;
+            let attach = bearer && self.same_origin_as_base(&current);
+            let response = self.send(&current, query, range_from, attach)?;
             let Some(location) = redirect_location(&response) else {
                 return Ok(response);
             };
@@ -425,12 +429,14 @@ impl HubClient {
         }
     }
 
-    /// One request without following redirects.
+    /// One request without following redirects. `attach` says whether the bearer token goes on
+    /// this hop; the caller decides, from the request's first URL and this hop's origin.
     fn send(
         &self,
         url: &str,
         query: &[(&str, String)],
         range_from: Option<u64>,
+        attach: bool,
     ) -> Result<Response<Body>, HubError> {
         let mut request = self.agent.get(url);
         for (key, value) in query {
@@ -440,7 +446,7 @@ impl HubClient {
             request = request.header("Range", format!("bytes={from}-"));
         }
         if let Some(token) = &self.token
-            && self.same_origin_as_base(url)
+            && attach
         {
             request = request.header("Authorization", format!("Bearer {token}"));
         }

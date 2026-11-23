@@ -322,6 +322,10 @@ fn route(state: &State, target: &str, range: Option<&str>) -> Reply {
     if let Some(rest) = path.strip_prefix("/redirect/") {
         return with(reply(302, ""), "Location", format!("{cdn}/blobs/{rest}"));
     }
+    // `/cdn-to-hub/<file>` is answered by the CDN and redirects back to the Hub's blob route.
+    if let Some(rest) = path.strip_prefix("/cdn-to-hub/") {
+        return with(reply(302, ""), "Location", format!("{hub}/blobs/{rest}"));
+    }
     if let Some(rest) = path.strip_prefix("/insecure/") {
         let target = format!("http://{OFF_LOOPBACK_HOST}/blobs/{rest}");
         return with(reply(302, ""), "Location", target);
