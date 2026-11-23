@@ -1932,6 +1932,21 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_cxx_runtime_is_never_pending_without_android() {
+        let root = temp_root("libcxx-no-android");
+        let app = scaffold_app(&root);
+        fs::remove_dir_all(app.join("android")).unwrap();
+        let entry = CatalogEntry::built_in(crate::plugin::PluginSpec {
+            id: Cow::Borrowed("acme-native"),
+            crate_dir: Cow::Borrowed("acme-native"),
+            base: Cow::Owned(vec![Contribution::AndroidLibcxxShared]),
+            ..crate::plugin::PluginSpec::DEFAULT
+        });
+        assert!(pending_contributions(&app, &entry, &[]).unwrap().is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_theme_parent_is_never_pending_without_android() {
         let root = temp_root("theme-parent-no-android");
         let app = scaffold_app(&root);
