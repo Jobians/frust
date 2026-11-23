@@ -299,7 +299,7 @@ The NDK is the scaffold's r28 (28.2.13676358), which aligns every `.so` to 16 KB
 
 | ABI | What happens |
 |-----|--------------|
-| arm64-v8a | Static link, as above. Builds, links and packages; the device run is still owed. |
+| arm64-v8a | Static link, as above. A `frust create` app with `frust plugin add onnx` and no hand edit builds, packages `libc++_shared.so` and starts on a OnePlus 9, where `runtime_info()` reports ONNX Runtime 1.31.0 linked `Static`. |
 | x86_64 | `ort` has an `nnapi` prebuilt row for it too, but this crate does not use it yet (no build has proven it), so it takes the run-time route: it compiles, and every session returns `OnnxError::Runtime` unless the app ships its own `libonnxruntime.so`. |
 | armeabi-v7a | No prebuilt row: the run-time route, as for x86_64. |
 
@@ -318,6 +318,7 @@ the app's `/sdcard/Android/data/<application id>/files/`, not bundled):
 |---------|-------|
 | Release APK without `frust-onnx` | 10,793,449 bytes (app `.so` 10,551,048) |
 | Release APK with `frust-onnx` | 31,195,333 bytes (+20.4 MB): app `.so` 29,691,288 (+19.1 MB), `libc++_shared.so` 1,253,544 |
+| Release APK with `frust-onnx` added by `frust plugin add onnx` (later build, no U2-NetP smoke code) | 31,114,032 bytes: app `.so` 29,609,984, `libc++_shared.so` 1,253,544; the same app without the plugin ships no `libc++_shared.so` |
 | 16 KB page size (`scripts/ci/page-size-check.sh` on the APK's `lib/arm64-v8a`) | both `.so` files pass, minimum PT_LOAD alignment 0x4000 |
 | Clean `cargo ndk -t arm64-v8a build --release -p frust-onnx` | 9.2 s wall, the archive download included |
 | U2-NetP on a OnePlus 9, ONNX Runtime's memory defaults (arena and memory pattern on) | 458 ms median per run; app peak RSS 133 MB before the session, 607 MB after (native heap 439 MB) |
