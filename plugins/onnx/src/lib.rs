@@ -71,5 +71,5 @@ pub use runtime::{LinkKind, RuntimeInfo, runtime_info};
 pub use session::{Optimization, Session, SessionOptions};
 pub use tensor::{DType, Tensor, TensorData, TensorInfo};
 #[cfg(feature = "vision")]
-pub use vision::{DepthConvention, Face, VisionModels};
+pub use vision::{DepthConvention, Face, VisionModels, VisionRun};
 pub use worker::{RunEvent, RunHandle, RunSink};

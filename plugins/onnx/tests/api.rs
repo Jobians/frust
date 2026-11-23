@@ -1,16 +1,19 @@
-//! `VisionHandle` over a stub runner: the status order, the supersede rule and failures, with no
-//! model and no ONNX Runtime session involved.
+//! `VisionHandle` over a stub runner: the status order, the supersede rule, failures and the
+//! per-task run reports, with no model and no ONNX Runtime session involved.
 
 #![cfg(all(feature = "frust-api", feature = "vision"))]
+
+mod support;
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use frust::GetUntracked;
+use frust_models::ModelId;
 use frust_onnx::api::{VisionHandle, VisionOutput, VisionStatus};
 use frust_onnx::catalog::VisionTask;
-use frust_onnx::{Face, OnnxError, Plane, RgbaView};
+use frust_onnx::{Face, OnnxError, Plane, Provider, RgbaView, SessionOptions, VisionModels};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -162,8 +165,12 @@ fn a_newer_request_supersedes_an_older_one_of_the_same_task() {
     gate.release.send(()).unwrap();
     // The next run is width 3: width 2 never ran.
     assert_eq!(gate.started.recv_timeout(WAIT).unwrap(), 3);
-    // Width 1 finished while superseded, and its result was dropped.
+    // Width 1 finished while superseded, and its result was dropped, its run report with it.
     assert_eq!(handle.mask().get_untracked(), None);
+    assert_eq!(
+        handle.last_run(VisionTask::Segmentation).get_untracked(),
+        None
+    );
 
     gate.release.send(()).unwrap();
     assert_eq!(
@@ -176,6 +183,12 @@ fn a_newer_request_supersedes_an_older_one_of_the_same_task() {
     let mask = handle.mask().get_untracked().expect("the newest mask");
     assert_eq!(mask.width, 3);
     assert!(gate.started.try_recv().is_err(), "nothing else ran");
+    // A plain stub runner names no provider.
+    let run = handle
+        .last_run(VisionTask::Segmentation)
+        .get_untracked()
+        .expect("the published run is reported");
+    assert_eq!(run.provider, None);
 }
 
 #[test]
@@ -292,4 +305,106 @@ fn a_panicking_runner_is_a_failure_and_the_worker_keeps_serving() {
     handle.segment(image(2, 1), 2, 1);
     assert_eq!(log.next_settled().last(), Some(&VisionStatus::Idle));
     assert_eq!(handle.mask().get_untracked().unwrap().width, 2);
+}
+
+#[test]
+fn each_task_reports_the_provider_and_duration_of_its_last_published_run() {
+    const DELAY: Duration = Duration::from_millis(30);
+    let fail = Arc::new(Mutex::new(false));
+    let failing = fail.clone();
+    let (handle, log) = logged(VisionHandle::with_runner_on(
+        Provider::Cpu,
+        move |task, image| {
+            std::thread::sleep(DELAY);
+            if *failing.lock().unwrap() {
+                return Err(OnnxError::Run("stub failure".to_owned()));
+            }
+            Ok(match task {
+                VisionTask::FaceDetection => VisionOutput::Faces(Vec::new()),
+                _ => VisionOutput::Plane(plane_of(image, 0.5)),
+            })
+        },
+    ));
+    let tasks = [
+        VisionTask::Segmentation,
+        VisionTask::FaceDetection,
+        VisionTask::Depth,
+    ];
+    for task in tasks {
+        assert_eq!(handle.last_run(task).get_untracked(), None, "{task:?}");
+    }
+
+    handle.segment(image(2, 2), 2, 2);
+    log.next_settled();
+    let first = handle
+        .last_run(VisionTask::Segmentation)
+        .get_untracked()
+        .expect("the run is reported once its result is published");
+    assert_eq!(first.provider, Some(Provider::Cpu));
+    assert!(first.duration >= DELAY, "{first:?}");
+    assert!(first.duration < WAIT, "{first:?}");
+    // A stub runner loads no session.
+    assert!(!first.loaded_model);
+    // The other tasks have not run.
+    assert_eq!(
+        handle.last_run(VisionTask::FaceDetection).get_untracked(),
+        None
+    );
+    assert_eq!(handle.last_run(VisionTask::Depth).get_untracked(), None);
+
+    // A failed run leaves the last published run's report.
+    *fail.lock().unwrap() = true;
+    handle.segment(image(2, 2), 2, 2);
+    assert!(matches!(
+        log.next_settled().last(),
+        Some(VisionStatus::Failed(_))
+    ));
+    assert_eq!(
+        handle.last_run(VisionTask::Segmentation).get_untracked(),
+        Some(first)
+    );
+
+    // Each task keeps its own report.
+    *fail.lock().unwrap() = false;
+    handle.detect_faces(image(3, 3), 3, 3, None);
+    handle.estimate_depth(image(3, 3), 3, 3);
+    assert_eq!(log.next_settled().last(), Some(&VisionStatus::Idle));
+    for task in [VisionTask::FaceDetection, VisionTask::Depth] {
+        let run = handle.last_run(task).get_untracked().expect("reported");
+        assert_eq!(run.provider, Some(Provider::Cpu), "{task:?}");
+        assert!(run.duration >= DELAY, "{task:?}: {run:?}");
+    }
+    assert_eq!(
+        handle.last_run(VisionTask::Segmentation).get_untracked(),
+        Some(first)
+    );
+}
+
+/// The provider a model-backed handle reports comes from `VisionModels::loaded_provider`, which
+/// reads the loaded session and never loads one itself.
+#[test]
+fn loaded_provider_reads_the_loaded_session_and_never_loads() {
+    let store = support::empty_store("api-provider");
+    let id = ModelId::new("local", "fixtures", "add_f32.onnx").unwrap();
+    let models = VisionModels::new(store.clone(), SessionOptions::default())
+        .with_model(VisionTask::Depth, id.clone());
+    // Not in the store yet, then in the store but not loaded.
+    assert_eq!(models.loaded_provider(VisionTask::Depth), None);
+    store.import(&support::add_f32_path(), &id, None).unwrap();
+    assert_eq!(models.loaded_provider(VisionTask::Depth), None);
+    assert!(models.cache().is_empty(), "asking loads nothing");
+    assert_eq!(models.cache().load_count(), 0);
+
+    let path = store.get(&id).unwrap().path;
+    let session = models.cache().get_or_load(&path, models.options()).unwrap();
+    assert_eq!(
+        models.loaded_provider(VisionTask::Depth),
+        Some(session.provider())
+    );
+    // Another task's model is a different file: not loaded.
+    assert_eq!(models.loaded_provider(VisionTask::Segmentation), None);
+    models.cache().clear();
+    assert_eq!(models.loaded_provider(VisionTask::Depth), None);
+    assert_eq!(models.cache().load_count(), 1);
+    let _ = std::fs::remove_dir_all(store.root());
 }

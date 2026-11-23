@@ -4,12 +4,13 @@ use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+use std::time::Instant;
 
 use frust::{ReadSignal, RwSignal, Set};
 
 use crate::catalog::{VisionModel, VisionTask};
-use crate::vision::{Face, VisionModels};
-use crate::{OnnxError, Plane, RgbaView};
+use crate::vision::{Face, VisionModels, VisionRun};
+use crate::{OnnxError, Plane, Provider, RgbaView};
 
 /// What a [`VisionHandle`] is doing.
 ///
@@ -47,7 +48,8 @@ pub enum VisionOutput {
 /// What runs a request: the models themselves, or a stand-in a test injects.
 enum Backend {
     Models(Arc<VisionModels>),
-    Runner(Box<RunnerFn>),
+    /// The runner, and the provider its runs report.
+    Runner(Box<RunnerFn>, Option<Provider>),
 }
 
 type RunnerFn =
@@ -96,6 +98,8 @@ struct Shared {
     mask: RwSignal<Option<Arc<Plane>>>,
     faces: RwSignal<Arc<Vec<Face>>>,
     depth: RwSignal<Option<Arc<Plane>>>,
+    /// Each task's last completed run, in [`slot`] order.
+    runs: [RwSignal<Option<VisionRun>>; TASKS],
     inner: Mutex<Inner>,
 }
 
@@ -107,7 +111,8 @@ struct Shared {
 /// worker thread, `frust-onnx-vision`, which loads the model on first use and runs it through
 /// [`VisionModels`]; requests run one at a time, in the order made. The worker then writes the
 /// task's result signal ([`mask`](Self::mask), [`faces`](Self::faces),
-/// [`depth`](Self::depth)) and [`status`](Self::status). It only writes signals: it never
+/// [`depth`](Self::depth)), then the task's [`last_run`](Self::last_run) (provider and
+/// duration), then [`status`](Self::status). It only writes signals: it never
 /// reads one, never waits on the UI thread, and holds the handle's lock only while it writes.
 ///
 /// **A newer request for a task supersedes an older one.** A queued older request is dropped
@@ -149,7 +154,20 @@ impl VisionHandle {
         + Sync
         + 'static,
     ) -> Self {
-        Self::with_backend(Backend::Runner(Box::new(runner)))
+        Self::with_backend(Backend::Runner(Box::new(runner), None))
+    }
+
+    /// [`with_runner`](Self::with_runner) whose runs report `provider` in
+    /// [`last_run`](Self::last_run).
+    #[doc(hidden)]
+    pub fn with_runner_on(
+        provider: Provider,
+        runner: impl Fn(VisionTask, RgbaView<'_>) -> Result<VisionOutput, OnnxError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self::with_backend(Backend::Runner(Box::new(runner), Some(provider)))
     }
 
     fn with_backend(backend: Backend) -> Self {
@@ -160,6 +178,7 @@ impl VisionHandle {
                 mask: RwSignal::new(None),
                 faces: RwSignal::new(Arc::new(Vec::new())),
                 depth: RwSignal::new(None),
+                runs: [(); TASKS].map(|()| RwSignal::new(None)),
                 inner: Mutex::new(Inner::default()),
             }),
         }
@@ -197,12 +216,19 @@ impl VisionHandle {
         self.shared.depth.read_only()
     }
 
+    /// `task`'s last completed run: the provider that ran it and how long it took, `None` until
+    /// one has published its result. Written with the result, before the status turns
+    /// [`Idle`](VisionStatus::Idle).
+    pub fn last_run(&self, task: VisionTask) -> ReadSignal<Option<VisionRun>> {
+        self.shared.runs[slot(task)].read_only()
+    }
+
     /// The catalog models still to download ([`VisionModels::missing`]). Reads the store's
     /// directory: call it from `Component::init` or a worker, not on every frame.
     pub fn missing_models(&self) -> Vec<&'static VisionModel> {
         match &self.shared.backend {
             Backend::Models(models) => models.missing(),
-            Backend::Runner(_) => Vec::new(),
+            Backend::Runner(..) => Vec::new(),
         }
     }
 
@@ -298,8 +324,17 @@ impl Shared {
                 job
             };
             // The model runs without the lock, so requests can queue meanwhile.
+            let loads = self.load_count();
+            let started = Instant::now();
             let result = catch_unwind(AssertUnwindSafe(|| self.run(&job))).unwrap_or_else(|_| {
                 Err(OnnxError::Run(format!("the {:?} task panicked", job.task)))
+            });
+            let duration = started.elapsed();
+            // Read before taking the lock: the provider lookup reads the store's directory.
+            let run = result.is_ok().then(|| VisionRun {
+                provider: self.provider(job.task),
+                duration,
+                loaded_model: self.load_count() != loads,
             });
             let mut inner = self.lock();
             let failed = if inner.latest[slot(job.task)] != job.generation {
@@ -307,7 +342,10 @@ impl Shared {
                 false
             } else {
                 match result.and_then(|output| self.write(job.task, output)) {
-                    Ok(()) => false,
+                    Ok(()) => {
+                        self.runs[slot(job.task)].set(run);
+                        false
+                    }
                     Err(err) => {
                         self.publish(&mut inner, VisionStatus::Failed(err.to_string()));
                         true
@@ -330,7 +368,23 @@ impl Shared {
                     .map(VisionOutput::Faces),
                 VisionTask::Depth => models.estimate_depth(image).map(VisionOutput::Plane),
             },
-            Backend::Runner(run) => run(job.task, image),
+            Backend::Runner(run, _) => run(job.task, image),
+        }
+    }
+
+    /// The provider `task`'s session runs on, when it is loaded.
+    fn provider(&self, task: VisionTask) -> Option<Provider> {
+        match &self.backend {
+            Backend::Models(models) => models.loaded_provider(task),
+            Backend::Runner(_, provider) => *provider,
+        }
+    }
+
+    /// The loads the models' session cache has made; zero for a runner.
+    fn load_count(&self) -> u64 {
+        match &self.backend {
+            Backend::Models(models) => models.cache().load_count(),
+            Backend::Runner(..) => 0,
         }
     }
 

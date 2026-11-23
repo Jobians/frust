@@ -73,6 +73,18 @@ pub enum Show {
     Depth,
 }
 
+impl Show {
+    /// The task whose result this shows; `None` for the photo alone.
+    pub fn task(self) -> Option<VisionTask> {
+        match self {
+            Self::Photo => None,
+            Self::Mask => Some(VisionTask::Segmentation),
+            Self::Faces => Some(VisionTask::FaceDetection),
+            Self::Depth => Some(VisionTask::Depth),
+        }
+    }
+}
+
 /// An overlay image and the photo it was computed for.
 #[derive(Clone)]
 struct Overlay {
@@ -276,10 +288,11 @@ impl Component for VisionScreen {
         let mut status_line = match &status {
             VisionStatus::Running(task) => format!("Running {}...", task_label(*task)),
             VisionStatus::Failed(message) => format!("Failed: {message}"),
-            VisionStatus::Idle => services.last_run.get().map_or_else(
-                || "Choose a task to run a model".to_owned(),
-                |t| timing_line(&t),
-            ),
+            // The shown result's run: the handle reports each task's provider and time.
+            VisionStatus::Idle => shown
+                .task()
+                .and_then(|task| Some(timing_line(task, &vision.last_run(task).get()?)))
+                .unwrap_or_else(|| "Choose a task to run a model".to_owned()),
         };
         if shown == Show::Faces
             && let Some(faces) = &faces

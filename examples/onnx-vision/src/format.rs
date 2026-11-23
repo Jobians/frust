@@ -1,7 +1,7 @@
 //! The text the screens show, as pure functions over plain values so the tests can pin it.
 
 use frust_models::api::{DownloadProgress, DownloadState};
-use frust_onnx::Provider;
+use frust_onnx::VisionRun;
 use frust_onnx::catalog::VisionTask;
 
 /// Devices with less total memory than this get the low-memory note (decimal, as phones are
@@ -107,38 +107,30 @@ pub fn task_kind(task: VisionTask) -> &'static str {
     }
 }
 
-/// One finished vision request, as the status line reports it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RunTiming {
-    /// The task that ran.
-    pub task: VisionTask,
-    /// Wall time from the request to its result, in milliseconds.
-    pub millis: u64,
-    /// The execution provider of the session that ran it, when known.
-    pub provider: Option<Provider>,
-    /// Whether this was the task's first run in this process (the time includes the model load).
-    pub first: bool,
-}
-
-/// The status line after a run: `Depth: 412 ms on CPU (first run, includes loading)`.
-pub fn timing_line(timing: &RunTiming) -> String {
-    let provider = timing
+/// The status line after `task`'s last run, as `VisionHandle::last_run` reports it:
+/// `Depth: 412 ms on CPU (includes loading the model)`.
+pub fn timing_line(task: VisionTask, run: &VisionRun) -> String {
+    let provider = run
         .provider
         .map_or_else(|| "an unknown provider".to_owned(), |p| p.to_string());
-    let first = if timing.first {
-        " (first run, includes loading the model)"
+    let loaded = if run.loaded_model {
+        " (includes loading the model)"
     } else {
         ""
     };
     format!(
-        "{}: {} ms on {provider}{first}",
-        task_label(timing.task),
-        timing.millis
+        "{}: {} ms on {provider}{loaded}",
+        task_label(task),
+        run.duration.as_millis()
     )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use frust_onnx::Provider;
+
     use super::*;
 
     #[test]
@@ -162,22 +154,21 @@ mod tests {
     }
 
     #[test]
-    fn timing_names_the_provider_and_the_first_run() {
-        let timing = RunTiming {
-            task: VisionTask::Depth,
-            millis: 412,
+    fn timing_names_the_provider_and_a_run_that_loaded_the_model() {
+        let run = VisionRun {
             provider: Some(Provider::Cpu),
-            first: false,
+            duration: Duration::from_micros(412_900),
+            loaded_model: false,
         };
-        assert_eq!(timing_line(&timing), "Depth: 412 ms on CPU");
-        let first = RunTiming {
-            first: true,
+        assert_eq!(timing_line(VisionTask::Depth, &run), "Depth: 412 ms on CPU");
+        let loading = VisionRun {
             provider: None,
-            ..timing
+            loaded_model: true,
+            ..run
         };
         assert_eq!(
-            timing_line(&first),
-            "Depth: 412 ms on an unknown provider (first run, includes loading the model)"
+            timing_line(VisionTask::Depth, &loading),
+            "Depth: 412 ms on an unknown provider (includes loading the model)"
         );
     }
 }
