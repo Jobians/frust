@@ -40,9 +40,12 @@ applies a toggle or an answer itself: the app owns the transcript and every open
 **Untrusted content.** Markdown emits no HTML and fetches no image. A link's URL is
 attacker-controlled and may differ from its label, so show or confirm it before opening; `on_link`
 receives only a validated `http`, `https` or `mailto` URL. Approval titles, details and options are
-supplied by the agent: do not treat them as the app's own words. Key each approval card per request
-so one request's answer cannot carry to the next, and make an `ApprovalDeadline` once, when the
-request arrives, and store it, or the countdown restarts on every rebuild.
+supplied by the agent: do not treat them as the app's own words. Give every request a
+`.request_id(..)`: the card tells successive requests apart by it (without one, two identical
+requests shown in the same card share the answered state), and `on_select` receives an
+`ApprovalSelection` with the request id and the option id, naming the request the press began on.
+Make an `ApprovalDeadline` once, when the request arrives, and store it, or the countdown restarts
+on every rebuild.
 
 **Performance.** Markdown re-parses its whole source on each change and keeps unchanged blocks, so
 coalesce stream chunks to one update per frame. Key `message_scroller` rows by a stable message id.

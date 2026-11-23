@@ -8637,38 +8637,6 @@ gestures, the handles, the soft keyboard interplay or the live edge under a real
 
 ---
 
-### `glyph-chat-approval-select-no-request-identity` — an approval card's `on_select` reports only the option id
-
-**Observed**: `ApprovalCardView::on_select` hands the callback the chosen option's id and nothing identifying the request. An app with several pending requests must close over the request in the callback it builds for each card; one shared callback cannot tell which request an answer belongs to. The same hazard is recorded for beUI in `beui-consent-correlation-is-opt-in`.
-
-**Applies to**: apps showing more than one approval request at a time.
-
-**Workaround**: build each card with its own `on_select` closure over that request's id, and key the card per request.
-
-**Why accepted**: a controlled card keeps no request model of its own; the app already owns the list of requests.
-
-**Trigger for removal**: a request-id builder method and a callback that carries it.
-
-**Evidence**: (2026-11-22) `plugins/glyph/src/chat/approval.rs` (`on_select`, module doc "Contract"). Code and headless tests.
-
----
-
-### `glyph-chat-approval-identical-requests-share-state` — two identical consecutive requests in one approval card widget share the answered state
-
-**Observed**: the card treats a change of title, detail, options or deadline as a new request and resets its answered state. Two consecutive requests with the same title, detail and options and no deadline, shown by the same card widget, are not told apart: the second inherits the first's answered state and cannot be answered.
-
-**Applies to**: an app that rebuilds one `approval_card` in place for successive requests.
-
-**Workaround**: key each request's card by its own id (the rows of a keyed `message_scroller` already do this), so each request gets its own widget.
-
-**Why accepted**: the card has no request identity to compare (see `glyph-chat-approval-select-no-request-identity`); the open decision is a request id on the builder.
-
-**Trigger for removal**: a request id on the builder that the card compares.
-
-**Evidence**: (2026-11-22) `plugins/glyph/src/chat/approval.rs` (request comparison on rebuild; module doc "Contract"); the catalog's Agent chat page keys one card per request. Code and headless tests.
-
----
-
 ### `glyph-chat-approval-countdown-paced-frames` — an approval countdown redraws on paced frames while pending
 
 **Observed**: a pending card with an `ApprovalDeadline` requests paced frames to redraw its countdown (the semantics timer moves in ten-second steps), and stops requesting frames once the card is answered or expired. The card offers no arming delay after it appears. An `ApprovalDeadline` made again on each rebuild restarts the countdown.
