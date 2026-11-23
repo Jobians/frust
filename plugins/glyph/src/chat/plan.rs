@@ -119,7 +119,7 @@ fn status_word(status: PlanEntryStatus) -> &'static str {
 fn entry_row<State: 'static>(entry: &PlanEntry) -> impl View<State> + use<State> {
     let role = match entry.status {
         PlanEntryStatus::Pending => ThemeTextColor::OnSurface,
-        PlanEntryStatus::InProgress => ThemeTextColor::OnPrimaryContainer,
+        PlanEntryStatus::InProgress => style::PLAN_ACTIVE_ROLE,
         PlanEntryStatus::Completed => ThemeTextColor::OnSurfaceVariant,
     };
     let weight = if entry.status == PlanEntryStatus::InProgress {
