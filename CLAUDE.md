@@ -17,6 +17,7 @@ cold.
 | SHELLS — desktop/Android/iOS host integration | [docs/SHELLS_ARCHITECTURE.md](docs/SHELLS_ARCHITECTURE.md) |
 | PLUGINS — OS-capability plugins | [docs/PLUGINS_ARCHITECTURE.md](docs/PLUGINS_ARCHITECTURE.md) |
 | NATIVE_WIDGETS — native-control plugin | [docs/NATIVE_WIDGETS_ARCHITECTURE.md](docs/NATIVE_WIDGETS_ARCHITECTURE.md) |
+| AI — on-device model store/downloader and ONNX inference plugins | [docs/AI_ARCHITECTURE.md](docs/AI_ARCHITECTURE.md) |
 | CLI — `frust` command + drive library | [docs/CLI_ARCHITECTURE.md](docs/CLI_ARCHITECTURE.md) |
 | TUI — terminal workbench | [docs/TUI_ARCHITECTURE.md](docs/TUI_ARCHITECTURE.md) |
 | DEVTOOLS — wire protocol + in-app debug service | [docs/DEVTOOLS_ARCHITECTURE.md](docs/DEVTOOLS_ARCHITECTURE.md) |
@@ -48,7 +49,7 @@ it also covers the standalone-workspace gates (e.g. `huddle`/`clean-signals-frus
   with the engine gate suite (RENDER_DEVELOPMENT.md), never casually.
 - `examples/huddle`, `examples/shadertoy`, `examples/glyph-catalog`, `examples/playground`,
   `examples/design-system-sample`, `examples/material3-demo`, `examples/beui-demo`, `examples/native-widgets-demo`,
-  `examples/hotpatch-spike`, `testing/hotpatch-canary`, and `plugins/clean-signals-frust` are
+  `examples/onnx-vision`, `examples/hotpatch-spike`, `testing/hotpatch-canary`, and `plugins/clean-signals-frust` are
   standalone workspaces excluded from the root graph — run their gates from their own directories.
 - `workflow/` is a separate nested repo — never commit it.
 - Doc edits must respect the budgets recorded in [docs/DOC_POLICY.md](docs/DOC_POLICY.md).

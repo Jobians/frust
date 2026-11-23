@@ -1,6 +1,6 @@
 # Frust - PLUGINS Code Standards
 
-Conventions specific to the two plugin tiers under `plugins/` (the PLUGINS and NATIVE_WIDGETS
+Conventions specific to the two plugin tiers under `plugins/` (the PLUGINS, NATIVE_WIDGETS and AI
 units — see [ARCHITECTURE.md](ARCHITECTURE.md)'s Doc Map). Everything shared with the rest of the
 workspace — language idioms, error handling, naming, anti-patterns, testing, comment conventions
 — lives in [CODE_STANDARDS.md](CODE_STANDARDS.md) and binds here too; this doc records only what
@@ -20,7 +20,9 @@ is additional or different for a plugin.
   ([CODE_STANDARDS.md](CODE_STANDARDS.md)'s Language Idioms).
 - **Platform plugins never depend on `frust-*` framework crates** (`frust-plugin` +
   `frust-paths` + FFI crates only, or `frust-reactive` when the plugin implements one of its backend seams: `background-task`); **facade plugins depend on `frust` alone** (sole exception: `frust-network-image` also depends on the `frust-paths` leaf for its cache directory, mirroring the platform-plugin allowance). A platform
-  plugin MAY depend on another platform plugin instead, provided the edge is target-gated,
+  plugin MAY depend on another platform plugin instead, provided the edge is target-gated (or,
+  where the capability is reused on every target, behind an optional cargo feature, as
+  `frust-onnx`'s `catalog` on `frust-models` with that crate's `frust-api` off),
   the capability is literally reused rather than re-implemented, and it never forms a cycle —
   the forbidden thing is a dependency on a *framework* crate, and a sibling platform plugin has
   none. The first such edge: `frust-auth-session` → `frust-url-launcher`, target-gated to
@@ -119,6 +121,14 @@ is additional or different for a plugin.
   - an unknown key is an error, never ignored, so a typo cannot silently drop a requirement;
   - a broken manifest skips that whole plugin with a warning and is never applied in part; one bad
     plugin does not fail discovery or the build of the others.
+- **A plugin that ships a native runtime library ships it inside the app, never downloads it at
+  run time.** The library is linked into the app's own native library or packaged by the plugin's
+  own Gradle module or Swift package; whatever the app must add to load it (`frust-onnx`'s
+  `libc++_shared.so`, through `Contribution::AndroidLibcxxShared`) is a registry contribution, not
+  a README step. Model data is different: it may be downloaded, through `frust-models`, checked
+  against a pinned size and SHA-256 where one is known. The binding crate is pinned exactly in the
+  root `Cargo.toml` and moves only with the plugin's gate suite, and none of its types appears in
+  the plugin's public API ([AI_ARCHITECTURE.md](AI_ARCHITECTURE.md)).
 - **A plugin host launches Activity Result contracts** through the resumed
   `ComponentActivity`'s `activityResultRegistry`, under a plugin-prefixed key.
 - **Content a plugin picks or shares is staged in a plugin-named cache subdirectory** (`frust-photo-library` picks, `frust-share/<uuid>/`

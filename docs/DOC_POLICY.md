@@ -1,10 +1,13 @@
 # Doc Policy
 
 **Set by:** agent
-**Scale:** large (225,723 source LOC → 9 doc units, 3 stacks: Rust + Kotlin/Android + Swift/iOS)
+**Scale:** large (225,723 source LOC → 10 doc units, 3 stacks: Rust + Kotlin/Android + Swift/iOS)
 **Structure:** hub-and-spoke (all spokes central in `docs/`, prefixed `<UNIT>_<DOCTYPE>.md`).
-Re-derived at the 8→9 unit trigger (adding `DEVTOOLS`) and confirmed: `DEVTOOLS` shares the
-tooling-isolation charter/verify-gate/pin policy with every unit rather than reading in isolation.
+Re-derived at each unit trigger and confirmed. 8→9 (`DEVTOOLS`): it shares the tooling-isolation
+charter/verify-gate/pin policy with every unit rather than reading in isolation. 9→10 (`AI`): the
+model plugins read apart from the OS-capability plugins, and `PLUGINS_ARCHITECTURE.md` and the
+shared `DEVELOPMENT.md` are at or near their caps, so `AI` gets one spoke that also carries its
+pins, gates and manual tests (no `AI_DEVELOPMENT.md` until that content outgrows it).
 
 ## Budgets
 
@@ -28,14 +31,16 @@ tooling-isolation charter/verify-gate/pin policy with every unit rather than rea
 | `SHELLS` | crates/frust-shell-{common,desktop,macos,windows,linux,android,ios,web} | A D |
 | `PLUGINS` | crates/frust-plugin, plugins/{shared-preferences,secure-storage,camera,clipboard,haptics,url-launcher,auth-session,oauth-native,share,file-dialogs,qr,charts,iap,video-player,clean-signals-frust,database,i18n,network-image,glyph,material,cupertino,shadcn,beui,connectivity,material-i18n,device-info,permissions,photo-library,background-task} | A D C |
 | `NATIVE_WIDGETS` | plugins/native-widgets | A |
+| `AI` | plugins/models, plugins/onnx | A |
 | `CLI` | crates/frust-cli, frust-drive, frust-mcp, frust-dap | A D |
 | `TUI` | crates/frust-tui | A D C |
 | `DEVTOOLS` | crates/frust-devtools, frust-devtools-protocol | A |
 | `GPU`/`ENGINE` | crates/frust-gpu, crates/frust-engine | – |
 
-**Excluded** (consumers, not units — index line + own README only): examples/huddle, examples/shadertoy, examples/web-spike, examples/web-gallery, examples/glyph-catalog, examples/playground, examples/design-system-sample, examples/material3-demo, examples/beui-demo, examples/native-widgets-demo, examples/hotpatch-spike, testing/hotpatch-canary, editors/vscode-frust.
+**Excluded** (consumers, not units — index line + own README only): examples/huddle, examples/shadertoy, examples/web-spike, examples/web-gallery, examples/glyph-catalog, examples/playground, examples/design-system-sample, examples/material3-demo, examples/beui-demo, examples/native-widgets-demo, examples/onnx-vision, examples/hotpatch-spike, testing/hotpatch-canary, editors/vscode-frust.
 
 NATIVE_WIDGETS' pins/conventions ride PLUGINS' spokes (shared Apple FFI pins, one plugin charter).
+`AI`'s conventions ride `PLUGINS_CODE_STANDARDS.md` too (one plugin charter); its pins do not.
 GPU/ENGINE get no spoke of their own — they document inside RENDER's (`RENDER_ARCHITECTURE.md`,
 `RENDER_DEVELOPMENT.md`) since the engine plan folds them into that unit's render pipeline.
 Conventions binding more than one unit (sanctioned-unsafe register, interaction/semantics
