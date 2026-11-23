@@ -9,7 +9,9 @@
 //! optimisation level and the memory behaviour. A [`SessionCache`] keeps a bounded set warm.
 //!
 //! [`image`] turns RGBA pixels into normalised input tensors and resizes result planes; the
-//! default `catalog` feature adds [`catalog`], a verified list of downloadable vision models.
+//! default `catalog` feature adds [`catalog`], a verified list of downloadable vision models,
+//! and the default `vision` feature adds [`vision`]: subject masks, face boxes and depth maps
+//! from pixels in one blocking call each, through [`VisionModels`].
 //!
 //! One ONNX Runtime environment serves the whole process. It is created on the first session (or
 //! [`runtime_info`] call); a failed creation is cached and returned to every later caller as
@@ -51,6 +53,8 @@ pub mod image;
 mod runtime;
 mod session;
 mod tensor;
+#[cfg(feature = "vision")]
+pub mod vision;
 mod worker;
 
 pub use accelerator::{Accelerator, CoreMlUnits, Provider};
@@ -62,4 +66,6 @@ pub use image::{
 pub use runtime::{LinkKind, RuntimeInfo, runtime_info};
 pub use session::{Optimization, Session, SessionOptions};
 pub use tensor::{DType, Tensor, TensorData, TensorInfo};
+#[cfg(feature = "vision")]
+pub use vision::{DepthConvention, Face, VisionModels};
 pub use worker::{RunEvent, RunHandle, RunSink};

@@ -321,7 +321,101 @@ The Base and Large depth models are CC-BY-NC and are deliberately not listed. Th
 fails when a pin has drifted. Call `download_request` and start the download from a worker
 thread, as `frust-models` describes.
 
-## 9. License
+## 9. Vision tasks
+
+The default `vision` feature (which turns on `catalog`) adds `frust_onnx::vision`: one call from
+RGBA pixels to a result for each catalog task. `VisionModels::new(store, options)` reads the
+models from a `frust_models::ModelStore`, loads each on first use through its own
+`SessionCache` (one session per task) and checks the model's inputs and outputs fit the task.
+
+- **Every task function is blocking**: it may load the model, then runs it on the calling
+  thread. Call it from a worker thread (in a frust app, inside `frust::spawn_blocking`), never
+  from the UI thread.
+- **No fallback.** A model that is not in the store is `OnnxError::ModelMissing { key }` (the
+  catalog key, or a custom model's store id); nothing is substituted. `missing()` lists the
+  catalog rows still to download, and `is_installed(task)` checks one task.
+- **Custom models.** `with_model(task, model_id)` uses another store file for a task. It must
+  take one f32 `[1, 3, H, W]` image (and, for faces, return YuNet's twelve outputs); a model
+  that does not fit is `OnnxError::Unsupported` when it is first loaded. Dynamic input sides take
+  the catalog model's size.
+
+```rust,no_run
+use frust_models::{Downloader, HubClient, ModelStore};
+use frust_onnx::{SessionOptions, VisionModels};
+
+let store = ModelStore::open()?;
+let models = VisionModels::new(store.clone(), SessionOptions::default());
+let hub = HubClient::new()?;
+for model in models.missing() {
+    // On a worker thread: downloads block too.
+    Downloader::start(&hub, &store, model.download_request(), std::sync::Arc::new(|_| {}))?
+        .wait()?;
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+**Subject mask** (U2-NetP): one sample per pixel, 0 (background) to 1 (subject).
+
+```rust,no_run
+# use frust_onnx::{RgbaView, SessionOptions, VisionModels};
+# let models = VisionModels::new(frust_models::ModelStore::open()?, SessionOptions::default());
+# let (width, height, pixels) = (640, 480, vec![0u8; 640 * 480 * 4]);
+let mask = models.segment_subject(RgbaView::new(width, height, &pixels)?)?;
+assert_eq!((mask.width, mask.height), (640, 480));
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+**Faces** (YuNet): boxes `[x, y, w, h]` and five landmarks (eyes, nose tip, mouth corners) in
+image pixels, highest score first. `None` keeps faces scoring at least 0.6.
+
+```rust,no_run
+# use frust_onnx::{RgbaView, SessionOptions, VisionModels};
+# let models = VisionModels::new(frust_models::ModelStore::open()?, SessionOptions::default());
+# let (width, height, pixels) = (640, 480, vec![0u8; 640 * 480 * 4]);
+for face in models.detect_faces(RgbaView::new(width, height, &pixels)?, None)? {
+    let [x, y, w, h] = face.rect;
+    println!("{:.2} at {x},{y} {w}x{h}, nose at {:?}", face.score, face.landmarks[2]);
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+**Depth** (Depth Anything V2 Small): relative depth 0..1 per pixel, near is 1
+(`DepthConvention::NearIsOne`); `Plane::inverted()` gives far-is-one. Values compare within one
+image only: no metres, no scale shared between images.
+
+```rust,no_run
+# use frust_onnx::{RgbaView, SessionOptions, VisionModels};
+# let models = VisionModels::new(frust_models::ModelStore::open()?, SessionOptions::default());
+# let (width, height, pixels) = (640, 480, vec![0u8; 640 * 480 * 4]);
+let near_is_one = models.estimate_depth(RgbaView::new(width, height, &pixels)?)?;
+let far_is_one = near_is_one.inverted();
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+| Task | Model input (stretched, not letterboxed) | Pixels in | Output used |
+|------|------------------------------------------|-----------|-------------|
+| `segment_subject` | `input.1` f32 [1, 3, 320, 320] | RGB, ImageNet mean/std | first of seven [1, 1, 320, 320] outputs (`1959`), min-max normalised, resized to the image |
+| `detect_faces` | `input` f32 [1, 3, 640, 640] | BGR, raw 0..255 | `cls`/`obj`/`bbox`/`kps` at strides 8, 16, 32 ([1, 6400/1600/400, 1/1/4/10]); score `sqrt(cls * obj)`, NMS at IoU 0.3, top 5000 |
+| `estimate_depth` | `pixel_values` f32 [?, 3, ?, ?], fed 518x518 | RGB, ImageNet mean/std | `predicted_depth` [1, 518, 518] disparity, min-max normalised, resized to the image |
+
+The decode and suppression are pure functions over output slices (`vision::decode_yunet`,
+`vision::nms`, `vision::map_to_image`), usable on any YuNet run.
+
+**Memory.** Every result plane is an f32 per image pixel, and the input image stays alive for
+the call: a 12-megapixel photo is 46 MiB of RGBA in and 46 MiB of plane out. One Depth Anything
+V2 Small session (518x518, the default `SessionOptions`) on a 4032x3024 photo peaked at
+**294 to 305 MiB** resident over three fresh processes (x86_64 Linux host, i5-12600, release
+build, two calls), from 56 MiB with the photo loaded; 202 to 213 MiB stayed resident afterwards
+with the session warm. Keep at most one large photo and its planes in flight, and call
+`models.cache().clear()` on the platform's memory-pressure signal. Reproduce with
+`cargo test --release -p frust-onnx --test vision -- --ignored --exact measure_depth_memory --nocapture`
+(Linux; set `FRUST_ONNX_MODEL_STORE` to pick where the models are downloaded).
+
+The ignored live tests (`cargo test -p frust-onnx --test vision -- --ignored`) download the three
+catalog models (about 32 MB) into `target/` (or `FRUST_ONNX_MODEL_STORE`) and run each task on
+synthetic images.
+
+## 10. License
 
 The crate is MIT OR Apache-2.0. A binary that ships it ships ONNX Runtime (MIT, Microsoft) and
 the third-party components ONNX Runtime contains: see [`NOTICE`](NOTICE).

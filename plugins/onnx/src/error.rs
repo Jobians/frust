@@ -36,6 +36,13 @@ pub enum OnnxError {
     /// element type other than f32, u8 or i64, or a strict accelerator that cannot be used.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// A vision task's model file is not in the model store. Nothing is substituted: download
+    /// it (for a catalog model, its `download_request`) and call again.
+    #[error("the model `{key}` is not installed")]
+    ModelMissing {
+        /// The catalog key (for example `u2netp`), or the store identifier of a custom model.
+        key: String,
+    },
 }
 
 fn model_source(path: Option<&Path>) -> String {

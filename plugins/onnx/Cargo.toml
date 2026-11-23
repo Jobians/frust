@@ -14,8 +14,10 @@ readme = "README.md"
 
 [features]
 # `catalog`: the curated vision model list (src/catalog.rs), which pulls in frust-models.
-default = ["catalog"]
+# `vision`: the segmentation, face and depth tasks over it (src/vision/).
+default = ["catalog", "vision"]
 catalog = ["dep:frust-models"]
+vision = ["catalog"]
 
 [dependencies]
 log = { workspace = true }
