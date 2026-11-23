@@ -1,2 +1,5 @@
 org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
 android.useAndroidX=true
+# `true` packages the NDK's libc++_shared.so for a dependency built against it
+# (see app/build.gradle.kts); `frust plugin add` sets it for a plugin that needs it.
+frust.cargoNdk.linkLibcxxShared=false

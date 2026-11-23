@@ -1,4 +1,4 @@
-//! The static plugin registry (v1) — thirty-one entries mirroring `plugins/`:
+//! The static plugin registry (v1) — thirty-two entries mirroring `plugins/`:
 //! `shared-preferences` (dependency only), `secure-storage` (dependency plus
 //! an optional `biometric-gate` feature wiring in the plugin's own Android
 //! library module and the iOS plist key its README documents),
@@ -74,7 +74,11 @@
 //! originals into the library), is described at `PHOTO_LIBRARY`. `models` is
 //! dependency only: an on-device model store and downloader needing no permission,
 //! Gradle module or plist key (the Hub downloads use the INTERNET permission the
-//! scaffold already declares).
+//! scaffold already declares). `onnx` is the dependency plus
+//! [`Contribution::AndroidLibcxxShared`] (the first entry to use it): ONNX Runtime
+//! links statically into the app's own `.so`, so there is no Gradle module, but
+//! the archive needs the NDK's `libc++_shared.so` in the APK; its iOS
+//! contributions are not settled yet (see `ONNX_BASE`).
 
 use std::borrow::Cow;
 
@@ -937,6 +941,41 @@ const MODELS: PluginSpec = PluginSpec {
     ..PluginSpec::DEFAULT
 };
 
+/// `onnx`'s base contributions, exactly what `plugins/onnx/README.md`'s
+/// "Android packaging" section requires of an app:
+///
+/// - the Cargo dependency;
+/// - [`Contribution::AndroidLibcxxShared`]: on `aarch64-linux-android` the
+///   prebuilt ONNX Runtime archive is linked statically into the app's own
+///   `.so`, which then needs the NDK's `libc++_shared.so` (`NEEDED`); without
+///   it the APK installs and the library fails to load.
+///
+/// No [`Contribution::GradleModule`] and no Maven repository: the static route
+/// ships no `libonnxruntime.so` and no Kotlin. No manifest permission: the
+/// vision catalog's downloads use the INTERNET permission the scaffold already
+/// declares. Nothing for iOS yet: its packaging route (and so any Swift
+/// package, framework link or `-l` flag) waits on the iOS link gate.
+const ONNX_BASE: &[Contribution] = &[
+    Contribution::CargoDep {
+        name: Cow::Borrowed("frust-onnx"),
+    },
+    Contribution::AndroidLibcxxShared,
+];
+
+const ONNX: PluginSpec = PluginSpec {
+    id: Cow::Borrowed("onnx"),
+    summary: Cow::Borrowed(
+        "On-device ONNX model inference over ONNX Runtime: sessions, image helpers and \
+              vision tasks (subject mask, faces, depth) with reactive handles; desktop and \
+              arm64 Android.",
+    ),
+    crate_dir: Cow::Borrowed("onnx"),
+    base: Cow::Borrowed(ONNX_BASE),
+    optional_features: Cow::Borrowed(&[]),
+    requires_sibling: None,
+    ..PluginSpec::DEFAULT
+};
+
 /// `permissions`' feature contributions. Every feature turns on the matching
 /// cargo feature of `frust-permissions` and adds the app-side declarations
 /// the OS requires before it will show that permission's prompt.
@@ -1570,6 +1609,7 @@ pub fn known_plugins() -> Vec<PluginSpec> {
         BACKGROUND_TASK,
         CHARTS,
         MODELS,
+        ONNX,
     ]
 }
 
@@ -1590,7 +1630,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
-    fn registry_lists_the_thirty_one_v1_plugins() {
+    fn registry_lists_the_thirty_two_v1_plugins() {
         let plugins = known_plugins();
         let ids: Vec<&str> = plugins.iter().map(|p| &*p.id).collect();
         assert_eq!(
@@ -1627,8 +1667,53 @@ mod tests {
                 "background-task",
                 "charts",
                 "models",
+                "onnx",
             ]
         );
+    }
+
+    /// `onnx` is its Cargo dependency and the shared C++ runtime, nothing else.
+    #[test]
+    fn onnx_is_a_cargo_dep_and_the_shared_cxx_runtime() {
+        let spec = find_plugin("onnx").unwrap();
+        assert_eq!(spec.crate_dir, "onnx");
+        assert!(spec.optional_features.is_empty());
+        assert_eq!(spec.requires_sibling, None);
+        assert_eq!((spec.min_ios.clone(), spec.min_android_sdk), (None, None));
+        assert_eq!(
+            &*spec.base,
+            [
+                // The crate itself; its Android arm links ONNX Runtime statically.
+                Contribution::CargoDep {
+                    name: Cow::Borrowed("frust-onnx"),
+                },
+                // The static archive's `NEEDED libc++_shared.so` must be in the APK.
+                Contribution::AndroidLibcxxShared,
+            ]
+        );
+        // The static route ships no native module, Android or iOS.
+        assert!(spec.native_modules().is_empty());
+    }
+
+    /// Only `onnx` packages the shared C++ runtime: every other app keeps the
+    /// template's default and ships no `libc++_shared.so`.
+    #[test]
+    fn only_onnx_packages_the_shared_cxx_runtime() {
+        let users: Vec<String> = known_plugins()
+            .iter()
+            .filter(|spec| {
+                spec.base
+                    .iter()
+                    .chain(
+                        spec.optional_features
+                            .iter()
+                            .flat_map(|f| f.contributions.iter()),
+                    )
+                    .any(|c| matches!(c, Contribution::AndroidLibcxxShared))
+            })
+            .map(|spec| spec.id.to_string())
+            .collect();
+        assert_eq!(users, ["onnx"]);
     }
 
     /// `models` is one `CargoDep` on its own crate and nothing else.

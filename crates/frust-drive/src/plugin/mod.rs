@@ -378,6 +378,23 @@ pub enum Contribution {
         /// A short comment written above the block.
         comment: Cow<'static, str>,
     },
+    /// The NDK's shared C++ runtime, `libc++_shared.so`, packaged into the
+    /// APK beside the app's own `.so`: for a plugin whose Rust side links a
+    /// native library built against it (`frust-onnx`'s ONNX Runtime archive
+    /// gives the app's `.so` a `NEEDED libc++_shared.so`, which the loader
+    /// refuses at start-up when the library is missing).
+    ///
+    /// Sets the Gradle property `frust.cargoNdk.linkLibcxxShared=true` in
+    /// `android/gradle.properties`, which the app template's
+    /// `cargoNdkBuild` task reads to pass `cargo ndk --link-libcxx-shared`;
+    /// an app that never asks for it ships no copy (about 1.25 MB per ABI).
+    /// A line already setting the property to another value is rewritten in
+    /// place, a missing one appended; a property already `true` reports
+    /// [`AddOutcome::AlreadyPresent`]. A project whose
+    /// `android/app/build.gradle.kts` predates the property (it never reads
+    /// it, so setting it would change nothing) is refused before
+    /// `add_plugin` writes anything, with the line to add.
+    AndroidLibcxxShared,
     /// The parent of the app-owned `FrustAppTheme` style in
     /// `android/app/src/main/res/values/themes.xml` — the activity theme the
     /// app template's `AndroidManifest.xml` names on both its `<application>`
@@ -570,6 +587,10 @@ impl Contribution {
             }
             Contribution::MavenRepository { url, .. } => {
                 format!("Gradle Maven repository `{url}`")
+            }
+            Contribution::AndroidLibcxxShared => {
+                "Android `libc++_shared.so` in the APK (`frust.cargoNdk.linkLibcxxShared`)"
+                    .to_string()
             }
             Contribution::AndroidThemeParent { parent } => {
                 format!("Android theme `FrustAppTheme` parent `{parent}`")
@@ -947,6 +968,14 @@ mod tests {
             description: "test item".to_string(),
             outcome,
         }
+    }
+
+    #[test]
+    fn android_libcxx_shared_describe_names_the_library_and_property() {
+        assert_eq!(
+            Contribution::AndroidLibcxxShared.describe(),
+            "Android `libc++_shared.so` in the APK (`frust.cargoNdk.linkLibcxxShared`)"
+        );
     }
 
     #[test]
