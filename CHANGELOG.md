@@ -582,9 +582,9 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   links. `frust plugin add onnx` requires 15.1 and tells a project still at 15.0 to raise its
   deployment target; nothing is written until it does.
 - `Contribution::IosFramework` (and `IosLibrary`) count as already present in a project without an
-  `ios/` directory, so a desktop- or Android-only app can add `auth-session`, `onnx` and the other
-  plugins whose iOS side is only link lines. A project with `ios/` but no `project.pbxproj` still
-  fails.
+  `ios/` directory, so the iOS link lines no longer block an add there: an app without `ios/` can
+  add `onnx`, and one that has `android/` can add `auth-session` and the other plugins whose iOS
+  side is only link lines. A project with `ios/` but no `project.pbxproj` still fails.
 - The framework's Android pthread key use: each crate keeps its per-thread state in one struct, so
   the framework links 7 thread-local statics (57 before). On a OnePlus 9 (Android 15) the native-widgets
   demo links 33 in all (84 before) and ends a full walk with 82 pthread keys free (40 before).
