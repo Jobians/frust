@@ -1374,9 +1374,11 @@ mod tests {
             3,
             "{pbxproj}"
         );
+        // iOS 15.1: the minimum of the prebuilt ONNX Runtime archive the
+        // `onnx` plugin links, so a new app can add every built-in plugin.
         assert_eq!(
             pbxproj
-                .matches("IPHONEOS_DEPLOYMENT_TARGET = 15.0;")
+                .matches("IPHONEOS_DEPLOYMENT_TARGET = 15.1;")
                 .count(),
             3,
             "{pbxproj}"

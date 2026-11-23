@@ -16,6 +16,7 @@
 //! [package.metadata.frust.plugin.ios]
 //! swift-package = { name = "FrustAcmeBle", path = "platform/ios" }
 //! frameworks = ["CoreBluetooth"]
+//! libraries = ["c++"]            # `-l<name>` link lines
 //! plist = { NSBluetoothAlwaysUsageDescription = "Finds nearby Acme devices." }
 //! plist-arrays = { "com.example.key" = ["a", "b"] }
 //! entitlements = { "com.example.flag" = true, "com.example.mode" = "development" }
@@ -46,7 +47,7 @@ const ROOT_KEY: &str = "package.metadata.frust.plugin";
 /// is relative, has no `..`, and names a directory inside the package; a Maven
 /// url is http(s) with at least one group; `min-ios` is dotted integers;
 /// `link-libcxx-shared` is a bool; permission and framework names match
-/// `[A-Za-z0-9_.]+`; Gradle module and
+/// `[A-Za-z0-9_.]+`, library names `[A-Za-z0-9_+.-]+`; Gradle module and
 /// Swift package names match `[A-Za-z0-9_-]+`; plist and entitlement keys are
 /// non-empty; an entitlement is a bool, a string or an array of strings; a
 /// `cargo-feature` is one of the crate's features; and no key is unknown.
@@ -337,6 +338,8 @@ struct IosTable {
     #[serde(default)]
     frameworks: Vec<String>,
     #[serde(default)]
+    libraries: Vec<String>,
+    #[serde(default)]
     plist: BTreeMap<String, String>,
     #[serde(default)]
     plist_arrays: BTreeMap<String, Vec<String>>,
@@ -533,6 +536,12 @@ fn platform(
                 name: Cow::Owned(name),
             });
         }
+        for library in table.libraries {
+            let name = library_name(ctx, &format!("{key}.libraries"), library)?;
+            out.push(Contribution::IosLibrary {
+                name: Cow::Owned(name),
+            });
+        }
         for (plist_key, value) in table.plist {
             non_empty_key(ctx, &format!("{key}.plist"), &plist_key)?;
             out.push(Contribution::PlistEntry {
@@ -657,6 +666,18 @@ fn dotted_name(ctx: &Ctx<'_>, key: &str, name: String) -> Result<String, Manifes
     }
 }
 
+/// A library name as `-l` takes it: `[A-Za-z0-9_+.-]+` (so `c++`).
+fn library_name(ctx: &Ctx<'_>, key: &str, name: String) -> Result<String, ManifestError> {
+    if matches_charset(&name, |c| c.is_ascii_alphanumeric() || "_+.-".contains(c)) {
+        Ok(name)
+    } else {
+        Err(ctx.err(
+            key,
+            format!("has `{name}`, which is not of `[A-Za-z0-9_+.-]+`"),
+        ))
+    }
+}
+
 /// A Gradle module or Swift package name: `[A-Za-z0-9_-]+`, not starting
 /// with `-`.
 fn module_name(ctx: &Ctx<'_>, key: &str, name: String) -> Result<String, ManifestError> {
@@ -769,6 +790,7 @@ mod tests {
         [package.metadata.frust.plugin.ios]
         swift-package = { name = "FrustAcmeBle", path = "platform/ios" }
         frameworks = ["AcmeRadio"]
+        libraries = ["c++", "z"]
         plist = { NSBluetoothAlwaysUsageDescription = "Finds nearby Acme devices.", AcmeMode = "on" }
         plist-arrays = { "com.example.key" = ["a", "b"] }
         entitlements = { "com.example.formats" = ["TAG"], "com.example.flag" = true, "com.example.mode" = "development" }
@@ -823,6 +845,8 @@ mod tests {
                 Contribution::IosFramework {
                     name: s("AcmeRadio"),
                 },
+                Contribution::IosLibrary { name: s("c++") },
+                Contribution::IosLibrary { name: s("z") },
                 Contribution::PlistEntry {
                     key: s("AcmeMode"),
                     value: s("on"),
@@ -1180,6 +1204,49 @@ mod tests {
                 ".ios.frameworks",
             );
         }
+    }
+
+    #[test]
+    fn libraries_parse_in_order_beside_frameworks() {
+        let dir = temp_dir("libraries");
+        let entry = parse(
+            &dir,
+            "[package.metadata.frust.plugin]\nid = \"acme-ble\"\nsummary = \"Acme\"\n\
+             [package.metadata.frust.plugin.ios]\n\
+             frameworks = [\"CoreML\"]\n\
+             libraries = [\"c++\", \"sqlite3\", \"z.1_x-y\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            &*entry.spec.base,
+            [
+                Contribution::CargoDep {
+                    name: s("frust-acme-ble")
+                },
+                Contribution::IosFramework { name: s("CoreML") },
+                Contribution::IosLibrary { name: s("c++") },
+                Contribution::IosLibrary { name: s("sqlite3") },
+                Contribution::IosLibrary { name: s("z.1_x-y") },
+            ]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn library_names_are_checked() {
+        for name in ["", "c ++", "lib/z", "z\\\"", "z,", "a;b"] {
+            assert_rejected(
+                "library",
+                &format!("[package.metadata.frust.plugin.ios]\nlibraries = [\"{name}\"]\n"),
+                ".ios.libraries",
+            );
+        }
+        // A string rather than a list is a type error on the table.
+        assert_rejected(
+            "library-string",
+            "[package.metadata.frust.plugin.ios]\nlibraries = \"c++\"\n",
+            ".ios",
+        );
     }
 
     #[test]

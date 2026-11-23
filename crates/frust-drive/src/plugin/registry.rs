@@ -77,10 +77,14 @@
 //! profile manifests only, so a release app that adds `models` needs the main
 //! manifest to carry it for the Hub downloads (no Gradle module or plist key).
 //! `onnx` is the dependency, [`Contribution::AndroidLibcxxShared`] (the first
-//! entry to use it) and the same INTERNET permission for its default-on catalog
-//! downloads: ONNX Runtime links statically into the app's own `.so`, so there
-//! is no Gradle module, but the archive needs the NDK's `libc++_shared.so` in
-//! the APK; its iOS contributions are not settled yet (see `ONNX_BASE`).
+//! entry to use it), the same INTERNET permission for its default-on catalog
+//! downloads, and three iOS link lines: [`Contribution::IosLibrary`] for
+//! `-lc++` (the first entry to use it) and the `CoreML` and `Foundation`
+//! framework links. ONNX Runtime links statically into the app's own `.so` and
+//! into its iOS staticlib, so there is no Gradle module or Swift package, but
+//! the Android archive needs the NDK's `libc++_shared.so` in the APK and the
+//! iOS one the three lines in the Xcode link; it is also the only entry with a
+//! `min_ios` (15.1, the archive's minimum; see `ONNX_BASE`).
 
 use std::borrow::Cow;
 
@@ -954,7 +958,7 @@ const MODELS: PluginSpec = PluginSpec {
 };
 
 /// `onnx`'s base contributions, exactly what `plugins/onnx/README.md`'s
-/// "Android packaging" section requires of an app:
+/// "Android packaging" and "iOS packaging" sections require of an app:
 ///
 /// - the Cargo dependency;
 /// - [`Contribution::AndroidLibcxxShared`]: on `aarch64-linux-android` the
@@ -964,12 +968,20 @@ const MODELS: PluginSpec = PluginSpec {
 /// - [`Contribution::ManifestPermission`] for `android.permission.INTERNET`: the
 ///   vision catalog downloads its models by default, and the scaffold declares
 ///   INTERNET in its debug and profile manifests only, so a release app needs
-///   the main manifest to carry it.
+///   the main manifest to carry it;
+/// - [`Contribution::IosLibrary`] `c++` and [`Contribution::IosFramework`]
+///   `CoreML` and `Foundation`: on `aarch64-apple-ios` and
+///   `aarch64-apple-ios-sim` the prebuilt archive links statically into the
+///   app's staticlib, whose link requests never reach the Xcode link. An
+///   unmodified scaffold below iOS 15.4 happened to link without them; at a
+///   17.0 deployment target the Simulator link fails with 233 undefined `std::`
+///   references until `-lc++` is added.
 ///
-/// No [`Contribution::GradleModule`] and no Maven repository: the static route
-/// ships no `libonnxruntime.so` and no Kotlin. Nothing for iOS yet: its
-/// packaging route (and so any Swift package, framework link or `-l` flag)
-/// waits on the iOS link gate.
+/// No [`Contribution::GradleModule`], Maven repository or Swift package: the
+/// static route ships no `libonnxruntime.so`, no Kotlin and no Swift. The
+/// spec's `min_ios` is 15.1 because the archive's objects are built for it
+/// (`minos 15.1`): at a 15.0 deployment target the link prints a warning per
+/// object, and no iOS 15 device has run it.
 const ONNX_BASE: &[Contribution] = &[
     Contribution::CargoDep {
         name: Cow::Borrowed("frust-onnx"),
@@ -978,19 +990,29 @@ const ONNX_BASE: &[Contribution] = &[
     Contribution::ManifestPermission {
         permission: Cow::Borrowed("android.permission.INTERNET"),
     },
+    Contribution::IosLibrary {
+        name: Cow::Borrowed("c++"),
+    },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("CoreML"),
+    },
+    Contribution::IosFramework {
+        name: Cow::Borrowed("Foundation"),
+    },
 ];
 
 const ONNX: PluginSpec = PluginSpec {
     id: Cow::Borrowed("onnx"),
     summary: Cow::Borrowed(
         "On-device ONNX model inference over ONNX Runtime: sessions, image helpers and \
-              vision tasks (subject mask, faces, depth) with reactive handles; desktop and \
-              arm64 Android.",
+              vision tasks (subject mask, faces, depth) with reactive handles; desktop, \
+              arm64 Android and arm64 iOS.",
     ),
     crate_dir: Cow::Borrowed("onnx"),
     base: Cow::Borrowed(ONNX_BASE),
     optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
+    min_ios: Some(Cow::Borrowed("15.1")),
     ..PluginSpec::DEFAULT
 };
 
@@ -1691,14 +1713,17 @@ mod tests {
     }
 
     /// `onnx` is its Cargo dependency, the shared C++ runtime and the INTERNET
-    /// permission its default-on catalog downloads need, nothing else.
+    /// permission its default-on catalog downloads need on Android, and the
+    /// three iOS link lines the static archive needs, nothing else.
     #[test]
-    fn onnx_is_a_cargo_dep_the_shared_cxx_runtime_and_internet() {
+    fn onnx_is_a_cargo_dep_the_shared_cxx_runtime_internet_and_three_ios_links() {
         let spec = find_plugin("onnx").unwrap();
         assert_eq!(spec.crate_dir, "onnx");
         assert!(spec.optional_features.is_empty());
         assert_eq!(spec.requires_sibling, None);
-        assert_eq!((spec.min_ios.clone(), spec.min_android_sdk), (None, None));
+        // The prebuilt iOS archive's objects are built for iOS 15.1.
+        assert_eq!(spec.min_ios.as_deref(), Some("15.1"));
+        assert_eq!(spec.min_android_sdk, None);
         assert_eq!(
             &*spec.base,
             [
@@ -1711,6 +1736,19 @@ mod tests {
                 // The scaffold declares INTERNET in debug and profile only.
                 Contribution::ManifestPermission {
                     permission: Cow::Borrowed("android.permission.INTERNET"),
+                },
+                // The archive is C++: at a 17.0 deployment target the link
+                // fails without it.
+                Contribution::IosLibrary {
+                    name: Cow::Borrowed("c++"),
+                },
+                // The archive carries the CoreML execution provider.
+                Contribution::IosFramework {
+                    name: Cow::Borrowed("CoreML"),
+                },
+                // `ort-sys` links Foundation too, for the CoreML provider.
+                Contribution::IosFramework {
+                    name: Cow::Borrowed("Foundation"),
                 },
             ]
         );
@@ -1756,12 +1794,15 @@ mod tests {
             } if permission == "android.permission.INTERNET"));
     }
 
-    /// No registry entry or feature states a platform floor, so adding any of
-    /// them reads no project floor and refuses nothing it did not before.
+    /// No registry entry or feature states a platform floor except `onnx`'s
+    /// iOS 15.1, so adding any other reads no project floor and refuses
+    /// nothing it did not before.
     #[test]
-    fn no_registry_entry_or_feature_states_a_platform_floor() {
+    fn no_registry_entry_or_feature_states_a_platform_floor_but_onnx() {
         for spec in known_plugins() {
-            assert_eq!(spec.min_ios, None, "{}", spec.id);
+            // The prebuilt ONNX Runtime archive is built for iOS 15.1.
+            let expected_ios = (spec.id == "onnx").then_some("15.1");
+            assert_eq!(spec.min_ios.as_deref(), expected_ios, "{}", spec.id);
             assert_eq!(spec.min_android_sdk, None, "{}", spec.id);
             for feature in spec.optional_features.iter() {
                 assert_eq!(feature.min_ios, None, "{}/{}", spec.id, feature.id);
@@ -3162,6 +3203,87 @@ mod tests {
             .unwrap();
         assert_eq!(framework_item.outcome, AddOutcome::Applied, "{third:?}");
         assert_eq!(fs::read_to_string(&pbxproj_path).unwrap(), pbxproj);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `onnx` on a fresh scaffold: `-lc++`, `-framework CoreML` and
+    /// `-framework Foundation` land in **every** `OTHER_LDFLAGS` list, the
+    /// scaffold's deployment target meets the plugin's iOS 15.1, and a second
+    /// add reports every item present and leaves a byte-identical tree.
+    #[test]
+    fn onnx_add_plugin_links_libcxx_coreml_and_foundation_in_every_configuration() {
+        let root = scaffold_project("onnx-ios-links");
+        let pbxproj_path = root.join("ios/Runner.xcodeproj/project.pbxproj");
+        let before = fs::read_to_string(&pbxproj_path).unwrap();
+        assert_eq!(
+            before.matches("IPHONEOS_DEPLOYMENT_TARGET = 15.1;").count(),
+            3,
+            "{before}"
+        );
+
+        let first = add_plugin(&root, "onnx", &[]).unwrap();
+        let items: Vec<(&str, AddOutcome)> = first
+            .items
+            .iter()
+            .map(|i| (i.description.as_str(), i.outcome))
+            .collect();
+        assert_eq!(
+            items[3..],
+            [
+                (
+                    "Xcode library `-lc++` (`OTHER_LDFLAGS`)",
+                    AddOutcome::Applied
+                ),
+                (
+                    "Xcode framework `CoreML` (`OTHER_LDFLAGS`)",
+                    AddOutcome::Applied
+                ),
+                (
+                    "Xcode framework `Foundation` (`OTHER_LDFLAGS`)",
+                    AddOutcome::Applied
+                ),
+            ],
+            "{first:?}"
+        );
+        assert!(
+            first.items.iter().all(|i| i.outcome == AddOutcome::Applied),
+            "{first:?}"
+        );
+
+        let pbxproj = fs::read_to_string(&pbxproj_path).unwrap();
+        let lists = pbxproj.matches("OTHER_LDFLAGS = (").count();
+        assert_eq!(lists, 3, "{pbxproj}");
+        // Each list ends with the three lines, in registry order.
+        assert_eq!(
+            pbxproj
+                .matches(
+                    "\t\t\t\t\t\"-lc++\",\n\
+                     \t\t\t\t\t\"-framework\",\n\t\t\t\t\tCoreML,\n\
+                     \t\t\t\t\t\"-framework\",\n\t\t\t\t\tFoundation,\n\
+                     \t\t\t\t);"
+                )
+                .count(),
+            lists,
+            "{pbxproj}"
+        );
+        assert_pbxproj_well_formed(&pbxproj);
+
+        let after_first = snapshot_tree(&root);
+        let second = add_plugin(&root, "onnx", &[]).unwrap();
+        assert_eq!(second.items.len(), first.items.len());
+        assert!(
+            second
+                .items
+                .iter()
+                .all(|i| i.outcome == AddOutcome::AlreadyPresent),
+            "{second:?}"
+        );
+        assert_eq!(
+            after_first,
+            snapshot_tree(&root),
+            "a second apply must leave a byte-identical tree"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -289,7 +289,8 @@ pub(super) fn prepare_add<'e>(
     // pbxproj's Runner target is resolved; plan it in memory (and discard the
     // plan) so a project it cannot be applied to is refused before the first
     // write. A project without `ios/` is left to the applier itself, which
-    // answers it exactly as every other iOS contribution does.
+    // answers it as the plist and Swift package appliers do (a missing
+    // project file); only the link flags count as satisfied there.
     if project_root.join(IOS_DIR_REL).is_dir() {
         for contribution in &contributions {
             if let Contribution::IosEntitlement {
@@ -897,6 +898,7 @@ fn apply_contribution(
             Ok(pbxproj)
         }
         Contribution::IosFramework { name } => apply_ios_framework(project_root, name),
+        Contribution::IosLibrary { name } => apply_ios_library(project_root, name),
         Contribution::IosEntitlement {
             key,
             value,
@@ -2789,13 +2791,77 @@ pub(super) fn swift_package_present(src: &str, package_name: &str) -> Result<boo
     Ok(swift_package_missing_sites(src, package_name)?.is_empty())
 }
 
-/// Append `"-framework", <name>,` to every `OTHER_LDFLAGS` list of the
-/// `XCBuildConfiguration` section that does not already link `name` — one
-/// list per build configuration. Lists are edited back to front so the
-/// ranges scanned from the original stay valid, the whole edit is built in
-/// memory, re-scanned, and written once; a project with no `OTHER_LDFLAGS`
-/// list at all is [`PluginAddError::MalformedProjectFile`].
+/// One link request an `OTHER_LDFLAGS` list carries: a framework
+/// ([`Contribution::IosFramework`], the two entries `"-framework", <name>,`)
+/// or a library ([`Contribution::IosLibrary`], the one entry `"-l<name>",`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LinkFlag<'n> {
+    /// `-framework <name>`.
+    Framework(&'n str),
+    /// `-l<name>`.
+    Library(&'n str),
+}
+
+impl LinkFlag<'_> {
+    /// The entries appended to one list, each line indented by `indent`. A
+    /// library entry is always quoted: `+` (as in `c++`) is not a character
+    /// an unquoted pbxproj string may hold.
+    fn entries(self, indent: &str) -> String {
+        match self {
+            LinkFlag::Framework(name) => format!("{indent}\"-framework\",\n{indent}{name},\n"),
+            LinkFlag::Library(name) => format!("{indent}\"-l{name}\",\n"),
+        }
+    }
+
+    /// The name a [`PluginAddError::PbxWiringNotVerified`] reports.
+    fn label(self) -> String {
+        match self {
+            LinkFlag::Framework(name) => name.to_string(),
+            LinkFlag::Library(name) => format!("-l{name}"),
+        }
+    }
+
+    /// Whether an `OTHER_LDFLAGS` entry region already carries this flag,
+    /// matched on trimmed lines (bare or quoted) so a pbxproj Xcode has since
+    /// reformatted still reads as present.
+    fn linked_in(self, body: &str) -> bool {
+        match self {
+            LinkFlag::Framework(name) => ldflags_link_framework(body, name),
+            LinkFlag::Library(name) => {
+                let bare = format!("-l{name},");
+                let quoted = format!("\"-l{name}\",");
+                body.lines()
+                    .map(str::trim)
+                    .any(|line| line == bare || line == quoted)
+            }
+        }
+    }
+}
+
+/// [`Contribution::IosFramework`]: `-framework <name>` in every
+/// `OTHER_LDFLAGS` list ([`apply_ios_link_flag`]).
 fn apply_ios_framework(project_root: &Path, name: &str) -> Result<AddOutcome, PluginAddError> {
+    apply_ios_link_flag(project_root, LinkFlag::Framework(name))
+}
+
+/// [`Contribution::IosLibrary`]: `-l<name>` in every `OTHER_LDFLAGS` list
+/// ([`apply_ios_link_flag`]).
+fn apply_ios_library(project_root: &Path, name: &str) -> Result<AddOutcome, PluginAddError> {
+    apply_ios_link_flag(project_root, LinkFlag::Library(name))
+}
+
+/// Append `flag`'s entries to every `OTHER_LDFLAGS` list of the
+/// `XCBuildConfiguration` section that does not already carry it — one list
+/// per build configuration. Lists are edited back to front so the ranges
+/// scanned from the original stay valid, the whole edit is built in memory,
+/// re-scanned, and written once; a project with no `OTHER_LDFLAGS` list at
+/// all is [`PluginAddError::MalformedProjectFile`]. A project without an
+/// `ios/` directory has nothing to link, so the flag is satisfied there; one
+/// with `ios/` but no pbxproj is [`PluginAddError::MissingProjectFile`].
+fn apply_ios_link_flag(project_root: &Path, flag: LinkFlag) -> Result<AddOutcome, PluginAddError> {
+    if !project_root.join(IOS_DIR_REL).is_dir() {
+        return Ok(AddOutcome::AlreadyPresent);
+    }
     let path = project_root.join(PBXPROJ_REL);
     let src = read_required(&path, PBXPROJ_REL)?;
 
@@ -2804,7 +2870,7 @@ fn apply_ios_framework(project_root: &Path, name: &str) -> Result<AddOutcome, Pl
     let mut changed = false;
     for range in lists.into_iter().rev() {
         let body = &src[range.clone()];
-        if ldflags_link_framework(body, name) {
+        if flag.linked_in(body) {
             continue;
         }
         // Indent like the list's own entries (five tabs in the scaffold),
@@ -2816,22 +2882,19 @@ fn apply_ios_framework(project_root: &Path, name: &str) -> Result<AddOutcome, Pl
             .map_or("\t\t\t\t\t", |line| {
                 &line[..line.len() - line.trim_start().len()]
             });
-        out.insert_str(
-            range.end,
-            &format!("{indent}\"-framework\",\n{indent}{name},\n"),
-        );
+        out.insert_str(range.end, &flag.entries(indent));
         changed = true;
     }
     if !changed {
         return Ok(AddOutcome::AlreadyPresent);
     }
 
-    // All-or-nothing: every list must link the framework before a byte is
+    // All-or-nothing: every list must carry the flag before a byte is
     // written.
-    if !framework_linked(&out, name)? {
+    if !link_flag_present(&out, flag)? {
         return Err(PluginAddError::PbxWiringNotVerified {
             file: PBXPROJ_REL.to_string(),
-            package: name.to_string(),
+            package: flag.label(),
             site: LDFLAGS_KEY.to_string(),
         });
     }
@@ -2840,7 +2903,23 @@ fn apply_ios_framework(project_root: &Path, name: &str) -> Result<AddOutcome, Pl
     Ok(AddOutcome::Applied)
 }
 
-/// The build setting a framework is linked through.
+/// Whether the project at `project_root` carries `flag` in every
+/// `OTHER_LDFLAGS` list — the predicate [`apply_ios_link_flag`] skips by,
+/// `true` for a project without `ios/`.
+pub(super) fn ios_link_flag_satisfied(
+    project_root: &Path,
+    flag: LinkFlag,
+) -> Result<bool, PluginAddError> {
+    if !project_root.join(IOS_DIR_REL).is_dir() {
+        return Ok(true);
+    }
+    link_flag_present(
+        &read_required(&project_root.join(PBXPROJ_REL), PBXPROJ_REL)?,
+        flag,
+    )
+}
+
+/// The build setting a framework or library is linked through.
 const LDFLAGS_KEY: &str = "OTHER_LDFLAGS";
 
 /// Every `OTHER_LDFLAGS` list of pbxproj text `src` (one per build
@@ -2855,12 +2934,11 @@ fn ldflags_lists(src: &str) -> Result<Vec<Range<usize>>, PluginAddError> {
     Ok(lists)
 }
 
-/// Whether every `OTHER_LDFLAGS` list of pbxproj text `src` links framework
-/// `name`.
-pub(super) fn framework_linked(src: &str, name: &str) -> Result<bool, PluginAddError> {
+/// Whether every `OTHER_LDFLAGS` list of pbxproj text `src` carries `flag`.
+fn link_flag_present(src: &str, flag: LinkFlag) -> Result<bool, PluginAddError> {
     Ok(ldflags_lists(src)?
         .into_iter()
-        .all(|range| ldflags_link_framework(&src[range], name)))
+        .all(|range| flag.linked_in(&src[range])))
 }
 
 /// Whether an `OTHER_LDFLAGS` entry region already links `name`: a
@@ -6509,23 +6587,120 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A project without `ios/` answers an entitlement exactly as it answers
-    /// every other iOS contribution today.
+    /// A project without `ios/` refuses an entitlement with the missing
+    /// pbxproj, as it refuses a plist key or a Swift package; only the link
+    /// flags are satisfied there, because an app with no iOS project has no
+    /// Xcode link to complete (a desktop- or Android-only app keeps adding a
+    /// plugin whose iOS arm is link lines alone, such as `onnx`).
     #[test]
-    fn a_project_without_ios_answers_like_every_other_ios_contribution() {
+    fn a_project_without_ios_refuses_an_entitlement_and_satisfies_link_flags() {
         let root = scaffold_project("ios-entitlement-no-ios");
         fs::remove_dir_all(root.join("ios")).unwrap();
 
         let entitlement = apply_test_entitlement(&root).unwrap_err();
-        let framework = apply_ios_framework(&root, "UserNotifications").unwrap_err();
         assert!(
             matches!(&entitlement, PluginAddError::MissingProjectFile(f) if f == PBXPROJ_REL),
             "{entitlement}"
         );
-        assert_eq!(entitlement.to_string(), framework.to_string());
+        let plist = apply_plist_entry(&root, "K", "v", "c").unwrap_err();
+        assert!(
+            matches!(&plist, PluginAddError::MissingProjectFile(f) if f == PLIST_REL),
+            "{plist}"
+        );
+        assert_eq!(
+            apply_ios_framework(&root, "UserNotifications").unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        assert_eq!(
+            apply_ios_library(&root, "c++").unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        assert!(ios_link_flag_satisfied(&root, LinkFlag::Library("c++")).unwrap());
+        assert!(ios_link_flag_satisfied(&root, LinkFlag::Framework("CoreML")).unwrap());
         assert!(!root.join("ios").exists(), "nothing is created under ios/");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `ios/` present but its pbxproj gone is a broken iOS project, not an
+    /// absent one: both link flags still fail on the missing file.
+    #[test]
+    fn link_flags_on_an_ios_directory_without_its_pbxproj_fail() {
+        let root = scaffold_project("ios-links-no-pbxproj");
+        fs::remove_file(root.join(PBXPROJ_REL)).unwrap();
+        let before = snapshot_tree(&root);
+        for err in [
+            apply_ios_framework(&root, "CoreML").unwrap_err(),
+            apply_ios_library(&root, "c++").unwrap_err(),
+            ios_link_flag_satisfied(&root, LinkFlag::Library("c++")).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, PluginAddError::MissingProjectFile(f) if f == PBXPROJ_REL),
+                "{err}"
+            );
+        }
+        assert_eq!(snapshot_tree(&root), before);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // `Contribution::IosLibrary`
+    // -----------------------------------------------------------------------
+
+    /// `-l<name>` is appended, quoted, to every list; a second run writes
+    /// nothing; a half-applied project is completed and reported `Applied`.
+    #[test]
+    fn ios_library_lands_in_every_list_once_and_completes_a_half_applied_project() {
+        let root = scaffold_project("ios-library");
+        let before = read_pbxproj(&root);
+        let lists = before.matches("OTHER_LDFLAGS = (").count();
+        assert_eq!(lists, 3);
+
+        assert_eq!(
+            apply_ios_library(&root, "c++").unwrap(),
+            AddOutcome::Applied
+        );
+        let once = read_pbxproj(&root);
+        let line = "\t\t\t\t\t\"-lc++\",\n";
+        assert_eq!(once.matches(line).count(), lists, "{once}");
+        // Only the three lines were added; the list closes right after each.
+        assert_eq!(once.matches(&format!("{line}\t\t\t\t);")).count(), lists);
+        assert_eq!(once.len(), before.len() + lists * line.len());
+        assert_pbxproj_well_formed(&once);
+
+        assert_eq!(
+            apply_ios_library(&root, "c++").unwrap(),
+            AddOutcome::AlreadyPresent
+        );
+        assert_eq!(read_pbxproj(&root), once);
+
+        let half = once.replacen(line, "", 1);
+        fs::write(root.join(PBXPROJ_REL), &half).unwrap();
+        assert!(!ios_link_flag_satisfied(&root, LinkFlag::Library("c++")).unwrap());
+        assert_eq!(
+            apply_ios_library(&root, "c++").unwrap(),
+            AddOutcome::Applied
+        );
+        assert_eq!(read_pbxproj(&root), once);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A library line is matched bare or quoted, on trimmed lines, and only
+    /// as a whole entry: `-lc++` is not `-lc` and the app's own `-l<app>` is
+    /// not another library.
+    #[test]
+    fn ios_library_presence_matches_whole_entries_bare_or_quoted() {
+        let library = LinkFlag::Library("c++");
+        assert!(library.linked_in("\t\"-lc++\",\n"));
+        assert!(library.linked_in("  -lc++,  \n"));
+        assert!(!library.linked_in("\"-lc++abi\",\n"));
+        assert!(!library.linked_in("\"-lc\",\n"));
+        assert!(!library.linked_in("\"-framework\",\nc++,\n"));
+        assert!(LinkFlag::Library("c").linked_in("\"-lc\",\n"));
+        assert!(!LinkFlag::Library("c").linked_in("\"-lc++\",\n"));
+        // A framework of the same name is not the library, nor the reverse.
+        assert!(!LinkFlag::Framework("z").linked_in("\"-lz\",\n"));
+        assert!(!LinkFlag::Library("z").linked_in("\"-framework\",\nz,\n"));
     }
 
     #[test]
@@ -6857,6 +7032,18 @@ mod tests {
                     "AndroidManifest.xml permission `android.permission.INTERNET`",
                     AddOutcome::Applied
                 ),
+                (
+                    "Xcode library `-lc++` (`OTHER_LDFLAGS`)",
+                    AddOutcome::Applied
+                ),
+                (
+                    "Xcode framework `CoreML` (`OTHER_LDFLAGS`)",
+                    AddOutcome::Applied
+                ),
+                (
+                    "Xcode framework `Foundation` (`OTHER_LDFLAGS`)",
+                    AddOutcome::Applied
+                ),
             ]
         );
         let after = read_gradle_properties(&root);
@@ -6968,6 +7155,18 @@ mod tests {
                     "AndroidManifest.xml permission `android.permission.INTERNET`",
                     AddOutcome::AlreadyPresent
                 ),
+                (
+                    "Xcode library `-lc++` (`OTHER_LDFLAGS`)",
+                    AddOutcome::Applied
+                ),
+                (
+                    "Xcode framework `CoreML` (`OTHER_LDFLAGS`)",
+                    AddOutcome::Applied
+                ),
+                (
+                    "Xcode framework `Foundation` (`OTHER_LDFLAGS`)",
+                    AddOutcome::Applied
+                ),
             ]
         );
         let after = snapshot_tree(&dest);
@@ -6975,7 +7174,8 @@ mod tests {
             .keys()
             .filter(|k| before.get(*k) != after.get(*k))
             .collect();
-        assert_eq!(changed, [CARGO_TOML_REL], "{changed:?}");
+        // The app still has `ios/`, so its Xcode link gains the three lines.
+        assert_eq!(changed, [CARGO_TOML_REL, PBXPROJ_REL], "{changed:?}");
         assert_eq!(before.len(), after.len());
         assert!(!dest.join(ANDROID_DIR_REL).exists());
         assert!(libcxx_shared_present(&dest).unwrap());
@@ -6994,10 +7194,11 @@ mod tests {
     }
 
     /// `models` and `onnx` on a scaffold generated without the android platform:
-    /// only `Cargo.toml` changes, every Android item reports already present and
-    /// `plugin_statuses` reports both added.
+    /// only `Cargo.toml` and (for `onnx`'s link lines) the pbxproj change, every
+    /// Android item reports already present and `plugin_statuses` reports both
+    /// added.
     #[test]
-    fn models_and_onnx_on_an_app_without_android_change_only_cargo_toml() {
+    fn models_and_onnx_on_an_app_without_android_change_no_android_file() {
         let dest = unique_temp_dir("internet-no-android");
         let platforms: Vec<_> = scaffold::ScaffoldPlatform::DEFAULT
             .iter()
@@ -7023,7 +7224,7 @@ mod tests {
             .keys()
             .filter(|k| before.get(*k) != after.get(*k))
             .collect();
-        assert_eq!(changed, [CARGO_TOML_REL], "{changed:?}");
+        assert_eq!(changed, [CARGO_TOML_REL, PBXPROJ_REL], "{changed:?}");
         assert_eq!(before.len(), after.len());
         assert!(!dest.join(ANDROID_DIR_REL).exists());
 
@@ -7071,6 +7272,108 @@ mod tests {
         assert_eq!(changed, [CARGO_TOML_REL], "{changed:?}");
         assert!(!dest.join(ANDROID_DIR_REL).exists());
         let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// `onnx` on an app without `ios/` (desktop and Android only): its three
+    /// link lines are satisfied, so only `Cargo.toml` and the two Android files
+    /// change, nothing under `ios/` is created, and nothing stays pending.
+    #[test]
+    fn adding_onnx_to_an_app_without_ios_writes_no_ios_file() {
+        let dest = unique_temp_dir("onnx-no-ios");
+        let platforms: Vec<_> = scaffold::ScaffoldPlatform::DEFAULT
+            .iter()
+            .copied()
+            .filter(|p| *p != scaffold::ScaffoldPlatform::Ios)
+            .collect();
+        scaffold::generate_with_platforms(&dest, &test_context(), None, false, None, &platforms)
+            .unwrap();
+        assert!(!dest.join(IOS_DIR_REL).exists());
+        let before = snapshot_tree(&dest);
+
+        let report = add_plugin(&dest, "onnx", &[]).unwrap();
+        let outcomes: Vec<(&str, AddOutcome)> = report
+            .items
+            .iter()
+            .map(|i| (i.description.as_str(), i.outcome))
+            .collect();
+        assert_eq!(
+            outcomes[3..],
+            [
+                (
+                    "Xcode library `-lc++` (`OTHER_LDFLAGS`)",
+                    AddOutcome::AlreadyPresent
+                ),
+                (
+                    "Xcode framework `CoreML` (`OTHER_LDFLAGS`)",
+                    AddOutcome::AlreadyPresent
+                ),
+                (
+                    "Xcode framework `Foundation` (`OTHER_LDFLAGS`)",
+                    AddOutcome::AlreadyPresent
+                ),
+            ],
+            "{report:?}"
+        );
+        let after = snapshot_tree(&dest);
+        let changed: Vec<&String> = after
+            .keys()
+            .filter(|k| before.get(*k) != after.get(*k))
+            .collect();
+        assert_eq!(
+            changed,
+            [CARGO_TOML_REL, MANIFEST_REL, GRADLE_PROPERTIES_REL],
+            "{changed:?}"
+        );
+        assert!(!dest.join(IOS_DIR_REL).exists());
+
+        let catalog = PluginCatalog::built_in();
+        let entry = catalog.find("onnx").unwrap();
+        assert_eq!(
+            crate::plugin::pending_contributions(&dest, entry, &[]).unwrap(),
+            []
+        );
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// An app generated before the template moved to iOS 15.1 is refused by
+    /// `onnx` with the platform-floor message, before anything is written;
+    /// raising the target as the message says lets the add through.
+    #[test]
+    fn adding_onnx_to_an_app_at_ios_15_0_is_refused_until_it_is_raised() {
+        let root = scaffold_project("onnx-ios-15-0");
+        rewrite(
+            &root,
+            PBXPROJ_REL,
+            "IPHONEOS_DEPLOYMENT_TARGET = 15.1;",
+            "IPHONEOS_DEPLOYMENT_TARGET = 15.0;",
+        );
+        let before = snapshot_tree(&root);
+
+        let err = add_plugin(&root, "onnx", &[]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "plugin `onnx` needs iOS 15.1 or later; \
+             ios/Runner.xcodeproj/project.pbxproj sets IPHONEOS_DEPLOYMENT_TARGET = 15.0. \
+             Raise it in every build configuration (and keep it at or above every Swift \
+             package's minimum), then re-run."
+        );
+        assert_eq!(snapshot_tree(&root), before, "nothing may be written");
+
+        rewrite(
+            &root,
+            PBXPROJ_REL,
+            "IPHONEOS_DEPLOYMENT_TARGET = 15.0;",
+            "IPHONEOS_DEPLOYMENT_TARGET = 15.1;",
+        );
+        let report = add_plugin(&root, "onnx", &[]).unwrap();
+        assert!(
+            report
+                .items
+                .iter()
+                .all(|i| i.outcome == AddOutcome::Applied),
+            "{report:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -7334,7 +7637,7 @@ mod tests {
 
     /// The generated app's deployment-target line, in each of the three
     /// build configurations.
-    const TARGET_15: &str = "IPHONEOS_DEPLOYMENT_TARGET = 15.0;";
+    const SCAFFOLD_TARGET: &str = "IPHONEOS_DEPLOYMENT_TARGET = 15.1;";
 
     fn floor_spec(
         base: &'static [Contribution],
@@ -7418,7 +7721,7 @@ mod tests {
                 assert_eq!(&**plugin, "floor-test-plugin");
                 assert_eq!(*platform, FloorPlatform::Ios);
                 assert_eq!(required, "16.4");
-                assert_eq!(found, "15.0");
+                assert_eq!(found, "15.1");
                 assert_eq!(*key, IOS_DEPLOYMENT_TARGET);
                 assert_eq!(*file, PBXPROJ_REL);
             }
@@ -7427,7 +7730,7 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "plugin `floor-test-plugin` needs iOS 16.4 or later; \
-             ios/Runner.xcodeproj/project.pbxproj sets IPHONEOS_DEPLOYMENT_TARGET = 15.0. \
+             ios/Runner.xcodeproj/project.pbxproj sets IPHONEOS_DEPLOYMENT_TARGET = 15.1. \
              Raise it in every build configuration (and keep it at or above every Swift \
              package's minimum), then re-run."
         );
@@ -7444,7 +7747,7 @@ mod tests {
             rewrite(
                 &root,
                 PBXPROJ_REL,
-                TARGET_15,
+                SCAFFOLD_TARGET,
                 &format!("IPHONEOS_DEPLOYMENT_TARGET = {raised};"),
             );
             let report = add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[])
@@ -7465,11 +7768,11 @@ mod tests {
         let root = scaffold_project("floor-ios-partial");
         let path = root.join(PBXPROJ_REL);
         let src = fs::read_to_string(&path).unwrap();
-        assert_eq!(src.matches(TARGET_15).count(), 3);
+        assert_eq!(src.matches(SCAFFOLD_TARGET).count(), 3);
         // Raise the first two configurations only.
         let raised = src
-            .replacen(TARGET_15, "IPHONEOS_DEPLOYMENT_TARGET = 17.0;", 2)
-            .replacen(TARGET_15, "IPHONEOS_DEPLOYMENT_TARGET = 16.0;", 1);
+            .replacen(SCAFFOLD_TARGET, "IPHONEOS_DEPLOYMENT_TARGET = 17.0;", 2)
+            .replacen(SCAFFOLD_TARGET, "IPHONEOS_DEPLOYMENT_TARGET = 16.0;", 1);
         fs::write(&path, &raised).unwrap();
         let err =
             add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[]).unwrap_err();
@@ -7489,7 +7792,7 @@ mod tests {
         rewrite(
             &root,
             PBXPROJ_REL,
-            TARGET_15,
+            SCAFFOLD_TARGET,
             "IPHONEOS_DEPLOYMENT_TARGET = 17.0;",
         );
         rewrite(
@@ -7616,7 +7919,7 @@ mod tests {
         rewrite(
             &root,
             PBXPROJ_REL,
-            TARGET_15,
+            SCAFFOLD_TARGET,
             "IPHONEOS_DEPLOYMENT_TARGET = \"$(BASE)\";",
         );
         let err =
@@ -7638,7 +7941,7 @@ mod tests {
     #[test]
     fn a_floor_key_missing_entirely_is_malformed_naming_the_key() {
         let root = scaffold_project("floor-missing-key");
-        rewrite(&root, PBXPROJ_REL, TARGET_15, "SDKROOT = iphoneos;");
+        rewrite(&root, PBXPROJ_REL, SCAFFOLD_TARGET, "SDKROOT = iphoneos;");
         let err =
             add_floor_spec(&root, &floor_spec(FLOOR_BASE, Some("16.4"), None), &[]).unwrap_err();
         assert!(
@@ -7680,7 +7983,7 @@ mod tests {
         rewrite(
             &root,
             PBXPROJ_REL,
-            TARGET_15,
+            SCAFFOLD_TARGET,
             "IPHONEOS_DEPLOYMENT_TARGET = 16.4;",
         );
         rewrite(

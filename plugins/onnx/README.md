@@ -3,15 +3,17 @@
 **ONNX model inference** for frust apps, over [ONNX Runtime](https://onnxruntime.ai) through the
 [`ort`](https://crates.io/crates/ort) crate. Load a model from a file or from bytes, read its
 named inputs and outputs, and run it on typed tensors (f32, u8, i64), blocking or on a
-per-session worker thread with cancel. CoreML accelerates Apple targets; everything else runs on
-the CPU, and an accelerator that cannot be used falls back to the CPU.
+per-session worker thread with cancel. CoreML accelerates models with static input shapes on Apple
+targets; everything else runs on the CPU, and an accelerator that cannot be used falls back to the
+CPU.
 
 **Status:** desktop, arm64 Android and arm64 iOS. Linux (glibc, x86_64/aarch64), Apple-silicon
 macOS, Windows (MSVC), Android arm64-v8a, iOS devices and the arm64 iOS Simulator link ONNX
 Runtime statically from a prebuilt archive fetched at build time. Android also needs the NDK's
 `libc++_shared.so` in the APK, which `frust plugin add onnx` arranges (see
-[Android packaging](#6-android-packaging)); iOS needs three extra lines in the Xcode link, which
-`frust plugin add onnx` does not make yet (see [iOS packaging](#7-ios-packaging)). Intel macOS,
+[Android packaging](#6-android-packaging)); iOS needs three extra lines in the Xcode link and a
+deployment target of 15.1 or later, and `frust plugin add onnx` adds the lines (see
+[iOS packaging](#7-ios-packaging)). Intel macOS,
 the x86_64 Simulator, Mac Catalyst, 32-bit Android and x86_64 Android load the library at run
 time instead and ship none.
 
@@ -27,7 +29,7 @@ Building it needs Rust 1.92 or newer (the pinned `ort` requires it), above the w
 frust plugin add onnx
 ```
 
-or pick **onnx** in the TUI's Add Plugin dialog. It makes three edits to a project made by
+or pick **onnx** in the TUI's Add Plugin dialog. It makes these edits to a project made by
 `frust create`:
 
 - `Cargo.toml`: the `frust-onnx` dependency, written in the form the app's own `frust`
@@ -38,13 +40,16 @@ or pick **onnx** in the TUI's Add Plugin dialog. It makes three edits to a proje
 - `android/app/src/main/AndroidManifest.xml`: `<uses-permission android:name="android.permission.INTERNET" />`
   in the main manifest, because the catalog downloads need it and the scaffold declares it only in
   its debug and profile manifests.
+- `ios/Runner.xcodeproj/project.pbxproj`: `-lc++`, `-framework CoreML` and `-framework Foundation`
+  at the end of every `OTHER_LDFLAGS` list (see [iOS packaging](#7-ios-packaging)).
 
 It adds no Gradle module, Swift package or plist key. Running it twice changes nothing. A
-project whose `android/app/build.gradle.kts` predates the property is refused before anything is
-written, and the error quotes the line to add. Adding the dependency by hand
-(`frust-onnx = "0.6"`) skips the two Android edits; make them yourself (the property, and the
-permission for a release build that downloads) or the APK will not load or downloads will fail.
-A project with no `android/` directory gets only the dependency.
+project whose `android/app/build.gradle.kts` predates the property, or whose iOS deployment target
+is below 15.1, is refused before anything is written, and the error says what to change. Adding
+the dependency by hand (`frust-onnx = "0.6"`) skips the Android and iOS edits; make them yourself
+(the property, the permission for a release build that downloads, and the three linker lines) or
+the APK will not load, downloads will fail or the iOS link will fail. A project with no `android/`
+directory gets no Android edit, and one with no `ios/` directory no iOS edit.
 
 Features, all on by default:
 
@@ -131,8 +136,12 @@ if session.provider() == Provider::Cpu { /* no accelerator on this device */ }
 | `memory_pattern` | `false` | pre-plan one block for a run's intermediate tensors |
 | `arena_shrinkage` | `false` | give unused arena blocks back after each run (only with `cpu_arena`) |
 
-**Accelerator policy.** `Auto` is CoreML on all compute units on Apple targets and the CPU
-everywhere else. On Android that is the CPU because the shipped ONNX Runtime archive has no
+**Accelerator policy.** On Apple targets `Auto` uses CoreML (all compute units) only for a model
+whose inputs are all fully static in shape; a model with any dynamic input dimension loads on the
+CPU, and the load logs why. Set `Accelerator::CoreMl` to force CoreML on such a model. Measured
+on an Apple M4: Depth Anything V2 Small (input `[?, 3, ?, ?]`) ran 232 ms at 473 MB on the CPU
+against 728 ms at about 5.2 GB on CoreML; U2-NetP (static `[1, 3, 320, 320]`) 90 ms on the CPU
+against 75 ms on CoreML. Everywhere else `Auto` is the CPU. On Android that is the CPU because the shipped ONNX Runtime archive has no
 XNNPACK provider (see [Android packaging](#6-android-packaging)); NNAPI is compiled into that
 archive but this crate never registers it. `Xnnpack` is accepted but compiled into no build yet,
 so it always falls back (or is `Unsupported` when strict). When the provider is missing from the
@@ -144,16 +153,16 @@ provider, strict or not.
 
 | Target | Provider library | `Auto` |
 |--------|------------------|--------|
-| Apple-silicon macOS | CoreML in the prebuilt `coreml` archive, linked statically | CoreML |
-| iOS device, arm64 Simulator | CoreML in the prebuilt `coreml` archive, linked statically | CoreML |
-| Intel macOS, x86_64 Simulator, Mac Catalyst | CoreML if the ONNX Runtime library loaded at run time has it | CoreML, else CPU |
+| Apple-silicon macOS | CoreML in the prebuilt `coreml` archive, linked statically | CoreML for static input shapes, else CPU |
+| iOS device, arm64 Simulator | CoreML in the prebuilt `coreml` archive, linked statically | CoreML for static input shapes, else CPU |
+| Intel macOS, x86_64 Simulator, Mac Catalyst | CoreML if the ONNX Runtime library loaded at run time has it | CoreML for static input shapes if present, else CPU |
 | Android arm64 | static `nnapi` archive: CPU (and NNAPI, unused), no XNNPACK | CPU |
 | Linux, Windows, others | CPU | CPU |
 
 CoreML needs iOS 13 or newer; nodes it cannot run stay on the CPU. For a model loaded from a file,
 CoreML keeps its compiled model under `<cache dir>/frust-onnx/coreml` (`frust_paths::cache_dir()`);
 a model from bytes gets no cache. The CoreML code compiles only for Apple targets; it has run on
-an iPhone and the iOS Simulator (see [iOS packaging](#7-ios-packaging)).
+an Apple M4 Mac, an iPhone and the iOS Simulator (see [iOS packaging](#7-ios-packaging)).
 
 **Memory.** U2-NetP (`u2netp.onnx`, 4.4 MiB) at 1x3x320x320, x86_64 Linux host (i5-12600,
 12 threads), release build, ONNX Runtime 1.31.0, one fresh process per row, one warm-up run then
@@ -269,9 +278,11 @@ exactly; `lax-feature-matching` is never turned on.
    `frust build apk --release --target-platform android-arm64`, its `lib/arm64-v8a` passing
    `scripts/ci/page-size-check.sh`, installed and started on a phone. Check the archive still
    needs only `libc++_shared.so` beyond the NDK's system libraries (`llvm-readelf -d` on the
-   app's `.so`). Then the iOS gate: the same app built for the Simulator and, signed in
-   Release, for an iPhone with the [iOS packaging](#7-ios-packaging) linker lines, started on
-   both; re-read the archive's minimum iOS version (`otool -l libonnxruntime.a | grep minos`).
+   app's `.so`). Then the iOS gate: the same app (its [iOS packaging](#7-ios-packaging) linker
+   lines come from `frust plugin add onnx`) built for the Simulator and, signed in Release, for an
+   iPhone, started on both; re-read the archive's minimum iOS version
+   (`otool -l libonnxruntime.a | grep minos`) and keep the registry's `min_ios` for `onnx` equal
+   to it.
 4. Update the version numbers and measurements in this README.
 
 ## 6. Android packaging
@@ -344,7 +355,8 @@ predicts; the run costs about 13 % more time (519 ms against 458 ms).
 `coreml`, the only row for each; about 10 MB compressed, an 88 MB `libonnxruntime.a` once
 extracted) and links it statically into the app's Rust staticlib. No Swift package, xcframework,
 CocoaPod or bundled framework is needed, and the app ships no ONNX Runtime library. The archive
-contains the CoreML execution provider, so `Accelerator::Auto` is CoreML on iOS. The alternative,
+contains the CoreML execution provider, which `Accelerator::Auto` uses for static-shape models
+(see [Sessions and accelerators](#2-sessions-and-accelerators)). The alternative,
 a local Swift package over Microsoft's onnxruntime xcframework, was not needed and was not tried.
 `x86_64-apple-ios` (the Intel Simulator) and Mac Catalyst have no prebuilt row and load the
 library at run time.
@@ -352,7 +364,9 @@ library at run time.
 **What the app's Xcode link must add.** A Rust staticlib carries `ort-sys`' link requests
 (`-lc++`, `-framework Foundation`, `-framework CoreML`) only into Cargo's own link, never into
 Xcode's, so the Runner target's `OTHER_LDFLAGS` (every configuration) must name them, after the
-scaffold's own entries:
+scaffold's own entries. `frust plugin add onnx` adds exactly these three to every list
+(`Contribution::IosLibrary` for `-lc++`, `Contribution::IosFramework` for the two frameworks).
+Add them by hand only for a dependency added by hand:
 
 ```text
 -lc++
@@ -360,21 +374,25 @@ scaffold's own entries:
 -framework Foundation
 ```
 
-This list is authoritative: the registry's iOS contributions for `onnx` must be exactly these
-three. The two frameworks fit the existing `Contribution::IosFramework { name }`; `-lc++` is not a
-framework, so it needs a new contribution kind that adds an `-l<name>` line
-(`Contribution::IosLibrary`). An unmodified scaffold (Debug, Simulator) linked without them,
-but only by accident: the archive autolinks CoreML, the embedding's Swift objects autolink
-Foundation, and `libc++` arrives through Swift's back-deployment library
-`libswiftCompatibility56.a`, which Xcode links only while the deployment target is below
-iOS 15.4. A deployment target of 15.4 or later is expected to lose `libc++` that way (not tried),
-so all three are named. `Accelerate` and other frameworks are not needed.
+An unmodified scaffold (Debug, Simulator) linked without them, but only by accident: the archive
+autolinks CoreML, the embedding's Swift objects autolink Foundation, and `libc++` arrives through
+Swift's back-deployment library `libswiftCompatibility56.a`, which Xcode links only while the
+deployment target is below iOS 15.4. At 15.4 or later that route is gone: a scaffold at a 17.0
+deployment target fails the Simulator link with 233 undefined `std::` references, and adding only
+`-lc++` fixes it. So all three are named. `Accelerate` and other frameworks are not needed.
 
 **Minimum iOS version: 15.1.** The archive's objects are built for iOS 15.1 (`minos 15.1`, SDK
-18.5, in `otool -l`). The scaffold targets 15.0; that links and runs, but the linker prints a
-warning for each of about 940 objects (`was built for newer 'iOS' version (15.1) than being
-linked (15.0)`). Set `IPHONEOS_DEPLOYMENT_TARGET = 15.1` or higher to silence them. CoreML needs
-iOS 13, so it adds no constraint.
+18.5, in `otool -l`). A deployment target of 15.0 links, but the linker prints a warning for each
+of about 940 objects (`was built for newer 'iOS' version (15.1) than being linked (15.0)`), and
+nothing has run on iOS 15. New apps target 15.1, and `frust plugin add onnx` refuses a project
+below it before writing anything:
+
+```text
+Error: plugin `onnx` needs iOS 15.1 or later; ios/Runner.xcodeproj/project.pbxproj sets IPHONEOS_DEPLOYMENT_TARGET = 15.0. Raise it in every build configuration (and keep it at or above every Swift package's minimum), then re-run.
+```
+
+Raise `IPHONEOS_DEPLOYMENT_TARGET` to 15.1 or higher in every configuration and add it again.
+CoreML needs iOS 13, so it adds no constraint.
 
 **Simulator.** The `aarch64-apple-ios-sim` row works the same way and needs the same three
 lines; the Simulator build needed nothing different from the device build. CoreML registers on
@@ -555,12 +573,16 @@ Android, so the CPU is the only provider measured there. Times are `VisionHandle
 | `segment_subject` (U2-NetP) | 595 to 597 ms | 519 ms | 522 ms |
 | `detect_faces` (YuNet) | 62 to 69 ms | 58 ms | 57 ms |
 | `estimate_depth` (Depth Anything V2 Small, quantized) | 1,139 to 1,157 ms | 930 ms | 947 ms |
+| U2-NetP alone, iPhone 13 mini, CPU (4 threads) | 306.6 ms, load not included | 278.8 ms (median of 10, one 320x320 tensor) | not measured |
+| U2-NetP alone, iPhone 13 mini, CoreML | 165.6 ms after a 2.27 s load | 94.4 ms (median of 10, one 320x320 tensor) | not measured |
 
 App peak RSS (`VmHWM`) in a fresh process: 171 MB after start, 245 MB with a 12-megapixel photo
 picked and downscaled to 2048x1536, 409 MB after the first U2-NetP run, 458 MB with all three
 sessions loaded; 499 MB after 30 runs over both images. A run with the app in the background
-took about 1.7 times as long (1,649 ms for depth) and completed. These tasks have no Apple or
-desktop row yet; U2-NetP alone on an iPhone 13 mini is in [iOS packaging](#7-ios-packaging).
+took about 1.7 times as long (1,649 ms for depth) and completed. The two iPhone rows are the
+[iOS packaging](#7-ios-packaging) smoke, not this example: `Session::run_blocking` on a prepared
+input tensor (no pixel conversion or decode), signed Release build, iOS 27.2. The tasks have no
+other Apple or desktop row yet.
 
 The ignored live tests (`cargo test -p frust-onnx --test vision -- --ignored`) download the three
 catalog models (about 32 MB) into `target/` (or `FRUST_ONNX_MODEL_STORE`) and run each task on
@@ -644,7 +666,7 @@ network afterwards; the session tests run small models under `tests/fixtures`. `
 drives `VisionHandle` over a stub runner, so it loads no model: it checks the status order, that
 a superseded request's result is dropped, that an error becomes `Failed` and that each task's
 `last_run` reports the published run's provider and duration. The registry entry
-and its Android edit are tested in `frust-drive` (`cargo test -p frust-drive plugin::`).
+and its Android and iOS edits are tested in `frust-drive` (`cargo test -p frust-drive plugin::`).
 
 ## 13. License
 
