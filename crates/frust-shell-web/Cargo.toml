@@ -40,9 +40,9 @@ web-time = { workspace = true }
 
 # Browser-only rows, reached solely by the `wasm32` frame loop (`src/app_handler.rs`) and bring-up retry (`src/render.rs`).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# Imported by no `use`, yet not removable: it anchors the whole graph's `wasm-bindgen` identity, which must match `wasm-bindgen-cli` (0.2.128;
-# winit/web-sys alone resolve 0.2.127). The exact workspace pin binds only where something depends on it. `js-sys`/`web-sys`/
-# `wasm-bindgen-futures` are lockstep partners (each requires an exact `wasm-bindgen`).
+# Imported by no `use`, yet not removable: it sets the graph's minimum `wasm-bindgen` (0.2.128; winit/web-sys alone resolve
+# 0.2.127). The workspace row binds only where something depends on it. The exact version, which must match `wasm-bindgen-cli`,
+# is the app's pin. `js-sys`/`web-sys`/`wasm-bindgen-futures` are lockstep partners (each requires an exact `wasm-bindgen`).
 wasm-bindgen = { workspace = true }
 # `spawn_local`: surface bring-up is `async` and a browser has no blocking executor; also the `JsFuture` for the retry wait.
 wasm-bindgen-futures = { workspace = true }
@@ -50,7 +50,7 @@ wasm-bindgen-futures = { workspace = true }
 js-sys = { workspace = true }
 # Features cover exactly the two direct browser calls: `window.setTimeout` (`src/render.rs`) and the hidden-input IME overlay
 # (`src/ime.rs`); winit owns the canvas and input handlers. No `console` row: logging goes through `src/logging.rs`.
-# `web-sys` stays the lockstep partner of the `=0.2.128` `wasm-bindgen` pin above.
+# `web-sys` stays the lockstep partner of the `wasm-bindgen` version the app pins.
 web-sys = { workspace = true, features = [
     # `Window`/`Document`/`Node` ladder: `setTimeout` and the overlay `<input>`.
     "Window",

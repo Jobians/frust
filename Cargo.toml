@@ -30,9 +30,12 @@ wgpu = { version = "30.0.1", default-features = false, features = [
 winit = "0.30.13"
 
 # --- Browser shell (wasm32-unknown-unknown) rows -------------------------------
-# Exact pin: must equal the host `wasm-bindgen-cli` (0.2.128). wasm-bindgen-futures/js-sys/web-sys and
-# frust-testing's exact `wasm-bindgen-test` move in lockstep with it (docs/SHELLS_DEVELOPMENT.md).
-wasm-bindgen = "=0.2.128"
+# Minimum, not exact: the published crates must not forbid a newer `wasm-bindgen` that another
+# dependency of the app needs. The exact pin that must equal the host `wasm-bindgen-cli` (0.2.128)
+# sits in each app's own manifest (the scaffold writes it, `frust build web` checks it) and, for
+# this workspace, in frust-testing; wasm-bindgen-futures/js-sys/web-sys and frust-testing's exact
+# `wasm-bindgen-test` move in lockstep with it (docs/SHELLS_DEVELOPMENT.md).
+wasm-bindgen = "0.2.128"
 wasm-bindgen-futures = "0.4.77"
 js-sys = "0.3.104"
 web-sys = "0.3.104"

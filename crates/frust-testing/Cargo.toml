@@ -79,12 +79,13 @@ proptest = { workspace = true }
 # --- Browser (wasm32-unknown-unknown) test harness -----------------------------
 # Only for `tests/wasm_goldens.rs`/`tests/wasm_binary_invariants.rs`, both `cfg(all(target_arch = "wasm32", feature = "webgl"))`.
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-# Exact: paired with the root `wasm-bindgen = "=0.2.128"` pin and the installed wasm-bindgen-cli, whose
+# Exact: paired with the `wasm-bindgen = "=0.2.128"` pin below and the installed wasm-bindgen-cli, whose
 # test runner refuses a schema-hash mismatch. Bump all three together, never alone
 # (docs/DEVELOPMENT.md's Version-Pin Policy).
 wasm-bindgen-test = "=0.3.78"
-# Takes the root's exact pin: one wasm-bindgen identity in the browser graph.
-wasm-bindgen = { workspace = true }
+# This workspace's exact pin (the root row is only the published crates' minimum): one wasm-bindgen
+# identity in the browser graph, the one the installed wasm-bindgen-cli matches.
+wasm-bindgen = "=0.2.128"
 wasm-bindgen-futures = { workspace = true }
 # Exactly the features the two targets use. The canvas is required (wasm32 GL enumerates no adapter
 # without a canvas `compatible_surface`); `console` because `println!` is a no-op on wasm32.
