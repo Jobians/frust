@@ -38,6 +38,11 @@ pub enum Optimization {
 /// memory defaults (arena and memory pattern off, unlike ONNX Runtime's own) trade a few percent
 /// of speed for a much smaller footprint; the README's "Sessions and accelerators" section
 /// records what each option costs and saves.
+///
+/// [`accelerator`](Self::accelerator) left at `Auto` means CoreML on Apple targets only for a
+/// model whose inputs are all fully static; a dynamic-shape model loads on the CPU, because
+/// CoreML measured 3 times slower and about 10 times larger on one (see [`Accelerator::Auto`]).
+/// Setting `Accelerator::CoreMl` forces CoreML regardless, at the caller's risk.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct SessionOptions {
@@ -225,7 +230,7 @@ impl Session {
             reason,
         };
         let env = environment()?;
-        let wanted = options.accelerator.resolve();
+        let wanted = resolve_accelerator(env, source, options)?;
         let provider = wanted.provider();
         if provider == Provider::Cpu {
             let session = commit(env, source, options, Accelerator::Cpu).map_err(load_error)?;
@@ -289,8 +294,12 @@ impl Session {
         &self.options
     }
 
-    /// The execution provider the session runs on: the one asked for, or
-    /// [`Provider::Cpu`] after a fall back.
+    /// The execution provider the session actually runs on: the one asked for, or
+    /// [`Provider::Cpu`] after a fall back. For `Auto` on an Apple target that is CoreML only
+    /// when every model input has a fully static shape, and the CPU otherwise: on an Apple M4 a
+    /// dynamic-shape depth model ran 232 ms at 473 MB on the CPU against 728 ms at about
+    /// 5.2 GB on CoreML. An explicit [`Accelerator::CoreMl`] is honoured on any model, at the
+    /// caller's risk.
     pub fn provider(&self) -> Provider {
         self.provider
     }
@@ -388,6 +397,41 @@ impl Session {
             .collect();
         names.join(", ")
     }
+}
+
+/// The accelerator to load with. Only `Auto` on an Apple target needs the model: its inputs are
+/// read from a metadata-only load (CPU, one thread, graph optimisation off, dropped before the
+/// real load), because CoreML is chosen only for fully static input shapes. Every other case
+/// is decided without touching the model.
+fn resolve_accelerator(
+    env: &ort::environment::Environment,
+    source: Source<'_>,
+    options: &SessionOptions,
+) -> Result<Accelerator, OnnxError> {
+    if options.accelerator != Accelerator::Auto || !cfg!(target_vendor = "apple") {
+        return Ok(options.accelerator.resolve());
+    }
+    let probe = SessionOptions {
+        intra_threads: Some(1),
+        optimization: Optimization::Basic,
+        ..options.clone()
+    };
+    let session =
+        commit(env, source, &probe, Accelerator::Cpu).map_err(|reason| OnnxError::Load {
+            path: source.path(),
+            reason,
+        })?;
+    let inputs: Vec<TensorInfo> = session.inputs().iter().map(describe).collect();
+    drop(session);
+    let resolved = Accelerator::Auto.resolve_for(&inputs);
+    if resolved == Accelerator::Cpu {
+        log::info!(
+            "frust-onnx: the model has a dynamic input shape, so Accelerator::Auto runs it on the \
+             CPU (CoreML is slower and far larger on dynamic shapes); ask for \
+             Accelerator::CoreMl to force it"
+        );
+    }
+    Ok(resolved)
 }
 
 /// Builds a session for `source` on `accelerator` (`Cpu` or a resolved provider), the runtime's
