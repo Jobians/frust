@@ -16,12 +16,25 @@ readme = "README.md"
 frust = { package = "frust-ui", path = "../../crates/frust", version = "0.6.6", default-features = false }
 kurbo = { workspace = true }
 peniko = { workspace = true }
+# `chat` feature only. Markdown parsing for the chat family (MIT, MSRV 1.71.1); no HTML renderer
+# and no `getopts` binary dependency, so only the parser is compiled (tables and strikethrough are
+# runtime `Options` flags, not cargo features).
+pulldown-cmark = { version = "0.13.6", default-features = false, optional = true }
+# `chat` feature only. Line diffing for the chat diff view (Apache-2.0, MSRV 1.71); the
+# `unified_diff` printer is left off, the view builds its own rows from the hunks.
+imara-diff = { version = "0.2.0", default-features = false, optional = true }
+# `chat` feature only. The chat components read a monotonic clock; `std::time::Instant::now()`
+# panics on wasm32, so they take `web_time::Instant` (the workspace route, as frust-text does).
+web-time = { workspace = true, optional = true }
 
 [features]
 default = ["bundled-fonts"]
 # Space Mono + IBM Plex Mono via `include_bytes!`; off drops them, `font_data()` is empty
 # and the type scale falls back to fontique.
 bundled-fonts = []
+# The `chat` component family (`frust_glyph::chat`): markdown, code/diff blocks, tool calls,
+# approvals, composer. Off by default so the base catalog compiles neither parser.
+chat = ["dep:pulldown-cmark", "dep:imara-diff", "dep:web-time"]
 
 [dev-dependencies]
 frust-widgets = { path = "../../crates/frust-widgets", version = "0.6.6", features = ["test-support"] }

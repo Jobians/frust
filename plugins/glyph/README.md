@@ -12,6 +12,52 @@ the default-on `bundled-fonts` feature.
 It is built on the `frust` facade's public `authoring` surface only. Applications
 depend on `frust-glyph` directly, next to `frust`; the facade does not re-export it.
 
+## Chat components (`chat` feature)
+
+The opt-in `chat` feature adds `frust_glyph::chat`, a family for agent-conversation UIs. It is
+off by default: a default build compiles none of it and gains no dependency. Enable it with
+`frust-glyph = { version = "..", features = ["chat"] }`. The feature turns on three optional
+dependencies: `pulldown-cmark` (markdown parsing), `imara-diff` (line diffs) and `web-time`
+(the monotonic clock the countdown and animations read).
+
+Components, each reached as `frust_glyph::chat::<name>`:
+
+- `message_scroller`: the virtualized transcript, stuck to its live end, with a jump-to-latest control.
+- `message_row`: a user, assistant or thought message.
+- `markdown`: assistant markdown, one widget per block.
+- `code_block`: monospace code that scrolls sideways, with a copy control.
+- `diff_view` (and `compute_diff`): a file edit as a line diff.
+- `tool_call`: a tool call card with its output and diff.
+- `plan_block`: the agent's plan entries.
+- `approval_card`: a permission request and its answer, with an optional countdown.
+- `notice_row`: a status line.
+- `usage_meter`: a context-window meter.
+- `composer`: the prompt input with send and stop.
+
+**Controlled and non-reactive.** Each component takes data and callbacks, holds no signals and never
+applies a toggle or an answer itself: the app owns the transcript and every open or answered state.
+
+**Untrusted content.** Markdown emits no HTML and fetches no image. A link's URL is
+attacker-controlled and may differ from its label, so show or confirm it before opening; `on_link`
+receives only a validated `http`, `https` or `mailto` URL. Approval titles, details and options are
+supplied by the agent: do not treat them as the app's own words. Give every request a
+`.request_id(..)`: the card tells successive requests apart by it (without one, two identical
+requests shown in the same card share the answered state), and `on_select` receives an
+`ApprovalSelection` with the request id and the option id, naming the request the press began on.
+Make an `ApprovalDeadline` once, when the request arrives, and store it, or the countdown restarts
+on every rebuild.
+
+**Performance.** Markdown re-parses its whole source on each change and keeps unchanged blocks, so
+coalesce stream chunks to one update per frame. Key `message_scroller` rows by a stable message id.
+A markdown source over `MARKDOWN_MAX_SOURCE_BYTES` (256 KiB) is shown as plain text.
+
+The module documentation of `src/chat/mod.rs` holds the contract. `tests/chat_api.rs` composes a
+transcript (message, tool-call, plan, approval and notice rows above a composer), and the catalog's
+**Agent chat** page ([`examples/glyph-catalog`](../../examples/glyph-catalog)) plays a scripted turn
+through every component. Known limits are in the `glyph-chat-*` entries of
+[`docs/LIMITATIONS.md`](../../docs/LIMITATIONS.md). The family has been tested headlessly on Linux
+only.
+
 Documentation and project home: <https://frust.dev>. Source: <https://github.com/frust-rs/frust>.
 
 ## License
