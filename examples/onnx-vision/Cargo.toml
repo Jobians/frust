@@ -1,0 +1,125 @@
+# Standalone package, excluded from the root workspace: the device projects resolve a
+# project-local target (the iOS build phase links `target/<triple>/<profile>/libonnxvision.a`).
+[workspace]
+
+[package]
+name = "onnxvision"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# `cdylib`: Android JNI library; `staticlib`: iOS Xcode link target; `rlib`:
+# the desktop `main.rs` preview binary.
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+# Published as `frust-ui`, imported as `frust` (crates.io `frust` belongs to
+# another project). `--frust-path <checkout>` emits a path dependency instead.
+frust = { package = "frust-ui", path = "../../crates/frust" }
+
+# Material 3 is a sibling plugin crate, installed by `src/lib.rs`'s `app!` setup;
+# swap this dependency and that call to change design system.
+frust-material = { path = "../../plugins/material" }
+
+# Present so the release-only `lean` feature can cap the log level. Never make
+# the cap unconditional: `profile` builds must keep `frust-perf` output.
+log = "0.4"
+
+# Added by `frust plugin add models|onnx|photo-library --feature decode|device-info`; the
+# applier wrote each path through `crates/frust/../..`, shortened here to the same directory.
+frust-models = { path = "../../plugins/models" }
+frust-onnx = { path = "../../plugins/onnx" }
+frust-photo-library = { path = "../../plugins/photo-library", features = ["decode"] }
+frust-device-info = { path = "../../plugins/device-info" }
+
+# Test builds only: the facade's headless `frust::testing` driver.
+[dev-dependencies]
+frust = { package = "frust-ui", path = "../../crates/frust", features = ["complex-scripts", "test-support"] }
+
+# Browser row: `app!` glue names `wasm_bindgen::` paths absolutely, so this crate needs the edge.
+# Exact pin: must equal the `wasm-bindgen-cli` version of the build; moves with Frust's web
+# crates (`docs/DEVELOPMENT.md` § Version-Pin Policy).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.128"
+
+[features]
+# Release-only log cap; the CLI passes `--features lean` for `--release`.
+lean = ["log/release_max_level_warn"]
+# Never passed by frust: it makes Cargo.lock pin the debug-only crates the
+# debug and hot builds enable, so a frust upgrade relocks them with everything else.
+frust-debug = ["frust/perf-trace", "frust/devtools", "frust/hotpatch"]
+
+# Store-distribution release profile. Kept in sync with Frust's root
+# `Cargo.toml` and `examples/huddle/Cargo.toml`.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+# BEGIN release cold-set opt-level overrides (generated: keep hand-synced)
+# Shrinks crates cold on the per-frame path; byte-synced with Frust's root
+# `Cargo.toml` (tripwire: `crates/frust-cli/tests/profile_sync.rs`).
+
+[profile.release.package.naga]
+opt-level = "z"
+
+[profile.release.package.codespan-reporting]
+opt-level = "z"
+
+[profile.release.package.ash]
+opt-level = "z"
+
+[profile.release.package.gpu-allocator]
+opt-level = "z"
+
+[profile.release.package.serde_json]
+opt-level = "z"
+
+[profile.release.package.fontique]
+opt-level = "z"
+
+[profile.release.package.mio]
+opt-level = "z"
+
+[profile.release.package.image]
+opt-level = "z"
+
+[profile.release.package.png]
+opt-level = "z"
+# END release cold-set opt-level overrides
+
+# `--profile`: release performance with symbols kept, for on-device measurement.
+[profile.profile]
+inherits = "release"
+debug = true
+strip = "none"
+
+# Shader-compile crates at `opt-level = 2`: unoptimized wgpu/naga translation is
+# slow enough that iOS kills a debug launch. Kept in sync with Frust's root.
+[profile.dev.package.wgpu]
+opt-level = 2
+
+[profile.dev.package.wgpu-core]
+opt-level = 2
+
+[profile.dev.package.wgpu-hal]
+opt-level = 2
+
+[profile.dev.package.naga]
+opt-level = 2
+
+[profile.dev.package.vello_common]
+opt-level = 2
+
+[profile.dev.package.glifo]
+opt-level = 2
+
+[profile.dev.package.fearless_simd]
+opt-level = 2
+
+# Debug dependencies at `opt-level = 1` (the named overrides above win).
+# Kept in sync with Frust's root `Cargo.toml` and `examples/huddle/Cargo.toml`.
+[profile.dev.package."*"]
+opt-level = 1
