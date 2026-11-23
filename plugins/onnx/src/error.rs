@@ -27,12 +27,13 @@ pub enum OnnxError {
     /// The runtime failed while running the model.
     #[error("inference failed: {0}")]
     Run(String),
-    /// The run was cancelled before it finished. Reserved for cancellable runs; a blocking run
+    /// The run was cancelled before it finished. A cancelled [`Session::run`](crate::Session::run)
+    /// reports [`RunEvent::Cancelled`](crate::RunEvent::Cancelled) instead, and a blocking run
     /// never reports it.
     #[error("inference was cancelled")]
     Cancelled,
     /// The model or the target needs something this crate does not support, such as an output
-    /// element type other than f32, u8 or i64.
+    /// element type other than f32, u8 or i64, or a strict accelerator that cannot be used.
     #[error("unsupported: {0}")]
     Unsupported(String),
 }

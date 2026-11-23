@@ -1,9 +1,12 @@
 //! ONNX model inference for Frust apps, over ONNX Runtime.
 //!
 //! A [`Session`] loads a model from a file or from bytes, reports its named inputs and outputs
-//! ([`TensorInfo`]), and runs it on typed [`Tensor`]s with [`Session::run_blocking`]. Inputs are
-//! checked against the model (names, element types, static dimensions) before the runtime sees
-//! them. Execution is CPU only.
+//! ([`TensorInfo`]), and runs it on typed [`Tensor`]s, either blocking ([`Session::run_blocking`])
+//! or on the session's own worker thread with a cancellable [`RunHandle`] ([`Session::run`]).
+//! Inputs are checked against the model (names, element types, static dimensions) before the
+//! runtime sees them. [`SessionOptions`] choose the [`Accelerator`] (CoreML on Apple targets by
+//! default, the CPU elsewhere; an unusable one falls back to the CPU), the thread count, the
+//! optimisation level and the memory behaviour. A [`SessionCache`] keeps a bounded set warm.
 //!
 //! One ONNX Runtime environment serves the whole process. It is created on the first session (or
 //! [`runtime_info`] call); a failed creation is cached and returned to every later caller as
@@ -32,16 +35,22 @@
 //! ```
 //!
 //! `run_blocking` parks the calling thread for the whole inference: call it from a worker thread,
-//! never from the UI thread.
+//! never from the UI thread, or use [`Session::run`].
 
 #![forbid(unsafe_code)]
 
+mod accelerator;
+mod cache;
 mod error;
 mod runtime;
 mod session;
 mod tensor;
+mod worker;
 
+pub use accelerator::{Accelerator, CoreMlUnits, Provider};
+pub use cache::SessionCache;
 pub use error::OnnxError;
 pub use runtime::{LinkKind, RuntimeInfo, runtime_info};
-pub use session::Session;
+pub use session::{Optimization, Session, SessionOptions};
 pub use tensor::{DType, Tensor, TensorData, TensorInfo};
+pub use worker::{RunEvent, RunHandle, RunSink};

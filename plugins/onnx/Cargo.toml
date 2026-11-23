@@ -25,19 +25,28 @@ thiserror = { workspace = true }
 [target.'cfg(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17"] }
 
+# `coreml` registers the CoreML provider the prebuilt macOS archive contains (see src/accelerator.rs).
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17", "coreml"] }
 
 [target.'cfg(all(target_os = "windows", target_env = "msvc", any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17", "directml"] }
 
-# arm64 Android: ONNX Runtime 1.31.0 linked statically into the app's cdylib from the only prebuilt
-# row (`nnapi`, no XNNPACK); the feature selects that row and registers no provider. The archive
-# needs the NDK's libc++_shared.so in the APK: see README "Android packaging".
+# arm64 Android: ONNX Runtime 1.31.0 linked statically from the only prebuilt row (`nnapi`, which
+# selects it and registers nothing). No row has XNNPACK, so `xnnpack` stays off: Android runs on the
+# CPU. The archive needs the NDK's libc++_shared.so in the APK: see README "Android packaging".
 [target.'cfg(all(target_os = "android", target_arch = "aarch64"))'.dependencies]
 ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17", "nnapi"] }
 
-# PLACEHOLDER, not a packaging decision: iOS, Android other than arm64 and every other target (Intel
-# macOS included) load the ONNX Runtime library at run time. Mirrors `src/runtime.rs`' link cfg.
-[target.'cfg(not(any(all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "macos", target_arch = "aarch64"), all(target_os = "windows", target_env = "msvc", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "android", target_arch = "aarch64"))))'.dependencies]
+# PLACEHOLDER, not a packaging decision: iOS, Intel macOS and every other target without a static row
+# load ONNX Runtime at run time; Apple's `coreml` uses CoreML if that library has it, else the CPU.
+[target.'cfg(all(target_vendor = "apple", not(all(target_os = "macos", target_arch = "aarch64"))))'.dependencies]
+ort = { workspace = true, features = ["std", "load-dynamic", "api-17", "coreml"] }
+
+# Mirrors `src/runtime.rs`' link cfg, Apple excluded (the row above).
+[target.'cfg(not(any(target_vendor = "apple", all(target_os = "linux", target_env = "gnu", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "windows", target_env = "msvc", any(target_arch = "x86_64", target_arch = "aarch64")), all(target_os = "android", target_arch = "aarch64"))))'.dependencies]
 ort = { workspace = true, features = ["std", "load-dynamic", "api-17"] }
+
+# CoreML's compiled-model cache directory.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+frust-paths = { workspace = true }
