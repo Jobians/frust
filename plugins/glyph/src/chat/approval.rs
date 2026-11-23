@@ -4,14 +4,15 @@
 //! # Contract
 //!
 //! - **Controlled and non-reactive.** The caller owns the [`ApprovalState`]
-//!   and `.busy(..)`; a tap reports the option's id through `.on_select(..)`
-//!   and then disables the options until the caller changes either, or the
-//!   request itself (title, detail, options or deadline), so a double tap
-//!   fires once and a new request in the same slot starts fresh. A press
-//!   only fires against the request it began on.
-//! - **Options**: allow kinds first (filled), then reject kinds (outlined),
-//!   each group in the given order; full-width buttons at least 44 px
-//!   high, label wrapping to two lines then eliding.
+//!   and `.busy(..)`; a tap reports an [`ApprovalSelection`] through
+//!   `.on_select(..)` and disables the options until either changes or a new
+//!   request arrives, so a double tap fires once, on the request it began on.
+//! - **Request identity.** When one card slot shows successive requests, give
+//!   each a `.request_id(..)`: a new id starts fresh, the same id keeps its
+//!   answer. Without ids, a changed title, detail, options or deadline is a new
+//!   request, and two identical consecutive requests share the answered state.
+//! - **Options**: allow kinds (filled), then reject kinds (outlined), each in
+//!   the given order; full-width, at least 44 px high, two label lines then elided.
 //! - **Countdown.** `.expires(..)` takes an [`ApprovalDeadline`] made once per
 //!   request; at zero the options disable. Nothing requests frames once resolved.
 //! - **Untrusted text.** Control, bidi and zero-width characters in the title,
@@ -203,9 +204,22 @@ fn outcome_parts(state: ApprovalState) -> (&'static str, &'static str) {
     }
 }
 
+/// One answer, as `.on_select(..)` reports it: the id of the request the
+/// press began on (`None` when the card was given no `.request_id(..)`) and
+/// the chosen option's id, unaltered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ApprovalSelection {
+    /// The caller's id for the request answered, if it gave one.
+    pub request_id: Option<String>,
+    /// The chosen option's [`ApprovalOption::id`].
+    pub option_id: String,
+}
+
 /// The everything-but-children part of a view, compared as one value.
 #[derive(Clone, Debug, PartialEq)]
 struct Spec {
+    request_id: Option<String>,
     options: Vec<ApprovalOption>,
     state: ApprovalState,
     deadline: Option<ApprovalDeadline>,
@@ -234,12 +248,13 @@ pub struct ApprovalCardView<State: 'static> {
     title: String,
     detail: Option<String>,
     spec: Spec,
-    on_select: Option<TypedArgCallback<State, String>>,
+    on_select: Option<TypedArgCallback<State, ApprovalSelection>>,
 }
 
 impl<State: 'static> std::fmt::Debug for ApprovalCardView<State> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApprovalCardView")
+            .field("request_id", &self.spec.request_id)
             .field("title", &self.title)
             .field("detail", &self.detail)
             .field("options", &self.spec.options)
@@ -263,6 +278,7 @@ pub fn approval_card<State: 'static>(
         title: title.into(),
         detail: None,
         spec: Spec {
+            request_id: None,
             options: options.into(),
             state: ApprovalState::Pending,
             deadline: None,
@@ -275,6 +291,18 @@ pub fn approval_card<State: 'static>(
 }
 
 impl<State: 'static> ApprovalCardView<State> {
+    /// The caller's opaque identity for the request shown (default none).
+    /// Give every request one when this card slot shows successive requests:
+    /// a different id is a new request, which clears the answer and any
+    /// press; the same id keeps the answer even when the title, detail,
+    /// options or deadline change (a press still ends if title, detail or
+    /// options do). Without one, two identical consecutive requests share
+    /// the answered state. [`ApprovalSelection`] reports it back.
+    pub fn request_id(mut self, id: impl Into<String>) -> Self {
+        self.spec.request_id = Some(id.into());
+        self
+    }
+
     /// The command or path asked about, in a wrapping monospace block that
     /// scrolls past a few lines.
     pub fn detail(mut self, detail: impl Into<String>) -> Self {
@@ -295,10 +323,18 @@ impl<State: 'static> ApprovalCardView<State> {
         self
     }
 
-    /// Run `callback` with the app state and the chosen option's id.
-    pub fn on_select(mut self, callback: impl Fn(&mut State, &str) + 'static) -> Self {
-        let typed: TypedArgCallback<State, String> =
-            Rc::new(move |state: &mut State, id: String| callback(state, &id));
+    /// Run `callback` with the app state and the [`ApprovalSelection`]: the
+    /// chosen option's id and the id of the request the press began on.
+    /// Fires once, then not again until the state or busy flag changes or a
+    /// new request arrives.
+    pub fn on_select(
+        mut self,
+        callback: impl Fn(&mut State, &ApprovalSelection) + 'static,
+    ) -> Self {
+        let typed: TypedArgCallback<State, ApprovalSelection> =
+            Rc::new(move |state: &mut State, selection: ApprovalSelection| {
+                callback(state, &selection)
+            });
         self.on_select = Some(typed);
         self
     }
@@ -382,7 +418,7 @@ impl Palette {
 pub struct ApprovalCardWidget {
     spec: Spec,
     title: String,
-    on_select: Option<ErasedArgCallback<String>>,
+    on_select: Option<ErasedArgCallback<ApprovalSelection>>,
     title_pod: ChildPod,
     detail: Option<ChildPod>,
     loader: ChildPod,
@@ -396,12 +432,15 @@ pub struct ApprovalCardWidget {
     /// The note shown while the detail scrolls, and its size.
     overflow: Option<(TextLayout, Point)>,
     shown_secs: Option<u64>,
-    /// A select fired; options stay off until state or busy changes.
+    /// A select fired; options stay off until state or busy changes or a
+    /// new request arrives.
     answered: bool,
     /// The deadline passed while the state was still pending.
     timed_out: bool,
     pressed: Option<usize>,
     captured: Option<usize>,
+    /// The request id the captured press began on, reported when it fires.
+    press_request: Option<String>,
 }
 
 impl ApprovalCardWidget {
@@ -443,11 +482,17 @@ impl ApprovalCardWidget {
         passed
     }
 
-    fn fire(&mut self, ctx: &mut EventCtx, button: usize) {
-        let id = self.spec.options[self.buttons[button].option].id.clone();
+    fn fire(&mut self, ctx: &mut EventCtx, button: usize, request_id: Option<String>) {
+        let option_id = self.spec.options[self.buttons[button].option].id.clone();
         self.answered = true;
         if let Some(cb) = self.on_select.as_mut() {
-            cb(ctx, id);
+            cb(
+                ctx,
+                ApprovalSelection {
+                    request_id,
+                    option_id,
+                },
+            );
         }
     }
 
@@ -704,6 +749,7 @@ impl<State: 'static> View<State> for ApprovalCardView<State> {
             timed_out: false,
             pressed: None,
             captured: None,
+            press_request: None,
         }
     }
 
@@ -748,16 +794,28 @@ impl<State: 'static> View<State> for ApprovalCardView<State> {
             _ => {}
         }
         let (old, new) = (&prev.spec, &self.spec);
-        let new_request = prev.title != self.title
-            || prev.detail != self.detail
-            || old.options != new.options
-            || old.deadline != new.deadline;
+        let content_changed =
+            prev.title != self.title || prev.detail != self.detail || old.options != new.options;
+        let deadline_changed = old.deadline != new.deadline;
+        // A request id on either side decides alone; without ids, any content
+        // or deadline change is taken for a new request.
+        let new_request = if old.request_id.is_some() || new.request_id.is_some() {
+            old.request_id != new.request_id
+        } else {
+            content_changed || deadline_changed
+        };
         if new_request {
             element.answered = false;
             element.timed_out = false;
+        }
+        if new_request || content_changed {
             element.pressed = None;
             element.captured = None;
+            element.press_request = None;
             flags |= ChangeFlags::PAINT;
+        }
+        if deadline_changed {
+            element.timed_out = false;
         }
         if old != new || prev.on_select.is_some() != self.on_select.is_some() {
             if old.state != new.state || old.busy != new.busy {
@@ -908,6 +966,7 @@ impl Widget for ApprovalCardWidget {
                 };
                 self.captured = Some(k);
                 self.pressed = Some(k);
+                self.press_request = self.spec.request_id.clone();
                 ctx.capture_pointer();
                 ctx.request_redraw();
                 EventResult::Handled
@@ -922,18 +981,20 @@ impl Widget for ApprovalCardWidget {
             }
             PointerPhase::Up if self.captured.is_some() => {
                 let captured = self.captured.take();
+                let request_id = self.press_request.take();
                 self.pressed = None;
                 if let Some(k) = captured
                     && self.hit(p.position) == Some(k)
                     && self.interactive()
                 {
-                    self.fire(ctx, k);
+                    self.fire(ctx, k, request_id);
                 }
                 ctx.request_redraw();
                 EventResult::Handled
             }
             PointerPhase::Cancel if self.captured.is_some() => {
                 self.captured = None;
+                self.press_request = None;
                 self.pressed = None;
                 ctx.request_redraw();
                 EventResult::Handled
@@ -1074,7 +1135,23 @@ mod tests {
 
     #[derive(Default)]
     struct App {
+        /// The option id of every selection, in order.
         picked: Vec<String>,
+        /// Every selection, whole.
+        selections: Vec<ApprovalSelection>,
+    }
+
+    /// The `on_select` every test card uses.
+    fn pick(app: &mut App, selection: &ApprovalSelection) {
+        app.picked.push(selection.option_id.clone());
+        app.selections.push(selection.clone());
+    }
+
+    fn selection(request_id: Option<&str>, option_id: &str) -> ApprovalSelection {
+        ApprovalSelection {
+            request_id: request_id.map(str::to_owned),
+            option_id: option_id.to_owned(),
+        }
     }
 
     /// Records every rounded-rect fill, to read the countdown bar.
@@ -1236,8 +1313,7 @@ mod tests {
     }
 
     fn card(opts: Vec<ApprovalOption>) -> ApprovalCardView<App> {
-        approval_card("Run this command?", opts)
-            .on_select(|app: &mut App, id| app.picked.push(id.to_owned()))
+        approval_card("Run this command?", opts).on_select(pick)
     }
 
     /// The bar fill's share of the track, from one paint.
@@ -1704,7 +1780,7 @@ mod tests {
         answered_then(
             approval_card("Another question?", options(2))
                 .detail("a")
-                .on_select(|app: &mut App, id| app.picked.push(id.to_owned())),
+                .on_select(pick),
             "o0",
         );
         answered_then(card(options(2)).detail("b"), "o0");
@@ -1788,7 +1864,7 @@ mod tests {
                 }],
             )
             .detail(format!("D\ta\n{raw}"))
-            .on_select(|app: &mut App, id| app.picked.push(id.to_owned())),
+            .on_select(pick),
         );
         let text = rig.all_text();
         for c in ['\u{202E}', '\u{2066}', '\u{200B}', '\u{0007}', '\u{0085}'] {
@@ -1821,5 +1897,114 @@ mod tests {
             first,
             "a fresh deadline is unequal"
         );
+    }
+
+    /// How many option buttons offer `Click` to assistive technology.
+    fn clicks(rig: &Rig) -> usize {
+        let update = rig.root.semantics();
+        update
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.role() == Role::Button)
+            .filter(|(_, n)| n.supports_action(Action::Click))
+            .count()
+    }
+
+    #[test]
+    fn distinct_request_ids_separate_identical_requests() {
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(2)).detail("ls").request_id("a"));
+        let at = rig.buttons()[0].2.center();
+        rig.tap(at);
+        assert_eq!(rig.app.selections, [selection(Some("a"), "o0")]);
+        assert_eq!(clicks(&rig), 0, "answered");
+        rig.show(card(options(2)).detail("ls").request_id("b"));
+        assert!(rig.buttons().iter().all(|b| !b.3), "the second is live");
+        assert_eq!(clicks(&rig), 2);
+        rig.tap(at);
+        assert_eq!(
+            rig.app.selections,
+            [selection(Some("a"), "o0"), selection(Some("b"), "o0")]
+        );
+    }
+
+    #[test]
+    fn identical_requests_without_ids_share_the_answered_state() {
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(2)).detail("ls"));
+        let at = rig.buttons()[0].2.center();
+        rig.tap(at);
+        rig.show(card(options(2)).detail("ls"));
+        assert!(rig.buttons().iter().all(|b| b.3), "still latched");
+        assert_eq!(clicks(&rig), 0);
+        rig.tap(at);
+        assert_eq!(rig.app.selections, [selection(None, "o0")]);
+    }
+
+    #[test]
+    fn the_same_request_id_keeps_its_answer_through_edits() {
+        let clock = TestClock::new();
+        let edits: [ApprovalCardView<App>; 4] = [
+            approval_card("Edited title?", options(2)).on_select(pick),
+            card(options(2)).detail("edited"),
+            card(fresh_options()),
+            card(options(2)).expires(clock.deadline(SECS_30)),
+        ];
+        for (n, edit) in edits.into_iter().enumerate() {
+            let mut rig = Rig::new(true, 360.0);
+            rig.show(card(options(2)).request_id("r"));
+            let at = rig.buttons()[0].2.center();
+            rig.tap(at);
+            rig.show(edit.request_id("r"));
+            assert!(rig.buttons().iter().all(|b| b.3), "edit {n} latched");
+            assert_eq!(clicks(&rig), 0, "edit {n}");
+            rig.tap(at);
+            assert_eq!(rig.app.picked, ["o0"], "edit {n}: no second fire");
+        }
+    }
+
+    #[test]
+    fn the_same_request_id_ends_a_press_when_the_options_change() {
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(2)).request_id("r"));
+        let at = rig.buttons()[0].2.center();
+        rig.pointer(PointerPhase::Down, at);
+        rig.show(card(fresh_options()).request_id("r"));
+        rig.pointer(PointerPhase::Up, at);
+        assert!(rig.app.selections.is_empty(), "nothing fires");
+        rig.show(card(fresh_options()).request_id("r"));
+        rig.pointer(PointerPhase::Down, at);
+        rig.show(card(fresh_options()).request_id("r"));
+        rig.pointer(PointerPhase::Up, at);
+        assert_eq!(
+            rig.app.selections,
+            [selection(Some("r"), "n0")],
+            "an equal view keeps the press"
+        );
+    }
+
+    #[test]
+    fn a_press_on_one_request_never_answers_the_next() {
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(2)).request_id("a"));
+        let at = rig.buttons()[0].2.center();
+        rig.pointer(PointerPhase::Down, at);
+        rig.show(card(fresh_options()).request_id("b"));
+        rig.pointer(PointerPhase::Up, at);
+        assert!(rig.app.selections.is_empty(), "no on_select at all");
+        rig.tap(at);
+        assert_eq!(rig.app.selections, [selection(Some("b"), "n0")]);
+    }
+
+    #[test]
+    fn a_selection_names_its_request_and_option() {
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(2)).request_id("req-7"));
+        rig.tap(rig.buttons()[1].2.center());
+        assert_eq!(rig.app.selections, [selection(Some("req-7"), "o1")]);
+        let mut rig = Rig::new(true, 360.0);
+        rig.show(card(options(2)));
+        rig.tap(rig.buttons()[1].2.center());
+        assert_eq!(rig.app.selections, [selection(None, "o1")]);
     }
 }

@@ -36,10 +36,10 @@ use frust::{
     use_context,
 };
 use frust_glyph::chat::{
-    ApprovalDeadline, ApprovalOption, ApprovalOptionKind, ApprovalState, ChatRole, DiffInput,
-    NoticeTone, PlanEntry, PlanEntryStatus, ToolContent, ToolKind, ToolStatus, UsageLabel,
-    approval_card, composer, message_row, message_scroller, notice_row, plan_block, tool_call,
-    usage_meter,
+    ApprovalDeadline, ApprovalOption, ApprovalOptionKind, ApprovalSelection, ApprovalState,
+    ChatRole, DiffInput, NoticeTone, PlanEntry, PlanEntryStatus, ToolContent, ToolKind, ToolStatus,
+    UsageLabel, approval_card, composer, message_row, message_scroller, notice_row, plan_block,
+    tool_call, usage_meter,
 };
 
 use crate::CatalogState;
@@ -1229,7 +1229,8 @@ impl Component for AgentChat {
         );
 
         // Rows are keyed by their own stable id, so every approval request
-        // gets its own card widget and a streaming row rebuilds alone.
+        // gets its own card widget and a streaming row rebuilds alone; the
+        // same id names the request, so each answer says which it was.
         let rows = Rc::clone(&state.script.rows);
         let keys = Rc::clone(&rows);
         let transcript = message_scroller(
@@ -1275,11 +1276,12 @@ impl Component for AgentChat {
                     Body::Approval(a) => {
                         let mut card =
                             approval_card::<ChatPage>(a.title.as_str(), a.options.clone())
+                                .request_id(id.to_string())
                                 .detail(a.detail.as_str())
                                 .state(a.state)
                                 .expired_hint("Send the prompt again to retry")
-                                .on_select(move |s: &mut ChatPage, option: &str| {
-                                    s.script.answer(id, option);
+                                .on_select(move |s: &mut ChatPage, picked: &ApprovalSelection| {
+                                    s.script.answer(id, &picked.option_id);
                                 });
                         if let Some(deadline) = &a.deadline {
                             card = card.expires(deadline.clone());
