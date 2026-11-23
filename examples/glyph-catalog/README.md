@@ -285,7 +285,31 @@ composition for app authors.
 | Composer (send and stop) | ✓ |
 | Large transcript (5,000 rows) | ✓ — **Load 5,000 rows** |
 
-Its headless tests are `tests/agent_chat.rs`; the section has no recorded device run.
+Its headless tests are `tests/agent_chat.rs`.
+
+Gate run 2026-11-23, Android only: Pixel 5 (Android 14) over adb, debug build, driven with synthetic
+taps and judged from screenshots and screen recordings. Passed: the transcript holds the live edge
+through a streamed turn; a scroll up releases it and the jump control or a scroll back returns to
+the end; every markdown block kind renders, with the unsafe link, raw HTML and image as text; the
+code block scrolls sideways, copies to the system clipboard and passes a vertical drag to the
+transcript; long-press selects a word with handles and a Copy / Select all bar, and Copy reaches the
+clipboard; tool calls and the plan advance; the approval card counts down to Expired and a double
+tap answers once; the keyboard raises the composer with the end still in view and a typed prompt
+sends; the 5,000-row transcript opens at its last row and returns to it; light theme and rotation.
+Failed: a safe link's label was near-invisible in the dark theme; links now use the body text
+colour with an underline.
+
+Gate run 2026-11-23, second phone, with that fix: OnePlus 9 (Android 15, 120 Hz) over adb, debug
+build, same method. Passed: the link label reads in both themes; the live edge holds through a
+streamed turn; a scroll up releases it and the jump control shows the count of new rows and returns
+to the end; a double tap on the approval card answers once and the next request runs to Expired;
+long-press selection and Copy; a selection inside the code block clears the one in the paragraph;
+the code block scrolls sideways; a prompt typed on the soft keyboard sends, and Stop interrupts the
+turn; the 5,000-row transcript; rotation. Text sent as hardware key events over adb did not reach
+the composer on this phone, where it did on the Pixel 5.
+
+Not run on either phone: a screen reader, frame times, a table wider than the viewport, diff
+collapse, the composer's line cap and IME composition. No iPhone or macOS run is recorded.
 
 ### Components the reference inventory listed as "no direct Frust widget"
 

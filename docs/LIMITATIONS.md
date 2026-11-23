@@ -8701,17 +8701,17 @@ gestures, the handles, the soft keyboard interplay or the live edge under a real
 
 ---
 
-### `glyph-chat-linux-headless-only` — the chat family has headless Linux tests only and no device run
+### `glyph-chat-linux-headless-only` — the chat family has headless tests and two Android walks; no iPhone, macOS or screen-reader run
 
-**Observed**: every `frust_glyph::chat` component is covered by headless tests run on Linux. No recorded run on an Android phone, an iPhone or macOS exists for touch gestures, the soft keyboard with the composer, the transcript under a real fling, or the frame cost of a long stream.
+**Observed**: every `frust_glyph::chat` component is covered by headless tests run on Linux, and the catalog's Agent chat page was walked on a Pixel 5 (Android 14) and a OnePlus 9 (Android 15) with synthetic taps, judged from screenshots and screen recordings. No recorded run exists on an iPhone or on macOS, with a screen reader, or measuring the frame cost of a long stream; on Android a wide table, diff collapse, the composer's line cap and IME composition were not exercised.
 
-**Applies to**: all hosts; touch input, the keyboard and real frame pacing are what a headless test cannot show.
+**Applies to**: iOS and macOS hosts; assistive technology and real frame pacing on every host.
 
-**Why accepted**: the device gate walks the catalog's Agent chat page after the family lands; until it is recorded the behaviour is code and headless-test only.
+**Why accepted**: the Android leg of the device gate is recorded; the iPhone and macOS legs need a Mac host.
 
-**Trigger for removal**: the device gate's results are recorded.
+**Trigger for removal**: the iPhone and macOS legs of the device gate and a screen-reader pass are recorded.
 
-**Evidence**: (2026-11-22) `plugins/glyph/tests/chat_api.rs`, `plugins/glyph/tests/layout_skip_audit.rs`, `examples/glyph-catalog/tests/agent_chat.rs`; no device run.
+**Evidence**: (2026-11-23) `examples/glyph-catalog/README.md` §10 (the dated gate run); `plugins/glyph/tests/chat_api.rs`, `plugins/glyph/tests/layout_skip_audit.rs`, `examples/glyph-catalog/tests/agent_chat.rs`.
 
 ---
 
