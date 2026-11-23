@@ -15,15 +15,23 @@ readme = "README.md"
 [features]
 # `catalog`: the curated vision model list (src/catalog.rs), which pulls in frust-models.
 # `vision`: the segmentation, face and depth tasks over it (src/vision/).
-default = ["catalog", "vision"]
+# `frust-api`: the reactive handles (src/api/), the only code that names `frust`.
+default = ["catalog", "vision", "frust-api"]
 catalog = ["dep:frust-models"]
 vision = ["catalog"]
+frust-api = ["dep:frust"]
+
+[[example]]
+name = "vision_component"
+required-features = ["frust-api", "vision"]
 
 [dependencies]
 log = { workspace = true }
 thiserror = { workspace = true }
 # The downloader only: `hub` keeps `frust-ui` out of the tree.
 frust-models = { path = "../models", version = "0.6.6", default-features = false, features = ["hub"], optional = true }
+# Published as frust-ui, imported as frust: crates.io `frust` belongs to another project.
+frust = { package = "frust-ui", path = "../../crates/frust", version = "0.6.6", default-features = false, optional = true }
 
 # Each desktop row's feature set must equal one prebuilt row of ort-sys' `dist.tsv` exactly (no
 # `lax-feature-matching`): plain on Linux, `coreml` on Apple-silicon macOS, `directml` on Windows.

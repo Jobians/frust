@@ -8,15 +8,46 @@ the CPU, and an accelerator that cannot be used falls back to the CPU.
 
 **Status:** desktop and arm64 Android. Linux (glibc, x86_64/aarch64), Apple-silicon macOS,
 Windows (MSVC) and Android arm64-v8a link ONNX Runtime statically from a prebuilt archive fetched
-at build time; Android also needs the NDK's `libc++_shared.so` in the APK (see
-[Android packaging](#6-android-packaging)). iOS packaging is not settled yet: it compiles, but
-loads the ONNX Runtime library at run time and ships none. Intel macOS, 32-bit Android and x86_64
-Android take the same run-time route.
+at build time; Android also needs the NDK's `libc++_shared.so` in the APK, which
+`frust plugin add onnx` arranges (see [Android packaging](#6-android-packaging)). iOS packaging
+is not settled yet: it compiles, but loads the ONNX Runtime library at run time and ships none
+(see [iOS packaging](#7-ios-packaging)). Intel macOS, 32-bit Android and x86_64 Android take the
+same run-time route.
 
 Like every frust **platform plugin**, this crate is added to your app's own `Cargo.toml`
-alongside `frust`; the `frust` facade does not re-export it. It depends on no frust crate.
+alongside `frust`; the `frust` facade does not re-export it. The reactive handles
+([In a component](#11-in-a-component)) are the only code that names `frust`.
 
 Building it needs Rust 1.92 or newer (the pinned `ort` requires it), above the workspace's 1.89.
+
+## Add it
+
+```sh
+frust plugin add onnx
+```
+
+or pick **onnx** in the TUI's Add Plugin dialog. It makes two edits to a project made by
+`frust create`:
+
+- `Cargo.toml`: the `frust-onnx` dependency, written in the form the app's own `frust`
+  dependency takes (a path into the same checkout, or the same version).
+- `android/gradle.properties`: `frust.cargoNdk.linkLibcxxShared=true`, so the scaffold's
+  `cargoNdkBuild` task packages the NDK's `libc++_shared.so` (see
+  [Android packaging](#6-android-packaging)).
+
+It adds no Gradle module, Swift package, permission or plist key; the catalog downloads use the
+`INTERNET` permission every scaffold already declares. Running it twice changes nothing. A
+project whose `android/app/build.gradle.kts` predates the property is refused before anything is
+written, and the error quotes the line to add. Adding the dependency by hand
+(`frust-onnx = "0.6"`) skips the Android edit; make it yourself or the APK will not load.
+
+Features, all on by default:
+
+- `catalog`: the verified vision model list, which brings in `frust-models`.
+- `vision` (turns on `catalog`): segmentation, face detection and depth.
+- `frust-api`: `api::VisionHandle`, the reactive handle. Turn the defaults off
+  (`default-features = false`, then `features = ["vision"]` to keep the tasks) for a build with
+  no `frust-ui` in its graph.
 
 ---
 
@@ -218,6 +249,22 @@ crate's gate suite (`cargo test -p frust-onnx` on each desktop prebuilt row), ne
 Each desktop target's `ort` feature set must equal one prebuilt row of `ort`'s distribution table
 exactly; `lax-feature-matching` is never turned on.
 
+**Bumping it**, as one change:
+
+1. Move the root `Cargo.toml` pin and read the new `ort-sys` `dist.tsv`: every row this crate's
+   `Cargo.toml` selects (plain Linux, `coreml` macOS, `directml` Windows, `nnapi` Android
+   arm64) must still exist with the same feature set, or the target table changes with it.
+2. Check the new ONNX Runtime release against `api-17` (the lowest API level selected) and
+   against `rust-version` here, which follows `ort`'s own minimum.
+3. Run `cargo test -p frust-onnx` on each desktop row, the ignored live tests
+   (`--test vision -- --ignored`, `--test catalog -- --ignored`), and the Android gate: a
+   `frust create` app with `frust plugin add onnx` built with
+   `frust build apk --release --target-platform android-arm64`, its `lib/arm64-v8a` passing
+   `scripts/ci/page-size-check.sh`, installed and started on a phone. Check the archive still
+   needs only `libc++_shared.so` beyond the NDK's system libraries (`llvm-readelf -d` on the
+   app's `.so`).
+4. Update the version numbers and measurements in this README.
+
 ## 6. Android packaging
 
 **Route: the prebuilt static archive.** On `aarch64-linux-android` `ort` downloads its prebuilt
@@ -231,19 +278,21 @@ needed and was not tried.
 C++ runtime, so the app's `.so` gains `NEEDED libc++_shared.so`. `cargo ndk` stages that library
 next to the app's `.so` only when asked (`--link-libcxx-shared`); without it the APK still
 builds, but ships an app `.so` whose dependency is missing, which the loader refuses at start-up.
-In the scaffold's `android/app/build.gradle.kts`, the `cargoNdkBuild` task's command line gains
-one argument:
+
+The scaffold's `cargoNdkBuild` task (`android/app/build.gradle.kts`) passes that flag when the
+Gradle property `frust.cargoNdk.linkLibcxxShared` is `true`; `android/gradle.properties` ships it
+`false`, so an app without this plugin carries no copy. `frust plugin add onnx` sets it `true`.
+A project generated before the template read the property needs one line in that task's
+command line, right after `add("ndk")` (the add refuses, quoting it, until it is there):
 
 ```kotlin
-add("cargo")
-add("ndk")
-add("--link-libcxx-shared") // frust-onnx: ONNX Runtime needs libc++_shared.so in the APK
-add("--platform")
+if ((project.findProperty("frust.cargoNdk.linkLibcxxShared") as String?)?.trim() == "true") add("--link-libcxx-shared")
 ```
 
 Setting `CARGO_NDK_LINK_LIBCXX_SHARED=true` in the environment of `frust build` does the same
 for one build (`1` is rejected; the value must be `true`). AGP strips the staged copy (9.2 MB in
-the NDK, 1.25 MB in the APK).
+the NDK, 1.25 MB in the APK). A hot-patch `frust run --hot` session builds the app's `.so`
+outside Gradle and does not stage the library.
 
 **Floors and ABIs.** minSdk 29: the scaffold's floor, and the archive links at API level 29.
 The NDK is the scaffold's r28 (28.2.13676358), which aligns every `.so` to 16 KB pages.
@@ -277,7 +326,16 @@ the app's `/sdcard/Android/data/<application id>/files/`, not bundled):
 The second device row is owed; the host table in [Sessions and accelerators](#2-sessions-and-accelerators)
 predicts the growth falling by about a third.
 
-## 7. Image helpers
+## 7. iOS packaging
+
+**Not settled.** iOS builds take the run-time route: the crate compiles for `aarch64-apple-ios`
+and the simulator, but loads `onnxruntime` at run time and the app ships none, so unless the app
+bundles an ONNX Runtime library itself every session returns `OnnxError::Runtime` there. The iOS link gate has not run yet, so `frust plugin add onnx`
+makes no iOS edit: no Swift package, no framework link (`CoreML`, `Foundation`) and no `-l`
+linker flag (such as `-lc++`). Those contributions are owed by that gate and will be added to the
+`onnx` entry once it has recorded what a linked app needs.
+
+## 8. Image helpers
 
 `frust_onnx::image` (no extra dependency, single-threaded) turns pixels into model inputs and
 back:
@@ -302,7 +360,7 @@ assert_eq!(input.shape(), &[1, 3, 320, 320]);
 # Ok::<(), frust_onnx::OnnxError>(())
 ```
 
-## 8. Vision catalog
+## 9. Vision catalog
 
 The default `catalog` feature adds `frust_onnx::catalog`, a short list of vision models that
 download through `frust-models` with a pinned source, byte size and SHA-256 (the feature is the
@@ -321,7 +379,7 @@ The Base and Large depth models are CC-BY-NC and are deliberately not listed. Th
 fails when a pin has drifted. Call `download_request` and start the download from a worker
 thread, as `frust-models` describes.
 
-## 9. Vision tasks
+## 10. Vision tasks
 
 The default `vision` feature (which turns on `catalog`) adds `frust_onnx::vision`: one call from
 RGBA pixels to a result for each catalog task. `VisionModels::new(store, options)` reads the
@@ -415,7 +473,81 @@ The ignored live tests (`cargo test -p frust-onnx --test vision -- --ignored`) d
 catalog models (about 32 MB) into `target/` (or `FRUST_ONNX_MODEL_STORE`) and run each task on
 synthetic images.
 
-## 10. License
+## 11. In a component
+
+`frust_onnx::api::VisionHandle` (default `frust-api` feature) runs the vision tasks off the UI
+thread and publishes what they return as signals. `build` reads the signals; a handler hands the
+handle an image and returns at once:
+
+```rust,ignore
+use std::sync::Arc;
+use frust::{Component, Get, View, button, column, text};
+use frust_onnx::api::{VisionHandle, VisionStatus};
+use frust_onnx::{SessionOptions, VisionModels};
+
+struct State { vision: VisionHandle, photo: (Arc<[u8]>, u32, u32) }
+
+// in `init`:
+let models = VisionModels::new(frust_models::ModelStore::open()?, SessionOptions::default());
+let vision = VisionHandle::new(models);
+
+// in `build`:
+let status = match state.vision.status().get() {
+    VisionStatus::Idle => "Ready".to_owned(),
+    VisionStatus::Running(task) => format!("{task:?}..."),
+    VisionStatus::Failed(message) => message,
+};
+let mask = state.vision.mask().get(); // Option<Arc<Plane>>
+column()
+    .child(button("Cut out", |s: &mut State| {
+        let (pixels, w, h) = s.photo.clone();
+        s.vision.segment(pixels, w, h);
+    }))
+    .child(text(status))
+```
+
+| Request (returns at once) | Result signal | Value |
+|---------|---------------|-------|
+| `segment(pixels, width, height)` | `mask()` | `Option<Arc<Plane>>`, 0 background to 1 subject |
+| `detect_faces(pixels, width, height, min_score)` | `faces()` | `Arc<Vec<Face>>`, highest score first |
+| `estimate_depth(pixels, width, height)` | `depth()` | `Option<Arc<Plane>>`, near is 1 |
+
+- `pixels` is RGBA8, `width * height * 4` bytes, shared as an `Arc<[u8]>` so the request copies
+  nothing.
+- `status()` is `Idle`, `Running(task)` or `Failed(message)`. A request made while the handle is
+  idle shows `Running` before the call returns; `Idle` comes once the last queued result is
+  published. A failure (a model not downloaded, a buffer of the wrong size) keeps the task's
+  previous result and stays until the next request starts. `on_status` sees every status, in
+  order, for logging.
+- **The newest request for a task wins.** Requests run one at a time on the handle's own worker
+  thread, `frust-onnx-vision`, in the order made. A newer request for the same task drops a
+  queued older one unrun; one already running finishes and its result is dropped, so `mask()`
+  never goes back to an older image. Requests for different tasks do not replace each other.
+- The worker only writes signals: it never reads one and never waits on the UI thread. It starts
+  on the first request, ends when the queue is empty, and holds no thread-local state.
+- `missing_models()` lists the catalog models still to download (it reads the store: call it in
+  `init` or a handler, not every frame). Keep your own clone of the `Arc<VisionModels>` passed
+  to `VisionHandle::new` to clear its session cache on memory pressure.
+
+`examples/vision_component.rs` is the whole component: a button that segments a generated image
+and the mask status.
+
+## 12. Testing
+
+```sh
+cargo test -p frust-onnx                    # unit, session, image, catalog, vision and api tests
+cargo test -p frust-onnx --examples         # builds examples/vision_component.rs
+cargo test -p frust-onnx --test vision -- --ignored    # live: the three catalog models (~32 MB)
+cargo test -p frust-onnx --test catalog -- --ignored   # live: every catalog pin still resolves
+```
+
+The default tests need the build-time ONNX Runtime download on the first build of a machine and no
+network afterwards; the session tests run small models under `tests/fixtures`. `tests/api.rs`
+drives `VisionHandle` over a stub runner, so it loads no model: it checks the status order, that
+a superseded request's result is dropped and that an error becomes `Failed`. The registry entry
+and its Android edit are tested in `frust-drive` (`cargo test -p frust-drive plugin::`).
+
+## 13. License
 
 The crate is MIT OR Apache-2.0. A binary that ships it ships ONNX Runtime (MIT, Microsoft) and
 the third-party components ONNX Runtime contains: see [`NOTICE`](NOTICE).

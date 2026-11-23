@@ -2678,6 +2678,7 @@ version = "0.6.6"
 dependencies = [
  "frust-models",
  "frust-paths",
+ "frust-ui",
  "log",
  "ort",
  "thiserror 2.0.20",

@@ -11,7 +11,9 @@
 //! [`image`] turns RGBA pixels into normalised input tensors and resizes result planes; the
 //! default `catalog` feature adds [`catalog`], a verified list of downloadable vision models,
 //! and the default `vision` feature adds [`vision`]: subject masks, face boxes and depth maps
-//! from pixels in one blocking call each, through [`VisionModels`].
+//! from pixels in one blocking call each, through [`VisionModels`]. The default `frust-api`
+//! feature adds [`api`]: `VisionHandle` runs those tasks on a worker thread and publishes their
+//! results and its status as signals a component reads.
 //!
 //! One ONNX Runtime environment serves the whole process. It is created on the first session (or
 //! [`runtime_info`] call); a failed creation is cached and returned to every later caller as
@@ -45,6 +47,8 @@
 #![forbid(unsafe_code)]
 
 mod accelerator;
+#[cfg(feature = "frust-api")]
+pub mod api;
 mod cache;
 #[cfg(feature = "catalog")]
 pub mod catalog;
