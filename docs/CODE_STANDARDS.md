@@ -5,7 +5,7 @@ off this index — read this plus the one that covers what you are touching:
 
 | Unit | Spoke | Holds |
 |------|-------|-------|
-| PLUGINS + NATIVE_WIDGETS | [PLUGINS_CODE_STANDARDS.md](PLUGINS_CODE_STANDARDS.md) | Plugin Conventions — backend gating, JNI attach scope, the platform/facade charter lines, theme-token folding, idempotent project mutation |
+| PLUGINS + NATIVE_WIDGETS + AI | [PLUGINS_CODE_STANDARDS.md](PLUGINS_CODE_STANDARDS.md) | Plugin Conventions — backend gating, JNI attach scope, the platform/facade charter lines, theme-token folding, idempotent project mutation |
 | WIDGETS | [WIDGETS_CODE_STANDARDS.md](WIDGETS_CODE_STANDARDS.md) | Child Lists — keyed-list uniqueness; Theming & Animation Conventions — token resolution/precedence (including `ThemeExtensions`), animation pacing, design-system installation |
 | TUI | [TUI_CODE_STANDARDS.md](TUI_CODE_STANDARDS.md) | TUI Conventions — render/update layering, keyboard parity, the single command registry |
 
@@ -61,6 +61,7 @@ off this index — read this plus the one that covers what you are touching:
     `apple_metadata`: PhotoKit fetch, resource-data request, `cancelDataRequest:`; `android_decode`: one `NewDirectByteBuffer` over a Rust `Vec`;
     `apple_changes`: the PhotoKit persistent-change fetch and enumeration, keyed archiving, the `define_class!` change observer with its `Send`/`Sync` impls, the cloud-identifier mapping; `apple_library`'s fetch-result `Snapshot` wrapper (`Send`/`Sync`, read-only use).
   - `frust-url-launcher`'s `apple` backend (`new_unchecked()`, one `openURL:` call; `desktop`: `ShellExecuteW`) and `frust-haptics`'s (`new_unchecked()`).
+  - `frust-models`' `apple` module — one `SAFETY`-noted `setResourceValue_forKey_error` (backup exclusion); `frust-onnx` is `#![forbid(unsafe_code)]`.
   - `frust-gpu`'s Android `import` zone — the hand-opened Vulkan device (`open_with_callback` +
     `create_device_from_hal`, `context.rs`), `import_hardware_buffer` (`create_texture_from_hal`,
     raw `ash`) and the `dlsym`-resolved `AHardwareBuffer_*` entries, each `# Safety`-noted, behind the
@@ -143,7 +144,7 @@ off this index — read this plus the one that covers what you are touching:
   layer threads a resource owned by a higher layer, pass it as `&mut dyn Any` and recover it at the
   one call site that knows the concrete type via a documented, panic-on-mismatch `downcast_mut::<T>()`.
 - **Erase at the API boundary, not at call sites.** A helper returns `-> impl View<S>`
-  (`+ use<..>` only when the opaque type must not be tied to a borrow — a navigator closure, a
+  (`+ use<..>` only when the opaque type must not be tied to a borrow — a navigator or `RenderRoot` closure, a
   stored result; edition 2024 captures correctly by default otherwise); a child list is a tuple
   of up to 12 views (nest beyond; `Vec<V>` when homogeneous or dynamic; `keyed()` lists stay
   `Vec`); an API that takes a child list is written `fn f<M>(.., c: impl ViewSeq<S, M>)` and
@@ -156,9 +157,6 @@ off this index — read this plus the one that covers what you are touching:
   drives it via the generic `build_child`/`rebuild_child`/`teardown_child`. A kept site carries
   `// erasure: keep <why>` (`scripts/ci/erasure-check.sh`, rules T1-T7); a driver closure erases
   `Component::build`: `move |s| AnyView::new(root.build(s))`. No `#[allow(refining_impl_trait)]`.
-- **Edition-2024 `-> impl Trait` return types capture all in-scope lifetimes by default.** When a
-  returned `impl View<State>` must not borrow a parameter (stored, or returned from a
-  navigator/`RenderRoot` closure), opt out explicitly with `+ use<>` — the compiler says so.
 - **A platform value with no published spec is a named constant with a source comment, not a bare
   literal.** Where a platform's exact behavior is private (an iOS gesture's edge zone, commit
   threshold, or fling velocity; an animation's duration/curve), name the constant; its doc comment

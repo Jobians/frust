@@ -11,8 +11,14 @@ there.
 frust plugin add models
 ```
 
-or add the dependency yourself: `frust-models = "0.6"`. It needs no permission, Gradle module or
-plist key beyond the `INTERNET` permission every scaffolded app already declares. Features:
+or add the dependency yourself: `frust-models = "0.6"`. It needs no Gradle module or plist key.
+On Android it needs the `INTERNET` permission, which a scaffolded app declares only in its debug
+and profile manifests. `frust plugin add models` writes
+`<uses-permission android:name="android.permission.INTERNET" />` to
+`android/app/src/main/AndroidManifest.xml` (the main manifest, so release builds have it) when the
+project has an `android/` directory. With the dependency added by hand, add that line yourself, or
+every download in a release build fails with a DNS or `Operation not permitted` error.
+Features:
 
 - `hub` (default): the Hub client and the downloader.
 - `frust-api` (default): the reactive handles described under "In a component". Turn it off

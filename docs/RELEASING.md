@@ -132,6 +132,9 @@ For each, from a `vX.Y.Z` checkout, the maintainer:
 
 Then re-run the failed `publish` job so `github-release` runs.
 
+`frust-models` and `frust-onnx` are new crates, so the first release that carries them stops here
+and needs this first publish for each (`frust-models` first: `frust-onnx` depends on it).
+
 ### Ownership
 
 Crate ownership is held by the `frust-rs` GitHub organisation's `owners` team. New crates are
@@ -149,7 +152,7 @@ number can never be reused. A yanked release gets a note in its GitHub release e
 
 The root gate does not cover the standalone workspaces (`examples/huddle`, `examples/playground`,
 `examples/native-widgets-demo`, `examples/design-system-sample`, `examples/material3-demo`,
-`examples/beui-demo`, `plugins/clean-signals-frust`, `benchmarks/frust_bench`, `testing/hotpatch-canary`, and the other
+`examples/beui-demo`, `examples/onnx-vision`, `plugins/clean-signals-frust`, `benchmarks/frust_bench`, `testing/hotpatch-canary`, and the other
 excluded examples). Their gates must pass, run from their own directories, before tagging;
 [DEVELOPMENT.md](DEVELOPMENT.md) § Test is canonical for the full list and the
 `standalone` job of [ci.yml](../.github/workflows/ci.yml) runs the same set. Refresh their lock

@@ -18,11 +18,11 @@
    --workspace`.
 3. **Version-pin and hand-sync discipline in manifests.** `wgpu` is a frust-owned pin (no `vello`
    constraint above it) — a bump still needs the full engine gate suite (device smokes across
-   backends), not a casual `cargo update`. The `[profile.*]` blocks are hand-synced across six manifests (root
+   backends), not a casual `cargo update`. The `[profile.*]` blocks are hand-synced across seven manifests (root
    `Cargo.toml`, `crates/frust-drive/templates/app/Cargo.toml.tmpl`, `examples/huddle/Cargo.toml`,
    `examples/glyph-catalog/Cargo.toml`, `examples/material3-demo/Cargo.toml`,
-   `examples/beui-demo/Cargo.toml`; `[profile.release]` also in five more standalone workspaces,
-   eleven in all) — there is no single
+   `examples/beui-demo/Cargo.toml`, `examples/onnx-vision/Cargo.toml`; `[profile.release]` also in
+   five more standalone workspaces, twelve in all) — there is no single
    source of truth, only the tripwire test `cargo test -p frust-cli --test profile_sync`. Flag any
    manifest edit that touches one copy without the others.
 4. **Plugin backend parity.** A new public API surface on the shared-preferences, secure-storage,

@@ -19,12 +19,15 @@ mod segment;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use frust_models::{ModelId, ModelStore};
 
 use crate::catalog::{self, VisionModel, VisionTask};
 use crate::image::{ChannelOrder, Normalization, Plane, RgbaView, to_nchw_f32};
-use crate::{DType, OnnxError, Session, SessionCache, SessionOptions, Tensor, normalize_plane};
+use crate::{
+    DType, OnnxError, Provider, Session, SessionCache, SessionOptions, Tensor, normalize_plane,
+};
 
 pub use depth::DepthConvention;
 pub use faces::{
@@ -38,6 +41,28 @@ const TASKS: [VisionTask; 3] = [
     VisionTask::FaceDetection,
     VisionTask::Depth,
 ];
+
+/// One completed run of a vision task: the provider that ran it and how long it took.
+///
+/// The reactive handle reports one per task (`api::VisionHandle::last_run`, behind the
+/// `frust-api` feature), written only for a run whose result it published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VisionRun {
+    /// The execution provider of the session that ran it ([`Session::provider`]); `None` when
+    /// the handle cannot tell, as when the session was dropped before the run ended.
+    ///
+    /// [`Session::provider`]: crate::Session::provider
+    pub provider: Option<Provider>,
+    /// Wall time from taking the request off the queue to its result: loading the model
+    /// when [`loaded_model`](Self::loaded_model) is set, the pixel conversion, the inference and
+    /// the decode. Time spent waiting in the queue is not included.
+    pub duration: Duration,
+    /// Whether the session was loaded during this run (the task's first run, or the first after
+    /// its session was evicted or the cache cleared), so [`duration`](Self::duration) includes
+    /// the load. Read from the session cache's load count, so a load another thread makes on
+    /// the same [`VisionModels`] meanwhile counts too.
+    pub loaded_model: bool,
+}
 
 /// The models behind the vision tasks: where they are stored, how their sessions are loaded,
 /// and the sessions already loaded.
@@ -103,6 +128,15 @@ impl VisionModels {
     pub fn is_installed(&self, task: VisionTask) -> bool {
         self.model_id(task)
             .is_some_and(|id| self.store.get(&id).is_some())
+    }
+
+    /// The execution provider of `task`'s session when it is loaded, `None` when it is not (or
+    /// its model is not in the store). Never loads the model; reads the store's directory.
+    pub fn loaded_provider(&self, task: VisionTask) -> Option<Provider> {
+        let local = self.store.get(&self.model_id(task)?)?;
+        self.cache
+            .peek(&local.path, &self.options)
+            .map(|session| session.provider())
     }
 
     /// The catalog models still to download, in catalog order. A task given a custom model with

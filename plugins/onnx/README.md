@@ -26,7 +26,7 @@ Building it needs Rust 1.92 or newer (the pinned `ort` requires it), above the w
 frust plugin add onnx
 ```
 
-or pick **onnx** in the TUI's Add Plugin dialog. It makes two edits to a project made by
+or pick **onnx** in the TUI's Add Plugin dialog. It makes three edits to a project made by
 `frust create`:
 
 - `Cargo.toml`: the `frust-onnx` dependency, written in the form the app's own `frust`
@@ -34,12 +34,16 @@ or pick **onnx** in the TUI's Add Plugin dialog. It makes two edits to a project
 - `android/gradle.properties`: `frust.cargoNdk.linkLibcxxShared=true`, so the scaffold's
   `cargoNdkBuild` task packages the NDK's `libc++_shared.so` (see
   [Android packaging](#6-android-packaging)).
+- `android/app/src/main/AndroidManifest.xml`: `<uses-permission android:name="android.permission.INTERNET" />`
+  in the main manifest, because the catalog downloads need it and the scaffold declares it only in
+  its debug and profile manifests.
 
-It adds no Gradle module, Swift package, permission or plist key; the catalog downloads use the
-`INTERNET` permission every scaffold already declares. Running it twice changes nothing. A
+It adds no Gradle module, Swift package or plist key. Running it twice changes nothing. A
 project whose `android/app/build.gradle.kts` predates the property is refused before anything is
 written, and the error quotes the line to add. Adding the dependency by hand
-(`frust-onnx = "0.6"`) skips the Android edit; make it yourself or the APK will not load.
+(`frust-onnx = "0.6"`) skips the two Android edits; make them yourself (the property, and the
+permission for a release build that downloads) or the APK will not load or downloads will fail.
+A project with no `android/` directory gets only the dependency.
 
 Features, all on by default:
 
@@ -286,7 +290,7 @@ A project generated before the template read the property needs one line in that
 command line, right after `add("ndk")` (the add refuses, quoting it, until it is there):
 
 ```kotlin
-if ((project.findProperty("frust.cargoNdk.linkLibcxxShared") as String?)?.trim() == "true") add("--link-libcxx-shared")
+if ((project.findProperty("frust.cargoNdk.linkLibcxxShared") as String?)?.trim().equals("true", ignoreCase = true)) add("--link-libcxx-shared")
 ```
 
 Setting `CARGO_NDK_LINK_LIBCXX_SHARED=true` in the environment of `frust build` does the same
@@ -322,10 +326,11 @@ the app's `/sdcard/Android/data/<application id>/files/`, not bundled):
 | 16 KB page size (`scripts/ci/page-size-check.sh` on the APK's `lib/arm64-v8a`) | both `.so` files pass, minimum PT_LOAD alignment 0x4000 |
 | Clean `cargo ndk -t arm64-v8a build --release -p frust-onnx` | 9.2 s wall, the archive download included |
 | U2-NetP on a OnePlus 9, ONNX Runtime's memory defaults (arena and memory pattern on) | 458 ms median per run; app peak RSS 133 MB before the session, 607 MB after (native heap 439 MB) |
-| U2-NetP on a OnePlus 9, this crate's defaults | not measured yet: repeat the smoke with `SessionOptions::default()` |
+| U2-NetP on a OnePlus 9, this crate's defaults | 519 ms median per warm run (`examples/onnx-vision`, release); app peak RSS 245 MB with a 2048x1536 photo loaded, 409 MB once the U2-NetP session had run |
 
-The second device row is owed; the host table in [Sessions and accelerators](#2-sessions-and-accelerators)
-predicts the growth falling by about a third.
+With this crate's defaults the growth one U2-NetP session causes falls from about 470 MB to about
+165 MB, close to the third the host table in [Sessions and accelerators](#2-sessions-and-accelerators)
+predicts; the run costs about 13 % more time (519 ms against 458 ms).
 
 ## 7. iOS packaging
 
@@ -470,6 +475,25 @@ with the session warm. Keep at most one large photo and its planes in flight, an
 `cargo test --release -p frust-onnx --test vision -- --ignored --exact measure_depth_memory --nocapture`
 (Linux; set `FRUST_ONNX_MODEL_STORE` to pick where the models are downloaded).
 
+### Measured performance
+
+`examples/onnx-vision` release build on a OnePlus 9 (LE2115, Android 15, Snapdragon 888), ONNX
+Runtime 1.31.0 linked statically, `SessionOptions::default()`. `Accelerator::Auto` is the CPU on
+Android, so the CPU is the only provider measured there. Times are `VisionHandle::last_run`'s
+`duration`: the worker's wall time for one request, pixel conversion and decode included.
+
+| Task (model) | First run, model load included | Median of 5 warm runs, 640x480 sample | Median of 5 warm runs, 2048x1536 photo |
+|--------------|-------------------------------:|--------------------------------------:|---------------------------------------:|
+| `segment_subject` (U2-NetP) | 595 to 597 ms | 519 ms | 522 ms |
+| `detect_faces` (YuNet) | 62 to 69 ms | 58 ms | 57 ms |
+| `estimate_depth` (Depth Anything V2 Small, quantized) | 1,139 to 1,157 ms | 930 ms | 947 ms |
+
+App peak RSS (`VmHWM`) in a fresh process: 171 MB after start, 245 MB with a 12-megapixel photo
+picked and downscaled to 2048x1536, 409 MB after the first U2-NetP run, 458 MB with all three
+sessions loaded; 499 MB after 30 runs over both images. A run with the app in the background
+took about 1.7 times as long (1,649 ms for depth) and completed. No Apple or desktop row is
+measured yet.
+
 The ignored live tests (`cargo test -p frust-onnx --test vision -- --ignored`) download the three
 catalog models (about 32 MB) into `target/` (or `FRUST_ONNX_MODEL_STORE`) and run each task on
 synthetic images.
@@ -526,6 +550,11 @@ column()
   never goes back to an older image. Requests for different tasks do not replace each other.
 - The worker only writes signals: it never reads one and never waits on the UI thread. It starts
   on the first request, ends when the queue is empty, and holds no thread-local state.
+- `last_run(task)` is a signal of the task's last published run, `Option<VisionRun>`: the
+  provider of the session that ran it, its `duration` on the worker (queue wait excluded) and
+  `loaded_model`, set when the run loaded the session, so the time includes the load. It is
+  written with the result, before `Idle`; a failed or superseded run leaves it unchanged.
+  `VisionModels::loaded_provider(task)` reads the same provider without loading anything.
 - `missing_models()` lists the catalog models still to download (it reads the store: call it in
   `init` or a handler, not every frame). Keep your own clone of the `Arc<VisionModels>` passed
   to `VisionHandle::new` to clear its session cache on memory pressure.
@@ -545,7 +574,8 @@ cargo test -p frust-onnx --test catalog -- --ignored   # live: every catalog pin
 The default tests need the build-time ONNX Runtime download on the first build of a machine and no
 network afterwards; the session tests run small models under `tests/fixtures`. `tests/api.rs`
 drives `VisionHandle` over a stub runner, so it loads no model: it checks the status order, that
-a superseded request's result is dropped and that an error becomes `Failed`. The registry entry
+a superseded request's result is dropped, that an error becomes `Failed` and that each task's
+`last_run` reports the published run's provider and duration. The registry entry
 and its Android edit are tested in `frust-drive` (`cargo test -p frust-drive plugin::`).
 
 ## 13. License

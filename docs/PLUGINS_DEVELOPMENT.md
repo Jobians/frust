@@ -5,7 +5,8 @@ Device gates and version pins owned by the PLUGINS unit (`frust-plugin` plus the
 gate, the Android/iOS compile gates, and the version-pin *policy* live in
 [DEVELOPMENT.md](DEVELOPMENT.md); the unit's design lives in
 [PLUGINS_ARCHITECTURE.md](PLUGINS_ARCHITECTURE.md), its conventions in
-[PLUGINS_CODE_STANDARDS.md](PLUGINS_CODE_STANDARDS.md).
+[PLUGINS_CODE_STANDARDS.md](PLUGINS_CODE_STANDARDS.md). The model plugins (`plugins/models`,
+`plugins/onnx`) keep their gates, manual tests and pins in [AI_ARCHITECTURE.md](AI_ARCHITECTURE.md).
 
 A plugin's Android module and Swift package are reached through `packages::locate` and wired by
 `platform_wiring::sync` (`frust.plugin.<module>.dir` in `android/local.properties`, an
@@ -434,10 +435,10 @@ fn with_context() -> Result<(), frust_plugin::PlatformHandleError> {
 
 ### TLS trust on Android
 
-Frust sets up no TLS for app network code. `frust-network-image` uses `reqwest` with `rustls` and
-`webpki-roots` (root `Cargo.toml`). The comment there says Android's platform verifier is not
-consulted, because it reports `Revoked` for CRL-only roots. The system and user trust stores are
-therefore not used by that plugin. The trust store is the Mozilla root set shipped by
+Frust sets up no TLS for app network code. `frust-network-image` uses `reqwest`, and
+`frust-models` `ureq`, each with `rustls` and `webpki-roots` (root `Cargo.toml`). The comment there
+says Android's platform verifier is not consulted, because it reports `Revoked` for CRL-only roots.
+The system and user trust stores are therefore not used by those plugins. The trust store is the Mozilla root set shipped by
 `webpki-roots`, and it moves with that crate's patch releases. `rustls-platform-verifier` is in `Cargo.lock` only as a
 transitive dependency of `reqwest`; no frust crate declares or initialises it.
 

@@ -535,6 +535,39 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   with the keys in use and free, and warn when fewer than 24 are free.
 - Contributor note: `crates/frust/tests/thread_local_budget.rs` fails on a `thread_local!` static not
   listed under `crates/frust/tests/thread_local_budget/` or on a crate over its Android budget.
+- `frust-models`: the one place on-device model files live. A store under `data_dir()/frust-models`
+  with a `.part` file and a `.frust-meta.json` sidecar beside each model; Hugging Face Hub and HTTPS
+  downloads with resume, SHA-256 and size checks; the token goes only to the Hub origin and only on
+  requests that start there, and the crate follows redirects itself (at most five, HTTPS only). A
+  blocking Hub call refuses the UI thread on Android and Apple. Reactive handles: `DownloadTracker`
+  (`start`, `start_hub`, `on_state`) and `ModelList`. The HTTP client is `ureq`, pinned `~3.5`.
+  `frust plugin add models` (registry id `models`) adds the dependency and
+  `android.permission.INTERNET` to the main manifest. Not done: no free-space check before a download
+  and no `If-Range` validator on resume (`models-no-free-space-check`,
+  `models-resume-without-validator`).
+- `frust-onnx`: ONNX inference over ONNX Runtime 1.31.0 through `ort = "=2.0.0-rc.15"`, a frust-owned
+  exact pin of a release candidate that needs Rust 1.92 (the workspace minimum stays 1.89). Sessions
+  from a file or bytes, typed tensors, a per-session worker with cancel, a session cache and an
+  accelerator policy (`Auto` is CoreML on Apple and the CPU elsewhere); the CPU arena and memory
+  pattern are off by default. Vision tasks `segment_subject` (U2-NetP), `detect_faces` (YuNet) and
+  `estimate_depth` (Depth Anything V2 Small), a catalog of three pinned models, and `VisionHandle`
+  with `status`, `results` and `last_run`. Desktop builds fetch a prebuilt ONNX Runtime archive at
+  build time (about 10.7 MB on Linux; `cargo --offline` fails the link). Android arm64 links it
+  statically (+20.4 MB APK); other Android ABIs ship no runtime. Measured on a OnePlus 9 (Android 15,
+  release, CPU): subject mask 519 ms, faces 58 ms, depth 930 ms warm median, 458 MB with the three
+  models loaded. Not done or not verified: iOS packaging (sessions fail at creation), CoreML on
+  Apple hardware, macOS and Windows builds, Intel macOS, face detection on a real face; see the
+  `onnx-*` entries in docs/LIMITATIONS.md. `frust plugin add onnx` (registry id `onnx`) adds the
+  dependency, the Gradle property and `android.permission.INTERNET`.
+- `examples/onnx-vision`: a standalone app that downloads the catalog models and runs the three vision
+  tasks on a sample or a picked photo. Its Android device leg passed (the download rows used a host
+  mirror, not the internet); the iPhone, macOS and Linux desktop legs have not been run. It is in the
+  CI `standalone` matrix.
+- `frust-drive`: a new plugin contribution kind, `Contribution::AndroidLibcxxShared` (manifest key
+  `link-libcxx-shared = true` under `[package.metadata.frust.plugin.android]`). It sets the Gradle
+  property `frust.cargoNdk.linkLibcxxShared`, which the app template's `cargoNdkBuild` task turns
+  into `cargo ndk --link-libcxx-shared` so the APK carries `libc++_shared.so`. `Contribution` is not
+  `#[non_exhaustive]`, so an exhaustive `match` needs the new arm.
 
 ### Changed
 
@@ -628,6 +661,9 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   signal had its own `thread_local!`, and the process ran out of pthread keys; the page signals now
   share one thread-local map. An app with many `thread_local!` statics can hit the same abort
   (`android-thread-local-key-limit` in docs/LIMITATIONS.md).
+- `frust plugin add` satisfies `ManifestPermission` and `AndroidLibcxxShared` contributions on a
+  project with no `android/` directory (it skips them), where it used to fail; this fixes
+  `frust plugin add haptics` on a desktop-only app.
 
 ### Security
 

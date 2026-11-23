@@ -1,0 +1,85 @@
+[app]
+name = "onnxvision"
+org = "it.f0x"
+description = "On-device vision with frust-models and frust-onnx: download catalog models, then mask, faces and depth"
+# When set, frust applies it to the Android label and the iOS display name at build time; when absent, the platform files' own label is used.
+# display-name = "Onnxvision"
+# Release version and build number: the default for every platform build.
+# `--build-name` and `--build-number` override them for one build.
+version = "1.0.0"
+build-number = 1
+
+# Identifiers, the app name and flavor suffixes below are applied at build time. The Android
+# namespace, deep links and the desktop files are not: they are rendered once at scaffold time,
+# so editing `[desktop]` here does not rewrite them, and a build reports any disagreement.
+[desktop]
+name = "Onnxvision"
+identifier = "it.f0x.onnxvision"
+# Source for every platform icon; at least 512x512.
+icon = "assets/logo.png"
+
+# macOS-only. `minimum-system-version` only feeds a generated `Info.plist` (this project ships its
+# own: edit `LSMinimumSystemVersion` there); `notarize` uploads the signed app with APPLE_* env credentials.
+# [macos]
+# minimum-system-version = "11.0"
+# signing-identity = "Developer ID Application: Example Org (TEAMID1234)"
+# notarize = true
+
+# Windows-only. Version info comes from `windows/build.rs`; `frust build` ignores these.
+# [windows]
+# file-version = "1.0.0.0"
+# product-version = "1.0.0"
+
+# Linux-only: the `Categories=` entry of `linux/app.desktop`.
+# [linux]
+# categories = ["Utility"]
+
+# Browser build. Every key is optional and shown at its default. Parsed by
+# Frust, unlike the platform-file-backed sections above.
+# [web]
+# # Checked-in host-page sources, relative to this file (read by a build).
+# host-dir = "web"
+# # Assembled site output; must differ from `host-dir`.
+# out-dir = "build/web"
+# # `wasm-bindgen --out-name`: basename of the JS glue module. Default: `[app] name`.
+# out-name = "onnxvision"
+# # Run `wasm-opt`; absent follows the build mode (release on), `true`/`false` force it.
+# wasm-opt = true
+# # Port of the local preview server.
+# port = 8000
+
+# Build flavors: declare a flavor either here or natively (Gradle flavor / Xcode scheme), not both.
+# [flavors.dev]
+# app-id-suffix = ".dev"
+# app-name-suffix = " Dev"
+
+# Android release signing reads gitignored `android/key.properties` (keys below; create the keystore with the
+# keytool line), falling back per value to `ANDROID_*` env vars. Parsed by Frust; set only to change the defaults.
+# A manual `./gradlew assembleRelease` bypasses Frust's signing gate and may debug-sign with only a warning.
+#   storePassword=<keystore password>
+#   keyPassword=<key password>
+#   keyAlias=<key alias>
+#   storeFile=<path to .jks, relative to the android/ dir>
+#   keytool -genkey -v -keystore ~/upload-keystore.jks -keyalg RSA \
+#     -storetype JKS -keysize 2048 -validity 10000 -alias upload
+# [signing]
+# # Properties file path, relative to `android/`. Default: "key.properties".
+# key-properties = "app/keystores/key.properties"
+# # Key prefix for a file holding several key sets. Default: none.
+# prefix = "prod"
+# # Waives the gate when signing happens outside Frust; release builds then warn.
+# external = false
+#
+# Renames the environment variable behind a value (names only, never values).
+# [signing.env]
+# store-file = "CI_STORE_FILE"
+# store-password = "CI_STORE_PASSWORD"
+# key-alias = "CI_KEY_ALIAS"
+# key-password = "CI_KEY_PASSWORD"
+
+# The installed application id / bundle identifier of each mobile build.
+[android]
+identifier = "it.f0x.onnxvision"
+
+[ios]
+identifier = "it.f0x.onnxvision"

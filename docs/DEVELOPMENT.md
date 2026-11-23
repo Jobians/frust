@@ -4,7 +4,7 @@ This is the shared index — prerequisites, build/run/test gates, benchmarks, in
 version-pin *policy*, platform-support floors, known issues; the canonical test-tier, golden-image,
 headless GPU and Android emulator runbook is `docs/TESTING.md`. Per-unit device gates, template
 work, and the version-pin rows each unit owns live in its spoke (WIDGETS and NATIVE_WIDGETS have
-none — everything they need is here):
+none — everything they need is here; AI's live in [AI_ARCHITECTURE.md](AI_ARCHITECTURE.md)):
 
 | Unit | Development spoke | Holds |
 |------|-------------------|-------|
@@ -17,7 +17,7 @@ none — everything they need is here):
 
 ## Prerequisites
 
-- Rust 1.89+ (workspace `rust-version`), edition 2024.
+- Rust 1.89+ (workspace `rust-version`; `frust-onnx` needs 1.92, and its first build on a machine fetches ONNX Runtime, so an offline first build fails to link: [AI_ARCHITECTURE.md](AI_ARCHITECTURE.md)), edition 2024.
 - A real Metal or Vulkan adapter for the GPU smoke gate (`frust-render`'s `--ignored` test);
   headless Vulkan needs no display server. Other hosts build and run the non-GPU suite.
 - **Android** (only for `frust run`/`build`/`create`'s Android output): `rustup target add aarch64-linux-android`; `cargo install
@@ -44,12 +44,12 @@ cargo build --workspace --locked
 ```
 
 `--locked` must always pass — it is part of the verify gate below and is how manifest/lockfile drift
-is caught. It is not this workspace's rule alone: fifteen lockfiles are held to it — this root plus
-the fourteen standalone workspaces (`benchmarks/frust_bench`, `testing/hotpatch-canary`, `plugins/clean-signals-frust`, and eleven under `examples/`: `beui-demo`, `design-system-sample`, `glyph-catalog`, `hotpatch-spike`, `huddle`, `material3-demo`, `native-widgets-demo`, `playground`, `shadertoy`, `web-gallery`, `web-spike`) a pin move keeps current — and such a move regenerates all fifteen lockfiles
+is caught. It is not this workspace's rule alone: sixteen lockfiles are held to it — this root plus
+the fifteen standalone workspaces (`benchmarks/frust_bench`, `testing/hotpatch-canary`, `plugins/clean-signals-frust`, and twelve under `examples/`: `beui-demo`, `design-system-sample`, `glyph-catalog`, `hotpatch-spike`, `huddle`, `material3-demo`, `native-widgets-demo`, `onnx-vision`, `playground`, `shadertoy`, `web-gallery`, `web-spike`) a pin move keeps current — and such a move regenerates all sixteen lockfiles
 with targeted per-crate updates rather than a blind re-resolve (see *Version-Pin Policy*). **Dev-profile
-shader-stack overrides.** Six of the manifests the `profile_sync` tripwire checks (root `Cargo.toml`,
+shader-stack overrides.** Seven of the manifests the `profile_sync` tripwire checks (root `Cargo.toml`,
 `crates/frust-drive/templates/app/Cargo.toml.tmpl`, `examples/huddle/Cargo.toml`, `examples/glyph-catalog/Cargo.toml`,
-`examples/material3-demo/Cargo.toml`, `examples/beui-demo/Cargo.toml`) each carry a `[profile.dev.package.*]`
+`examples/material3-demo/Cargo.toml`, `examples/beui-demo/Cargo.toml`, `examples/onnx-vision/Cargo.toml`) each carry a `[profile.dev.package.*]`
 override (`opt-level = 2`) for the shader/render crates: debug-profile (`opt-level = 0`) shader compilation/translation is
 slow enough on mobile CPUs to trip the iOS launch watchdog. They stay hand-synced via that tripwire
 (`cargo test -p frust-cli --test profile_sync`); a `[profile.dev.package."*"]` wildcard (`opt-level
@@ -267,7 +267,7 @@ Additionally run:
 
 All seven gate from their own directory rather than `-p` from the repo root, being standalone
 workspaces excluded from the root one (*Version-Pin Policy*) — the same shape `examples/shadertoy`,
-`examples/glyph-catalog`, `examples/web-gallery` and `examples/web-spike` gate under, per their own
+`examples/glyph-catalog`, `examples/onnx-vision`, `examples/web-gallery` and `examples/web-spike` gate under, per their own
 READMEs (the latter two against the wasm32 target). `huddle` and `clean-signals-frust` take
 `clean-signals` from crates.io, so no local sibling checkout is needed. `design-system-sample`
 additionally needs `cargo tree -e features -i frust-ui -p sample-app` (from its own directory) to print
@@ -297,12 +297,12 @@ that must be refused; the fixture also gates from its own directory like the cha
 tests: [TESTING.md](TESTING.md).
 
 ```bash
-# frust-database / frust-network-image Android gates: C builds (bindgen, ring) need cargo-ndk's
+# frust-database / frust-network-image / frust-models / frust-onnx Android gates: C builds (bindgen, ring) need cargo-ndk's
 # CC_*/AR_* passthrough, which plain `cargo check --target` lacks (plain works only with
 # `-p frust-network-image --no-default-features`); playground links ring (same form); iOS gate needs xcrun (macOS-only): rusqlite's `bundled` SQLite and ring compile C against the iOS SDK.
-cargo ndk -t arm64-v8a check -p frust-database
+cargo ndk -t arm64-v8a check -p frust-database -p frust-models -p frust-onnx
 cargo ndk -t arm64-v8a -P 29 check -p frust-network-image
-cargo check -p frust-database --target aarch64-apple-ios
+cargo check -p frust-database -p frust-models -p frust-onnx --target aarch64-apple-ios
 ```
 
 **Render golden/oracle tests** (`frust-testing`) ride this gate's CPU arm automatically (root
@@ -443,7 +443,7 @@ touching it. The pin rows themselves — pin, rationale, tripwire — live with 
 |------|-------|
 | `wgpu`, `image`, `vello_common`/`glifo`, `parley_engine`/`fontique`/`parlance`, the oracle backends' `yeslogic-fontconfig-sys`/`windows-link` | [RENDER_DEVELOPMENT.md](RENDER_DEVELOPMENT.md) |
 | `reactive_graph`/`any_spawner`/`tokio`, `clean-signals`, `accesskit` + adapters, `frust-hotpatch`'s crate-local `libloading`/`memmap2`/`memfd`/`subsecond-types` | [CORE_DEVELOPMENT.md](CORE_DEVELOPMENT.md) |
-| `ndk-context`, `objc2*` (Foundation/Security/LocalAuthentication/UIKit/QuartzCore/CoreText/CoreFoundation), `androidx.camera`, `openiap-google`/`OpenIAP`, `keyring-core`, `arboard` (one pin, three consumers — `frust-clipboard`, `frust-shell-desktop`'s clipboard route, `frust-tui` — so its row carries a tripwire per consumer), `rfd`, `fluent-rs`, `icu` (2.2/2.3), `icu_experimental`, `jiff`, `icu_list`, `sys-locale`, `reqwest`/`rustls`/`webpki-roots` | [PLUGINS_DEVELOPMENT.md](PLUGINS_DEVELOPMENT.md) |
+| `ndk-context`, `objc2*` (Foundation/Security/LocalAuthentication/UIKit/QuartzCore/CoreText/CoreFoundation), `androidx.camera`, `openiap-google`/`OpenIAP`, `keyring-core`, `arboard` (one pin, three consumers — `frust-clipboard`, `frust-shell-desktop`'s clipboard route, `frust-tui` — so its row carries a tripwire per consumer), `rfd`, `fluent-rs`, `icu` (2.2/2.3), `icu_experimental`, `jiff`, `icu_list`, `sys-locale`, `reqwest`/`rustls`/`webpki-roots`; the AI unit's `ort` (exact, frust-owned, its own `rust-version` 1.92) and `ureq` | [PLUGINS_DEVELOPMENT.md](PLUGINS_DEVELOPMENT.md); `ort`/`ureq`: [AI_ARCHITECTURE.md](AI_ARCHITECTURE.md) |
 | `muda`, `windows-sys` (desktop shells' native menu-bar/Win32 bindings; `objc2-app-kit` rides the objc2 pin family above); web shell tier: `wasm-bindgen` (=0.2.128 exact — must equal the host `wasm-bindgen-cli`), `wasm-bindgen-futures`, `js-sys`/`web-sys`, `web-time` (every crate in the web graph, not only the shell), `console_log`, `console_error_panic_hook`, `wasm-bindgen-test` (=0.3.78 exact — crate-local, bumps in lockstep with `wasm-bindgen`) | [SHELLS_DEVELOPMENT.md](SHELLS_DEVELOPMENT.md) |
 | `notify`, `rmcp`, `axum`, `base64`, `tokio-util`, `icns`, the hot-patch builder's `object`/`ar`/`gimli`/`rustc-demangle`/`pdb` (+ `cargo-packager`/`winresource`, external-tool/template-side, not `[workspace.dependencies]`) | [CLI_DEVELOPMENT.md](CLI_DEVELOPMENT.md) |
 | `ratatui`/`crossterm`/`ansi-to-tui`, `toml_edit` | [TUI_DEVELOPMENT.md](TUI_DEVELOPMENT.md) |
@@ -468,11 +468,11 @@ The rules below bind every pin, wherever its row lives:
   instead, which prunes orphaned entries (`cargo generate-lockfile` is for adding/widening); review the diff.
   **Carve-out for a duplicate-collapsing bump** (e.g. `parley_engine` aligning `skrifa`/`read-fonts`
   onto `glifo`'s copies): `cargo generate-lockfile` re-resolves unrelated crates, so run
-  `cargo update -p <crate> --precise <version>` inside each of the fifteen workspaces, then a plain
+  `cargo update -p <crate> --precise <version>` inside each of the sixteen workspaces, then a plain
   `cargo metadata` for missing path-dep edges; audit every lock diff's `name`/`version` lines.
   **Carve-out for a security patch update** (a fixed release for an advisory, or the successor of
   a yanked version, inside an unchanged manifest requirement). Same command, one crate at a time,
-  in every one of the fifteen workspaces whose lockfile carries the crate; take the smallest fixed
+  in every one of the sixteen workspaces whose lockfile carries the crate; take the smallest fixed
   release unless the owner decides otherwise. Audit each lock diff, re-run that pin's tripwire, remove the
   matching `deny.toml` `ignore` entry in the same change, then run `scripts/ci/advisories.sh` (every tracked
   lockfile). An exact-pin or major move follows the pin row's tripwire with an owner decision instead.

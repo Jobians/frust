@@ -128,6 +128,23 @@ impl SessionCache {
         slot
     }
 
+    /// The session already loaded for `path` and `options`, if any. Never loads, never waits
+    /// on a load under way and does not count as a use for eviction.
+    pub(crate) fn peek(
+        &self,
+        path: impl AsRef<Path>,
+        options: &SessionOptions,
+    ) -> Option<Arc<Session>> {
+        let path = std::fs::canonicalize(path.as_ref()).ok()?;
+        let slot = lock(&self.entries)
+            .entries
+            .iter()
+            .find(|entry| entry.path == path && entry.options == *options)
+            .map(|entry| Arc::clone(&entry.slot))?;
+        let loaded = slot.try_lock().ok()?;
+        loaded.as_ref().map(Arc::clone)
+    }
+
     /// Drops every cached session for `path`, whatever its options; returns how many there were.
     pub fn evict(&self, path: impl AsRef<Path>) -> usize {
         let given = path.as_ref();

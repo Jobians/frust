@@ -222,6 +222,10 @@ fn is_pending(
         Contribution::CargoFeature { name, feature } => {
             apply::cargo_feature_present(doc, name, feature, DepLookup::of(&entry.origin))
         }
+        // No `android/` directory: no manifest to edit, so satisfied.
+        Contribution::ManifestPermission { .. } if !root.join(apply::ANDROID_DIR_REL).is_dir() => {
+            true
+        }
         Contribution::ManifestPermission { permission } => {
             apply::manifest_permission_present(&read(root, apply::MANIFEST_REL)?, permission)
         }
