@@ -91,6 +91,9 @@ pub struct DownloadTracker {
 struct Publisher {
     state: RwSignal<DownloadState>,
     progress: RwSignal<DownloadProgress>,
+    /// Read handles made once beside the writable signals, so an accessor allocates nothing.
+    state_read: ReadSignal<DownloadState>,
+    progress_read: ReadSignal<DownloadProgress>,
     observer: Option<StateObserver>,
     inner: Arc<Mutex<Inner>>,
 }
@@ -159,10 +162,14 @@ impl std::fmt::Debug for DownloadTracker {
 impl DownloadTracker {
     /// An idle tracker.
     pub fn new() -> Self {
+        let state = RwSignal::new(DownloadState::Idle);
+        let progress = RwSignal::new(DownloadProgress::default());
         Self {
             publisher: Publisher {
-                state: RwSignal::new(DownloadState::Idle),
-                progress: RwSignal::new(DownloadProgress::default()),
+                state,
+                progress,
+                state_read: state.read_only(),
+                progress_read: progress.read_only(),
                 observer: None,
                 inner: Arc::default(),
             },
@@ -185,14 +192,16 @@ impl DownloadTracker {
         self
     }
 
-    /// The download's state.
+    /// The download's state. Every call returns the same signal and is cheap to call from
+    /// `build`.
     pub fn state(&self) -> ReadSignal<DownloadState> {
-        self.publisher.state.read_only()
+        self.publisher.state_read
     }
 
-    /// The download's progress. It resets when a new download starts.
+    /// The download's progress. It resets when a new download starts. Every call returns the
+    /// same signal and is cheap to call from `build`.
     pub fn progress(&self) -> ReadSignal<DownloadProgress> {
-        self.publisher.progress.read_only()
+        self.publisher.progress_read
     }
 
     /// Downloads `paths` from the Hub `repo` at `revision`, returning at once. The state is
@@ -326,5 +335,20 @@ impl DownloadTracker {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accessors_return_the_same_signal_on_every_call() {
+        let tracker = DownloadTracker::new();
+        let (state, progress) = (tracker.state(), tracker.progress());
+        for _ in 0..1000 {
+            assert!(tracker.state() == state);
+            assert!(tracker.progress() == progress);
+        }
     }
 }
