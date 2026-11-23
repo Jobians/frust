@@ -12,7 +12,8 @@
 //! Covered: the animated-height widgets `docs/REVIEW_FOCUS.md` names for this
 //! crate — the accordion's reveal and the app bar's connection banner — plus
 //! the staggered reveal and the tab strip, each under both motion settings and
-//! through every open/close flip, the landing frames included.
+//! through every open/close flip, the landing frames included. With the `chat`
+//! feature, every chat component whose height follows its state too.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -245,5 +246,139 @@ fn a_flip_mid_flight_stays_laid_out() {
         }
         audit.settle();
         audit.assert_clean("mid-flight reversals");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The chat family: every component whose height follows its state, and the
+// approval card's paint-driven relayout when its deadline passes.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "chat")]
+mod chat {
+    use std::time::Duration;
+
+    use frust::authoring::{AnyView, any};
+    use frust::column;
+    use frust_glyph::chat::{
+        ApprovalDeadline, ApprovalOption, ApprovalOptionKind, ChatRole, DiffInput, PlanEntry,
+        PlanEntryStatus, ToolKind, ToolStatus, approval_card, code_block, composer, diff_view,
+        markdown, message_row, notice_row, plan_block, tool_call, usage_meter,
+    };
+
+    use super::{Audit, DiscardScene, Size, both_motions};
+
+    #[derive(Default)]
+    struct Chat {
+        step: usize,
+        deadline: Option<ApprovalDeadline>,
+    }
+
+    fn numbered(n: usize) -> String {
+        (1..=n).map(|i| format!("line {i}\n")).collect()
+    }
+
+    fn options() -> Vec<ApprovalOption> {
+        [
+            ("yes", ApprovalOptionKind::AllowOnce),
+            ("no", ApprovalOptionKind::RejectOnce),
+        ]
+        .map(|(id, kind)| ApprovalOption {
+            id: id.to_owned(),
+            label: id.to_owned(),
+            kind,
+        })
+        .to_vec()
+    }
+
+    fn screen(state: &mut Chat) -> AnyView<Chat> {
+        let on = state.step % 2 == 1;
+        let lines = 4 + state.step * 3;
+        let entries: Vec<PlanEntry> = (0..=state.step)
+            .map(|i| PlanEntry {
+                text: format!("step {i}"),
+                status: PlanEntryStatus::Pending,
+            })
+            .collect();
+        let old = numbered(30);
+        let edit = DiffInput {
+            path: "a.rs".to_owned(),
+            new_text: old.replace("line 3\n", "changed\n"),
+            old_text: Some(old),
+        };
+        let mut card = approval_card("Run it?", options()).busy(on);
+        if let Some(deadline) = &state.deadline {
+            card = card.expires(deadline.clone());
+        }
+        let mut input = composer(numbered(state.step));
+        if on {
+            input = input.disabled("busy");
+        }
+        let status = if on {
+            ToolStatus::InProgress
+        } else {
+            ToolStatus::Completed
+        };
+        any(column()
+            .child(
+                message_row(ChatRole::Thought, "thinking it through")
+                    .thought_open(on)
+                    .on_thought_toggle(|_: &mut Chat| {}),
+            )
+            .child(markdown(numbered(state.step + 1)).streaming(!on))
+            .child(
+                code_block(numbered(lines))
+                    .max_visible_lines(3)
+                    .expanded(on)
+                    .on_toggle(|_: &mut Chat| {}),
+            )
+            .child(
+                diff_view(edit)
+                    .collapse_above(2)
+                    .expanded(on)
+                    .on_toggle(|_: &mut Chat| {}),
+            )
+            .child(
+                tool_call(ToolKind::Execute, "cargo test", status)
+                    .open(on)
+                    .content(numbered(lines)),
+            )
+            .child(plan_block(entries))
+            .child(notice_row("Waiting for approval").working(on))
+            .child(usage_meter(state.step as u64 * 40, 100))
+            .child(card)
+            .child(input))
+    }
+
+    /// A frame, then enough ticks for every paint-driven change to land; the
+    /// dots loaders never settle, so no `settle()`.
+    fn step(audit: &mut Audit<Chat>) {
+        audit.frame();
+        for _ in 0..4 {
+            audit.tick();
+        }
+    }
+
+    #[test]
+    fn the_chat_components_stay_laid_out() {
+        for theme in both_motions() {
+            let mut audit = Audit::new(Chat::default(), theme, screen);
+            audit.window = Size::new(400.0, 4000.0);
+            step(&mut audit);
+            for next in 1..6 {
+                audit.state.step = next;
+                step(&mut audit);
+            }
+            audit.state.deadline = Some(ApprovalDeadline::after(Duration::from_millis(300)));
+            audit.state.step = 0;
+            step(&mut audit);
+            std::thread::sleep(Duration::from_millis(350));
+            // Paint first, as a shell's frame does after the deadline passes:
+            // the card notices, requests layout, and the next pass relays it.
+            audit.paint(&mut DiscardScene);
+            audit.tick();
+            audit.tick();
+            audit.assert_clean("chat components");
+        }
     }
 }

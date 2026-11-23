@@ -19,7 +19,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 frust = { package = "frust-ui", path = "../../crates/frust" }
 # The Glyph catalog is this plugin crate beside the facade, never a `frust` feature (`frust` carries
 # no design system): widgets, `baseline()` theme, bundled fonts and motion patterns.
-frust-glyph = { path = "../../plugins/glyph" }
+frust-glyph = { path = "../../plugins/glyph", features = ["chat"] }
 
 # Present so the release-only `lean` feature can cap the log level. Never make
 # the cap unconditional: `profile` builds must keep `frust-perf` output.

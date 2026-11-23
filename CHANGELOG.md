@@ -138,6 +138,31 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 
 ### Added
 
+- `frust-widgets` `rich_text`: `SpanView::background` and `themed_background` fill a padded rounded rect
+  behind a span (paint only, layout unchanged). `SpanView::link(id)` marks a span as a link and
+  `RichTextView::on_link` receives the id on a tap that starts and ends on it; the paragraph's
+  semantics gain one link child per link. `RichTextView::selectable(true)` makes a block selectable:
+  long-press, handles and toolbar on touch, drag, double-click and triple-click with the mouse, and
+  the copy and select-all chords, inside one block. It is off by default, and a block that does not
+  opt in is unchanged.
+- `frust-widgets` `ListView`: `stick_to_end(true)` keeps a keyed variable-extent list on its live
+  edge, for a transcript. `on_stick_change` reports each time the list sticks or lets go, and
+  `ListViewWidget::is_stuck_to_end` reads the state. `ListViewWidget::STICK_TO_END_THRESHOLD_PX` is the
+  distance from the end that releases it. `ScrollController::jump_to_end` and `animate_to_end` move
+  any scroll surface to its end, resolved at layout against the extent known then.
+- `frust-text` `TextLayout` publishes read-only geometry for a laid-out paragraph: `range_rects`,
+  `line_bounds`, `position_at_point`, `word_range_at` and `caret_rect`, over the new `TextPosition`
+  and `TextAffinity` types (re-exported from the crate root).
+- `frust-glyph`: the opt-in `chat` cargo feature adds `frust_glyph::chat`, a family of controlled,
+  non-reactive components for agent-conversation UIs: `message_scroller`, `message_row`, `markdown`,
+  `code_block`, `diff_view` with `compute_diff`, `tool_call`, `plan_block`, `approval_card`,
+  `notice_row`, `usage_meter` and `composer`. The feature adds three optional dependencies
+  (`pulldown-cmark`, `imara-diff` and `web-time`); a build without it gains none. Markdown emits no
+  HTML and fetches no image, and a link is reported only for an `http`, `https` or `mailto` URL.
+  An approval request can carry a `request_id`, and `on_select` receives an `ApprovalSelection`
+  naming the request and the chosen option.
+  The glyph catalog gains an Agent chat page that plays a scripted turn through every component.
+  See `plugins/glyph/README.md` and the `glyph-chat-*` entries of `docs/LIMITATIONS.md`.
 - `frust-charts` (`plugins/charts`): live charts drawn on the facade alone, with no platform code.
   Data lives in shared handles that any thread can write: `Series`, a fixed-capacity ring of evenly
   spaced samples where `None` is a gap, and `Samples`, a fixed set of current values. A write

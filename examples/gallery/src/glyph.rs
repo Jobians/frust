@@ -3,7 +3,8 @@
 //! `glyph/<file-stem>`: `accordion`, `alert`, `app-bar`, `badge-and-tag`,
 //! `card`, `card-switcher`, `command-palette`, `dialog`, `fab`, `list`,
 //! `loaders`, `nav-bar`, `page-dots`, `tabs`, `term-block`, `toast`,
-//! `toggle`.
+//! `toggle`; plus the `chat-*` previews of `frust_glyph::chat` (see the chat
+//! family note below).
 //!
 //! Every case is a static composition of the real `plugins/glyph` widgets,
 //! built directly (never through `frust_glyph::install`/`show_glyph_dialog`/
@@ -35,7 +36,13 @@
 
 use kurbo::Size;
 
-use frust_core::View;
+use frust_core::{AnyView, View};
+use frust_glyph::chat::{
+    ApprovalOption, ApprovalOptionKind, ApprovalSelection, ApprovalState, ChatRole, CodeSpan,
+    CodeTone, DiffInput, NoticeTone, PlanEntry, PlanEntryStatus, ToolContent, ToolKind, ToolStatus,
+    UsageLabel, approval_card, code_block, composer, diff_view, message_row, message_scroller,
+    notice_row, plan_block, tool_call, usage_meter,
+};
 use frust_glyph::{
     AlertVariant, BadgeVariant, PaletteItem, StatDelta, TermLine, ToastVariant, accordion, alert,
     app_bar, badge, card_switcher, command_palette, dots_loader, empty_state, fab, glyph_card,
@@ -44,8 +51,8 @@ use frust_glyph::{
     term_block, toast, toggle,
 };
 use frust_widgets::{
-    ButtonStyle, CrossAxisAlignment, EdgeInsets, Padding, SizedBox, button, column, icons, row,
-    scaffold, text,
+    ButtonStyle, ChildKey, CrossAxisAlignment, EdgeInsets, Padding, SizedBox, button, column,
+    flexible, icons, row, scaffold, text,
 };
 
 use crate::base::{framed, framed_in};
@@ -482,6 +489,377 @@ fn toggle_case() -> impl View<()> {
     )
 }
 
+// ---- chat family -----------------------------------------------------------
+//
+// Every chat component is controlled and non-reactive, so a case is the
+// component built from plain data with its callbacks wired to no-ops, and only
+// in a state a correctly wired app can produce: a collapsible block carries its
+// toggle callback (a block with none never collapses), a pending approval its
+// `on_select`, a running composer its `on_stop`.
+//
+// Determinism: no case streams (`.streaming` stays off, so no caret blinks),
+// none sets a busy loader or a working notice (both animate), and no case
+// makes a clock-dependent label. `ApprovalDeadline` has no public fixed-clock
+// seam (it counts down from a real `Instant`), so the pending approval is
+// shown WITHOUT a deadline; the countdown bar and its time label are not
+// previewed. Monospace text uses the generic fallback (see the module docs).
+
+/// The vertical gap between the states a chat case stacks.
+const CHAT_GAP: f64 = 14.0;
+
+/// A tall frame for the cases that stack several states.
+const CHAT_TALL: Size = Size::new(360.0, 560.0);
+
+/// A frame for a single, content-heavy component.
+const CHAT_MEDIUM: Size = Size::new(360.0, 340.0);
+
+/// A chat case's frame: the states stacked with [`CHAT_GAP`] between them,
+/// inside a 12 px margin.
+fn chat_frame(size: Size, states: Vec<AnyView<()>>) -> impl View<()> {
+    let mut stack = column();
+    for (i, state) in states.into_iter().enumerate() {
+        if i > 0 {
+            stack = stack.child(SizedBox(None, Some(CHAT_GAP)));
+        }
+        stack = stack.child(state);
+    }
+    framed_in(size, Padding(EdgeInsets::all(12.0), stack))
+}
+
+fn option(id: &str, label: &str, kind: ApprovalOptionKind) -> ApprovalOption {
+    ApprovalOption {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        kind,
+    }
+}
+
+fn plan_entry(text: &str, status: PlanEntryStatus) -> PlanEntry {
+    PlanEntry {
+        text: text.to_owned(),
+        status,
+    }
+}
+
+/// The two-hunk-free edit the diff and tool-call cases share.
+fn sample_edit() -> DiffInput {
+    DiffInput {
+        path: "src/parse.rs".to_owned(),
+        old_text: Some(
+            "fn parse(input: &str) -> Option<u32> {\n    let n = input.trim().parse().ok()?;\n    Some(n)\n}\n"
+                .to_owned(),
+        ),
+        new_text: "fn parse(input: &str) -> Option<u32> {\n    let n: u32 = input.trim().parse().ok()?;\n    n.checked_add(1)\n}\n"
+            .to_owned(),
+    }
+}
+
+/// `glyph/chat-message-user` — a short and a long user bubble.
+fn chat_message_user_case() -> impl View<()> {
+    chat_frame(
+        Case::DEFAULT_SIZE,
+        vec![
+            AnyView::new(message_row(ChatRole::User, "Fix the failing parser test.")),
+            AnyView::new(message_row(
+                ChatRole::User,
+                "The parser test fails on an input with a trailing newline. Can you find out why \
+                 and fix it without changing the public API?",
+            )),
+        ],
+    )
+}
+
+/// `glyph/chat-message-assistant` — settled assistant markdown: a heading, a
+/// list, inline code, a link and a table.
+fn chat_message_assistant_case() -> impl View<()> {
+    chat_frame(
+        CHAT_TALL,
+        vec![AnyView::new(
+            message_row(
+                ChatRole::Assistant,
+                "## Findings\n\n\
+                 The test fails because `parse` trims the input but never the **newline** \
+                 inside it. Three things to change:\n\n\
+                 - read the value with `str::trim_end`\n\
+                 - return `None` for an empty string\n\
+                 - add a regression test\n\n\
+                 See the [parser notes](https://example.com/parser) for the grammar.\n\n\
+                 | Input | Before | After |\n\
+                 |---|---|---|\n\
+                 | `\"7\\n\"` | `None` | `Some(7)` |\n\
+                 | `\"\"` | `None` | `None` |\n",
+            )
+            .on_link(|_: &mut (), _url: &str| {}),
+        )],
+    )
+}
+
+/// `glyph/chat-message-thought` — a thought row closed, then open.
+fn chat_message_thought_case() -> impl View<()> {
+    chat_frame(
+        Case::DEFAULT_SIZE,
+        vec![
+            AnyView::new(
+                message_row(ChatRole::Thought, "Checking how the input is trimmed.")
+                    .thought_open(false)
+                    .on_thought_toggle(|_: &mut ()| {}),
+            ),
+            AnyView::new(
+                message_row(
+                    ChatRole::Thought,
+                    "The failing input ends in a newline. `trim` removes it, so the cause must \
+                     be elsewhere; the number parse is the next place to look.",
+                )
+                .thought_open(true)
+                .on_thought_toggle(|_: &mut ()| {}),
+            ),
+        ],
+    )
+}
+
+/// `glyph/chat-code-block` — a highlighted Rust block, then a plain one.
+fn chat_code_block_case() -> impl View<()> {
+    let rust = "fn main() {\n    // greet\n    let name = \"frust\";\n    println!(\"{name}\");\n}";
+    chat_frame(
+        CHAT_MEDIUM,
+        vec![
+            AnyView::new(
+                code_block(rust)
+                    .language("rust")
+                    .spans(vec![
+                        CodeSpan {
+                            range: 0..2,
+                            style: CodeTone::Keyword,
+                        },
+                        CodeSpan {
+                            range: 3..7,
+                            style: CodeTone::Function,
+                        },
+                        CodeSpan {
+                            range: 17..24,
+                            style: CodeTone::Comment,
+                        },
+                    ])
+                    .on_copy(|_: &mut (), _code: &str| {}),
+            ),
+            AnyView::new(
+                code_block("$ cargo test -p parser\nrunning 3 tests\ntest result: ok")
+                    .on_copy(|_: &mut (), _code: &str| {}),
+            ),
+        ],
+    )
+}
+
+/// `glyph/chat-diff` — an edit of an existing file.
+fn chat_diff_case() -> impl View<()> {
+    chat_frame(
+        CHAT_MEDIUM,
+        vec![AnyView::new(
+            diff_view(sample_edit()).on_toggle(|_: &mut ()| {}),
+        )],
+    )
+}
+
+/// `glyph/chat-diff-new-file` — a file the agent created.
+fn chat_diff_new_file_case() -> impl View<()> {
+    chat_frame(
+        Case::DEFAULT_SIZE,
+        vec![AnyView::new(
+            diff_view(DiffInput {
+                path: "tests/parse.rs".to_owned(),
+                old_text: None,
+                new_text: "#[test]\nfn trailing_newline() {\n    assert_eq!(parse(\"7\\n\"), Some(8));\n}\n"
+                    .to_owned(),
+            })
+            .on_toggle(|_: &mut ()| {}),
+        )],
+    )
+}
+
+/// `glyph/chat-tool-call` — one collapsed card per status, then an open card
+/// with output.
+fn chat_tool_call_case() -> impl View<()> {
+    let toggle = |_: &mut ()| {};
+    chat_frame(
+        CHAT_TALL,
+        vec![
+            AnyView::new(
+                tool_call(ToolKind::Read, "Read src/parse.rs", ToolStatus::Pending)
+                    .on_toggle(toggle),
+            ),
+            AnyView::new(
+                tool_call(
+                    ToolKind::Search,
+                    "Search for parse(",
+                    ToolStatus::InProgress,
+                )
+                .on_toggle(toggle),
+            ),
+            AnyView::new(
+                tool_call(ToolKind::Edit, "Edit src/parse.rs", ToolStatus::Completed)
+                    .on_toggle(toggle),
+            ),
+            AnyView::new(
+                tool_call(ToolKind::Execute, "cargo test", ToolStatus::Failed).on_toggle(toggle),
+            ),
+            AnyView::new(
+                tool_call(
+                    ToolKind::Execute,
+                    "cargo test -p parser",
+                    ToolStatus::Completed,
+                )
+                .open(true)
+                .on_toggle(toggle)
+                .content(ToolContent::Text(
+                    "running 3 tests\ntest trims_input ... ok\ntest rejects_empty ... ok\n\
+                         test trailing_newline ... ok\n\ntest result: ok. 3 passed"
+                        .to_owned(),
+                ))
+                .on_output_toggle(toggle)
+                .on_copy(|_: &mut (), _text: &str| {}),
+            ),
+        ],
+    )
+}
+
+/// `glyph/chat-plan` — one entry in each status.
+fn chat_plan_case() -> impl View<()> {
+    chat_frame(
+        Case::DEFAULT_SIZE,
+        vec![AnyView::new(
+            plan_block(vec![
+                plan_entry("Reproduce the failing test", PlanEntryStatus::Completed),
+                plan_entry("Trim the input before parsing", PlanEntryStatus::InProgress),
+                plan_entry("Add a regression test", PlanEntryStatus::Pending),
+            ])
+            .title("Plan"),
+        )],
+    )
+}
+
+/// `glyph/chat-approval` — a pending request (no countdown: see the family
+/// note above), an allowed one and an expired one.
+fn chat_approval_case() -> impl View<()> {
+    let options = || {
+        vec![
+            option("allow", "Allow once", ApprovalOptionKind::AllowOnce),
+            option("always", "Always allow", ApprovalOptionKind::AllowAlways),
+            option("deny", "Reject", ApprovalOptionKind::RejectOnce),
+        ]
+    };
+    chat_frame(
+        Size::new(360.0, 620.0),
+        vec![
+            AnyView::new(
+                approval_card("Run a shell command?", options())
+                    .request_id("req-fmt-2")
+                    .detail("cargo fmt --all")
+                    .on_select(|_: &mut (), _: &ApprovalSelection| {}),
+            ),
+            AnyView::new(
+                approval_card("Run a shell command?", options())
+                    .request_id("req-fmt-1")
+                    .detail("cargo fmt --all")
+                    .state(ApprovalState::Allowed)
+                    .selected("allow")
+                    .on_select(|_: &mut (), _: &ApprovalSelection| {}),
+            ),
+            AnyView::new(
+                approval_card("Delete build output?", options())
+                    .request_id("req-clean")
+                    .detail("rm -rf target/debug")
+                    .state(ApprovalState::Expired)
+                    .expired_hint("Ask the agent to try again.")
+                    .on_select(|_: &mut (), _: &ApprovalSelection| {}),
+            ),
+        ],
+    )
+}
+
+/// `glyph/chat-composer` — empty, multi-line, running and disabled.
+fn chat_composer_case() -> impl View<()> {
+    fn wired(value: &str) -> frust_glyph::chat::ComposerView<()> {
+        composer(value)
+            .on_change(|_: &mut (), _text: String| {})
+            .on_submit(|_: &mut (), _text: String| {})
+            .on_stop(|_: &mut ()| {})
+    }
+    chat_frame(
+        CHAT_TALL,
+        vec![
+            AnyView::new(wired("").placeholder("Ask anything")),
+            AnyView::new(wired(
+                "Fix the parser test.\nIt fails on a trailing newline.\nKeep the API.",
+            )),
+            AnyView::new(wired("Also update the docs").running(true)),
+            AnyView::new(wired("").disabled("Sign in to chat")),
+        ],
+    )
+}
+
+/// `glyph/chat-scroller` — a short transcript at its end, then one scrolled
+/// up from it with the jump control and an unread count.
+fn chat_scroller_case() -> impl View<()> {
+    fn transcript(at_end: bool, unread: usize) -> impl View<()> {
+        let mut scroller = message_scroller(
+            3,
+            |i| ChildKey::new(i as u64),
+            |i| match i {
+                0 => AnyView::new(message_row(ChatRole::User, "Fix the parser test.")),
+                1 => AnyView::new(message_row(
+                    ChatRole::Assistant,
+                    "The input keeps its trailing newline. I will trim it first.",
+                )),
+                _ => AnyView::new(tool_call(
+                    ToolKind::Edit,
+                    "Edit src/parse.rs",
+                    ToolStatus::Completed,
+                )),
+            },
+        )
+        .at_end(at_end)
+        .on_at_end_change(|_: &mut (), _at_end: bool| {})
+        .padding(EdgeInsets::all(12.0));
+        if !at_end {
+            scroller = scroller.unread(unread);
+        }
+        scroller
+    }
+    framed_in(
+        Size::new(360.0, 520.0),
+        column()
+            .push(flexible(1, transcript(true, 0)))
+            .child(SizedBox(None, Some(CHAT_GAP)))
+            .push(flexible(1, transcript(false, 3))),
+    )
+}
+
+/// `glyph/chat-usage` — normal, warning and critical, and the compact form.
+fn chat_usage_case() -> impl View<()> {
+    chat_frame(
+        Case::DEFAULT_SIZE,
+        vec![
+            AnyView::new(usage_meter(42_000, 200_000)),
+            AnyView::new(usage_meter(170_000, 200_000).label(UsageLabel::Counts)),
+            AnyView::new(usage_meter(196_000, 200_000)),
+            AnyView::new(usage_meter(98_000, 200_000).compact(true)),
+        ],
+    )
+}
+
+/// `glyph/chat-notice` — each tone.
+fn chat_notice_case() -> impl View<()> {
+    chat_frame(
+        Case::DEFAULT_SIZE,
+        vec![
+            AnyView::new(notice_row("Connected to the agent")),
+            AnyView::new(notice_row("Changes saved").tone(NoticeTone::Success)),
+            AnyView::new(notice_row("Context nearly full").tone(NoticeTone::Warning)),
+            AnyView::new(notice_row("The agent stopped unexpectedly").tone(NoticeTone::Error)),
+        ],
+    )
+}
+
 /// This module's slice of the registry [`crate::cases`]: one entry per
 /// `apps/website/widgets/design-systems/glyph/*.mdx` page (see the module
 /// docs' slug list).
@@ -638,5 +1016,122 @@ pub const CASES: &[Case] = &[
         time_ms: Case::DEFAULT_TIME_MS,
         design: Design::Glyph,
         build: case_build!(toggle_case),
+    },
+    Case {
+        slug: "glyph/chat-message-user",
+        title: "Chat message, user",
+        size: Case::DEFAULT_SIZE,
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_message_user_case),
+    },
+    Case {
+        slug: "glyph/chat-message-assistant",
+        title: "Chat message, assistant",
+        size: CHAT_TALL,
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_message_assistant_case),
+    },
+    Case {
+        slug: "glyph/chat-message-thought",
+        title: "Chat message, thought",
+        size: Case::DEFAULT_SIZE,
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_message_thought_case),
+    },
+    Case {
+        slug: "glyph/chat-code-block",
+        title: "Chat code block",
+        size: CHAT_MEDIUM,
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_code_block_case),
+    },
+    Case {
+        slug: "glyph/chat-diff",
+        title: "Chat diff, edit",
+        size: CHAT_MEDIUM,
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_diff_case),
+    },
+    Case {
+        slug: "glyph/chat-diff-new-file",
+        title: "Chat diff, new file",
+        size: Case::DEFAULT_SIZE,
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_diff_new_file_case),
+    },
+    Case {
+        slug: "glyph/chat-tool-call",
+        title: "Chat tool call",
+        size: CHAT_TALL,
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_tool_call_case),
+    },
+    Case {
+        slug: "glyph/chat-plan",
+        title: "Chat plan",
+        size: Case::DEFAULT_SIZE,
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_plan_case),
+    },
+    Case {
+        slug: "glyph/chat-approval",
+        title: "Chat approval",
+        size: Size::new(360.0, 620.0),
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_approval_case),
+    },
+    Case {
+        slug: "glyph/chat-composer",
+        title: "Chat composer",
+        size: CHAT_TALL,
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_composer_case),
+    },
+    Case {
+        slug: "glyph/chat-scroller",
+        title: "Chat scroller",
+        size: Size::new(360.0, 520.0),
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_scroller_case),
+    },
+    Case {
+        slug: "glyph/chat-usage",
+        title: "Chat usage meter",
+        size: Case::DEFAULT_SIZE,
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_usage_case),
+    },
+    Case {
+        slug: "glyph/chat-notice",
+        title: "Chat notice",
+        size: Case::DEFAULT_SIZE,
+        scale: Case::DEFAULT_SCALE,
+        time_ms: Case::DEFAULT_TIME_MS,
+        design: Design::Glyph,
+        build: case_build!(chat_notice_case),
     },
 ];

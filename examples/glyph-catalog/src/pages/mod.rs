@@ -1,7 +1,8 @@
-//! The nine catalog sections, one module per section, mirroring the
+//! The ten catalog sections, one module per section, mirroring the
 //! reference builds' section list (foundations, buttons+forms, feedback,
-//! navigation, content, overlays, motion) plus `interactions` and `appbar` —
-//! two sections with no reference-build section-list precedent of their own.
+//! navigation, content, overlays, motion) plus `interactions`, `appbar` and
+//! `agent_chat` — sections with no reference-build section-list precedent of
+//! their own.
 //!
 //! # Page-fn contract (fixed across every section)
 //!
@@ -25,7 +26,9 @@
 //!     the same root stack the shell mounts.
 //! - **Return**: a fully type-erased [`AnyView<CatalogState>`](frust::AnyView).
 //!   The shell wraps it in a [`scroll_view`](frust::scroll_view), so a page
-//!   returns its content column directly (no outer scroll of its own).
+//!   returns its content column directly (no outer scroll of its own). The
+//!   one exception is [`AGENT_CHAT`]: its transcript scrolls itself, so the
+//!   shell hands it the bounded body and keeps it above the keyboard.
 //!
 //! **Reactivity rule** (see `docs/CODE_STANDARDS.md`): a page's `build` may
 //! only *read* signals (`.get()` to subscribe). Every *write* to a signal —
@@ -33,6 +36,7 @@
 //! (`on_press`/`on_toggle`/…), which carries `&mut CatalogState`, never in the
 //! `build` body.
 
+pub mod agent_chat;
 pub mod appbar;
 pub mod buttons_forms;
 pub mod content;
@@ -47,9 +51,9 @@ use frust::{AnyView, any};
 
 use crate::CatalogState;
 
-/// The nine section tab labels, in order. Indexed by `CatalogState::section`
+/// The ten section tab labels, in order. Indexed by `CatalogState::section`
 /// and dispatched by [`current`].
-pub const SECTION_LABELS: [&str; 9] = [
+pub const SECTION_LABELS: [&str; 10] = [
     "Foundations",
     "Buttons + Forms",
     "Feedback",
@@ -59,12 +63,17 @@ pub const SECTION_LABELS: [&str; 9] = [
     "Motion",
     "Interactions",
     "AppBar",
+    "Agent chat",
 ];
 
-/// Dispatch to the section page for `section` (0..9), falling back to
+/// The Agent chat section's index: the one page the shell does not wrap in a
+/// scroll view (see the page-fn contract above).
+pub const AGENT_CHAT: usize = 9;
+
+/// Dispatch to the section page for `section` (0..10), falling back to
 /// foundations for any out-of-range index (defensive — the tab strip only ever
 /// yields a valid index).
-// erasure: keep the nine-arm section dispatch erases each page at this one boundary
+// erasure: keep the ten-arm section dispatch erases each page at this one boundary
 pub fn current(section: usize, state: &CatalogState) -> AnyView<CatalogState> {
     match section {
         0 => any(foundations::page(state)),
@@ -76,6 +85,7 @@ pub fn current(section: usize, state: &CatalogState) -> AnyView<CatalogState> {
         6 => any(motion::page(state)),
         7 => any(interactions::page(state)),
         8 => any(appbar::page(state)),
+        AGENT_CHAT => any(agent_chat::page(state)),
         _ => any(foundations::page(state)),
     }
 }
