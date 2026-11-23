@@ -9797,19 +9797,19 @@ viewport-top row, so the gap does not apply while it is stuck.
 
 ---
 
-### `models-no-multipart-or-http` — `frust-models` downloads one file over HTTPS only
+### `models-no-split-or-non-https-sources` — `frust-models` does not join split model files, and fetches only HTTPS or loopback HTTP
 
-**Observed**: a download is a single file from the Hugging Face Hub or an HTTPS URL. Sharded or multi-part models, and `http://` sources, are not supported; redirects are followed by the crate (at most five, HTTPS only), and the Hub token is sent only to the Hub origin.
+**Observed**: a request may hold several files, which download in order as one job (a bundle). A model that its publisher split into parts is not reassembled into one file, and a source other than HTTPS is refused, except plain `http://` to a loopback host. A redirect to plain `http://` is refused unless the first URL and the redirect are both loopback.
 
-**Applies to**: models published as several files and plain-HTTP mirrors.
+**Applies to**: models published as several parts that must be joined, and HTTP mirrors or redirects that leave HTTPS.
 
-**Workaround**: download the parts as separate models, or serve them over HTTPS.
+**Workaround**: download the parts as the files of one bundle and join them in your own code; serve a mirror over HTTPS.
 
-**Why accepted**: the supported shape is the single-file ONNX model.
+**Why accepted**: the supported shape is one ONNX model file, with any config or tokenizer files fetched in the same bundle.
 
-**Trigger for removal**: multi-part downloads are needed by a consumer.
+**Trigger for removal**: a consumer needs split models joined by the crate, or a non-loopback plain-HTTP source.
 
-**Evidence**: `plugins/models/src/download.rs`, `plugins/models/src/hub.rs`.
+**Evidence**: `plugins/models/README.md` ("Downloading": Requests and Redirects), `plugins/models/src/download.rs` (`DownloadRequest::from_url`), `plugins/models/src/hub.rs` (`check_hop`).
 
 ---
 

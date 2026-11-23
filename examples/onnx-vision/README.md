@@ -46,9 +46,11 @@ frust build apk --target-platform android-arm64
   ```
 
   A release build needs signing values (`android/key.properties` or the `ANDROID_*`
-  variables; see `frust.toml`). `android/app/src/main/AndroidManifest.xml` declares the
-  `INTERNET` permission by hand: the scaffold declares it only for debug and profile builds, and
-  without it every release download fails (`Operation not permitted`).
+  variables; see `frust.toml`). `android/app/src/main/AndroidManifest.xml` carries the
+  `INTERNET` permission: the scaffold declares it only for debug and profile builds, and without
+  the line in the main manifest every release download fails (`Operation not permitted`).
+  `frust plugin add models` and `frust plugin add onnx` write that line to the main manifest
+  for a new project, so a project created that way has it without a hand edit.
 - **iOS**: builds, but does not run the models yet. `frust-onnx` loads ONNX Runtime at run
   time on iOS and the app ships none (`frust plugin add onnx` makes no iOS edit until the iOS
   link gate settles it), so every task fails at session creation with `OnnxError::Runtime`,
