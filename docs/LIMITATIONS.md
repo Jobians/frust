@@ -9607,15 +9607,15 @@ viewport-top row, so the gap does not apply while it is stuck.
 
 ### `onnx-runtime-build-time-fetch` — `frust-onnx` downloads ONNX Runtime at build time on desktop and Android, and fails to link offline
 
-**Observed**: the desktop and Android builds of `frust-onnx` fetch a prebuilt ONNX Runtime archive from the `ort` distribution CDN while building (about 10.7 MB on Linux), and cache it under the user cache directory. `cargo --offline`, `ORT_SKIP_DOWNLOAD` and `ORT_OFFLINE` do not skip the step: the link fails when the archive is not already cached.
+**Observed**: the desktop and Android builds of `frust-onnx` fetch a prebuilt ONNX Runtime archive from the `ort` distribution CDN while building (about 10.7 MB on Linux), and cache it under the user cache directory. `cargo --offline`, `ORT_SKIP_DOWNLOAD` and `ORT_OFFLINE` skip the download and the cache lookup together, so the link fails even when the archive is already cached.
 
 **Applies to**: any build of an app that depends on `frust-onnx` on a host that has never fetched the archive, including a clean CI runner and an air-gapped build machine.
 
-**Workaround**: build once with network access so the archive is cached, and carry the cache directory to the offline machine.
+**Workaround**: point `ORT_LIB_PATH` at a local ONNX Runtime build, which is the supported offline route. Alternatively, build once with network access so the archive is cached, and carry the cache directory to the offline machine; that copied cache links only when none of `ORT_SKIP_DOWNLOAD`, `ORT_OFFLINE` and `cargo --offline` is set.
 
 **Why accepted**: the pinned `ort` fetches its runtime in its build script and offers no vendored alternative that keeps the exact-pinned prebuilt rows.
 
-**Trigger for removal**: `ort` or the crate vendors the archive, or frust adds its own offline path.
+**Trigger for removal**: `ort` or the crate vendors the archive so the build needs no download, or frust ships its own prebuilt-archive route that needs no network.
 
 **Evidence**: `plugins/onnx/Cargo.toml` (`download-binaries` feature rows) and `plugins/onnx/README.md` (build-time fetch section); the root CI jobs and the `onnx-vision` standalone job rely on the fetch.
 
