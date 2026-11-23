@@ -458,6 +458,29 @@ fn token_reaches_the_hub_and_never_the_redirect_target() {
 }
 
 #[test]
+fn a_request_that_starts_off_the_hub_never_carries_the_token() {
+    let fx = Fixture::start();
+    let tmp = Temp::new();
+    let store = tmp.store();
+    let client = client(&fx).with_token(Some("hf_fixture_token".into()));
+    let id = ModelId::new("mirror", "cdn-to-hub", "model.gguf").unwrap();
+    let req =
+        DownloadRequest::from_url(format!("{}/cdn-to-hub/{BLOB}", fx.cdn), id, None, None).unwrap();
+    let models = run(&client, &store, req).0.unwrap();
+    assert_eq!(fs::read(&models[0].path).unwrap(), fx.file(BLOB).bytes);
+    let log = fx.log();
+    let cdn: Vec<_> = log.iter().filter(|l| l.server == "cdn").collect();
+    let hub: Vec<_> = log.iter().filter(|l| l.server == "hub").collect();
+    assert_eq!(cdn.len(), 1, "{log:?}");
+    assert_eq!(hub.len(), 1, "the redirect reached the Hub: {log:?}");
+    assert_eq!(cdn[0].authorization, None, "{log:?}");
+    assert_eq!(
+        hub[0].authorization, None,
+        "a request that started off the Hub never carries the token: {log:?}"
+    );
+}
+
+#[test]
 fn plain_http_is_refused_unless_loopback() {
     let id = ModelId::new("mirror", "tiny", "model.gguf").unwrap();
     assert!(matches!(
