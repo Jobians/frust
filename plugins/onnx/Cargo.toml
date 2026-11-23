@@ -52,9 +52,14 @@ ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", 
 [target.'cfg(all(target_os = "android", target_arch = "aarch64"))'.dependencies]
 ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17", "nnapi"] }
 
-# PLACEHOLDER, not a packaging decision: iOS, Intel macOS and every other target without a static row
-# load ONNX Runtime at run time; Apple's `coreml` uses CoreML if that library has it, else the CPU.
-[target.'cfg(all(target_vendor = "apple", not(all(target_os = "macos", target_arch = "aarch64"))))'.dependencies]
+# iOS device and arm64 Simulator: static, from the only prebuilt row of each (`coreml`). The app link
+# must name -lc++ and the CoreML and Foundation frameworks itself: see README "iOS packaging".
+[target.'cfg(all(target_os = "ios", target_arch = "aarch64", not(target_abi = "macabi")))'.dependencies]
+ort = { workspace = true, features = ["std", "download-binaries", "tls-rustls", "api-17", "coreml"] }
+
+# Intel macOS, the x86_64 Simulator, Mac Catalyst and other Apple targets have no prebuilt row: they
+# load ONNX Runtime at run time; `coreml` uses CoreML if that library has it, else the CPU.
+[target.'cfg(all(target_vendor = "apple", not(any(all(target_os = "macos", target_arch = "aarch64"), all(target_os = "ios", target_arch = "aarch64", not(target_abi = "macabi"))))))'.dependencies]
 ort = { workspace = true, features = ["std", "load-dynamic", "api-17", "coreml"] }
 
 # Mirrors `src/runtime.rs`' link cfg, Apple excluded (the row above).

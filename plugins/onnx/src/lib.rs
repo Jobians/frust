@@ -21,12 +21,13 @@
 //!
 //! # Linking
 //!
-//! On Linux (glibc, x86_64/aarch64), Apple-silicon macOS, Windows (MSVC) and arm64 Android the
-//! runtime is linked statically from the prebuilt archive `ort` downloads at build time; on Android
-//! the app must also package the NDK's `libc++_shared.so`, which that archive needs. Every other
-//! target, iOS and the other Android ABIs included, loads the runtime library at run time
-//! ([`LinkKind::Dynamic`]): the library named by `ORT_DYLIB_PATH`, else the platform's
-//! `onnxruntime` library on the loader path.
+//! On Linux (glibc, x86_64/aarch64), Apple-silicon macOS, Windows (MSVC), arm64 Android and arm64
+//! iOS (device and Simulator) the runtime is linked statically from the prebuilt archive `ort`
+//! downloads at build time. On Android the app must also package the NDK's `libc++_shared.so`; on
+//! iOS the Xcode link must add `-lc++` and the CoreML and Foundation frameworks, which a Rust
+//! staticlib cannot pass on. Every other target, the other Android ABIs, the x86_64 Simulator and
+//! Mac Catalyst included, loads the runtime library at run time ([`LinkKind::Dynamic`]): the
+//! library named by `ORT_DYLIB_PATH`, else the platform's `onnxruntime` library on the loader path.
 //!
 //! # Example
 //!

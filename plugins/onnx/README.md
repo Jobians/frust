@@ -6,13 +6,14 @@ named inputs and outputs, and run it on typed tensors (f32, u8, i64), blocking o
 per-session worker thread with cancel. CoreML accelerates Apple targets; everything else runs on
 the CPU, and an accelerator that cannot be used falls back to the CPU.
 
-**Status:** desktop and arm64 Android. Linux (glibc, x86_64/aarch64), Apple-silicon macOS,
-Windows (MSVC) and Android arm64-v8a link ONNX Runtime statically from a prebuilt archive fetched
-at build time; Android also needs the NDK's `libc++_shared.so` in the APK, which
-`frust plugin add onnx` arranges (see [Android packaging](#6-android-packaging)). iOS packaging
-is not settled yet: it compiles, but loads the ONNX Runtime library at run time and ships none
-(see [iOS packaging](#7-ios-packaging)). Intel macOS, 32-bit Android and x86_64 Android take the
-same run-time route.
+**Status:** desktop, arm64 Android and arm64 iOS. Linux (glibc, x86_64/aarch64), Apple-silicon
+macOS, Windows (MSVC), Android arm64-v8a, iOS devices and the arm64 iOS Simulator link ONNX
+Runtime statically from a prebuilt archive fetched at build time. Android also needs the NDK's
+`libc++_shared.so` in the APK, which `frust plugin add onnx` arranges (see
+[Android packaging](#6-android-packaging)); iOS needs three extra lines in the Xcode link, which
+`frust plugin add onnx` does not make yet (see [iOS packaging](#7-ios-packaging)). Intel macOS,
+the x86_64 Simulator, Mac Catalyst, 32-bit Android and x86_64 Android load the library at run
+time instead and ship none.
 
 Like every frust **platform plugin**, this crate is added to your app's own `Cargo.toml`
 alongside `frust`; the `frust` facade does not re-export it. The reactive handles
@@ -144,14 +145,15 @@ provider, strict or not.
 | Target | Provider library | `Auto` |
 |--------|------------------|--------|
 | Apple-silicon macOS | CoreML in the prebuilt `coreml` archive, linked statically | CoreML |
-| iOS, Intel macOS | CoreML if the ONNX Runtime library loaded at run time has it | CoreML, else CPU |
+| iOS device, arm64 Simulator | CoreML in the prebuilt `coreml` archive, linked statically | CoreML |
+| Intel macOS, x86_64 Simulator, Mac Catalyst | CoreML if the ONNX Runtime library loaded at run time has it | CoreML, else CPU |
 | Android arm64 | static `nnapi` archive: CPU (and NNAPI, unused), no XNNPACK | CPU |
 | Linux, Windows, others | CPU | CPU |
 
 CoreML needs iOS 13 or newer; nodes it cannot run stay on the CPU. For a model loaded from a file,
 CoreML keeps its compiled model under `<cache dir>/frust-onnx/coreml` (`frust_paths::cache_dir()`);
-a model from bytes gets no cache. The CoreML code compiles only for Apple targets: it is
-type-checked for `aarch64-apple-ios` but has not yet been linked or run on an Apple device.
+a model from bytes gets no cache. The CoreML code compiles only for Apple targets; it has run on
+an iPhone and the iOS Simulator (see [iOS packaging](#7-ios-packaging)).
 
 **Memory.** U2-NetP (`u2netp.onnx`, 4.4 MiB) at 1x3x320x320, x86_64 Linux host (i5-12600,
 12 threads), release build, ONNX Runtime 1.31.0, one fresh process per row, one warm-up run then
@@ -257,7 +259,8 @@ exactly; `lax-feature-matching` is never turned on.
 
 1. Move the root `Cargo.toml` pin and read the new `ort-sys` `dist.tsv`: every row this crate's
    `Cargo.toml` selects (plain Linux, `coreml` macOS, `directml` Windows, `nnapi` Android
-   arm64) must still exist with the same feature set, or the target table changes with it.
+   arm64, `coreml` iOS device and Simulator) must still exist with the same feature set, or the
+   target table changes with it.
 2. Check the new ONNX Runtime release against `api-17` (the lowest API level selected) and
    against `rust-version` here, which follows `ort`'s own minimum.
 3. Run `cargo test -p frust-onnx` on each desktop row, the ignored live tests
@@ -266,7 +269,9 @@ exactly; `lax-feature-matching` is never turned on.
    `frust build apk --release --target-platform android-arm64`, its `lib/arm64-v8a` passing
    `scripts/ci/page-size-check.sh`, installed and started on a phone. Check the archive still
    needs only `libc++_shared.so` beyond the NDK's system libraries (`llvm-readelf -d` on the
-   app's `.so`).
+   app's `.so`). Then the iOS gate: the same app built for the Simulator and, signed in
+   Release, for an iPhone with the [iOS packaging](#7-ios-packaging) linker lines, started on
+   both; re-read the archive's minimum iOS version (`otool -l libonnxruntime.a | grep minos`).
 4. Update the version numbers and measurements in this README.
 
 ## 6. Android packaging
@@ -334,12 +339,75 @@ predicts; the run costs about 13 % more time (519 ms against 458 ms).
 
 ## 7. iOS packaging
 
-**Not settled.** iOS builds take the run-time route: the crate compiles for `aarch64-apple-ios`
-and the simulator, but loads `onnxruntime` at run time and the app ships none, so unless the app
-bundles an ONNX Runtime library itself every session returns `OnnxError::Runtime` there. The iOS link gate has not run yet, so `frust plugin add onnx`
-makes no iOS edit: no Swift package, no framework link (`CoreML`, `Foundation`) and no `-l`
-linker flag (such as `-lc++`). Those contributions are owed by that gate and will be added to the
-`onnx` entry once it has recorded what a linked app needs.
+**Route: the prebuilt static archive**, as on Android. On `aarch64-apple-ios` and
+`aarch64-apple-ios-sim` `ort` downloads its prebuilt ONNX Runtime 1.31.0 archive (feature set
+`coreml`, the only row for each; about 10 MB compressed, an 88 MB `libonnxruntime.a` once
+extracted) and links it statically into the app's Rust staticlib. No Swift package, xcframework,
+CocoaPod or bundled framework is needed, and the app ships no ONNX Runtime library. The archive
+contains the CoreML execution provider, so `Accelerator::Auto` is CoreML on iOS. The alternative,
+a local Swift package over Microsoft's onnxruntime xcframework, was not needed and was not tried.
+`x86_64-apple-ios` (the Intel Simulator) and Mac Catalyst have no prebuilt row and load the
+library at run time.
+
+**What the app's Xcode link must add.** A Rust staticlib carries `ort-sys`' link requests
+(`-lc++`, `-framework Foundation`, `-framework CoreML`) only into Cargo's own link, never into
+Xcode's, so the Runner target's `OTHER_LDFLAGS` (every configuration) must name them, after the
+scaffold's own entries:
+
+```text
+-lc++
+-framework CoreML
+-framework Foundation
+```
+
+This list is authoritative: the registry's iOS contributions for `onnx` must be exactly these
+three. The two frameworks fit the existing `Contribution::IosFramework { name }`; `-lc++` is not a
+framework, so it needs a new contribution kind that adds an `-l<name>` line
+(`Contribution::IosLibrary`). An unmodified scaffold (Debug, Simulator) linked without them,
+but only by accident: the archive autolinks CoreML, the embedding's Swift objects autolink
+Foundation, and `libc++` arrives through Swift's back-deployment library
+`libswiftCompatibility56.a`, which Xcode links only while the deployment target is below
+iOS 15.4. A deployment target of 15.4 or later is expected to lose `libc++` that way (not tried),
+so all three are named. `Accelerate` and other frameworks are not needed.
+
+**Minimum iOS version: 15.1.** The archive's objects are built for iOS 15.1 (`minos 15.1`, SDK
+18.5, in `otool -l`). The scaffold targets 15.0; that links and runs, but the linker prints a
+warning for each of about 940 objects (`was built for newer 'iOS' version (15.1) than being
+linked (15.0)`). Set `IPHONEOS_DEPLOYMENT_TARGET = 15.1` or higher to silence them. CoreML needs
+iOS 13, so it adds no constraint.
+
+**Simulator.** The `aarch64-apple-ios-sim` row works the same way and needs the same three
+lines; the Simulator build needed nothing different from the device build. CoreML registers on
+the Simulator too, but runs slower there than the CPU (table below), so a Simulator time says
+nothing about a phone.
+
+**Measured** on a fresh `frust create` app (Material counter) with `frust plugin add onnx`, the
+three linker lines added by hand for the device build, and a ten-run U2-NetP smoke on a worker
+thread (`u2netp.onnx` embedded with `include_bytes!` and loaded with `Session::from_bytes`, input
+1x3x320x320). Times
+are `run_blocking` per run, ten runs, first included. Memory is the process `phys_footprint`
+(`proc_pid_rusage`), what Jetsam counts.
+
+| Measure | Value |
+|---------|-------|
+| Device | iPhone 13 mini (A15), iOS 27.2 (24B115), signed Release build |
+| `runtime_info()` | ONNX Runtime 1.31.0, `Static` |
+| CPU (`Accelerator::Cpu`), 4 threads | median 278.8 ms, worst 306.6 ms (first run), best 271.6 ms; 10 of 10 outputs finite |
+| CoreML (`SessionOptions::default()`) | load 2.27 s from bytes (CoreML compiles the model); median 94.4 ms, worst 165.6 ms (first run), best 93.3 ms; 10 of 10 finite |
+| CoreML, model loaded from a file | first launch 2.30 s load; relaunch 0.46 s from the compiled-model cache; median 94.1 to 97.2 ms |
+| Memory, CPU session | 117 MB after the load, peak 275 MB during the first run, 109 MB after the tenth |
+| Memory, CoreML session | 281 MB after the load, 480 MB after the first run, 480 MB after the tenth, peak 602 MB; `os_proc_available_memory` 1,817 MB before the first run, 1,618 MB after |
+| Release `Runner` binary without `frust-onnx` | 12,907,568 bytes (`.app` zipped: 6,119,301) |
+| Release `Runner` binary with `frust-onnx` | 44,604,640 bytes, of which 4,574,861 are the embedded model: +27.1 MB for ONNX Runtime and the crate (`.app` zipped: 18,480,378, about +12 MB with the model) |
+| Clean Release `cargo build --target aarch64-apple-ios`, fresh target dir, archive cached | 137 s with `frust-onnx` (staticlib 238,239,000 bytes), 238 s without (124,883,416 bytes), on an Apple-silicon Mac running other builds: machine load, not the crate, made the difference. `frust-onnx` compiles no C or C++ |
+| Simulator (iPhone 17, Debug build, Apple-silicon Mac) | CPU median 114.5 ms, worst 227.5 ms; CoreML median 192.6 ms, load 418 ms; 10 of 10 finite each |
+
+U2-NetP under CoreML stays within an iPhone's budget: about 480 MB once warm, against the
+2,092 MB `os_proc_available_memory` reported at start, and the footprint did not grow between the
+first and the tenth run. CoreML holds about 370 MB more than the CPU session and runs about three
+times as fast. Larger models cost more under CoreML: keep one large CoreML session at a time and
+clear the `SessionCache` on memory pressure. A OnePlus 9 runs the same model on its CPU at 485 to
+519 ms median ([Android packaging](#6-android-packaging)).
 
 ## 8. Image helpers
 
@@ -491,8 +559,8 @@ Android, so the CPU is the only provider measured there. Times are `VisionHandle
 App peak RSS (`VmHWM`) in a fresh process: 171 MB after start, 245 MB with a 12-megapixel photo
 picked and downscaled to 2048x1536, 409 MB after the first U2-NetP run, 458 MB with all three
 sessions loaded; 499 MB after 30 runs over both images. A run with the app in the background
-took about 1.7 times as long (1,649 ms for depth) and completed. No Apple or desktop row is
-measured yet.
+took about 1.7 times as long (1,649 ms for depth) and completed. These tasks have no Apple or
+desktop row yet; U2-NetP alone on an iPhone 13 mini is in [iOS packaging](#7-ios-packaging).
 
 The ignored live tests (`cargo test -p frust-onnx --test vision -- --ignored`) download the three
 catalog models (about 32 MB) into `target/` (or `FRUST_ONNX_MODEL_STORE`) and run each task on
