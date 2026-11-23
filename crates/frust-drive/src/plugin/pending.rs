@@ -93,7 +93,7 @@ impl PendingContribution {
 /// lines, the repository url, the `libc++_shared.so` property (read by the
 /// build script and set in `gradle.properties`), the `FrustAppTheme` parent (or an activity
 /// theme that is already an accepted Material one), all six pbxproj package sites, the framework
-/// in every `OTHER_LDFLAGS` list, a manifest-described plugin's `ios/<package>`
+/// or library in every `OTHER_LDFLAGS` list, a manifest-described plugin's `ios/<package>`
 /// link in the root `.gitignore` (when the app has one), and an entitlement's key in every file the
 /// Runner configurations sign with plus `CODE_SIGN_ENTITLEMENTS` in each of
 /// them. Machine-local wiring (`local.properties` keys, `ios/` links) and
@@ -156,6 +156,7 @@ fn platform_dir(contribution: &Contribution) -> Option<&'static str> {
         | Contribution::PlistArrayEntry { .. }
         | Contribution::SwiftPackageRef { .. }
         | Contribution::IosFramework { .. }
+        | Contribution::IosLibrary { .. }
         | Contribution::IosEntitlement { .. } => Some("ios"),
         _ => None,
     }
@@ -248,8 +249,12 @@ fn is_pending(
         Contribution::SwiftPackageRef { package_name, .. } => {
             apply::swift_package_present(&read(root, apply::PBXPROJ_REL)?, package_name)?
         }
+        // No `ios/` directory: nothing to link, so satisfied.
         Contribution::IosFramework { name } => {
-            apply::framework_linked(&read(root, apply::PBXPROJ_REL)?, name)?
+            apply::ios_link_flag_satisfied(root, apply::LinkFlag::Framework(name))?
+        }
+        Contribution::IosLibrary { name } => {
+            apply::ios_link_flag_satisfied(root, apply::LinkFlag::Library(name))?
         }
         Contribution::IosEntitlement {
             key,
@@ -1327,6 +1332,43 @@ mod tests {
             matches!(&err, PluginAddError::MissingProjectFile(rel) if rel == apply::PLIST_REL),
             "{err:?}"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A built-in plugin's link flags are satisfied on an app without `ios/`
+    /// (nothing to link, the pending check agreeing with the applier), and
+    /// pending on one with `ios/` until applied.
+    #[test]
+    fn a_built_in_plugins_link_flags_are_never_pending_without_ios() {
+        let root = temp_root("built-in-links-no-ios");
+        let app = scaffold_app(&root);
+        let entry = CatalogEntry::built_in(crate::plugin::PluginSpec {
+            id: Cow::Borrowed("acme-link"),
+            crate_dir: Cow::Borrowed("acme-link"),
+            base: Cow::Owned(vec![
+                Contribution::IosLibrary {
+                    name: Cow::Borrowed("c++"),
+                },
+                Contribution::IosFramework {
+                    name: Cow::Borrowed("CoreML"),
+                },
+            ]),
+            ..crate::plugin::PluginSpec::DEFAULT
+        });
+        let pending: Vec<String> = pending_contributions(&app, &entry, &[])
+            .unwrap()
+            .iter()
+            .map(PendingContribution::describe)
+            .collect();
+        assert_eq!(
+            pending,
+            [
+                "Xcode library `-lc++` (`OTHER_LDFLAGS`)",
+                "Xcode framework `CoreML` (`OTHER_LDFLAGS`)",
+            ]
+        );
+        fs::remove_dir_all(app.join("ios")).unwrap();
+        assert_eq!(pending_contributions(&app, &entry, &[]).unwrap(), []);
         let _ = fs::remove_dir_all(&root);
     }
 
