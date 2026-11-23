@@ -159,6 +159,8 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   `notice_row`, `usage_meter` and `composer`. The feature adds three optional dependencies
   (`pulldown-cmark`, `imara-diff` and `web-time`); a build without it gains none. Markdown emits no
   HTML and fetches no image, and a link is reported only for an `http`, `https` or `mailto` URL.
+  An approval request can carry a `request_id`, and `on_select` receives an `ApprovalSelection`
+  naming the request and the chosen option.
   The glyph catalog gains an Agent chat page that plays a scripted turn through every component.
   See `plugins/glyph/README.md` and the `glyph-chat-*` entries of `docs/LIMITATIONS.md`.
 - `frust-charts` (`plugins/charts`): live charts drawn on the facade alone, with no platform code.
