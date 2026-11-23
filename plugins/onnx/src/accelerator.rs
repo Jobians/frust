@@ -4,10 +4,22 @@
 
 use std::fmt;
 
+use crate::{DType, TensorInfo};
+
 /// The hardware a session asks to run on.
 ///
-/// `Auto` picks per target: CoreML (all compute units) on Apple targets, the CPU everywhere else,
-/// Android included (the Android build of ONNX Runtime has no XNNPACK provider).
+/// `Auto` picks per target and per model. On Apple targets it is CoreML (all compute units) only
+/// when every model input has a fully static shape; a model with any dynamic input dimension
+/// loads on the CPU provider, and the load logs why. Everywhere else `Auto` is the CPU, Android
+/// included (the Android build of ONNX Runtime has no XNNPACK provider).
+///
+/// The rule exists because of what was measured on an Apple M4 (macOS 27, 640x480 input,
+/// default options). Depth Anything V2 Small, whose input `pixel_values` is `[?, 3, ?, ?]`: the
+/// CPU provider ran a warm median of 232 ms at 473 MB, CoreML (all units) 728 ms at 5.1 to
+/// 5.3 GB. U2-NetP, static `[1, 3, 320, 320]`: the CPU 90 ms at 432 MB, CoreML 75 ms at 564 MB
+/// (2.8 s on the first run). CoreML pays for dynamic shapes; it is only a win on static ones.
+/// Asking for [`Accelerator::CoreMl`] explicitly still forces CoreML on a dynamic-shape model,
+/// at the caller's risk of that time and memory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum Accelerator {
@@ -50,10 +62,29 @@ pub enum Provider {
 }
 
 impl Accelerator {
-    /// What `Auto` stands for on this target; any other value is returned unchanged.
+    /// What `Auto` stands for on this target for a model with static input shapes; any other
+    /// value is returned unchanged. Use [`resolve_for`](Self::resolve_for) when the model's
+    /// inputs are known.
     pub fn resolve(self) -> Accelerator {
         match self {
             Accelerator::Auto if cfg!(target_vendor = "apple") => {
+                Accelerator::CoreMl(CoreMlUnits::All)
+            }
+            Accelerator::Auto => Accelerator::Cpu,
+            other => other,
+        }
+    }
+
+    /// Like [`resolve`](Self::resolve), but `Auto` becomes CoreML on an Apple target only when
+    /// every one of `inputs` has a fully static shape (see the rule on [`Accelerator::Auto`]);
+    /// otherwise it is the CPU. Any other value is returned unchanged.
+    pub fn resolve_for(self, inputs: &[TensorInfo]) -> Accelerator {
+        self.resolve_for_target(inputs, cfg!(target_vendor = "apple"))
+    }
+
+    fn resolve_for_target(self, inputs: &[TensorInfo], apple: bool) -> Accelerator {
+        match self {
+            Accelerator::Auto if apple && inputs.iter().all(is_static) => {
                 Accelerator::CoreMl(CoreMlUnits::All)
             }
             Accelerator::Auto => Accelerator::Cpu,
@@ -92,6 +123,11 @@ impl fmt::Display for Provider {
             Provider::Xnnpack => "XNNPACK",
         })
     }
+}
+
+/// Whether `info` is a tensor whose every dimension is fixed.
+fn is_static(info: &TensorInfo) -> bool {
+    !matches!(info.dtype, DType::Other(_)) && info.shape.iter().all(Option::is_some)
 }
 
 /// Registers `accelerator`'s provider (never `Auto`, never `Cpu`) on `builder`, failing rather
@@ -153,6 +189,74 @@ mod apple {
                 );
                 None
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(shape: &[Option<usize>]) -> TensorInfo {
+        TensorInfo::new("x".to_owned(), shape.to_vec(), DType::F32)
+    }
+
+    #[test]
+    fn auto_on_apple_takes_coreml_only_for_static_inputs() {
+        let coreml = Accelerator::CoreMl(CoreMlUnits::All);
+        let fixed = info(&[Some(1), Some(3), Some(320), Some(320)]);
+        let dynamic = info(&[None, Some(3), None, None]);
+        let batch_only = info(&[None, Some(3), Some(8), Some(8)]);
+        assert_eq!(
+            Accelerator::Auto.resolve_for_target(std::slice::from_ref(&fixed), true),
+            coreml
+        );
+        assert_eq!(Accelerator::Auto.resolve_for_target(&[], true), coreml);
+        assert_eq!(
+            Accelerator::Auto.resolve_for_target(std::slice::from_ref(&dynamic), true),
+            Accelerator::Cpu
+        );
+        assert_eq!(
+            Accelerator::Auto.resolve_for_target(&[batch_only], true),
+            Accelerator::Cpu
+        );
+        assert_eq!(
+            Accelerator::Auto.resolve_for_target(&[fixed, dynamic], true),
+            Accelerator::Cpu
+        );
+    }
+
+    #[test]
+    fn non_tensor_input_counts_as_dynamic() {
+        let other = TensorInfo::new("seq".to_owned(), Vec::new(), DType::Other("seq".into()));
+        assert_eq!(
+            Accelerator::Auto.resolve_for_target(&[other], true),
+            Accelerator::Cpu
+        );
+    }
+
+    #[test]
+    fn auto_off_apple_is_always_cpu() {
+        let fixed = info(&[Some(1), Some(3)]);
+        assert_eq!(
+            Accelerator::Auto.resolve_for_target(&[fixed], false),
+            Accelerator::Cpu
+        );
+    }
+
+    #[test]
+    fn explicit_choices_are_untouched() {
+        let dynamic = info(&[None]);
+        let coreml = Accelerator::CoreMl(CoreMlUnits::CpuAndGpu);
+        for apple in [true, false] {
+            assert_eq!(
+                coreml.resolve_for_target(std::slice::from_ref(&dynamic), apple),
+                coreml
+            );
+            assert_eq!(
+                Accelerator::Cpu.resolve_for_target(std::slice::from_ref(&dynamic), apple),
+                Accelerator::Cpu
+            );
         }
     }
 }
