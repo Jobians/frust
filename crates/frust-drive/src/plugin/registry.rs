@@ -71,14 +71,16 @@
 //! (dependency, the plugin's own Android library module and the `PhotosUI`
 //! framework link; no permission or plist key in its base, and two optional
 //! features: `library` for album and asset browsing, and `save` for writing
-//! originals into the library), is described at `PHOTO_LIBRARY`. `models` is
-//! dependency only: an on-device model store and downloader needing no permission,
-//! Gradle module or plist key (the Hub downloads use the INTERNET permission the
-//! scaffold already declares). `onnx` is the dependency plus
-//! [`Contribution::AndroidLibcxxShared`] (the first entry to use it): ONNX Runtime
-//! links statically into the app's own `.so`, so there is no Gradle module, but
-//! the archive needs the NDK's `libc++_shared.so` in the APK; its iOS
-//! contributions are not settled yet (see `ONNX_BASE`).
+//! originals into the library), is described at `PHOTO_LIBRARY`. `models` is the
+//! dependency plus [`Contribution::ManifestPermission`] for
+//! `android.permission.INTERNET`: the scaffold declares INTERNET in its debug and
+//! profile manifests only, so a release app that adds `models` needs the main
+//! manifest to carry it for the Hub downloads (no Gradle module or plist key).
+//! `onnx` is the dependency, [`Contribution::AndroidLibcxxShared`] (the first
+//! entry to use it) and the same INTERNET permission for its default-on catalog
+//! downloads: ONNX Runtime links statically into the app's own `.so`, so there
+//! is no Gradle module, but the archive needs the NDK's `libc++_shared.so` in
+//! the APK; its iOS contributions are not settled yet (see `ONNX_BASE`).
 
 use std::borrow::Cow;
 
@@ -924,8 +926,20 @@ const DEVICE_INFO: PluginSpec = PluginSpec {
     ..PluginSpec::DEFAULT
 };
 
-/// `models`' single base contribution: a Cargo dependency only (a file store and an HTTPS
-/// downloader; no permission, Gradle module or plist key).
+/// `models`' base contributions: a Cargo dependency and the app's own
+/// `android.permission.INTERNET` `<uses-permission>` line. The scaffold declares
+/// INTERNET only in its debug and profile manifests, so a release build would
+/// otherwise fail every Hub download. No Gradle module or plist key: the file
+/// store and HTTPS downloader are pure Rust.
+const MODELS_BASE: &[Contribution] = &[
+    Contribution::CargoDep {
+        name: Cow::Borrowed("frust-models"),
+    },
+    Contribution::ManifestPermission {
+        permission: Cow::Borrowed("android.permission.INTERNET"),
+    },
+];
+
 const MODELS: PluginSpec = PluginSpec {
     id: Cow::Borrowed("models"),
     summary: Cow::Borrowed(
@@ -933,9 +947,7 @@ const MODELS: PluginSpec = PluginSpec {
               HTTPS URL), with reactive handles for progress and a model list.",
     ),
     crate_dir: Cow::Borrowed("models"),
-    base: Cow::Borrowed(&[Contribution::CargoDep {
-        name: Cow::Borrowed("frust-models"),
-    }]),
+    base: Cow::Borrowed(MODELS_BASE),
     optional_features: Cow::Borrowed(&[]),
     requires_sibling: None,
     ..PluginSpec::DEFAULT
@@ -948,18 +960,24 @@ const MODELS: PluginSpec = PluginSpec {
 /// - [`Contribution::AndroidLibcxxShared`]: on `aarch64-linux-android` the
 ///   prebuilt ONNX Runtime archive is linked statically into the app's own
 ///   `.so`, which then needs the NDK's `libc++_shared.so` (`NEEDED`); without
-///   it the APK installs and the library fails to load.
+///   it the APK installs and the library fails to load;
+/// - [`Contribution::ManifestPermission`] for `android.permission.INTERNET`: the
+///   vision catalog downloads its models by default, and the scaffold declares
+///   INTERNET in its debug and profile manifests only, so a release app needs
+///   the main manifest to carry it.
 ///
 /// No [`Contribution::GradleModule`] and no Maven repository: the static route
-/// ships no `libonnxruntime.so` and no Kotlin. No manifest permission: the
-/// vision catalog's downloads use the INTERNET permission the scaffold already
-/// declares. Nothing for iOS yet: its packaging route (and so any Swift
-/// package, framework link or `-l` flag) waits on the iOS link gate.
+/// ships no `libonnxruntime.so` and no Kotlin. Nothing for iOS yet: its
+/// packaging route (and so any Swift package, framework link or `-l` flag)
+/// waits on the iOS link gate.
 const ONNX_BASE: &[Contribution] = &[
     Contribution::CargoDep {
         name: Cow::Borrowed("frust-onnx"),
     },
     Contribution::AndroidLibcxxShared,
+    Contribution::ManifestPermission {
+        permission: Cow::Borrowed("android.permission.INTERNET"),
+    },
 ];
 
 const ONNX: PluginSpec = PluginSpec {
@@ -1672,9 +1690,10 @@ mod tests {
         );
     }
 
-    /// `onnx` is its Cargo dependency and the shared C++ runtime, nothing else.
+    /// `onnx` is its Cargo dependency, the shared C++ runtime and the INTERNET
+    /// permission its default-on catalog downloads need, nothing else.
     #[test]
-    fn onnx_is_a_cargo_dep_and_the_shared_cxx_runtime() {
+    fn onnx_is_a_cargo_dep_the_shared_cxx_runtime_and_internet() {
         let spec = find_plugin("onnx").unwrap();
         assert_eq!(spec.crate_dir, "onnx");
         assert!(spec.optional_features.is_empty());
@@ -1689,6 +1708,10 @@ mod tests {
                 },
                 // The static archive's `NEEDED libc++_shared.so` must be in the APK.
                 Contribution::AndroidLibcxxShared,
+                // The scaffold declares INTERNET in debug and profile only.
+                Contribution::ManifestPermission {
+                    permission: Cow::Borrowed("android.permission.INTERNET"),
+                },
             ]
         );
         // The static route ships no native module, Android or iOS.
@@ -1716,17 +1739,21 @@ mod tests {
         assert_eq!(users, ["onnx"]);
     }
 
-    /// `models` is one `CargoDep` on its own crate and nothing else.
+    /// `models` is its own `CargoDep` plus the INTERNET permission its Hub
+    /// downloads need, and nothing else.
     #[test]
-    fn models_is_a_cargo_dep_and_nothing_else() {
+    fn models_is_a_cargo_dep_and_internet_and_nothing_else() {
         let spec = find_plugin("models").unwrap();
         assert_eq!(spec.crate_dir, "models");
         assert!(spec.optional_features.is_empty());
         assert_eq!(spec.requires_sibling, None);
-        assert!(matches!(
-            &*spec.base,
-            [Contribution::CargoDep { name }] if *name == "frust-models"
-        ));
+        assert_eq!(spec.base.len(), 2, "{:?}", spec.base);
+        assert!(matches!(&spec.base[0], Contribution::CargoDep {
+                name
+            } if name == "frust-models"));
+        assert!(matches!(&spec.base[1], Contribution::ManifestPermission {
+                permission
+            } if permission == "android.permission.INTERNET"));
     }
 
     /// No registry entry or feature states a platform floor, so adding any of
@@ -1824,6 +1851,47 @@ mod tests {
         assert!(matches!(&spec.base[1], Contribution::ManifestPermission {
                 permission
             } if permission == "android.permission.VIBRATE"));
+    }
+
+    /// `models` on a fresh scaffold: the INTERNET permission lands in the main
+    /// manifest (the release app's, not only the debug and profile ones), and a
+    /// second add reports it already present and changes no file.
+    #[test]
+    fn models_add_plugin_puts_internet_in_the_main_manifest_and_reapply_is_idempotent() {
+        let root = scaffold_project("models-internet");
+
+        let first = add_plugin(&root, "models", &[]).unwrap();
+        assert_eq!(first.plugin_id, "models");
+        assert_eq!(first.items.len(), 2, "{first:?}");
+        assert!(
+            first.items.iter().all(|i| i.outcome == AddOutcome::Applied),
+            "{first:?}"
+        );
+
+        let manifest =
+            fs::read_to_string(root.join("android/app/src/main/AndroidManifest.xml")).unwrap();
+        assert!(
+            manifest.contains("android:name=\"android.permission.INTERNET\""),
+            "{manifest}"
+        );
+
+        let after_first = snapshot_tree(&root);
+        let second = add_plugin(&root, "models", &[]).unwrap();
+        assert_eq!(second.items.len(), 2);
+        assert!(
+            second
+                .items
+                .iter()
+                .all(|i| i.outcome == AddOutcome::AlreadyPresent),
+            "{second:?}"
+        );
+        assert_eq!(
+            after_first,
+            snapshot_tree(&root),
+            "a second apply must leave a byte-identical tree"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The `clipboard` entry is exactly one `CargoDep` — no manifest

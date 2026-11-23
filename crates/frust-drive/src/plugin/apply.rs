@@ -543,7 +543,7 @@ const IOS_DEPLOYMENT_TARGET: &str = "IPHONEOS_DEPLOYMENT_TARGET";
 /// property read when a project has no such variable.
 const MIN_SDK_VALUE: &str = "minSdkValue";
 const MIN_SDK: &str = "minSdk";
-const ANDROID_DIR_REL: &str = "android";
+pub(super) const ANDROID_DIR_REL: &str = "android";
 
 /// The highest floor over a plugin and its requested features: the iOS
 /// version as the registry writes it, and the Android API level.
@@ -1696,6 +1696,11 @@ fn apply_manifest_permission(
     project_root: &Path,
     permission: &str,
 ) -> Result<AddOutcome, PluginAddError> {
+    // A project without an `android/` directory has no manifest to edit, so
+    // the permission is satisfied there.
+    if !project_root.join(ANDROID_DIR_REL).is_dir() {
+        return Ok(AddOutcome::AlreadyPresent);
+    }
     let path = project_root.join(MANIFEST_REL);
     let src = read_required(&path, MANIFEST_REL)?;
     if manifest_permission_present(&src, permission) {
@@ -6848,6 +6853,10 @@ mod tests {
                     "Android `libc++_shared.so` in the APK (`frust.cargoNdk.linkLibcxxShared`)",
                     AddOutcome::Applied
                 ),
+                (
+                    "AndroidManifest.xml permission `android.permission.INTERNET`",
+                    AddOutcome::Applied
+                ),
             ]
         );
         let after = read_gradle_properties(&root);
@@ -6955,6 +6964,10 @@ mod tests {
                     "Android `libc++_shared.so` in the APK (`frust.cargoNdk.linkLibcxxShared`)",
                     AddOutcome::AlreadyPresent
                 ),
+                (
+                    "AndroidManifest.xml permission `android.permission.INTERNET`",
+                    AddOutcome::AlreadyPresent
+                ),
             ]
         );
         let after = snapshot_tree(&dest);
@@ -6977,6 +6990,86 @@ mod tests {
             matches!(status, crate::plugin::PluginStatus::Added),
             "{status:?}"
         );
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// `models` and `onnx` on a scaffold generated without the android platform:
+    /// only `Cargo.toml` changes, every Android item reports already present and
+    /// `plugin_statuses` reports both added.
+    #[test]
+    fn models_and_onnx_on_an_app_without_android_change_only_cargo_toml() {
+        let dest = unique_temp_dir("internet-no-android");
+        let platforms: Vec<_> = scaffold::ScaffoldPlatform::DEFAULT
+            .iter()
+            .copied()
+            .filter(|p| *p != scaffold::ScaffoldPlatform::Android)
+            .collect();
+        scaffold::generate_with_platforms(&dest, &test_context(), None, false, None, &platforms)
+            .unwrap();
+        assert!(!dest.join(ANDROID_DIR_REL).exists());
+        let before = snapshot_tree(&dest);
+
+        for id in ["models", "onnx"] {
+            let report = add_plugin(&dest, id, &[]).unwrap();
+            let internet = report
+                .items
+                .iter()
+                .find(|i| i.description.contains("android.permission.INTERNET"))
+                .unwrap();
+            assert_eq!(internet.outcome, AddOutcome::AlreadyPresent, "{report:?}");
+        }
+        let after = snapshot_tree(&dest);
+        let changed: Vec<&String> = after
+            .keys()
+            .filter(|k| before.get(*k) != after.get(*k))
+            .collect();
+        assert_eq!(changed, [CARGO_TOML_REL], "{changed:?}");
+        assert_eq!(before.len(), after.len());
+        assert!(!dest.join(ANDROID_DIR_REL).exists());
+
+        let catalog = PluginCatalog::built_in();
+        let statuses = crate::plugin::plugin_statuses(&dest, &catalog).unwrap();
+        for id in ["models", "onnx"] {
+            let (_, status) = statuses
+                .iter()
+                .find(|(entry, _)| &*entry.spec.id == id)
+                .unwrap();
+            assert!(
+                matches!(status, crate::plugin::PluginStatus::Added),
+                "{id}: {status:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// `haptics` on a desktop-only app: its VIBRATE permission is satisfied
+    /// without an `android/` directory, so only `Cargo.toml` changes.
+    #[test]
+    fn haptics_on_an_app_without_android_writes_only_the_dependency() {
+        let dest = unique_temp_dir("haptics-no-android");
+        let platforms: Vec<_> = scaffold::ScaffoldPlatform::DEFAULT
+            .iter()
+            .copied()
+            .filter(|p| *p != scaffold::ScaffoldPlatform::Android)
+            .collect();
+        scaffold::generate_with_platforms(&dest, &test_context(), None, false, None, &platforms)
+            .unwrap();
+        let before = snapshot_tree(&dest);
+
+        let report = add_plugin(&dest, "haptics", &[]).unwrap();
+        let vibrate = report
+            .items
+            .iter()
+            .find(|i| i.description.contains("android.permission.VIBRATE"))
+            .unwrap();
+        assert_eq!(vibrate.outcome, AddOutcome::AlreadyPresent, "{report:?}");
+        let after = snapshot_tree(&dest);
+        let changed: Vec<&String> = after
+            .keys()
+            .filter(|k| before.get(*k) != after.get(*k))
+            .collect();
+        assert_eq!(changed, [CARGO_TOML_REL], "{changed:?}");
+        assert!(!dest.join(ANDROID_DIR_REL).exists());
         let _ = fs::remove_dir_all(&dest);
     }
 
