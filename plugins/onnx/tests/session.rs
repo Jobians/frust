@@ -127,6 +127,26 @@ fn auto_reports_a_provider_and_runs() {
 }
 
 #[test]
+fn resolve_for_follows_the_input_shapes_of_a_loaded_model() {
+    let session = load(&SessionOptions::default()).expect("the fixture loads");
+    let resolved = Accelerator::Auto.resolve_for(session.inputs());
+    if cfg!(target_vendor = "apple") {
+        let static_inputs = session
+            .inputs()
+            .iter()
+            .all(|info| info.shape.iter().all(Option::is_some));
+        assert_eq!(resolved == Accelerator::Cpu, !static_inputs);
+        assert_eq!(session.provider() == Provider::Cpu, !static_inputs);
+    } else {
+        assert_eq!(resolved, Accelerator::Cpu);
+    }
+    assert_eq!(
+        Accelerator::Cpu.resolve_for(session.inputs()),
+        Accelerator::Cpu
+    );
+}
+
+#[test]
 fn an_unavailable_provider_falls_back_to_the_cpu() {
     assert!(!Provider::Xnnpack.is_compiled_in());
     let options = SessionOptions::default().with_accelerator(Accelerator::Xnnpack);
