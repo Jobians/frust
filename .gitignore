@@ -55,6 +55,11 @@
 # consuming app references the package. None of it is shared configuration.
 .swiftpm/
 
+# Xcode's per-user project state (window layout, breakpoints, scheme order),
+# written into every .xcodeproj/.xcworkspace opened in Xcode. Never shared
+# configuration; shared schemes live under `xcshareddata/`.
+xcuserdata/
+
 # Python bytecode caches (scripts/codemod tests)
 __pycache__/
 *.py[cod]
