@@ -15,8 +15,9 @@ Two destinations behind a Material 3 navigation bar:
   driven by `VisionHandle`: Subject mask (a tinted alpha layer over the photo), Faces (boxes
   and the five landmarks drawn over it) and Depth (a grayscale map, near is white). An action
   stays disabled, with a "download the model first" hint, until its model is in the store. The
-  status line names the execution provider that ran the session and the last run's time in
-  milliseconds; a task's first run includes loading its model.
+  status line shows the shown task's `VisionHandle::last_run`: the execution provider that ran
+  the session and the run's time in milliseconds, marked when the run included loading the
+  model.
 
 Nothing blocking runs on the UI thread: downloads run on their own threads, and photo
 decoding, the 2048 px downscale, disk walks, overlay conversion and inference run on blocking
@@ -45,7 +46,9 @@ frust build apk --target-platform android-arm64
   ```
 
   A release build needs signing values (`android/key.properties` or the `ANDROID_*`
-  variables; see `frust.toml`).
+  variables; see `frust.toml`). `android/app/src/main/AndroidManifest.xml` declares the
+  `INTERNET` permission by hand: the scaffold declares it only for debug and profile builds, and
+  without it every release download fails (`Operation not permitted`).
 - **iOS**: builds, but does not run the models yet. `frust-onnx` loads ONNX Runtime at run
   time on iOS and the app ships none (`frust plugin add onnx` makes no iOS edit until the iOS
   link gate settles it), so every task fails at session creation with `OnnxError::Runtime`,
@@ -117,7 +120,7 @@ shortened from `../../crates/frust/../../plugins/<id>` to `../../plugins/<id>`, 
 | Piece | Where |
 |-------|-------|
 | Shell (app bar, navigation bar, both screens kept mounted), `frust::app!` | `src/lib.rs` |
-| Shared handles: store, list, trackers, vision handle, run timing | `src/services.rs` |
+| Shared handles: store, list, trackers, vision handle | `src/services.rs` |
 | Models screen | `src/models_screen.rs` |
 | Vision screen, overlay canvas | `src/vision_screen.rs` |
 | Decoding, the 2048 px cap, overlay images | `src/imaging.rs` |
@@ -126,6 +129,26 @@ shortened from `../../crates/frust/../../plugins/<id>` to `../../plugins/<id>`, 
 
 ## Device status
 
-| Device | OS | Download / cancel / resume / delete | Subject mask | Faces | Depth | Provider and timings | Notes |
-|--------|----|-------------------------------------|--------------|-------|-------|----------------------|-------|
-| | | | | | | | |
+Release builds, `SessionOptions::default()`. Checklist: (1) fresh install lists three rows, none
+installed; (2) U2-NetP download with live progress, cancel, resume from the kept bytes, verified;
+(3) the other two, with the connection lost mid-download, a clean error and a resume; (4) the
+three tasks on the sample, overlays right, tabs switch during a run; (5) the three tasks on a
+picked photo of at least 12 MP; (6) median of five warm runs per task and provider; (7) the app
+sent to the background during a run; (8) relaunch keeps the models; (9) Delete returns the row
+to not installed and the storage line drops.
+
+| Device | OS | Packaging | 1 | 2 | 3 | 4 | 5 | 6: median warm ms (CPU) | 7 | 8 | 9 | Peak memory | App size |
+|--------|----|-----------|---|---|---|---|---|-------------------------|---|---|---|-------------|----------|
+| OnePlus 9 (LE2115, arm64) | Android 15 | ONNX Runtime 1.31.0 static in `libonnxvision.so` + `libc++_shared.so` | pass | pass | pass (connection lost by stopping the server) | pass | pass (4032x3024 JPEG, decoded at 2048x1536) | mask 519 / 522, faces 58 / 57, depth 930 / 947 (sample / photo); first runs with load 597, 69, 1,157 | pass (same process, the run completed, 1,649 ms) | pass | pass (32.1 MB to 27.5 MB) | 458 MB fresh with all three sessions; 499 MB after 30 runs | APK 33,366,987 B (app `.so` 31,780,904 B, `libc++_shared.so` 1,253,544 B) |
+| iPhone | iOS | run-time loading, no ONNX Runtime shipped | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run |
+| Mac (Apple silicon) | macOS | static, `coreml` archive | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run |
+| Linux desktop | glibc x86_64 | static, plain archive | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run | not run |
+
+Android notes. `Accelerator::Auto` is the CPU on Android, so one provider is measured. The phone
+had no internet during the run, so rows 2 and 3 downloaded the same pinned files (SHA-256
+checked by the app) from a computer over USB (`adb reverse` to a loopback HTTP server that
+honours `Range`); row 3's lost connection was that server stopping mid-download. Faces found no
+face on either image, as expected for images without a person: a check on a real face is owed.
+Depth put the sample's ball and the photo's sharp foreground disc near (white) and the sky and
+the blurred backdrop far, which matches near-is-one. The iPhone, macOS and Linux desktop rows
+are owed (Apple hardware; a Linux display server).
