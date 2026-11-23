@@ -9604,3 +9604,307 @@ viewport-top row, so the gap does not apply while it is stuck.
 **Evidence**: `crates/frust/tests/text_input_focus.rs` and the long-press tests in `crates/frust-widgets/src/gesture.rs`; no device run.
 
 ---
+
+### `onnx-runtime-build-time-fetch` — `frust-onnx` downloads ONNX Runtime at build time on desktop and Android, and fails to link offline
+
+**Observed**: the desktop and Android builds of `frust-onnx` fetch a prebuilt ONNX Runtime archive from the `ort` distribution CDN while building (about 10.7 MB on Linux), and cache it under the user cache directory. `cargo --offline`, `ORT_SKIP_DOWNLOAD` and `ORT_OFFLINE` do not skip the step: the link fails when the archive is not already cached.
+
+**Applies to**: any build of an app that depends on `frust-onnx` on a host that has never fetched the archive, including a clean CI runner and an air-gapped build machine.
+
+**Workaround**: build once with network access so the archive is cached, and carry the cache directory to the offline machine.
+
+**Why accepted**: the pinned `ort` fetches its runtime in its build script and offers no vendored alternative that keeps the exact-pinned prebuilt rows.
+
+**Trigger for removal**: `ort` or the crate vendors the archive, or frust adds its own offline path.
+
+**Evidence**: `plugins/onnx/Cargo.toml` (`download-binaries` feature rows) and `plugins/onnx/README.md` (build-time fetch section); the root CI jobs and the `onnx-vision` standalone job rely on the fetch.
+
+---
+
+### `onnx-ort-release-candidate-pin` — `frust-onnx` pins a release-candidate `ort` exactly
+
+**Observed**: the runtime binding is `ort = "=2.0.0-rc.15"`, a release candidate, pinned to one exact version and owned by frust (ONNX Runtime 1.31.0). A different `ort` release is never picked up by `cargo update`.
+
+**Applies to**: every app that depends on `frust-onnx`; a second crate in the graph that depends on a different `ort` will not resolve against it.
+
+**Workaround**: none needed; keep the other crates in the graph off `ort`.
+
+**Why accepted**: the release candidate is the line that binds the ONNX Runtime version frust ships and tests against; moving it is a deliberate bump with the plugin's gates.
+
+**Trigger for removal**: a stable `ort` 2.x that binds the same or a newer ONNX Runtime, at which point the pin moves to it.
+
+**Evidence**: root `Cargo.toml` (`ort` workspace dependency) and `plugins/onnx/Cargo.toml`.
+
+---
+
+### `onnx-needs-rust-1-92` — `frust-onnx` needs Rust 1.92, above the workspace minimum of 1.89
+
+**Observed**: the exact-pinned `ort` requires Rust 1.92, so `frust-onnx` declares `rust-version = "1.92"`. An app on an older toolchain cannot build it.
+
+**Applies to**: apps that add `frust-onnx` (the rest of the workspace still builds on 1.89).
+
+**Workaround**: build the app with Rust 1.92 or newer.
+
+**Why accepted**: the workspace minimum is not raised for one optional plugin.
+
+**Trigger for removal**: the pinned `ort` supports a lower Rust version, or the workspace minimum reaches 1.92.
+
+**Evidence**: `plugins/onnx/Cargo.toml` (`rust-version`).
+
+---
+
+### `onnx-android-binary-size` — ONNX Runtime adds about 20 MB to an Android APK
+
+**Observed**: ONNX Runtime is linked statically into the app's native library on Android arm64, which added 20.4 MB to the APK (the example's release APK is 33.4 MB). The prebuilt Linux archive downloads at about 10.7 MB.
+
+**Applies to**: Android apps that depend on `frust-onnx`. Per-platform sizes for the other targets are not recorded.
+
+**Workaround**: none; the size is not trimmed per operator set.
+
+**Why accepted**: the prebuilt archive is the full runtime, and frust ships no reduced-operator build.
+
+**Trigger for removal**: a reduced-operator ONNX Runtime build is offered, or a per-platform size is recorded as a gate.
+
+**Evidence**: `examples/onnx-vision` release APK measurement; `plugins/onnx/README.md` (Android packaging).
+
+---
+
+### `onnx-android-arm64-only` — `frust-onnx` ships an ONNX Runtime for Android arm64-v8a only
+
+**Observed**: no other Android ABI is linked: x86_64 and armeabi-v7a build with a run-time loader and ship no runtime, so every session fails with `OnnxError::Runtime` unless the app bundles its own `libonnxruntime.so`. The 32-bit Android ABI has no prebuilt archive at all.
+
+**Applies to**: Android emulators on x86_64 hosts and 32-bit devices.
+
+**Workaround**: test on an arm64 device or an arm64 emulator image.
+
+**Why accepted**: only the arm64-v8a build has been proven.
+
+**Trigger for removal**: an x86_64 build is proven, or a prebuilt archive exists for 32-bit Android.
+
+**Evidence**: `plugins/onnx/Cargo.toml` (target rows) and `plugins/onnx/README.md` (Android packaging, ABI table).
+
+---
+
+### `onnx-ios-packaging-missing` — `frust-onnx` has no iOS packaging, so ONNX sessions fail on iOS
+
+**Observed**: on iOS the crate compiles but loads ONNX Runtime at run time and no library is shipped in the app, so creating a session returns `OnnxError::Runtime`. `frust plugin add onnx` makes no iOS edit. Nothing about iOS inference has been run.
+
+**Applies to**: iOS devices and the simulator.
+
+**Workaround**: none; run vision features on other platforms, or ship a runtime library yourself and load it.
+
+**Why accepted**: the iOS link and packaging route has not been settled.
+
+**Trigger for removal**: an iOS packaging route is built and gated on a device.
+
+**Evidence**: `plugins/onnx/README.md` (iOS packaging); `examples/onnx-vision/README.md` (iOS).
+
+---
+
+### `onnx-coreml-unverified` — the CoreML execution provider has never run on Apple hardware
+
+**Observed**: `Accelerator::Auto` resolves to CoreML on Apple targets, but that code path has been compiled only, never run on a Mac, iPhone or iPad. Whether a model runs on CoreML, falls back to the CPU, or fails there is unknown.
+
+**Applies to**: Apple-silicon macOS and iOS.
+
+**Workaround**: pass `Accelerator::Cpu` to take the CPU path.
+
+**Why accepted**: no Apple hardware ran the plugin.
+
+**Trigger for removal**: an Apple-hardware gate runs the CoreML path and records the result.
+
+**Evidence**: `plugins/onnx/src/accelerator.rs`; no Apple-hardware run exists.
+
+---
+
+### `onnx-macos-windows-unverified` — `frust-onnx` and `frust-models` have not been built or run on macOS or Windows
+
+**Observed**: the macOS (Apple silicon) and Windows (MSVC) builds of both plugins and of `examples/onnx-vision` were never built or run; the Windows DirectML feature row is likewise unrun. The example's desktop legs on Linux, macOS and Windows have not been walked either; only its Android leg of the device gate passed.
+
+**Applies to**: macOS and Windows desktop apps using these plugins.
+
+**Workaround**: none.
+
+**Why accepted**: no macOS or Windows machine ran them.
+
+**Trigger for removal**: a macOS and a Windows gate record a build and a run.
+
+**Evidence**: `plugins/onnx/Cargo.toml` target rows; the example's device gate covers Android only.
+
+---
+
+### `onnx-no-intel-mac-or-x86-ios-sim` — `frust-onnx` has no ONNX Runtime for Intel macOS or the x86_64 iOS Simulator
+
+**Observed**: `ort` ships no prebuilt archive for Intel macOS or the x86_64 iOS Simulator, so those targets take the run-time route: the crate compiles and every session returns `OnnxError::Runtime` unless the app ships its own library.
+
+**Applies to**: Intel Macs and the simulator on an Intel Mac.
+
+**Workaround**: build ONNX Runtime yourself and ship it, or use Apple silicon.
+
+**Why accepted**: the pinned `ort` has no prebuilt row for them.
+
+**Trigger for removal**: `ort` ships a prebuilt row for them.
+
+**Evidence**: `plugins/onnx/README.md` (status and target table).
+
+---
+
+### `onnx-android-cpu-only` — ONNX on Android runs on the CPU only
+
+**Observed**: the Android archive contains an NNAPI provider but `frust-onnx` registers neither NNAPI nor QNN, and XNNPACK is compiled into no build. `Accelerator::Auto` is CoreML on Apple and the CPU elsewhere. Measured on an Android 15 phone (release, CPU): subject mask 519 ms, faces 58 ms, depth 930 ms warm median, 458 MB resident with all three models loaded.
+
+**Applies to**: Android, and every desktop target (CPU only).
+
+**Workaround**: none; an `Xnnpack` request is accepted but has no effect.
+
+**Why accepted**: NNAPI and QNN were not proven to be faster or correct for the catalog models.
+
+**Trigger for removal**: an accelerator is registered and gated per model.
+
+**Evidence**: `plugins/onnx/README.md` (execution providers); device gate timings.
+
+---
+
+### `models-no-free-space-check` — model downloads do not check free disk space first
+
+**Observed**: `frust-models` starts a download without comparing the file size to the free space on the volume, so a full disk fails part-way as an I/O error, leaving a `.part` file that a resume or a delete clears.
+
+**Applies to**: downloads of the catalog models (0.2 MB to 27 MB) on a nearly full device.
+
+**Workaround**: free space before downloading, and delete the model to remove its partial file.
+
+**Why accepted**: free-space queries differ per platform and were not built.
+
+**Trigger for removal**: the downloader checks free space (or the app does, through a hook).
+
+**Evidence**: `plugins/models/src/download.rs`.
+
+---
+
+### `models-resume-without-validator` — a model download resume does not send an ETag or If-Range validator
+
+**Observed**: resume continues from the `.part` file with a `Range` request but does not send `If-Range`. If the file changed upstream between attempts, the server can answer the range from the new file. The final SHA-256 and size checks catch this for a model with a known digest, not for one without.
+
+**Applies to**: interrupted downloads resumed after the upstream file changed, mainly Hub files addressed by a moving revision.
+
+**Workaround**: address Hub files by a commit revision and give the download a SHA-256.
+
+**Why accepted**: the checks at the end of a download cover the pinned catalog models.
+
+**Trigger for removal**: resume stores the validator and sends `If-Range`.
+
+**Evidence**: `plugins/models/src/download.rs`.
+
+---
+
+### `models-no-multipart-or-http` — `frust-models` downloads one file over HTTPS only
+
+**Observed**: a download is a single file from the Hugging Face Hub or an HTTPS URL. Sharded or multi-part models, and `http://` sources, are not supported; redirects are followed by the crate (at most five, HTTPS only), and the Hub token is sent only to the Hub origin.
+
+**Applies to**: models published as several files and plain-HTTP mirrors.
+
+**Workaround**: download the parts as separate models, or serve them over HTTPS.
+
+**Why accepted**: the supported shape is the single-file ONNX model.
+
+**Trigger for removal**: multi-part downloads are needed by a consumer.
+
+**Evidence**: `plugins/models/src/download.rs`, `plugins/models/src/hub.rs`.
+
+---
+
+### `models-user-installed-unverified` — a model imported by the user is stored without verification
+
+**Observed**: `ModelStore` imports a local file and records it with no SHA-256 check and `verified = false` in its manifest. The store cannot tell a corrupted or substituted file from a good one, and a session on a malformed model fails or misbehaves inside ONNX Runtime.
+
+**Applies to**: models added through import rather than downloaded with a known digest.
+
+**Workaround**: supply and compare the digest yourself before importing.
+
+**Why accepted**: an imported file has no expected digest to check against.
+
+**Trigger for removal**: an import path accepts an expected digest.
+
+**Evidence**: `plugins/models/src/store.rs` (manifest `verified` field).
+
+---
+
+### `onnx-face-detection-unverified` — face detection is unverified on real faces and stretches the input
+
+**Observed**: `detect_faces` (YuNet) stretches any photo to 640x640 instead of letterboxing it, so boxes on a non-square photo are distorted before mapping back, and it has not been run on a real photograph of a face.
+
+**Applies to**: apps that use `detect_faces`.
+
+**Workaround**: crop to a square before calling it.
+
+**Why accepted**: the gate ran the plumbing, not recall on faces.
+
+**Trigger for removal**: a face fixture is added and the input is letterboxed.
+
+**Evidence**: `plugins/onnx/src/vision/`; `examples/onnx-vision` (the bundled sample is a generated image, not a photograph of a face).
+
+---
+
+### `onnx-hot-run-libcxx-shared` — `frust run --hot` on Android may not package `libc++_shared.so`
+
+**Observed**: the app needs the NDK's `libc++_shared.so` in the APK when `frust-onnx` is linked statically. The `frust.cargoNdk.linkLibcxxShared` Gradle property makes the scaffold's `cargoNdkBuild` task add it, but the hot-run path has not been checked to go through that task.
+
+**Applies to**: Android apps that use `frust-onnx` run with `--hot`.
+
+**Workaround**: run without `--hot`.
+
+**Why accepted**: the hot path was not exercised.
+
+**Trigger for removal**: a hot run is checked with the property set.
+
+**Evidence**: `crates/frust-drive/src/plugin/registry.rs` (`AndroidLibcxxShared`).
+
+---
+
+### `plugin-add-android-after-plugin` — adding the android platform after a plugin does not report the skipped Android contributions as pending
+
+**Observed**: `frust plugin add` satisfies `ManifestPermission` and `AndroidLibcxxShared` contributions only when the project has an `android/` directory, and skips them otherwise (so `frust plugin add haptics` works on a desktop-only app). If `android/` is added later, those skipped contributions are not reported as pending.
+
+**Applies to**: a project that adds the android platform after adding `models`, `onnx` or another plugin that contributes to it.
+
+**Workaround**: re-run `frust plugin add <id>` after adding the platform, or make the edits listed in the plugin README.
+
+**Why accepted**: the skipped set is not recorded anywhere.
+
+**Trigger for removal**: the pending report covers skipped contributions.
+
+**Evidence**: `crates/frust-drive/src/plugin/pending.rs`.
+
+---
+
+### `onnx-vision-android-polish` — the onnx-vision example labels picked Android photos by media id and its accessibility tree can go stale during a download
+
+**Observed**: on Android a photo picked with the system picker is labelled by its media id rather than its file name, and while a model downloads the accessibility tree is not refreshed with the progress line, so a screen reader can read stale text.
+
+**Applies to**: `examples/onnx-vision` on Android.
+
+**Workaround**: none.
+
+**Why accepted**: the example is a demonstration and neither gap blocks it.
+
+**Trigger for removal**: the picker returns a display name; the progress line is announced.
+
+**Evidence**: `examples/onnx-vision` Android device gate.
+
+---
+
+### `android-release-internet-from-plugin-only` — a release scaffold declares `INTERNET` only when a plugin contributes it
+
+**Observed**: `frust create` declares `android.permission.INTERNET` only in the debug and profile manifests. A release build gets it from `frust plugin add models` or `frust plugin add onnx`; an app that downloads for another reason, or adds the dependency by hand, must write the line itself or its release downloads fail with `Operation not permitted`.
+
+**Applies to**: release builds on Android.
+
+**Workaround**: add `<uses-permission android:name="android.permission.INTERNET" />` to `android/app/src/main/AndroidManifest.xml`.
+
+**Why accepted**: the scaffold keeps a release app offline unless a plugin needs the network.
+
+**Trigger for removal**: the scaffold declares it by option.
+
+**Evidence**: `plugins/models/README.md`, `plugins/onnx/README.md`; the `models` and `onnx` registry entries.
+
+---

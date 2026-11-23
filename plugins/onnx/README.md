@@ -26,7 +26,7 @@ Building it needs Rust 1.92 or newer (the pinned `ort` requires it), above the w
 frust plugin add onnx
 ```
 
-or pick **onnx** in the TUI's Add Plugin dialog. It makes two edits to a project made by
+or pick **onnx** in the TUI's Add Plugin dialog. It makes three edits to a project made by
 `frust create`:
 
 - `Cargo.toml`: the `frust-onnx` dependency, written in the form the app's own `frust`
@@ -34,15 +34,16 @@ or pick **onnx** in the TUI's Add Plugin dialog. It makes two edits to a project
 - `android/gradle.properties`: `frust.cargoNdk.linkLibcxxShared=true`, so the scaffold's
   `cargoNdkBuild` task packages the NDK's `libc++_shared.so` (see
   [Android packaging](#6-android-packaging)).
+- `android/app/src/main/AndroidManifest.xml`: `<uses-permission android:name="android.permission.INTERNET" />`
+  in the main manifest, because the catalog downloads need it and the scaffold declares it only in
+  its debug and profile manifests.
 
-It adds no Gradle module, Swift package, permission or plist key. The catalog downloads need the
-`INTERNET` permission, which the scaffold declares only in its debug and profile manifests: for a
-release build add `<uses-permission android:name="android.permission.INTERNET" />` to
-`android/app/src/main/AndroidManifest.xml` yourself (`examples/onnx-vision` does). Running it
-twice changes nothing. A
+It adds no Gradle module, Swift package or plist key. Running it twice changes nothing. A
 project whose `android/app/build.gradle.kts` predates the property is refused before anything is
 written, and the error quotes the line to add. Adding the dependency by hand
-(`frust-onnx = "0.6"`) skips the Android edit; make it yourself or the APK will not load.
+(`frust-onnx = "0.6"`) skips the two Android edits; make them yourself (the property, and the
+permission for a release build that downloads) or the APK will not load or downloads will fail.
+A project with no `android/` directory gets only the dependency.
 
 Features, all on by default:
 
