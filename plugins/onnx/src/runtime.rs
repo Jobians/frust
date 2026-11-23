@@ -63,6 +63,7 @@ pub(crate) fn environment() -> Result<&'static Environment, OnnxError> {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ),
     all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "ios", target_arch = "aarch64", not(target_abi = "macabi")),
     all(
         target_os = "windows",
         target_env = "msvc",
@@ -87,6 +88,7 @@ mod link {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ),
     all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "ios", target_arch = "aarch64", not(target_abi = "macabi")),
     all(
         target_os = "windows",
         target_env = "msvc",
