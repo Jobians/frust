@@ -107,6 +107,20 @@ builds reuse the cache without network access. To build without the download, po
 On the run-time-loading targets the library is the one named by `ORT_DYLIB_PATH`, else the
 platform's `onnxruntime` library on the loader path; it must be ONNX Runtime 1.17 or newer.
 
+### The macOS release link
+
+The archive's CoreML objects call `___isPlatformVersionAtLeast`, the `@available` check from
+clang's builtins. Cross-crate LTO is what removes it: `lto = "fat"` or `"thin"` (the release
+profile `frust create` writes uses `"fat"`) internalizes the standard library's copy, which
+satisfies the call in every other build, while `codegen-units = 1`, `strip = "symbols"` and
+`panic = "abort"` each link fine on their own. On Apple-silicon macOS the crate's build script
+therefore asks `clang --print-file-name=libclang_rt.osx.a` for the toolchain's builtins archive and
+adds it to the final link, so an app needs no linker flag; the linker takes the function from it
+only when nothing else defines it. If `clang` cannot find the archive, the build prints a
+`frust-onnx` warning and an LTO release build fails as above: install the Xcode command-line tools,
+or build with `RUSTFLAGS="-C link-arg=-fapple-link-rtlib"`. Every other target, iOS and Intel
+macOS included, gets nothing from the script.
+
 ---
 
 ## 2. Sessions and accelerators
