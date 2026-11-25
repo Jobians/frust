@@ -8,6 +8,7 @@ use std::time::Instant;
 
 use frust::{ReadSignal, RwSignal, Set};
 
+use super::publish::Outbox;
 use crate::catalog::{VisionModel, VisionTask};
 use crate::vision::{Face, VisionModels, VisionRun};
 use crate::{OnnxError, Plane, Provider, RgbaView};
@@ -16,9 +17,10 @@ use crate::{OnnxError, Plane, Provider, RgbaView};
 ///
 /// From a request made while the handle is idle, the status is
 /// [`Running`](Self::Running) before the request call returns; it then names each task as the
-/// worker starts it, and becomes [`Idle`](Self::Idle) once the worker has published its last
-/// result, or [`Failed`](Self::Failed) when a request fails. A failure stays until the next
-/// request starts. The same status is never published twice in a row; a component reading the
+/// worker starts it, and becomes [`Idle`](Self::Idle) once the worker's last result is written,
+/// or [`Failed`](Self::Failed) when a request fails. A failure stays until the next request
+/// starts. Every status is written on the UI thread, in this order, the result it follows
+/// written first. The same status is never published twice in a row; a component reading the
 /// signal may still miss a short one between two frames, which
 /// [`VisionHandle::on_status`] does not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -57,6 +59,38 @@ type RunnerFn =
 
 type StatusObserver = Arc<dyn Fn(&VisionStatus) + Send + Sync>;
 
+/// One signal write, made on the worker and applied on the UI thread.
+enum Update {
+    Status(VisionStatus),
+    /// A task's result and its run report, written in this order.
+    Result(Value, Option<VisionRun>),
+}
+
+/// A result already checked against the task that asked for it.
+enum Value {
+    Mask(Arc<Plane>),
+    Faces(Arc<Vec<Face>>),
+    Depth(Arc<Plane>),
+}
+
+impl Value {
+    /// `output` as `task`'s result; an output of the wrong kind is an error.
+    fn of(task: VisionTask, output: VisionOutput) -> Result<Self, OnnxError> {
+        match (task, output) {
+            (VisionTask::Segmentation, VisionOutput::Plane(plane)) => {
+                Ok(Self::Mask(Arc::new(plane)))
+            }
+            (VisionTask::Depth, VisionOutput::Plane(plane)) => Ok(Self::Depth(Arc::new(plane))),
+            (VisionTask::FaceDetection, VisionOutput::Faces(faces)) => {
+                Ok(Self::Faces(Arc::new(faces)))
+            }
+            (task, _) => Err(OnnxError::Run(format!(
+                "the {task:?} task returned another task's result"
+            ))),
+        }
+    }
+}
+
 /// One queued request.
 struct Job {
     task: VisionTask,
@@ -86,12 +120,11 @@ struct Inner {
     worker: bool,
     /// The newest request's generation, per task.
     latest: [u64; TASKS],
-    /// The last status written, kept here so the worker never reads the signal.
+    /// The last status queued, kept here so the worker never reads the signal.
     published: VisionStatus,
-    observer: Option<StatusObserver>,
 }
 
-/// The signals, the backend and the lock every status write goes through.
+/// The signals, the backend, the lock every update is queued under and the queue itself.
 struct Shared {
     backend: Backend,
     status: RwSignal<VisionStatus>,
@@ -102,7 +135,10 @@ struct Shared {
     runs: [RwSignal<Option<VisionRun>>; TASKS],
     /// Read handles made once beside the writable signals, so an accessor allocates nothing.
     reads: Reads,
+    observer: Mutex<Option<StatusObserver>>,
     inner: Mutex<Inner>,
+    /// The signal writes on their way to the UI thread, in the order they were queued.
+    outbox: Outbox<Update>,
 }
 
 /// The read side of [`Shared`]'s signals.
@@ -120,11 +156,20 @@ struct Reads {
 /// [`segment`](Self::segment), [`detect_faces`](Self::detect_faces) and
 /// [`estimate_depth`](Self::estimate_depth) return at once. The request runs on the handle's
 /// worker thread, `frust-onnx-vision`, which loads the model on first use and runs it through
-/// [`VisionModels`]; requests run one at a time, in the order made. The worker then writes the
-/// task's result signal ([`mask`](Self::mask), [`faces`](Self::faces),
-/// [`depth`](Self::depth)), then the task's [`last_run`](Self::last_run) (provider and
-/// duration), then [`status`](Self::status). It only writes signals: it never
-/// reads one, never waits on the UI thread, and holds the handle's lock only while it writes.
+/// [`VisionModels`]; requests run one at a time, in the order made.
+///
+/// **Every signal is written on the UI thread.** The worker never writes one: it hands the
+/// task's result ([`mask`](Self::mask), [`faces`](Self::faces), [`depth`](Self::depth)), the
+/// task's [`last_run`](Self::last_run) (provider and duration) and the next
+/// [`status`](Self::status) to the UI thread, which writes them in that order on its next pump
+/// of the local task queue (the runtime wakes the shell for it). A request call applies the
+/// waiting writes itself before it returns. The worker never reads a signal, never waits on the
+/// UI thread, and holds the handle's lock only while it queues.
+///
+/// Construct the handle anywhere; make the requests on the UI thread, from `init`, an event
+/// handler or a `frust::spawn_local` task, with the reactive runtime a running app has. A
+/// request made on another thread panics before it changes anything (the first one with
+/// `frust::spawn_local`'s message).
 ///
 /// **A newer request for a task supersedes an older one.** A queued older request is dropped
 /// unrun; one already running finishes, and its result is dropped, so a result signal never
@@ -136,8 +181,9 @@ struct Reads {
 /// [`OnnxError::ModelMissing`]'s message; check [`missing_models`](Self::missing_models) first.
 ///
 /// Clones share the worker, the queue and the signals. Dropping the handle does not cancel the
-/// queue: the worker runs what is queued, its writes are harmless, and it ends once the queue is
-/// empty. The thread holds no thread-local state.
+/// queue: the worker runs what is queued and ends once the queue is empty, and the UI thread
+/// still applies its writes, which are harmless, then drops its task. The thread holds no
+/// thread-local state.
 #[derive(Clone)]
 pub struct VisionHandle {
     shared: Arc<Shared>,
@@ -203,18 +249,26 @@ impl VisionHandle {
                 depth,
                 runs,
                 reads,
+                observer: Mutex::new(None),
                 inner: Mutex::new(Inner::default()),
+                outbox: Outbox::new(),
             }),
         }
     }
 
     /// Calls `observer` with every status the handle publishes, in order, right after the
-    /// signal is written, for example to log the requests. It runs on whichever thread
-    /// published the status, with the handle's lock held: keep it short and never call back
-    /// into the handle from it.
+    /// signal is written, for example to log the requests. It runs on the UI thread, where
+    /// every write is made: inside the request call for the `Running` it publishes, and
+    /// otherwise in the pump of the UI thread's local queue that applies the status. No lock of
+    /// the handle is held, so it may read the handle's signals; keep it short and make no
+    /// request from it.
     #[must_use]
     pub fn on_status(self, observer: impl Fn(&VisionStatus) + Send + Sync + 'static) -> Self {
-        self.shared.lock().observer = Some(Arc::new(observer));
+        *self
+            .shared
+            .observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(observer));
         self
     }
 
@@ -286,6 +340,12 @@ impl VisionHandle {
         height: u32,
         min_score: Option<f32>,
     ) {
+        let shared = self.shared.clone();
+        // Panics off the UI thread, before anything has changed.
+        let work = self
+            .shared
+            .outbox
+            .begin("a VisionHandle request", move |update| shared.apply(update));
         let mut inner = self.shared.lock();
         let latest = &mut inner.latest[slot(task)];
         *latest += 1;
@@ -301,15 +361,20 @@ impl VisionHandle {
             min_score,
         });
         if inner.worker {
+            // The running worker serves the job and holds its own token.
+            drop(inner);
             return;
         }
         inner.worker = true;
         self.shared.publish(&mut inner, VisionStatus::Running(task));
         let shared = self.shared.clone();
-        // The worker's first lock waits for the one held here, so `Running` comes first.
+        // The worker's first lock waits for the one held here, so `Running` is queued first.
         let spawned = thread::Builder::new()
             .name("frust-onnx-vision".to_owned())
-            .spawn(move || shared.work());
+            .spawn(move || {
+                let _work = work;
+                shared.work();
+            });
         if let Err(err) = spawned {
             inner.worker = false;
             inner.queue.clear();
@@ -318,6 +383,10 @@ impl VisionHandle {
                 VisionStatus::Failed(format!("the vision worker thread did not start: {err}")),
             );
         }
+        drop(inner);
+        // `Running`, and anything the worker has queued since, is written before the call
+        // returns.
+        self.shared.outbox.flush(|update| self.shared.apply(update));
     }
 }
 
@@ -326,15 +395,49 @@ impl Shared {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Queues `status` unless it is the last one queued. Called with the lock held, so updates
+    /// are queued in the order they are made, whichever thread makes them.
     fn publish(&self, inner: &mut Inner, status: VisionStatus) {
         if inner.published == status {
             return;
         }
-        self.status.set(status.clone());
-        if let Some(observer) = &inner.observer {
-            observer(&status);
-        }
+        self.outbox.push(Update::Status(status.clone()));
         inner.published = status;
+    }
+
+    /// Writes one update to its signals. UI thread only: the outbox's drain task and the
+    /// request call's flush are its only callers.
+    fn apply(&self, update: Update) {
+        match update {
+            Update::Status(status) => {
+                self.status.set(status.clone());
+                let observer = self
+                    .observer
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(observer) = observer {
+                    observer(&status);
+                }
+            }
+            Update::Result(value, run) => {
+                let task = match value {
+                    Value::Mask(mask) => {
+                        self.mask.set(Some(mask));
+                        VisionTask::Segmentation
+                    }
+                    Value::Faces(faces) => {
+                        self.faces.set(faces);
+                        VisionTask::FaceDetection
+                    }
+                    Value::Depth(depth) => {
+                        self.depth.set(Some(depth));
+                        VisionTask::Depth
+                    }
+                };
+                self.runs[slot(task)].set(run);
+            }
+        }
     }
 
     /// The worker thread: runs the queue to its end.
@@ -367,9 +470,9 @@ impl Shared {
                 // Superseded while it ran: the result is dropped.
                 false
             } else {
-                match result.and_then(|output| self.write(job.task, output)) {
-                    Ok(()) => {
-                        self.runs[slot(job.task)].set(run);
+                match result.and_then(|output| Value::of(job.task, output)) {
+                    Ok(value) => {
+                        self.outbox.push(Update::Result(value, run));
                         false
                     }
                     Err(err) => {
@@ -412,27 +515,6 @@ impl Shared {
             Backend::Models(models) => models.cache().load_count(),
             Backend::Runner(..) => 0,
         }
-    }
-
-    /// Writes `output` to `task`'s result signal; an output of the wrong kind is an error.
-    fn write(&self, task: VisionTask, output: VisionOutput) -> Result<(), OnnxError> {
-        match (task, output) {
-            (VisionTask::Segmentation, VisionOutput::Plane(plane)) => {
-                self.mask.set(Some(Arc::new(plane)));
-            }
-            (VisionTask::Depth, VisionOutput::Plane(plane)) => {
-                self.depth.set(Some(Arc::new(plane)));
-            }
-            (VisionTask::FaceDetection, VisionOutput::Faces(faces)) => {
-                self.faces.set(Arc::new(faces));
-            }
-            (task, _) => {
-                return Err(OnnxError::Run(format!(
-                    "the {task:?} task returned another task's result"
-                )));
-            }
-        }
-        Ok(())
     }
 }
 

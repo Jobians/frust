@@ -647,13 +647,19 @@ column()
   idle shows `Running` before the call returns; `Idle` comes once the last queued result is
   published. A failure (a model not downloaded, a buffer of the wrong size) keeps the task's
   previous result and stays until the next request starts. `on_status` sees every status, in
-  order, for logging.
+  order, for logging; it runs on the UI thread, right after the status is written.
 - **The newest request for a task wins.** Requests run one at a time on the handle's own worker
   thread, `frust-onnx-vision`, in the order made. A newer request for the same task drops a
   queued older one unrun; one already running finishes and its result is dropped, so `mask()`
   never goes back to an older image. Requests for different tasks do not replace each other.
-- The worker only writes signals: it never reads one and never waits on the UI thread. It starts
-  on the first request, ends when the queue is empty, and holds no thread-local state.
+- Every signal is written on the UI thread. The worker never writes one: it hands each result,
+  run report and status to the UI thread, which writes them in that order on its next pump of the
+  local task queue; a request call writes the waiting ones, `Running` included, before it
+  returns. The worker never reads a signal and never waits on the UI thread. It starts on the
+  first request, ends when the queue is empty, and holds no thread-local state.
+- Make the requests on the UI thread (in `init`, a handler or a `frust::spawn_local` task), with
+  the reactive runtime a running app has: on another thread a request panics before it changes
+  anything.
 - `last_run(task)` is a signal of the task's last published run, `Option<VisionRun>`: the
   provider of the session that ran it, its `duration` on the worker (queue wait excluded) and
   `loaded_model`, set when the run loaded the session, so the time includes the load. It is
@@ -678,8 +684,10 @@ cargo test -p frust-onnx --test catalog -- --ignored   # live: every catalog pin
 The default tests need the build-time ONNX Runtime download on the first build of a machine and no
 network afterwards; the session tests run small models under `tests/fixtures`. `tests/api.rs`
 drives `VisionHandle` over a stub runner, so it loads no model: it checks the status order, that
-a superseded request's result is dropped, that an error becomes `Failed` and that each task's
-`last_run` reports the published run's provider and duration. The registry entry
+a superseded request's result is dropped, that an error becomes `Failed`, that each task's
+`last_run` reports the published run's provider and duration, and that every signal write lands
+on the UI thread, also while the UI reads every signal in a tight loop as 2,000 requests
+complete. The registry entry
 and its Android and iOS edits are tested in `frust-drive` (`cargo test -p frust-drive plugin::`).
 
 ## 13. License

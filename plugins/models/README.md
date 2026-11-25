@@ -170,8 +170,8 @@ into signals a component's `build` reads.
 
 - `ModelList::new(store)` holds the stored models. It starts empty; call `refresh()` once (for
   example in `init`). `refresh()` and `remove(id)` do their disk work on `frust::spawn_blocking`
-  and publish the new listing, so they need the reactive runtime a running app has.
-  `models()` is a `ReadSignal<Vec<LocalModel>>`.
+  and publish the new listing from the UI thread, so they need the reactive runtime a running app
+  has and must be called on the UI thread. `models()` is a `ReadSignal<Vec<LocalModel>>`.
 - `DownloadTracker::new()` runs one download at a time. `state()` is a
   `ReadSignal<DownloadState>` (`Idle`, `Running`, `Verifying`, `Done`, `Cancelled`,
   `Failed(String)`) and `progress()` a `ReadSignal<DownloadProgress>` with `bytes`, `total`,
@@ -186,11 +186,17 @@ into signals a component's `build` reads.
 - For each download the state is `Running` first, then `Verifying` and `Running` may alternate
   (at most one `Verifying` per file), then exactly one of `Done`, `Cancelled` or `Failed` comes
   last. A `build` may miss a short state between frames; `on_state(observer)` sees every one.
-- `DownloadTracker::with_list(list)` links a list: the download thread rescans the store just
-  before the state becomes `Done`, so a component that sees `Done` already sees the new models.
-- The code on the download thread only writes signals: it never reads one, never blocks on the
-  UI and never calls back into the downloader. Dropping the tracker does not cancel the
-  download; call `cancel()` first.
+- `DownloadTracker::with_list(list)` links a list: the download thread rescans the store and the
+  new listing is written just before the state becomes `Done`, so a component that sees `Done`
+  already sees the new models.
+- Every signal is written on the UI thread. The download thread and the blocking pool never write
+  one: they hand each state, progress value and listing to the UI thread, which writes them in
+  order on its next pump of the local task queue; a start call writes the waiting ones, `Running`
+  included, before it returns. They never read a signal, never block on the UI and never call
+  back into the downloader. `on_state` runs on the UI thread, right after the state is written.
+  Call `start_hub`, `start`, `refresh` and `remove` on the UI thread: on another thread they panic
+  before changing anything. Dropping the tracker does not cancel the download; call `cancel()`
+  first.
 
 `examples/download_component.rs` shows the whole shape in one `Component`: a list of stored
 models, a download button, a cancel button and a progress line. It compiles under
@@ -201,5 +207,7 @@ models, a download button, a cancel button and a progress line. It compiles unde
 `cargo test -p frust-models` runs everything against an in-process loopback server that stands
 in for the Hub and its CDN (`tests/support`); nothing touches the network. Tests that need the
 reactive runtime call `frust_reactive::ReactiveRuntime::init` first, which starts the blocking
-pool `spawn_blocking` uses and opens no GPU device. Point a store at a scratch directory with
+pool `spawn_blocking` uses, makes the test's thread the UI thread and opens no GPU device; they
+pump `ReactiveRuntime::pump_local` while they wait, as a shell does each frame, and check that
+every signal write lands on the test's thread. Point a store at a scratch directory with
 `ModelStore::with_root`.

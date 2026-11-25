@@ -1,35 +1,59 @@
+//! `DownloadTracker` and `ModelList` against the loopback Hub fixture. Each test starts the
+//! reactive runtime on its own thread, which makes that thread the UI thread, and pumps its local
+//! task queue the way a shell does each frame: every signal write is made there.
+
 #![cfg(all(feature = "frust-api", feature = "hub"))]
 
 mod support;
 
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
-use frust::GetUntracked;
+use frust::{Get, GetUntracked};
 use frust_models::api::{DownloadState, DownloadTracker, ModelList};
 use frust_models::{DownloadRequest, HubClient, ModelId, ModelsError};
+use frust_reactive::{ReactiveRuntime, RepaintScope};
 use support::Temp;
 use support::http_fixture::{BLOB, Fixture, REPO, TOKENIZER};
 
-fn runtime() {
-    frust_reactive::ReactiveRuntime::init(Arc::new(|| {}));
+fn runtime() -> &'static ReactiveRuntime {
+    ReactiveRuntime::init(Arc::new(|| {}))
 }
 
 fn client(fx: &Fixture) -> HubClient {
     HubClient::new().unwrap().with_base_url(fx.hub.clone())
 }
 
-/// Polls `cond` until it holds, failing after ten seconds.
-fn until(what: &str, mut cond: impl FnMut() -> bool) {
+/// Pumps the UI thread's local queue until `cond` holds, failing after `limit`.
+fn pump_until(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
+    let rt = runtime();
     let start = Instant::now();
-    while !cond() {
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "timed out: {what}"
-        );
-        std::thread::sleep(Duration::from_millis(2));
+    loop {
+        rt.pump_local();
+        if cond() {
+            return;
+        }
+        assert!(start.elapsed() < limit, "timed out: {what}");
+        thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// Pumps the UI thread's local queue until `cond` holds, failing after ten seconds.
+fn until(what: &str, cond: impl FnMut() -> bool) {
+    pump_until(what, Duration::from_secs(10), cond);
+}
+
+/// Records the thread of every write to the signals `track` reads, at the moment of the write.
+fn write_threads(track: impl FnOnce()) -> (RepaintScope, Arc<Mutex<Vec<ThreadId>>>) {
+    let threads: Arc<Mutex<Vec<ThreadId>>> = Arc::default();
+    let record = threads.clone();
+    let scope = RepaintScope::every_change(Arc::new(move || {
+        record.lock().unwrap().push(thread::current().id());
+    }));
+    scope.track(track);
+    (scope, threads)
 }
 
 /// Every state a tracker published, recorded by its `on_state` observer, so no state can be
@@ -43,10 +67,12 @@ impl StateLog {
     /// Waits for the next terminal state and returns every state recorded up to it, clearing
     /// the log for the next download.
     fn next_download(&self) -> Vec<DownloadState> {
-        let terminal = self
-            .terminals
-            .recv_timeout(Duration::from_secs(30))
-            .expect("a terminal state");
+        let mut terminal = None;
+        pump_until("a terminal state", Duration::from_secs(30), || {
+            terminal = self.terminals.try_recv().ok();
+            terminal.is_some()
+        });
+        let terminal = terminal.expect("a terminal state");
         let states = std::mem::take(&mut *self.states.lock().unwrap());
         assert_eq!(states.last(), Some(&terminal), "{states:?}");
         states
@@ -279,4 +305,133 @@ fn list_refresh_and_remove_run_off_the_calling_thread() {
 
     list.remove(id);
     until("the list to empty", || models.get_untracked().is_empty());
+}
+
+#[test]
+fn every_tracker_and_list_write_and_every_observer_call_runs_on_the_ui_thread() {
+    runtime();
+    let ui = thread::current().id();
+    let fx = Fixture::start();
+    let tmp = Temp::new();
+    let store = tmp.store();
+    let client = client(&fx);
+    let list = ModelList::new(store.clone());
+    let observed: Arc<Mutex<Vec<ThreadId>>> = Arc::default();
+    let record = observed.clone();
+    let (terminal_tx, terminals) = mpsc::channel();
+    let terminal_tx = Mutex::new(terminal_tx);
+    let tracker = DownloadTracker::new()
+        .with_list(list.clone())
+        .on_state(move |state| {
+            record.lock().unwrap().push(thread::current().id());
+            if state.is_terminal() {
+                let _ = terminal_tx.lock().unwrap().send(state.clone());
+            }
+        });
+    let (_scope, writes) = write_threads(|| {
+        let _ = tracker.state().get();
+        let _ = tracker.progress().get();
+        let _ = list.models().get();
+    });
+
+    tracker
+        .start_hub(&client, &store, REPO, "main", &[BLOB, TOKENIZER])
+        .unwrap();
+    // No pump yet: the start call itself wrote `Running`.
+    assert_eq!(tracker.state().get_untracked(), DownloadState::Running);
+    assert_eq!(observed.lock().unwrap().len(), 1);
+    let mut terminal = None;
+    until("the download to end", || {
+        terminal = terminals.try_recv().ok();
+        terminal.is_some()
+    });
+    assert_eq!(terminal, Some(DownloadState::Done));
+    assert_eq!(list.models().get_untracked().len(), 2);
+
+    let id = ModelId::hub(REPO, TOKENIZER).unwrap();
+    list.remove(id);
+    until("the list to shrink", || {
+        list.models().get_untracked().len() == 1
+    });
+    list.refresh();
+    let before = writes.lock().unwrap().len();
+    until("the refresh to land", || {
+        writes.lock().unwrap().len() > before
+    });
+
+    let writes = writes.lock().unwrap().clone();
+    // Progress, the states, the linked list's rescan, the removal and the refresh.
+    assert!(writes.len() >= 6, "{writes:?}");
+    assert!(writes.iter().all(|&id| id == ui), "{writes:?}");
+    let observed = observed.lock().unwrap().clone();
+    assert!(observed.len() >= 2, "{observed:?}");
+    assert!(observed.iter().all(|&id| id == ui), "{observed:?}");
+}
+
+#[test]
+fn dropping_the_tracker_mid_download_neither_panics_nor_leaks_the_task() {
+    runtime();
+    let fx = Fixture::start();
+    let tmp = Temp::new();
+    let store = tmp.store();
+    let client = client(&fx);
+    let list = ModelList::new(store.clone());
+    let alive = Arc::new(());
+    let held = alive.clone();
+    let tracker = DownloadTracker::new()
+        .with_list(list.clone())
+        .on_state(move |_| {
+            let _held = &held;
+        });
+
+    fx.hold_next_body();
+    tracker
+        .start_hub(&client, &store, REPO, "main", &[BLOB])
+        .unwrap();
+    fx.wait_held();
+    drop(tracker);
+    fx.release();
+    // The observer is freed once the download thread has ended and the UI thread's task, which
+    // still applied the download's writes, has dropped it.
+    pump_until(
+        "the download and the UI task to end",
+        Duration::from_secs(30),
+        || Arc::strong_count(&alive) == 1,
+    );
+    assert_eq!(
+        list.models().get_untracked().len(),
+        1,
+        "the rescan was still applied"
+    );
+}
+
+#[test]
+fn a_start_or_refresh_off_the_ui_thread_panics_and_changes_nothing() {
+    runtime();
+    let fx = Fixture::start();
+    let tmp = Temp::new();
+    let store = tmp.store();
+    let client = client(&fx);
+    let tracker = Arc::new(DownloadTracker::new());
+    let list = ModelList::new(store.clone());
+
+    let off = (tracker.clone(), client.clone(), store.clone(), list.clone());
+    let outcome = thread::spawn(move || {
+        let (tracker, client, store, _) = off;
+        tracker.start_hub(&client, &store, REPO, "main", &[TOKENIZER])
+    })
+    .join();
+    assert!(outcome.is_err(), "a start off the UI thread panics");
+    let off = list.clone();
+    assert!(thread::spawn(move || off.refresh()).join().is_err());
+    runtime().pump_local();
+    assert_eq!(tracker.state().get_untracked(), DownloadState::Idle);
+
+    // The tracker still works from the UI thread.
+    tracker
+        .start_hub(&client, &store, REPO, "main", &[TOKENIZER])
+        .unwrap();
+    until("the download to end", || {
+        tracker.state().get_untracked() == DownloadState::Done
+    });
 }
