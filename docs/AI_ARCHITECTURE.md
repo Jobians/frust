@@ -105,20 +105,23 @@ app ──► frust (facade)
   request it already has) and returns: the state is `Running` at once, the repository listing is
   fetched on `frust::spawn_blocking`, and `Downloader::start` runs the job on its own thread. That
   thread writes the `.part` file, hashes while writing, checks size and digest, renames the file
-  into the store with its manifest, and feeds `DownloadEvent`s back; the tracker turns them into
-  writes of its state and progress signals and, with a linked `ModelList`, rescans the store
-  before `Done`. The download thread only writes signals: it never reads one, never waits on the
-  UI thread and never calls back into the downloader. A blocking Hub call made on the UI thread
-  fails at once with `ModelsError::UiThread` on Android and Apple.
+  into the store with its manifest, and feeds `DownloadEvent`s back; the tracker queues them as
+  writes the UI thread applies in order, and a linked `ModelList` rescans on the download thread,
+  its listing written on the UI thread before `Done`. The download thread writes no signal, never
+  reads one, never waits on the UI thread and never calls back into the downloader. A blocking
+  Hub call made on the UI thread fails at once with `ModelsError::UiThread` on Android and Apple.
 - **An inference.** A handler hands `VisionHandle` an `Arc<[u8]>` of RGBA pixels and returns; the
   status is `Running` before the call returns. The handle's worker thread runs the request
   through `VisionModels`, which loads the task's model from the store on first use through its
   `SessionCache` (one session per task, checked to fit the task), converts the pixels to a
   tensor, runs the session on ONNX Runtime and decodes the output into a `Plane` or `Face`s. The
-  worker writes the result signal and `last_run` (provider, run time, whether the run loaded the
-  session), then `Idle` once the queue is empty. The newest request for a task drops a queued
-  older one, and a superseded result is never published. A model missing from the store is
-  `OnnxError::ModelMissing`; nothing is substituted.
+  worker queues the result signal and `last_run` (provider, run time, whether the run loaded the
+  session), then `Idle` once the queue is empty; the UI thread writes them in that order. The
+  newest request for a task drops a queued older one, and a superseded result is never published.
+  A model missing from the store is `OnnxError::ModelMissing`; nothing is substituted.
+- **Threads.** The three handles write signals only on the UI thread. Starts, requests, `refresh`
+  and `remove` must be called there and panic elsewhere; a call applies waiting writes before it
+  returns, and observers (`on_state`, `on_status`) run on the UI thread right after a write.
 - **Memory pressure.** The app keeps its own clone of the `Arc<VisionModels>` and clears its
   session cache on the platform's memory-pressure signal. The sizes behind the session-cache bound
   and the memory defaults (no CPU arena, no memory pattern) are in the onnx README's Sessions and
