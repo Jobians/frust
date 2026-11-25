@@ -639,6 +639,9 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 
 ### Fixed
 
+- `frust-onnx`: an app's LTO release build (the template's `lto = "fat"` profile) links on
+  Apple-silicon macOS; it failed on `___isPlatformVersionAtLeast`, which the crate's build script
+  now takes from clang's builtins archive. Other targets are unchanged.
 - iOS: Return on a single-line text field now submits it (`on_submit`) instead of inserting a
   line break; a multi-line field still gets a new line.
 - `frust-camera`: on Android the camera preview no longer stays shrunk after the device is turned
