@@ -3,7 +3,8 @@
 //! The component owns a `ModelList` and a `DownloadTracker`. `build` only reads their signals;
 //! the buttons write them through the handles. No handler waits on the network:
 //! `DownloadTracker::start_hub` fetches the repository listing on `frust::spawn_blocking` and
-//! reports a failure through the state signal. Run it inside a Frust app by passing
+//! reports a failure through the state signal, which, like every signal of the two handles, is
+//! written on the UI thread. Run it inside a Frust app by passing
 //! `ModelsScreen` to `frust::app!`; here it only has to compile.
 
 use frust::{Component, Get, RwSignal, Set, View, button, column, text};

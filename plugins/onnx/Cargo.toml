@@ -33,6 +33,11 @@ frust-models = { path = "../models", version = "0.6.6", default-features = false
 # Published as frust-ui, imported as frust: crates.io `frust` belongs to another project.
 frust = { package = "frust-ui", path = "../../crates/frust", version = "0.6.6", default-features = false, optional = true }
 
+[dev-dependencies]
+# Dev-only: the facade does not re-export `ReactiveRuntime`, whose UI-thread queue the api tests
+# pump, nor `RepaintScope`, which sees on which thread each signal write lands.
+frust-reactive = { workspace = true }
+
 # Each desktop row's feature set must equal one prebuilt row of ort-sys' `dist.tsv` exactly (no
 # `lax-feature-matching`): plain on Linux, `coreml` on Apple-silicon macOS, `directml` on Windows.
 # rustls only: native-tls/OpenSSL never enters the tree. `api-17` is the lowest level `ort` offers.

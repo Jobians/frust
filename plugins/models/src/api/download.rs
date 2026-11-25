@@ -5,6 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use frust::{ReadSignal, RwSignal, Set, spawn_blocking};
 
 use super::ModelList;
+use super::list::Scan;
+use super::publish::{Outbox, Work};
 use crate::download::{DownloadEvent, DownloadHandle, DownloadRequest, DownloadSink, Downloader};
 use crate::error::ModelsError;
 use crate::hub::HubClient;
@@ -22,8 +24,9 @@ use crate::store::ModelStore;
 /// 3. Exactly one terminal state, [`Done`](Self::Done), [`Cancelled`](Self::Cancelled) or
 ///    [`Failed`](Self::Failed), comes last. Nothing follows it until the next start.
 ///
-/// The same state is never published twice in a row. A component reading the signal may still
-/// miss short states between two frames; [`DownloadTracker::on_state`] sees every one.
+/// The same state is never published twice in a row. Every state is written on the UI thread,
+/// in this order. A component reading the signal may still miss short states between two
+/// frames; [`DownloadTracker::on_state`] sees every one.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum DownloadState {
     /// Nothing has been started, or the tracker was never used.
@@ -70,23 +73,40 @@ type StateObserver = Arc<dyn Fn(&DownloadState) + Send + Sync>;
 /// [`state`](Self::state) and [`progress`](Self::progress) are read-only signals for a
 /// component's `build`. [`start_hub`](Self::start_hub), [`start`](Self::start) and
 /// [`cancel`](Self::cancel) are called from event handlers and never block on the network:
-/// `start_hub` builds its request on `frust::spawn_blocking`. The code that runs on the download
-/// thread only writes signals: it never reads one, never blocks on the UI and never calls back
-/// into the downloader. Signal writes go through a short lock the tracker owns, which keeps the
-/// order [`DownloadState`] documents.
+/// `start_hub` builds its request on `frust::spawn_blocking`.
 ///
-/// Dropping the tracker does not cancel the download. The thread keeps running to its end and
-/// its signal writes are harmless; call [`cancel`](Self::cancel) first to stop it.
+/// **Every signal is written on the UI thread.** The download thread and the blocking pool never
+/// write one: they hand each state and progress value to the UI thread, which writes them in the
+/// order they were made on its next pump of the local task queue (the runtime wakes the shell
+/// for it). A start call applies the waiting writes itself before it returns. The download
+/// thread never reads a signal, never blocks on the UI and never calls back into the
+/// downloader; it takes the tracker's short lock only to queue a write, which keeps the order
+/// [`DownloadState`] documents.
+///
+/// Construct the tracker anywhere; call `start_hub` and `start` on the UI thread, with the
+/// reactive runtime a running app has. Called on another thread, a start panics before it changes
+/// anything (the first one with `frust::spawn_local`'s message).
+///
+/// Dropping the tracker does not cancel the download. The thread keeps running to its end, the
+/// UI thread still applies its writes, which are harmless, and then drops its task; call
+/// [`cancel`](Self::cancel) first to stop it.
 ///
 /// Link a [`ModelList`] with [`with_list`](Self::with_list) and a finished download rescans the
-/// store on the download thread before the state becomes [`DownloadState::Done`], so a
-/// component that sees `Done` also sees the new models.
+/// store on the download thread; the new listing is written before the state becomes
+/// [`DownloadState::Done`], so a component that sees `Done` also sees the new models.
 pub struct DownloadTracker {
     publisher: Publisher,
-    list: Option<ModelList>,
 }
 
-/// The signals and the lock every state write goes through.
+/// One signal write, made off the UI thread and applied on it.
+enum Update {
+    State(DownloadState),
+    Progress(DownloadProgress),
+    /// The linked list's rescan, written before the `Done` that follows it.
+    List(Scan),
+}
+
+/// The signals, the lock every update is queued under and the queue itself.
 #[derive(Clone)]
 struct Publisher {
     state: RwSignal<DownloadState>,
@@ -95,7 +115,10 @@ struct Publisher {
     state_read: ReadSignal<DownloadState>,
     progress_read: ReadSignal<DownloadProgress>,
     observer: Option<StateObserver>,
+    list: Option<ModelList>,
     inner: Arc<Mutex<Inner>>,
+    /// The signal writes on their way to the UI thread, in the order they were queued.
+    outbox: Outbox<Update>,
 }
 
 #[derive(Default)]
@@ -107,7 +130,7 @@ struct Inner {
     handle: Option<DownloadHandle>,
     /// Number of files of the running download.
     files: usize,
-    /// The last state written, kept here so the download thread never reads the signal.
+    /// The last state queued, kept here so the download thread never reads the signal.
     published: DownloadState,
 }
 
@@ -116,14 +139,13 @@ impl Publisher {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Queues `state` unless it is the last one queued. Called with the lock held, so updates
+    /// are queued in the order they are made, whichever thread makes them.
     fn publish(&self, inner: &mut Inner, state: DownloadState) {
         if inner.published == state {
             return;
         }
-        self.state.set(state.clone());
-        if let Some(observer) = &self.observer {
-            observer(&state);
-        }
+        self.outbox.push(Update::State(state.clone()));
         inner.published = state;
     }
 
@@ -133,11 +155,43 @@ impl Publisher {
         inner.cancel_requested = false;
         inner.handle = None;
         inner.files = files;
-        self.progress.set(DownloadProgress {
+        self.outbox.push(Update::Progress(DownloadProgress {
             files,
             ..DownloadProgress::default()
-        });
+        }));
         self.publish(inner, DownloadState::Running);
+    }
+
+    /// Starts a download's unit of work on the UI thread, which keeps the task that applies
+    /// its updates running. Panics off the UI thread, before anything has changed.
+    fn work(&self, call: &str) -> Work<Update> {
+        let publisher = self.clone();
+        self.outbox
+            .begin(call, move |update| publisher.apply(update))
+    }
+
+    /// Writes every waiting update now. UI thread only.
+    fn flush(&self) {
+        self.outbox.flush(|update| self.apply(update));
+    }
+
+    /// Writes one update to its signals. UI thread only: the outbox's drain task and a start
+    /// call's flush are its only callers.
+    fn apply(&self, update: Update) {
+        match update {
+            Update::State(state) => {
+                self.state.set(state.clone());
+                if let Some(observer) = &self.observer {
+                    observer(&state);
+                }
+            }
+            Update::Progress(progress) => self.progress.set(progress),
+            Update::List(scan) => {
+                if let Some(list) = &self.list {
+                    list.apply(scan);
+                }
+            }
+        }
     }
 
     fn finish(&self, inner: &mut Inner, terminal: DownloadState) {
@@ -171,22 +225,24 @@ impl DownloadTracker {
                 state_read: state.read_only(),
                 progress_read: progress.read_only(),
                 observer: None,
+                list: None,
                 inner: Arc::default(),
+                outbox: Outbox::new(),
             },
-            list: None,
         }
     }
 
     /// Links `list` so a finished download refreshes it. Use the same store for both.
     pub fn with_list(mut self, list: ModelList) -> Self {
-        self.list = Some(list);
+        self.publisher.list = Some(list);
         self
     }
 
     /// Calls `observer` with every state the tracker publishes, in order, right after the
-    /// signal is written, for example to log a download. It runs on whichever thread
-    /// published the state, with the tracker's lock held: keep it short and never call back
-    /// into the tracker from it.
+    /// signal is written, for example to log a download. It runs on the UI thread, where every
+    /// write is made: inside the start call for the first `Running`, and otherwise in the pump of
+    /// the UI thread's local queue that applies the state. No lock of the tracker is held, so it
+    /// may read the tracker's signals; keep it short and never start or cancel from it.
     pub fn on_state(mut self, observer: impl Fn(&DownloadState) + Send + Sync + 'static) -> Self {
         self.publisher.observer = Some(Arc::new(observer));
         self
@@ -211,8 +267,9 @@ impl DownloadTracker {
     /// download already owns) ends in [`DownloadState::Failed`].
     ///
     /// This is the path for an event handler: it never blocks on the network. It needs the
-    /// reactive runtime a running app has. Fails with [`ModelsError::Busy`] while an earlier
-    /// download of this tracker has not ended, leaving the signals as they were.
+    /// reactive runtime a running app has and the UI thread. Fails with [`ModelsError::Busy`]
+    /// while an earlier download of this tracker has not ended, leaving the signals as they
+    /// were.
     pub fn start_hub(
         &self,
         client: &HubClient,
@@ -221,6 +278,7 @@ impl DownloadTracker {
         revision: &str,
         paths: &[&str],
     ) -> Result<(), ModelsError> {
+        let work = self.publisher.work("DownloadTracker::start_hub");
         {
             let mut inner = self.publisher.lock();
             if inner.active {
@@ -228,8 +286,10 @@ impl DownloadTracker {
             }
             self.publisher.begin(&mut inner, paths.len());
         }
+        // `Running` is written before the call returns.
+        self.publisher.flush();
         let publisher = self.publisher.clone();
-        let sink = self.sink();
+        let sink = self.sink(work);
         let (client, store) = (client.clone(), store.clone());
         let (repo, revision) = (repo.to_owned(), revision.to_owned());
         let paths: Vec<String> = paths.iter().map(|p| (*p).to_owned()).collect();
@@ -254,25 +314,31 @@ impl DownloadTracker {
     /// a handler uses [`start_hub`](Self::start_hub) for Hub files; this suits a
     /// [`DownloadRequest::from_url`] request, which builds without the network.
     ///
-    /// Fails with [`ModelsError::Busy`] while an earlier download of this tracker has not
-    /// ended, and with whatever [`Downloader::start`] reports (for example a file another
-    /// download already owns). On failure the signals are left as they were.
+    /// Call it on the UI thread, with the reactive runtime a running app has. Fails with
+    /// [`ModelsError::Busy`] while an earlier download of this tracker has not ended, and with
+    /// whatever [`Downloader::start`] reports (for example a file another download already
+    /// owns). On failure the signals are left as they were.
     pub fn start(
         &self,
         client: &HubClient,
         store: &ModelStore,
         request: DownloadRequest,
     ) -> Result<(), ModelsError> {
-        let mut inner = self.publisher.lock();
-        if inner.active {
-            return Err(ModelsError::Busy);
+        let work = self.publisher.work("DownloadTracker::start");
+        {
+            let mut inner = self.publisher.lock();
+            if inner.active {
+                return Err(ModelsError::Busy);
+            }
+            let files = request.items.len();
+            // The download thread's first event waits for the lock held here, so `Running` is
+            // queued before anything the thread reports.
+            let handle = Downloader::start(client, store, request, self.sink(work))?;
+            self.publisher.begin(&mut inner, files);
+            inner.handle = Some(handle);
         }
-        let files = request.items.len();
-        // The download thread's first event waits for the lock held here, so `Running` is
-        // published before anything the thread reports.
-        let handle = Downloader::start(client, store, request, self.sink())?;
-        self.publisher.begin(&mut inner, files);
-        inner.handle = Some(handle);
+        // `Running` is written before the call returns.
+        self.publisher.flush();
         Ok(())
     }
 
@@ -289,23 +355,27 @@ impl DownloadTracker {
         }
     }
 
-    fn sink(&self) -> DownloadSink {
+    /// The download's sink. It owns `work`, so the UI thread's task applying the updates runs
+    /// until the last copy of the sink is dropped: when the download thread ends, or when the
+    /// request is never started.
+    fn sink(&self, work: Work<Update>) -> DownloadSink {
         let publisher = self.publisher.clone();
-        let list = self.list.clone();
         Arc::new(move |event| {
+            let _running = &work;
             // The rescan touches the disk, so it runs before the lock is taken.
-            if let (DownloadEvent::Done(_), Some(list)) = (&event, &list) {
-                list.refresh_now();
-            }
+            let scan = match (&event, &publisher.list) {
+                (DownloadEvent::Done(_), Some(list)) => Some(list.scan()),
+                _ => None,
+            };
             let mut inner = publisher.lock();
             match event {
                 DownloadEvent::Started { total, files, .. } => {
                     inner.files = files;
-                    publisher.progress.set(DownloadProgress {
+                    publisher.outbox.push(Update::Progress(DownloadProgress {
                         total,
                         files,
                         ..DownloadProgress::default()
-                    });
+                    }));
                     publisher.publish(&mut inner, DownloadState::Running);
                 }
                 DownloadEvent::Progress {
@@ -314,19 +384,24 @@ impl DownloadTracker {
                     bytes_per_sec,
                     file_index,
                 } => {
-                    publisher.progress.set(DownloadProgress {
+                    publisher.outbox.push(Update::Progress(DownloadProgress {
                         bytes,
                         total,
                         bytes_per_sec,
                         file_index,
                         files: inner.files,
-                    });
+                    }));
                     publisher.publish(&mut inner, DownloadState::Running);
                 }
                 DownloadEvent::Verifying { .. } => {
                     publisher.publish(&mut inner, DownloadState::Verifying);
                 }
-                DownloadEvent::Done(_) => publisher.finish(&mut inner, DownloadState::Done),
+                DownloadEvent::Done(_) => {
+                    if let Some(scan) = scan {
+                        publisher.outbox.push(Update::List(scan));
+                    }
+                    publisher.finish(&mut inner, DownloadState::Done);
+                }
                 DownloadEvent::Cancelled { .. } | DownloadEvent::Error(ModelsError::Cancelled) => {
                     publisher.finish(&mut inner, DownloadState::Cancelled);
                 }

@@ -1,21 +1,67 @@
-//! `VisionHandle` over a stub runner: the status order, the supersede rule, failures and the
-//! per-task run reports, with no model and no ONNX Runtime session involved.
+//! `VisionHandle` over a stub runner: the status order, the supersede rule, failures, the
+//! per-task run reports, and that every signal write lands on the UI thread, with no model and no
+//! ONNX Runtime session involved.
+//!
+//! Each test starts the reactive runtime on its own thread, which makes that thread the UI
+//! thread, and pumps its local task queue the way a shell does each frame.
 
 #![cfg(all(feature = "frust-api", feature = "vision"))]
 
 mod support;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::thread::{self, ThreadId};
+use std::time::{Duration, Instant};
 
-use frust::GetUntracked;
+use frust::{Get, GetUntracked};
 use frust_models::ModelId;
 use frust_onnx::api::{VisionHandle, VisionOutput, VisionStatus};
 use frust_onnx::catalog::VisionTask;
 use frust_onnx::{Face, OnnxError, Plane, Provider, RgbaView, SessionOptions, VisionModels};
+use frust_reactive::{ReactiveRuntime, RepaintScope};
 
 const WAIT: Duration = Duration::from_secs(10);
+
+const TASKS: [VisionTask; 3] = [
+    VisionTask::Segmentation,
+    VisionTask::FaceDetection,
+    VisionTask::Depth,
+];
+
+/// Starts the reactive runtime with the calling test thread as its UI thread, as a shell does.
+fn runtime() -> &'static ReactiveRuntime {
+    ReactiveRuntime::init(Arc::new(|| {}))
+}
+
+/// Pumps the UI thread's local queue, as a shell does each frame, until `rx` yields.
+fn pump_recv<T>(rx: &Receiver<T>) -> T {
+    let rt = runtime();
+    let start = Instant::now();
+    loop {
+        rt.pump_local();
+        if let Ok(value) = rx.try_recv() {
+            return value;
+        }
+        assert!(start.elapsed() < WAIT, "timed out pumping the UI thread");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Pumps the UI thread's local queue until `cond` holds.
+fn pump_until(what: &str, mut cond: impl FnMut() -> bool) {
+    let rt = runtime();
+    let start = Instant::now();
+    loop {
+        rt.pump_local();
+        if cond() {
+            return;
+        }
+        assert!(start.elapsed() < WAIT, "timed out: {what}");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
 
 /// An opaque RGBA8 image of `width` x `height`.
 fn image(width: u32, height: u32) -> Arc<[u8]> {
@@ -47,7 +93,7 @@ impl StatusLog {
     /// Waits for the next `Idle` or `Failed` and returns every status recorded up to it,
     /// clearing the log.
     fn next_settled(&self) -> Vec<VisionStatus> {
-        let last = self.settled.recv_timeout(WAIT).expect("the handle settles");
+        let last = pump_recv(&self.settled);
         let statuses = std::mem::take(&mut *self.statuses.lock().unwrap());
         assert_eq!(statuses.last(), Some(&last), "{statuses:?}");
         statuses
@@ -55,6 +101,7 @@ impl StatusLog {
 }
 
 fn logged(handle: VisionHandle) -> (VisionHandle, StatusLog) {
+    runtime();
     let statuses: Arc<Mutex<Vec<VisionStatus>>> = Arc::default();
     let (tx, settled) = mpsc::channel();
     let record = statuses.clone();
@@ -378,6 +425,241 @@ fn each_task_reports_the_provider_and_duration_of_its_last_published_run() {
         handle.last_run(VisionTask::Segmentation).get_untracked(),
         Some(first)
     );
+}
+
+/// Reads every signal of `handle` the way a component's `build` does.
+fn read_all(handle: &VisionHandle) {
+    let _ = handle.status().get();
+    let _ = handle.mask().get();
+    let _ = handle.faces().get();
+    let _ = handle.depth().get();
+    for task in TASKS {
+        let _ = handle.last_run(task).get();
+    }
+}
+
+/// The UI thread reads every signal in a tight loop, pumping its queue as a shell does each
+/// frame, while 2,000 requests complete. A worker that wrote the signals itself made such a read
+/// meet its write lock, which panics, or made its write meet the read and vanish.
+#[test]
+fn ui_reads_in_a_tight_loop_while_two_thousand_requests_complete() {
+    const REQUESTS: usize = 2_000;
+    let rt = runtime();
+    let settled = Arc::new(AtomicUsize::new(0));
+    let count = settled.clone();
+    let handle = VisionHandle::with_runner(|task, image| {
+        Ok(match task {
+            VisionTask::FaceDetection => VisionOutput::Faces(vec![face(image.width() as f32)]),
+            _ => VisionOutput::Plane(plane_of(image, image.width() as f32)),
+        })
+    })
+    .on_status(move |status| {
+        if *status == VisionStatus::Idle {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    for i in 0..REQUESTS {
+        let width = (i % 7 + 1) as u32;
+        let before = settled.load(Ordering::SeqCst);
+        match TASKS[i % TASKS.len()] {
+            VisionTask::Segmentation => handle.segment(image(width, 1), width, 1),
+            VisionTask::FaceDetection => handle.detect_faces(image(width, 1), width, 1, None),
+            VisionTask::Depth => handle.estimate_depth(image(width, 1), width, 1),
+        }
+        let start = Instant::now();
+        while settled.load(Ordering::SeqCst) == before {
+            read_all(&handle);
+            rt.pump_local();
+            assert!(
+                start.elapsed() < WAIT,
+                "request {i} never settled: {:?}",
+                handle.status().get()
+            );
+        }
+    }
+    read_all(&handle);
+    assert_eq!(handle.status().get(), VisionStatus::Idle);
+    // The last three requests, one per task, left their results.
+    let last = |offset: usize| ((REQUESTS - offset) % 7 + 1) as u32;
+    let by_task = |task: VisionTask| {
+        (1..=TASKS.len())
+            .find(|&offset| TASKS[(REQUESTS - offset) % TASKS.len()] == task)
+            .map(last)
+            .unwrap()
+    };
+    assert_eq!(
+        handle.mask().get().map(|m| m.width as u32),
+        Some(by_task(VisionTask::Segmentation))
+    );
+    assert_eq!(
+        handle.depth().get().map(|d| d.width as u32),
+        Some(by_task(VisionTask::Depth))
+    );
+    assert_eq!(
+        handle.faces().get()[0].score,
+        by_task(VisionTask::FaceDetection) as f32
+    );
+    for task in TASKS {
+        assert!(handle.last_run(task).get().is_some(), "{task:?}");
+    }
+}
+
+/// Records the thread of every write to the signals `track` reads, at the moment of the write.
+fn write_threads(track: impl FnOnce()) -> (RepaintScope, Arc<Mutex<Vec<ThreadId>>>) {
+    let threads: Arc<Mutex<Vec<ThreadId>>> = Arc::default();
+    let record = threads.clone();
+    let scope = RepaintScope::every_change(Arc::new(move || {
+        record.lock().unwrap().push(thread::current().id());
+    }));
+    scope.track(track);
+    (scope, threads)
+}
+
+#[test]
+fn every_signal_write_and_every_observer_call_runs_on_the_ui_thread() {
+    let ui = thread::current().id();
+    let observed: Arc<Mutex<Vec<ThreadId>>> = Arc::default();
+    let record = observed.clone();
+    runtime();
+    let handle = VisionHandle::with_runner(|task, image| {
+        Ok(match task {
+            VisionTask::FaceDetection => VisionOutput::Faces(vec![face(0.9)]),
+            _ => VisionOutput::Plane(plane_of(image, 0.5)),
+        })
+    })
+    .on_status(move |_| record.lock().unwrap().push(thread::current().id()));
+    let (_scope, writes) = write_threads(|| read_all(&handle));
+
+    handle.segment(image(2, 2), 2, 2);
+    handle.detect_faces(image(2, 2), 2, 2, None);
+    handle.estimate_depth(image(2, 2), 2, 2);
+    pump_until("every task to publish", || {
+        handle.status().get_untracked() == VisionStatus::Idle
+            && TASKS
+                .iter()
+                .all(|&task| handle.last_run(task).get_untracked().is_some())
+    });
+    // A failure is written the same way.
+    handle.segment(image(2, 2), 3, 3);
+    pump_until("the failure", || {
+        matches!(handle.status().get_untracked(), VisionStatus::Failed(_))
+    });
+
+    let writes = writes.lock().unwrap().clone();
+    // Three results, three run reports and at least `Running`, `Idle`, `Running`, `Failed`.
+    assert!(writes.len() >= 10, "{writes:?}");
+    assert!(writes.iter().all(|&id| id == ui), "{writes:?}");
+    let observed = observed.lock().unwrap().clone();
+    assert!(observed.len() >= 4, "{observed:?}");
+    assert!(observed.iter().all(|&id| id == ui), "{observed:?}");
+}
+
+/// A status, the mask's width and whether the mask's run was reported, as an observer saw them.
+type Seen = (VisionStatus, Option<usize>, bool);
+
+#[test]
+fn running_is_written_before_the_request_returns_and_a_result_before_the_idle_after_it() {
+    // The log's observer is replaced below by one that also reads the signals.
+    let (handle, _log, gate) = gated();
+    // What the observer saw of the mask and its run report when each status was written.
+    let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
+    let record = seen.clone();
+    let (mask, run) = (handle.mask(), handle.last_run(VisionTask::Segmentation));
+    let handle = handle.on_status(move |status| {
+        let width = mask.get_untracked().map(|m| m.width);
+        let reported = run.get_untracked().is_some();
+        record
+            .lock()
+            .unwrap()
+            .push((status.clone(), width, reported));
+    });
+
+    handle.segment(image(4, 1), 4, 1);
+    // No pump yet: the request call itself wrote `Running`.
+    assert_eq!(
+        handle.status().get_untracked(),
+        VisionStatus::Running(VisionTask::Segmentation)
+    );
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        [(VisionStatus::Running(VisionTask::Segmentation), None, false)]
+    );
+    assert_eq!(gate.started.recv_timeout(WAIT).unwrap(), 4);
+    gate.release.send(()).unwrap();
+    let settled = || seen.lock().unwrap().last().map(|s| s.0.clone()) == Some(VisionStatus::Idle);
+    pump_until("Idle", settled);
+    assert_eq!(
+        seen.lock().unwrap().last(),
+        Some(&(VisionStatus::Idle, Some(4), true)),
+        "the mask and its run report were written before Idle"
+    );
+
+    // From idle again, a second request: `Running` before it returns, the new mask by `Idle`.
+    handle.segment(image(6, 1), 6, 1);
+    assert_eq!(
+        seen.lock().unwrap().last(),
+        Some(&(
+            VisionStatus::Running(VisionTask::Segmentation),
+            Some(4),
+            true
+        ))
+    );
+    assert_eq!(gate.started.recv_timeout(WAIT).unwrap(), 6);
+    gate.release.send(()).unwrap();
+    pump_until("Idle", settled);
+    assert_eq!(
+        seen.lock().unwrap().last(),
+        Some(&(VisionStatus::Idle, Some(6), true))
+    );
+}
+
+#[test]
+fn dropping_every_clone_mid_request_neither_panics_nor_leaks_the_task() {
+    runtime();
+    let alive = Arc::new(());
+    let held = alive.clone();
+    let (started_tx, started) = mpsc::channel::<()>();
+    let (release, release_rx) = mpsc::channel::<()>();
+    let (started_tx, release_rx) = (Mutex::new(started_tx), Mutex::new(release_rx));
+    let handle = VisionHandle::with_runner(move |_, image| {
+        let _held = &held;
+        started_tx.lock().unwrap().send(()).unwrap();
+        release_rx.lock().unwrap().recv_timeout(WAIT).unwrap();
+        Ok(VisionOutput::Plane(plane_of(image, 1.0)))
+    });
+    let clone = handle.clone();
+    handle.segment(image(2, 1), 2, 1);
+    clone.estimate_depth(image(2, 1), 2, 1);
+    started.recv_timeout(WAIT).unwrap();
+    drop(handle);
+    drop(clone);
+    // Both queued requests finish with no handle left; their writes are applied and dropped.
+    release.send(()).unwrap();
+    release.send(()).unwrap();
+    // The runner is freed once the worker has ended and the UI thread's task has dropped it.
+    pump_until("the worker and the UI task to end", || {
+        Arc::strong_count(&alive) == 1
+    });
+}
+
+#[test]
+fn a_request_off_the_ui_thread_panics_and_changes_nothing() {
+    let (handle, log) = logged(VisionHandle::with_runner(|_, image| {
+        Ok(VisionOutput::Plane(plane_of(image, 1.0)))
+    }));
+    // Before any request, `frust::spawn_local` refuses the call; after one, the handle does.
+    for width in [1, 2] {
+        let mask = handle.mask().get_untracked();
+        let off = handle.clone();
+        let outcome = thread::spawn(move || off.segment(image(5, 1), 5, 1)).join();
+        assert!(outcome.is_err(), "a request off the UI thread panics");
+        runtime().pump_local();
+        assert_eq!(handle.status().get_untracked(), VisionStatus::Idle);
+        assert_eq!(handle.mask().get_untracked(), mask);
+        handle.segment(image(width, 1), width, 1);
+        assert_eq!(log.next_settled().last(), Some(&VisionStatus::Idle));
+        assert_eq!(handle.mask().get_untracked().unwrap().width, width as usize);
+    }
 }
 
 /// The provider a model-backed handle reports comes from `VisionModels::loaded_provider`, which

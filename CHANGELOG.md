@@ -639,6 +639,13 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
 
 ### Fixed
 
+- `frust-onnx` and `frust-models`: `VisionHandle`, `DownloadTracker` and `ModelList` write their
+  signals on the UI thread only. Their worker, download and blocking threads wrote them directly,
+  so a `build` reading a signal during such a write aborted the app ("reactive value already
+  disposed"), and a write that met a read was lost (a status stuck at `Running`, a missing result).
+  The threads now hand each write to the UI thread, which applies them in order on its next pump;
+  `on_status` and `on_state` run there. Make requests, starts and refreshes on the UI thread: on
+  another thread they now panic.
 - `frust-onnx`: an app's LTO release build (the template's `lto = "fat"` profile) links on
   Apple-silicon macOS; it failed on `___isPlatformVersionAtLeast`, which the crate's build script
   now takes from clang's builtins archive. Other targets are unchanged.

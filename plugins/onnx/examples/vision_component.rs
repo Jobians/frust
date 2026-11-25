@@ -2,7 +2,8 @@
 //! `Component`.
 //!
 //! The component owns a `VisionHandle`. `build` only reads its signals; the button hands the
-//! handle an image and returns at once, while the model runs on the handle's worker thread. A
+//! handle an image and returns at once, while the model runs on the handle's worker thread and
+//! its result is written on the UI thread, which wakes for it. A
 //! model that is not downloaded yet shows up as a failed status (see `frust-models` for the
 //! download). Run it inside a Frust app by passing `VisionScreen` to `frust::app!`; here it only
 //! has to compile.
