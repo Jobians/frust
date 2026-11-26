@@ -61,6 +61,19 @@
 //! on the iOS 26.2 simulator with the stale session's consent alert up), and
 //! nothing in the framework signals when that dismissal has finished.
 //!
+//! # Cancelling a live session
+//!
+//! [`cancel`] is [`crate::AuthSessionCancel::cancel`]'s backend hook. By the
+//! time it runs, `crate` has already resolved the session `Cancelled` and
+//! freed the Busy slot; what is left is the UI. It hops to the main queue
+//! (the same `exec_async` as [`start`], so it always runs after that
+//! session's own [`start_on_main`]), takes [`LIVE`]'s entry only if it is
+//! still tagged with that generation, and `-cancel`s the session before
+//! dropping the entry — the replace path's order above. The completion
+//! handler `-cancel` may trigger is a stale generation by then: `resolve`
+//! discards it and its [`release_live`] finds no matching entry. An entry
+//! for any other generation is never touched.
+//!
 //! # The iOS 15 floor and the deprecated initializer
 //!
 //! `-initWithURL:callbackURLScheme:completionHandler:` is marked
@@ -97,8 +110,9 @@
 //!   (`frust-haptics`'s apple backend's identical claim).
 //! - [`make_session`]'s initializer call, whose whole caller contract is
 //!   the completion-block lifetime — stated on that function.
-//! - [`start_on_main`]'s two property setters and [`present`]'s `-start`
-//!   call, each a plain message send to a live session on the main thread.
+//! - [`start_on_main`]'s two property setters, its stale-session `-cancel`,
+//!   [`cancel_on_main`]'s `-cancel` and [`present`]'s `-start` call, each a
+//!   plain message send to a live session on the main thread.
 //! - [`outcome_from`]'s two raw-pointer derefs plus the one `extern static`
 //!   read (`ASWebAuthenticationSessionErrorDomain`), all stated there.
 //! - [`Anchor`]'s `define_class!` block: its `#[unsafe(super(NSObject))]`,
@@ -504,6 +518,39 @@ unsafe fn outcome_from(
     Err(AuthSessionError::Platform(
         "the authentication session completed with neither a URL nor an error".to_string(),
     ))
+}
+
+/// The backend half of [`crate::AuthSessionCancel::cancel`]: on the main
+/// queue, `-cancel` the session [`LIVE`] holds for `generation` and empty
+/// the slot — see the module doc's *Cancelling a live session*. Called with
+/// `crate::ACTIVE` already released and `generation` already resolved
+/// `Cancelled`, from any thread.
+pub(crate) fn cancel(generation: u64) {
+    DispatchQueue::main().exec_async(move || cancel_on_main(generation));
+}
+
+/// [`cancel`]'s main-queue body. Does nothing when [`LIVE`] holds no entry
+/// for `generation` — the session already completed and was released, or a
+/// newer [`start_on_main`] already replaced (and `-cancel`led) it — so a
+/// cancel can never reach a newer session's objects.
+fn cancel_on_main(generation: u64) {
+    let Some(entry) = take_live(generation) else {
+        return;
+    };
+    // SAFETY: `-cancel` on a session this module built and still retains,
+    // on the main thread (this runs from `dispatch_get_main_queue()`) — the
+    // same call, on the same terms, as [`start_on_main`]'s stale-session
+    // `-cancel`, and a no-op on a session the user already dismissed. On
+    // the deferred-start path ([`defer_start`]) the session has not been
+    // `-start`ed yet; taking its entry here means [`present_pending`] finds
+    // nothing and never starts it.
+    unsafe { entry.1.cancel() };
+    // Dropped after `-cancel` returns, from this main-queue frame — never
+    // from inside the session's own completion handler — exactly like
+    // [`start_on_main`]'s replaced entry. The completion handler may still
+    // fire afterwards; it resolves nothing (`crate::resolve` discards the
+    // generation) and its [`release_live`] finds no matching entry.
+    drop(entry);
 }
 
 /// Release generation `generation`'s objects on a **later** main-queue turn

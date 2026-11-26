@@ -84,7 +84,7 @@ internal fun chooseCustomTabsProvider(
  * ## The contract (LAW — see `plugins/auth-session/src/android.rs`)
  *
  * This class's fully-qualified name (`dev.frust.authsession.FrustAuthSessionHost`)
- * and the names of its `@JvmStatic` entry points ([start]) are looked up by
+ * and the names of its `@JvmStatic` entry points ([start], [cancel]) are looked up by
  * string from the Rust side through the application classloader, and
  * [nativeOnAuthSessionResult]'s mangled JNI symbol
  * (`Java_dev_frust_authsession_FrustAuthSessionHost_nativeOnAuthSessionResult`)
@@ -120,7 +120,9 @@ internal fun chooseCustomTabsProvider(
  * [pending] is cleared *before* [nativeOnAuthSessionResult] is called in
  * [onActivityResumed], so a second resume with the same (already-consumed)
  * intent — or any resume once no session is pending — cannot re-deliver a
- * result. Exactly one native callback answers each [start].
+ * result. At most one native callback answers each [start]: exactly one,
+ * unless [cancel] clears [pending] first, in which case the native side has
+ * already resolved that session itself and none is sent.
  *
  * ## The double-delivery note
  *
@@ -174,8 +176,9 @@ object FrustAuthSessionHost {
     /**
      * The one session this host is waiting on a redirect for, or `null` when
      * none is in flight. Set by a successful [launch], cleared the instant
-     * [onActivityResumed] answers it (or decides it cannot) — see the class
-     * doc's one-delivery rule.
+     * [onActivityResumed] answers it (or decides it cannot), or by
+     * [cancelOnMain] for its own generation — see the class doc's
+     * one-delivery rule. Main-thread only.
      */
     private var pending: Pending? = null
 
@@ -277,6 +280,68 @@ object FrustAuthSessionHost {
             }
         }
         return 0
+    }
+
+    /**
+     * Cancel the session [generation] names. Called from any thread by Rust
+     * (`plugins/auth-session/src/android.rs`'s `cancel`), after the native
+     * side has already resolved that session as cancelled — so this host
+     * never calls [nativeOnAuthSessionResult] for it.
+     *
+     * Runs on the main thread, where [pending] is owned: inline when already
+     * there, otherwise posted through [mainHandler] — the same queue a
+     * posted [start] uses, so a cancel issued after a posted launch always
+     * runs after that launch. See [cancelOnMain].
+     */
+    @JvmStatic
+    fun cancel(generation: Long) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            cancelOnMain(generation)
+        } else {
+            mainHandler.post { cancelOnMain(generation) }
+        }
+    }
+
+    /**
+     * Clears [pending] only when it is still [generation]'s, so a later
+     * resume or a late redirect can neither resolve nor cancel anything for
+     * the cancelled session, and a cancel for an old generation can never
+     * clear a newer session's [pending]. Only on a match does it attempt
+     * [bringAppAboveCustomTab]. Must run on the main thread.
+     */
+    private fun cancelOnMain(generation: Long) {
+        val p = pending ?: return
+        if (p.generation != generation) return
+        pending = null
+        bringAppAboveCustomTab()
+    }
+
+    /**
+     * Best-effort close of a cancelled session's Custom Tab. There is no
+     * official API to close a Custom Tab; the documented community technique
+     * is to start the app's own Activity again with
+     * `FLAG_ACTIVITY_CLEAR_TOP | FLAG_ACTIVITY_SINGLE_TOP`, which clears the
+     * tab sitting above it in the task and re-delivers into the existing
+     * instance through `onNewIntent` (an `Intent` with no data, so the
+     * embedding's deep-link path ignores it). Attempted only while a
+     * resumed-Activity reference ([activity]) exists.
+     *
+     * **The tab may stay open**: a browser that launched the tab into its
+     * own task, or any other route by which the tab is not above [activity]
+     * in the same task, is out of reach. Self-contained on purpose — the
+     * cancel contract ([cancelOnMain]) does not depend on it, so it can be
+     * removed without touching anything else. Never throws: a failure is
+     * logged by exception class only.
+     */
+    private fun bringAppAboveCustomTab() {
+        val act = activity ?: return
+        try {
+            val intent = Intent(act, act.javaClass)
+                .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            act.startActivity(intent)
+        } catch (e: Exception) {
+            Log.w(TAG, "frust-auth-session: could not bring the app above the Custom Tab (${e.javaClass.name})")
+        }
     }
 
     /**
