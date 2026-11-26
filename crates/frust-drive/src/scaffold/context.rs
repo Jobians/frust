@@ -461,6 +461,74 @@ pub fn validate_deeplink_scheme(scheme: &str) -> Result<(), DeepLinkError> {
     Ok(())
 }
 
+/// Why a `--deeplink-https-host` value was rejected: it must be a bare DNS
+/// host name, since it is written verbatim into an Android `android:host`
+/// attribute and the iOS `applinks:`/`webcredentials:` entries.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum HttpsHostError {
+    #[error("--deeplink-https-host cannot be empty")]
+    Empty,
+    #[error("--deeplink-https-host `{0}` must not contain whitespace")]
+    ContainsWhitespace(String),
+    #[error(
+        "--deeplink-https-host `{0}` must be a bare host name (e.g. `example.com`), not a URL — \
+         omit the `https://`"
+    )]
+    ContainsScheme(String),
+    #[error("--deeplink-https-host `{0}` must be a bare host name — omit the `user@` part")]
+    ContainsUserinfo(String),
+    #[error("--deeplink-https-host `{0}` must be a bare host name — omit the path after `/`")]
+    ContainsPath(String),
+    #[error("--deeplink-https-host `{0}` must be a bare host name — omit the `:port`")]
+    ContainsPort(String),
+    #[error(
+        "--deeplink-https-host `{host}` may only contain ASCII letters, digits, `-` and `.`, not \
+         `{found}`"
+    )]
+    InvalidChar { host: String, found: char },
+    #[error("--deeplink-https-host `{0}` has an empty label (a leading, trailing or doubled `.`)")]
+    EmptyLabel(String),
+}
+
+/// Validates a `--deeplink-https-host` value as a bare DNS host name and
+/// returns it lower-cased (`Example.COM` → `example.com`): non-empty, no
+/// whitespace, scheme, userinfo, path or port, only ASCII letters, digits,
+/// `-` and `.`, and no empty label.
+pub fn validate_deeplink_https_host(host: &str) -> Result<String, HttpsHostError> {
+    let owned = || host.to_string();
+    if host.is_empty() {
+        return Err(HttpsHostError::Empty);
+    }
+    if host.chars().any(char::is_whitespace) {
+        return Err(HttpsHostError::ContainsWhitespace(owned()));
+    }
+    if host.contains("://") {
+        return Err(HttpsHostError::ContainsScheme(owned()));
+    }
+    if host.contains('@') {
+        return Err(HttpsHostError::ContainsUserinfo(owned()));
+    }
+    if host.contains('/') {
+        return Err(HttpsHostError::ContainsPath(owned()));
+    }
+    if host.contains(':') {
+        return Err(HttpsHostError::ContainsPort(owned()));
+    }
+    if let Some(found) = host
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '.'))
+    {
+        return Err(HttpsHostError::InvalidChar {
+            host: owned(),
+            found,
+        });
+    }
+    if host.split('.').any(str::is_empty) {
+        return Err(HttpsHostError::EmptyLabel(owned()));
+    }
+    Ok(host.to_ascii_lowercase())
+}
+
 /// Rust keywords (2015/2018/2021/2024 strict + reserved), used to reject
 /// project names that wouldn't compile as a crate name.
 const RUST_KEYWORDS: &[&str] = &[
@@ -717,6 +785,51 @@ mod tests {
         assert!(matches!(err, DeepLinkError::ContainsSchemeSeparator(_)));
         let err = validate_deeplink_scheme("https://example.com").unwrap_err();
         assert!(matches!(err, DeepLinkError::ContainsSchemeSeparator(_)));
+    }
+
+    #[test]
+    fn validate_deeplink_https_host_accepts_and_lower_cases_a_bare_host() {
+        assert_eq!(
+            validate_deeplink_https_host("example.com").as_deref(),
+            Ok("example.com")
+        );
+        assert_eq!(
+            validate_deeplink_https_host("Links.Example-1.COM").as_deref(),
+            Ok("links.example-1.com")
+        );
+        assert_eq!(
+            validate_deeplink_https_host("localhost").as_deref(),
+            Ok("localhost")
+        );
+    }
+
+    #[test]
+    fn validate_deeplink_https_host_rejects_every_non_host_form() {
+        use HttpsHostError as E;
+        /// An input and the check its error must pass.
+        type Case = (&'static str, fn(&E) -> bool);
+        let cases: [Case; 11] = [
+            ("", |e| matches!(e, E::Empty)),
+            ("example .com", |e| matches!(e, E::ContainsWhitespace(_))),
+            (" example.com", |e| matches!(e, E::ContainsWhitespace(_))),
+            ("https://example.com", |e| matches!(e, E::ContainsScheme(_))),
+            ("user@example.com", |e| matches!(e, E::ContainsUserinfo(_))),
+            ("example.com/app", |e| matches!(e, E::ContainsPath(_))),
+            ("example.com:443", |e| matches!(e, E::ContainsPort(_))),
+            ("*.example.com", |e| {
+                matches!(e, E::InvalidChar { found: '*', .. })
+            }),
+            ("exämple.com", |e| {
+                matches!(e, E::InvalidChar { found: 'ä', .. })
+            }),
+            ("example..com", |e| matches!(e, E::EmptyLabel(_))),
+            ("example.com.", |e| matches!(e, E::EmptyLabel(_))),
+        ];
+        for (input, expected) in cases {
+            let err = validate_deeplink_https_host(input).unwrap_err();
+            assert!(expected(&err), "`{input}` gave {err:?}");
+            assert!(err.to_string().contains("--deeplink-https-host"), "{err}");
+        }
     }
 
     #[test]

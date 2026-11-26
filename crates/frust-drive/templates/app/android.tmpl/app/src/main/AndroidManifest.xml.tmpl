@@ -14,7 +14,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-{%- if deeplink_scheme %}
+{%- if deeplink_scheme or deeplink_https_host %}
             android:launchMode="singleTop"
 {%- endif %}
             android:configChanges="orientation|screenSize|keyboardHidden|uiMode|fontScale"
@@ -30,6 +30,14 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="{{ deeplink_scheme }}"{% if deeplink_host %} android:host="{{ deeplink_host }}"{% endif %} />
+            </intent-filter>
+{%- endif %}
+{%- if deeplink_https_host %}
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="{{ deeplink_https_host }}" />
             </intent-filter>
 {%- endif %}
         </activity>

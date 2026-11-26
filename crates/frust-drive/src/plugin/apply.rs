@@ -3023,7 +3023,9 @@ pub(super) fn ios_entitlement_present(
 /// `CODE_SIGN_ENTITLEMENTS` in every configuration lacking it (see
 /// [`Contribution::IosEntitlement`]). The entitlements files are written
 /// before the pbxproj, so the project never names a file not yet on disk.
-fn apply_ios_entitlement(
+/// Crate-visible for the scaffold, which requests the associated domains a
+/// `frust create --deeplink-https-host` app needs the same way.
+pub(crate) fn apply_ios_entitlement(
     project_root: &Path,
     key: &str,
     value: &IosEntitlementValue,

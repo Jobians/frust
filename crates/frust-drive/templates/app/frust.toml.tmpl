@@ -48,13 +48,18 @@ icon = "assets/logo.png"
 # # Port of the local preview server.
 # port = 8000
 
-{% if deeplink_scheme -%}
-# Deep-link scheme baked into the Android manifest / iOS Info.plist by `frust
-# create --deeplink-scheme`. Not parsed; edit those files or re-run `--overwrite`.
+{% if deeplink_scheme or deeplink_https_host -%}
+# Deep links baked into the Android manifest and the iOS project by `frust create --deeplink-scheme`/
+# `--deeplink-https-host`. Not parsed; edit those files or re-run `--overwrite`.
 [deeplink]
+{% if deeplink_scheme -%}
 scheme = "{{ deeplink_scheme }}"
 {% if deeplink_host -%}
 host = "{{ deeplink_host }}"
+{% endif -%}
+{% endif -%}
+{% if deeplink_https_host -%}
+https-host = "{{ deeplink_https_host }}"
 {% endif %}
 {% endif -%}
 # Build flavors: declare a flavor either here or natively (Gradle flavor / Xcode scheme), not both.
