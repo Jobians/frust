@@ -31,9 +31,11 @@
 //! anything in UIKit/AppKit once [`start_on_main`] returns. Dropping either
 //! at the end of that function would tear the session down before the user
 //! ever saw it, so [`LIVE`] holds the session, its anchor, and the
-//! completion block for exactly as long as the session is live. It is a
-//! `thread_local!` rather than a `static` because `Retained`/`RcBlock` are
-//! `!Send`, and everything that touches it already runs on the main thread.
+//! completion block for exactly as long as the session is live (beside them
+//! it keeps the one piece of state that outlives a session — see *Waiting
+//! out a dismissal*). It is a `thread_local!` rather than a `static` because
+//! `Retained`/`RcBlock` are `!Send`, and everything that touches it already
+//! runs on the main thread.
 //!
 //! [`LIVE`] is populated *before* `-start`, and released on a **later** main
 //! queue turn (see [`release_live`]) rather than inline in the completion
@@ -54,12 +56,29 @@
 //! the presented sheet is dismissed rather than having its last strong
 //! reference released from under it, and its `CanceledLogin` completion is
 //! discarded by [`crate::resolve`] as a stale generation. The replacing
-//! session's own `-start` is then deferred by [`REPLACE_START_DELAY`]
-//! ([`defer_start`]) rather than issued in the same turn: a `-start` while the
-//! cancelled session's UI is still animating out fails with
-//! `ASWebAuthenticationSessionErrorCodePresentationContextInvalid` (observed
-//! on the iOS 26.2 simulator with the stale session's consent alert up), and
-//! nothing in the framework signals when that dismissal has finished.
+//! session's own `-start` then waits out that dismissal (next section).
+//!
+//! # Waiting out a dismissal
+//!
+//! A `-start` while a cancelled session's UI is still animating out fails
+//! with `ASWebAuthenticationSessionErrorCodePresentationContextInvalid`
+//! (observed on the iOS 26.2 simulator with the stale session's consent
+//! alert up), and nothing in the framework signals when that dismissal has
+//! finished. So every `-cancel` this module sends — the replace path above
+//! and [`cancel_on_main`] below alike — records its instant in [`LIVE`]'s
+//! [`crate::DismissalGrace`], and [`start_on_main`] never `-start`s inside
+//! [`REPLACE_START_DELAY`] of the last one: it defers the `-start` by what is
+//! left of that delay ([`defer_start`]) instead of issuing it in the same
+//! turn. A start with no recent `-cancel` presents at once.
+//!
+//! Keying the wait to the recorded instant rather than to the replace path
+//! is what makes it hold in both queue orders after a handle cancel. The
+//! handle frees the Busy slot and wakes its caller *before* [`cancel`]'s
+//! main-queue turn is queued, so a caller that starts a new session at once
+//! can land either side of it. Queued first, the new [`start_on_main`] still
+//! finds the cancelled session in [`LIVE`] and takes the replace path;
+//! queued after, it finds [`LIVE`] empty but the grace still running, and
+//! waits out the rest of it.
 //!
 //! # Cancelling a live session
 //!
@@ -69,7 +88,8 @@
 //! (the same `exec_async` as [`start`], so it always runs after that
 //! session's own [`start_on_main`]), takes [`LIVE`]'s entry only if it is
 //! still tagged with that generation, and `-cancel`s the session before
-//! dropping the entry — the replace path's order above. The completion
+//! dropping the entry — the replace path's order above — recording the
+//! cancel for the next start's dismissal grace. The completion
 //! handler `-cancel` may trigger is a stale generation by then: `resolve`
 //! discards it and its [`release_live`] finds no matching entry. An entry
 //! for any other generation is never touched.
@@ -133,7 +153,7 @@ compile_error!(
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchTime};
@@ -174,13 +194,28 @@ type LiveSession = (
     RcBlock<dyn Fn(*mut NSURL, *mut NSError)>,
 );
 
+/// Everything this module keeps on the main thread: the one live session's
+/// objects, and when a session was last `-cancel`led.
+struct MainState {
+    /// The live session's objects. `crate::ACTIVE`'s Busy guard is what
+    /// keeps this to at most one entry; the slot is purely about object
+    /// lifetime, never about routing — the tag it carries is the session's
+    /// own generation, issued by `crate`, not a counter of this module's own.
+    session: Option<LiveSession>,
+    /// The last `-cancel` this module sent, which a following `-start` waits
+    /// out (module doc's *Waiting out a dismissal*). Outlives the session it
+    /// was recorded for on purpose.
+    grace: crate::DismissalGrace,
+}
+
 thread_local! {
-    /// The live session's objects, on the main thread that owns them.
-    /// `crate::ACTIVE`'s Busy guard is what keeps this to at most one entry;
-    /// this slot is purely about object lifetime, never about routing — the
-    /// tag it carries is the session's own generation, issued by `crate`,
-    /// not a counter of this module's own.
-    static LIVE: RefCell<Option<LiveSession>> = const { RefCell::new(None) };
+    /// This module's [`MainState`], on the main thread that owns it.
+    static LIVE: RefCell<MainState> = const {
+        RefCell::new(MainState {
+            session: None,
+            grace: crate::DismissalGrace::new(),
+        })
+    };
 }
 
 define_class!(
@@ -351,8 +386,9 @@ fn start_on_main(mtm: MainThreadMarker, req: AuthSessionRequest, token: SessionT
     // immediate refusal) would otherwise call `release_live` against an
     // empty slot and leave these objects owned by nothing.
     let previous = LIVE.with(|live| {
-        let mut slot = live.borrow_mut();
-        slot.replace((generation, session.clone(), anchor, block))
+        live.borrow_mut()
+            .session
+            .replace((generation, session.clone(), anchor, block))
     });
     if let Some((_, stale_session, _, _)) = &previous {
         // A populated slot here means the caller dropped that session's
@@ -369,32 +405,49 @@ fn start_on_main(mtm: MainThreadMarker, req: AuthSessionRequest, token: SessionT
         // the main thread; documented as a no-op on an already-cancelled
         // session, so repeat calls cannot double-complete it.
         unsafe { stale_session.cancel() };
-        drop(previous);
-        // Not `present` here: the cancelled session's UI is still being
-        // dismissed, and a `-start` issued in the same turn fails with
-        // `PresentationContextInvalid` (module doc's *Retained until
-        // completion*).
-        defer_start(generation);
-        return;
+        record_cancel();
     }
     drop(previous);
 
-    present(generation, &session);
+    // A `-cancel` this turn (the replace path just above) or a recent one
+    // (a handle cancel queued before this start) means a sheet may still be
+    // animating out, and a `-start` now would fail with
+    // `PresentationContextInvalid` (module doc's *Waiting out a dismissal*).
+    match grace_remaining() {
+        Some(delay) => defer_start(generation, delay),
+        None => present(generation, &session),
+    }
 }
 
-/// How long a replacing session waits after `-cancel`ling the stale one
-/// before its own `-start` — long enough for a consent alert or sheet to
-/// finish animating out (UIKit's standard dismissal is ~0.35 s), short
-/// enough to read as immediate. The framework signals nothing at that
-/// moment, so a delay is the only handle (module doc's *Retained until
-/// completion*).
+/// How long a `-start` waits after this module last sent a session
+/// `-cancel` — whether a replacing start cancelled the stale session or the
+/// caller's handle did — long enough for a consent alert or sheet to finish
+/// animating out (UIKit's standard dismissal is ~0.35 s), short enough to
+/// read as immediate. The framework signals nothing at that moment, so a
+/// delay is the only handle (module doc's *Waiting out a dismissal*).
 const REPLACE_START_DELAY: Duration = Duration::from_millis(500);
 
+/// Note a `-cancel` sent just now in [`LIVE`]'s dismissal grace. Main thread
+/// only.
+fn record_cancel() {
+    LIVE.with(|live| live.borrow_mut().grace.record_cancel(Instant::now()));
+}
+
+/// What is left of [`REPLACE_START_DELAY`] since the last [`record_cancel`],
+/// or `None` when a `-start` may go ahead now. Main thread only.
+fn grace_remaining() -> Option<Duration> {
+    LIVE.with(|live| {
+        live.borrow()
+            .grace
+            .remaining(Instant::now(), REPLACE_START_DELAY)
+    })
+}
+
 /// Schedule [`present_pending`] for `generation` on the main queue after
-/// [`REPLACE_START_DELAY`], presenting at once instead if the timer cannot be
-/// armed — a failed deferral must never leave a session unpresented.
-fn defer_start(generation: u64) {
-    let armed = DispatchTime::try_from(REPLACE_START_DELAY).is_ok_and(|when| {
+/// `delay`, presenting at once instead if the timer cannot be armed — a
+/// failed deferral must never leave a session unpresented.
+fn defer_start(generation: u64, delay: Duration) {
+    let armed = DispatchTime::try_from(delay).is_ok_and(|when| {
         DispatchQueue::main()
             .after(when, move || present_pending(generation))
             .is_ok()
@@ -411,6 +464,7 @@ fn defer_start(generation: u64) {
 fn present_pending(generation: u64) {
     let session = LIVE.with(|live| {
         live.borrow()
+            .session
             .as_ref()
             .filter(|entry| entry.0 == generation)
             .map(|entry| entry.1.clone())
@@ -545,6 +599,9 @@ fn cancel_on_main(generation: u64) {
     // `-start`ed yet; taking its entry here means [`present_pending`] finds
     // nothing and never starts it.
     unsafe { entry.1.cancel() };
+    // The next start waits out this sheet's dismissal, whichever side of
+    // this turn it was queued on (module doc's *Waiting out a dismissal*).
+    record_cancel();
     // Dropped after `-cancel` returns, from this main-queue frame — never
     // from inside the session's own completion handler — exactly like
     // [`start_on_main`]'s replaced entry. The completion handler may still
@@ -567,7 +624,7 @@ fn release_live(generation: u64) {
 /// `generation`'s. Must run on the main thread.
 fn take_live(generation: u64) -> Option<LiveSession> {
     LIVE.with(|live| {
-        let mut slot = live.borrow_mut();
+        let slot = &mut live.borrow_mut().session;
         match slot.as_ref() {
             Some(entry) if entry.0 == generation => slot.take(),
             _ => None,

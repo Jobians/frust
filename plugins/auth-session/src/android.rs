@@ -15,7 +15,7 @@
 //! | Direction | Member | Notes |
 //! |---|---|---|
 //! | Rust → Kotlin | `@JvmStatic fun start(url: String, callbackScheme: String, ephemeral: Boolean, generation: Long): Int` — `(Ljava/lang/String;Ljava/lang/String;ZJ)I` | Resolved once via `context.getClassLoader().loadClass(...)` (the `FrustIapHost`/`FrustBiometric` mechanism — see [`host_class`]) and cached. |
-//! | Rust → Kotlin | `@JvmStatic fun cancel(generation: Long)` — `(J)V` | [`cancel`]'s call: forget the pending session only if it is still `generation`'s, on the main thread — see *Cancelling a live session*. |
+//! | Rust → Kotlin | `@JvmStatic fun cancel(generation: Long)` — `(J)V` | [`cancel`]'s call: a launch not yet run for `generation` opens no tab, and the pending session is forgotten only if it is still `generation`'s, on the main thread — see *Cancelling a live session*. |
 //! | Kotlin → Rust | [`Java_dev_frust_authsession_FrustAuthSessionHost_nativeOnAuthSessionResult`]`(env, class, generation: jlong, kind: jint, url: JString)` | The host's one callback into Rust — see *Two numbering schemes* below. |
 //!
 //! # The generation round trip
@@ -90,17 +90,22 @@
 //! [`cancel`] is [`crate::AuthSessionCancel::cancel`]'s backend hook. By the
 //! time it runs, `crate` has already resolved the session `Cancelled` and
 //! freed the Busy slot, so nothing the host reports for that generation
-//! afterwards can complete anything. It calls the host's `cancel`, which on
-//! the main thread clears `pending` **only** when it still carries this
-//! generation — a later resume or a late redirect then finds no pending
-//! session, and a cancel for an old generation can never clear a newer
-//! session's `pending`. When it does match, the host makes a best-effort
-//! attempt to close the Custom Tab: Android has no API for that, so it
-//! restarts the app's own Activity with `FLAG_ACTIVITY_CLEAR_TOP |
-//! FLAG_ACTIVITY_SINGLE_TOP`, which brings it back above the tab. **The tab
-//! may stay open** (a tab launched into another task, or a browser that
-//! does not honour the clear); that is accepted, and its eventual redirect
-//! is dropped by the host as unsolicited.
+//! afterwards can complete anything. It calls the host's `cancel`, which
+//! resolves the session on the host side and clears its pending state:
+//!
+//! - it records the generation at once, so a launch for it that is still
+//!   posted to the main thread (a [`start`] made off the main thread) opens
+//!   no tab when it runs;
+//! - it always posts its main-thread half to the same handler as that
+//!   launch — never inline, even when called on the main thread — so it runs
+//!   after the launch whatever thread either call came from, and clears
+//!   `pending` **only** when it still carries this generation: a later
+//!   resume or a late redirect then finds no pending session, and a cancel
+//!   for an old generation can never clear a newer session's `pending`.
+//!
+//! Nothing closes the Custom Tab: Android has no API for that, so **the
+//! browser stays open** in front of the app until the user leaves it, and
+//! the redirect it may still deliver is dropped by the host as unsolicited.
 //!
 //! A failure to reach the host (no platform handles, the Gradle module not
 //! linked, a JNI error) is not reported anywhere but a debug trace: the

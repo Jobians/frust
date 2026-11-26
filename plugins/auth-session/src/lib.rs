@@ -87,8 +87,9 @@
 //! [`AuthSession::start_with_cancel`] instead and call
 //! [`AuthSessionCancel::cancel`]: the future resolves
 //! [`AuthSessionOutcome::Cancelled`], the slot is freed, and the backend is
-//! asked to tear its UI down (`-cancel` on Apple; on Android a best-effort
-//! close that may leave the Custom Tab open — see [`AuthSessionCancel`]).
+//! asked to tear its UI down (`-cancel` on Apple; on Android, where no API
+//! closes a Custom Tab, the tab stays open until the user leaves it — see
+//! [`AuthSessionCancel`]).
 //!
 //! # Security
 //!
@@ -509,6 +510,47 @@ fn cancel_generation(generation: u64) {
     backend::cancel(generation);
 }
 
+/// The Apple backend's dismissal-grace bookkeeping: when it last sent a
+/// session `-cancel`, and so how much longer a new session's `-start` must
+/// wait for that sheet to finish animating out (`apple`'s module doc,
+/// *Waiting out a dismissal*). Pure arithmetic over caller-supplied
+/// instants, with no Apple API in it, so it lives here — where the host test
+/// binary can reach it — rather than in the `target_vendor = "apple"`-only
+/// `apple` module, which keeps one in its main-thread state.
+#[cfg(any(target_vendor = "apple", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DismissalGrace {
+    /// When the most recent `-cancel` was sent; `None` before the first.
+    cancelled_at: Option<std::time::Instant>,
+}
+
+#[cfg(any(target_vendor = "apple", test))]
+impl DismissalGrace {
+    /// No `-cancel` sent yet: nothing to wait for.
+    pub(crate) const fn new() -> Self {
+        Self { cancelled_at: None }
+    }
+
+    /// A session was sent `-cancel` at `now`; the grace window restarts
+    /// from it, whatever was recorded before.
+    pub(crate) fn record_cancel(&mut self, now: std::time::Instant) {
+        self.cancelled_at = Some(now);
+    }
+
+    /// How much longer a `-start` must wait at `now` for a dismissal that
+    /// takes `grace` — `None` when no `-cancel` was ever recorded or the
+    /// last one is at least `grace` old, so a start with no recent cancel is
+    /// never delayed.
+    pub(crate) fn remaining(
+        &self,
+        now: std::time::Instant,
+        grace: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        let elapsed = now.saturating_duration_since(self.cancelled_at?);
+        grace.checked_sub(elapsed).filter(|left| !left.is_zero())
+    }
+}
+
 /// Release generation `generation`'s slot without completing anything —
 /// the hook `oneshot::Receiver`'s `Drop` calls when the caller drops the
 /// future [`AuthSession::start`] returned. A later platform result for that
@@ -829,19 +871,24 @@ impl AuthSession {
 /// While that session is still the live one, [`Self::cancel`] resolves its
 /// future with [`AuthSessionOutcome::Cancelled`] (exactly once), frees the
 /// one-live-session slot (this crate doc's *Exactly one live session*) so
-/// the next [`AuthSession::start`] is accepted at once, and then asks the
-/// platform to tear the browser UI down:
+/// the next [`AuthSession::start`] is accepted at once — never refused
+/// [`AuthSessionError::Busy`] — and then asks the platform to tear the
+/// browser UI down:
 ///
 /// - **iOS / macOS**: the retained `ASWebAuthenticationSession` is sent
 ///   `-cancel` on the main queue, which dismisses its sheet. A completion
 ///   the framework still reports afterwards is discarded as a stale
-///   generation.
+///   generation. A session started right after the cancel is accepted at
+///   once too, but its own sheet appears only after a short dismissal delay
+///   (half a second at most) that lets the cancelled one finish animating
+///   out — the platform refuses to present over a sheet still on its way
+///   down.
 /// - **Android**: there is no API to close a Custom Tab. The host forgets
-///   the pending session on the main thread and makes a best-effort attempt
-///   to bring the app's own Activity back above the tab; **the tab may stay
-///   open**, and a redirect it delivers later finds no pending session and
-///   is dropped (it still reaches the app's own deep-link stream — this
-///   crate doc's *The Android double-delivery note*).
+///   the pending session, and a launch for it that had not run yet opens no
+///   tab; a tab already open **stays open** in front of the app until the
+///   user leaves it, and a redirect it delivers later finds no pending
+///   session and is dropped (it still reaches the app's own deep-link
+///   stream — this crate doc's *The Android double-delivery note*).
 ///
 /// Every step is keyed to the session's generation: once that session has
 /// finished (by outcome, error, a previous cancel, or the caller dropping
@@ -884,6 +931,7 @@ pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 mod tests {
     use std::task::{RawWaker, RawWakerVTable, Waker};
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -1291,6 +1339,73 @@ mod tests {
             );
             assert!(lock_active().is_none());
         });
+    }
+
+    /// The grace every [`DismissalGrace`] test waits out.
+    const GRACE: Duration = Duration::from_millis(500);
+
+    /// With no `-cancel` ever recorded, a start is never delayed.
+    #[test]
+    fn dismissal_grace_without_a_cancel_never_delays() {
+        let grace = DismissalGrace::new();
+        assert_eq!(grace.remaining(Instant::now(), GRACE), None);
+    }
+
+    /// A start right after a cancel waits the whole grace; one made part
+    /// way through waits only what is left of it.
+    #[test]
+    fn dismissal_grace_counts_down_from_the_cancel() {
+        let cancelled = Instant::now();
+        let mut grace = DismissalGrace::new();
+        grace.record_cancel(cancelled);
+
+        assert_eq!(grace.remaining(cancelled, GRACE), Some(GRACE));
+        assert_eq!(
+            grace.remaining(cancelled + Duration::from_millis(200), GRACE),
+            Some(Duration::from_millis(300))
+        );
+    }
+
+    /// Once the grace has run out — exactly at its end or any time after —
+    /// a start goes ahead at once.
+    #[test]
+    fn dismissal_grace_ends_after_the_delay() {
+        let cancelled = Instant::now();
+        let mut grace = DismissalGrace::new();
+        grace.record_cancel(cancelled);
+
+        assert_eq!(grace.remaining(cancelled + GRACE, GRACE), None);
+        assert_eq!(
+            grace.remaining(cancelled + Duration::from_secs(60), GRACE),
+            None
+        );
+    }
+
+    /// A later cancel restarts the window from its own instant.
+    #[test]
+    fn a_later_cancel_restarts_the_dismissal_grace() {
+        let first = Instant::now();
+        let second = first + Duration::from_millis(400);
+        let mut grace = DismissalGrace::new();
+        grace.record_cancel(first);
+        grace.record_cancel(second);
+
+        assert_eq!(
+            grace.remaining(first + Duration::from_millis(600), GRACE),
+            Some(Duration::from_millis(300))
+        );
+    }
+
+    /// An instant earlier than the recorded cancel (never produced on one
+    /// thread, but not ruled out by the type) counts as no time elapsed.
+    #[test]
+    fn dismissal_grace_clamps_an_instant_before_the_cancel() {
+        let earlier = Instant::now();
+        let cancelled = earlier + Duration::from_millis(100);
+        let mut grace = DismissalGrace::new();
+        grace.record_cancel(cancelled);
+
+        assert_eq!(grace.remaining(earlier, GRACE), Some(GRACE));
     }
 
     #[test]
