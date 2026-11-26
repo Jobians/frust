@@ -76,6 +76,16 @@ pub enum Command {
         #[arg(long = "deeplink-host", value_name = "HOST")]
         deeplink_host: Option<String>,
 
+        /// Claim https links on this host (a bare host name, e.g.
+        /// `links.example.com`): generates an Android `autoVerify` App Links
+        /// intent-filter and the iOS associated-domains entitlement
+        /// (`applinks:` and `webcredentials:`). Independent of
+        /// `--deeplink-scheme`. The app owner must host the two association
+        /// files on that host: `/.well-known/assetlinks.json` (Android) and
+        /// `/.well-known/apple-app-site-association` (iOS).
+        #[arg(long = "deeplink-https-host", value_name = "HOST")]
+        deeplink_https_host: Option<String>,
+
         /// Opt-in clean-architecture variant: scaffolds a controller +
         /// use-case + `async_view` screen wired to `clean-signals-frust`
         /// instead of the default counter app.
@@ -102,8 +112,8 @@ pub enum Command {
         /// `--overwrite`/`--template-dir`/`--frust-path` still apply.
         /// `--org`/`--description` are unused (a design-system crate has no
         /// bundle identifier or app manifest); `--deeplink-scheme`/
-        /// `--deeplink-host`/`--arch` are rejected outright rather than
-        /// silently ignored, since a plain library crate has no deep-link
+        /// `--deeplink-host`/`--deeplink-https-host`/`--arch` are rejected outright
+        /// rather than silently ignored, since a plain library crate has no deep-link
         /// config or app-architecture variant for them to apply to.
         #[arg(long = "design-system")]
         design_system: bool,
@@ -579,10 +589,35 @@ mod tests {
             Command::Create {
                 deeplink_scheme,
                 deeplink_host,
+                deeplink_https_host,
                 ..
             } => {
                 assert_eq!(deeplink_scheme, None);
                 assert_eq!(deeplink_host, None);
+                assert_eq!(deeplink_https_host, None);
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    /// `--deeplink-https-host` parses on its own, without `--deeplink-scheme`.
+    #[test]
+    fn parses_create_with_deeplink_https_host_alone() {
+        let cli = Cli::parse_from([
+            "frust",
+            "create",
+            "myapp",
+            "--deeplink-https-host",
+            "links.example.com",
+        ]);
+        match cli.command.unwrap() {
+            Command::Create {
+                deeplink_scheme,
+                deeplink_https_host,
+                ..
+            } => {
+                assert_eq!(deeplink_scheme, None);
+                assert_eq!(deeplink_https_host.as_deref(), Some("links.example.com"));
             }
             other => panic!("expected Create, got {other:?}"),
         }

@@ -75,6 +75,8 @@ use crate::route_state::RouteObserver;
 /// `path.rs`'s own precedent.
 ///
 /// Rules:
+/// 0. Everything from the first `#` (the fragment) is removed first, for every
+///    input form; the query (`?...`) is kept.
 /// 1. No `://` in the string → already a bare path; pass through unchanged
 ///    (bare-path sources like navdemo's simulate-deep-link button, plus
 ///    defense-in-depth).
@@ -92,15 +94,22 @@ use crate::route_state::RouteObserver;
 /// the error page like any other unmatched location (see this module's
 /// tests' Criterion 3); it never panics.
 fn normalize_deep_link(raw: &str) -> String {
+    // Rule 0: the fragment (from the first `#`) never reaches the router —
+    // `Location::parse` knows no `#` and would fold it into the last segment
+    // or the last query value. The query is kept.
+    let raw = raw.split_once('#').map_or(raw, |(before, _)| before);
+
     let Some((scheme, rest)) = raw.split_once("://") else {
         // Rule 1.
         return raw.to_string();
     };
 
     if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
-        // Rule 2, universal/App Links: drop the host.
-        return match rest.find('/') {
-            Some(idx) => rest[idx..].to_string(),
+        // Rule 2, universal/App Links: drop the host. The authority ends at
+        // the first `/` or `?`; a query right after the host sits under `/`.
+        return match rest.find(['/', '?']) {
+            Some(idx) if rest[idx..].starts_with('/') => rest[idx..].to_string(),
+            Some(idx) => format!("/{}", &rest[idx..]),
             None => "/".to_string(),
         };
     }
@@ -121,7 +130,16 @@ fn normalize_deep_link(raw: &str) -> String {
 }
 
 /// A [`Router`] wired to the process-wide deep-link source (see the module
-/// docs). Construct once with [`router_with_deep_links`] (or
+/// docs).
+///
+/// The route is built from the link with its `#fragment` removed (the query is
+/// kept); the raw URL, fragment included, stays available to the app through
+/// [`deep_links()`](frust_reactive::deep_links). The host of an `http(s)` link
+/// is dropped, so any claimed host maps to the same routes; the host of a
+/// custom-scheme link is treated as the first path segment
+/// (`myapp://approvals/42` routes to `/approvals/42`).
+///
+/// Construct once with [`router_with_deep_links`] (or
 /// [`RouterDeepLinks::new`] directly) — typically from `Component::init`,
 /// storing the result in `Component::State` — then call
 /// [`track`](Self::track) from every `Component::build` to keep navigating on
@@ -676,5 +694,63 @@ mod tests {
         assert_eq!(normalize_deep_link("fktest://"), "/");
         // Empty string has no `://` -> Rule 1 passthrough, unchanged.
         assert_eq!(normalize_deep_link(""), "");
+    }
+
+    #[test]
+    fn normalize_https_query_and_fragment() {
+        assert_eq!(
+            normalize_deep_link("https://example.com/approvals/42?x=1"),
+            "/approvals/42?x=1"
+        );
+        assert_eq!(
+            normalize_deep_link("https://example.com/approvals/42#frag"),
+            "/approvals/42"
+        );
+        assert_eq!(
+            normalize_deep_link("https://example.com/approvals/42?x=1#frag"),
+            "/approvals/42?x=1"
+        );
+    }
+
+    #[test]
+    fn normalize_custom_scheme_and_bare_path_fragment() {
+        assert_eq!(
+            normalize_deep_link("myapp://approvals/42#frag"),
+            "/approvals/42"
+        );
+        assert_eq!(
+            normalize_deep_link("myapp://approvals/42?x=1#frag"),
+            "/approvals/42?x=1"
+        );
+        assert_eq!(normalize_deep_link("/item/7#frag"), "/item/7");
+        assert_eq!(normalize_deep_link("/search?q=a#f"), "/search?q=a");
+    }
+
+    #[test]
+    fn normalize_https_host_only_with_and_without_fragment() {
+        assert_eq!(normalize_deep_link("https://example.com"), "/");
+        assert_eq!(normalize_deep_link("https://example.com#f"), "/");
+    }
+
+    #[test]
+    fn normalize_https_query_directly_after_host() {
+        // The authority ends at the first `/` or `?`, so a query with no
+        // path keeps its query under the root path.
+        assert_eq!(
+            normalize_deep_link("https://links.example.com?invite=abc"),
+            "/?invite=abc"
+        );
+        assert_eq!(
+            normalize_deep_link("https://links.example.com/?invite=abc"),
+            "/?invite=abc"
+        );
+        assert_eq!(normalize_deep_link("https://links.example.com"), "/");
+    }
+
+    #[test]
+    fn normalize_custom_scheme_host_with_query() {
+        // The host of a custom-scheme link is the first path segment, so
+        // the query stays attached to that segment's route.
+        assert_eq!(normalize_deep_link("myapp://open?x=1"), "/open?x=1");
     }
 }

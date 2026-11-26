@@ -28,6 +28,8 @@ pub struct CreateArgs {
     pub deeplink_scheme: Option<String>,
     /// `--deeplink-host`.
     pub deeplink_host: Option<String>,
+    /// `--deeplink-https-host`.
+    pub deeplink_https_host: Option<String>,
     /// `--arch`: a `scaffold::KNOWN_ARCHES` tag string (e.g.
     /// `"clean-signals"`), or `None` for the default template. Kept a plain
     /// `String` rather than `crate::cli::ArchArg` so `scaffold` stays
@@ -103,13 +105,14 @@ fn run_with(args: CreateArgs, sync: WireFn<'_>) -> Result<u8> {
     };
 
     let template_dir_override = args.template_dir.as_deref().map(Path::new);
-    let written = scaffold::generate_with_platforms(
+    let written = scaffold::generate_with_https_host(
         &dest,
         &ctx,
         template_dir_override,
         args.overwrite,
         args.arch.as_deref(),
         &platforms,
+        args.deeplink_https_host.as_deref(),
     )?;
 
     println!("Created {} file(s) in {}", written.len(), dest.display());
@@ -162,16 +165,19 @@ fn wire_platforms(dest: &Path, no_sync: bool, sync: WireFn<'_>) {
 /// project, so this bypasses the app-only options entirely rather than
 /// threading dummy values through them (`context::DesignSystemContext` is a
 /// strict subset of `TemplateContext`'s fields — see that struct's doc).
-/// `--deeplink-scheme`/`--deeplink-host`/`--arch` are rejected outright if
+/// The `--deeplink-*` flags and `--arch` are rejected outright if
 /// passed alongside `--design-system`, since silently ignoring them would
 /// look like they took effect; `--org`/`--description` don't apply either
 /// but are harmlessly unused (both carry a default value already, so a
 /// caller can't tell whether one was explicitly passed).
 fn run_design_system(args: CreateArgs) -> Result<u8> {
-    if args.deeplink_scheme.is_some() || args.deeplink_host.is_some() {
+    if args.deeplink_scheme.is_some()
+        || args.deeplink_host.is_some()
+        || args.deeplink_https_host.is_some()
+    {
         bail!(
-            "--deeplink-scheme/--deeplink-host don't apply to --design-system (a design-system \
-             crate has no platform manifest)"
+            "--deeplink-scheme/--deeplink-host/--deeplink-https-host don't apply to \
+             --design-system (a design-system crate has no platform manifest)"
         );
     }
     if args.arch.is_some() {
@@ -340,6 +346,7 @@ mod tests {
             frust_path: None,
             deeplink_scheme: None,
             deeplink_host: None,
+            deeplink_https_host: None,
             arch: None,
             platforms: CreatePlatformArgs {
                 list: None,
@@ -375,6 +382,123 @@ mod tests {
         let manifest =
             std::fs::read_to_string(dest.join("android/app/src/main/AndroidManifest.xml")).unwrap();
         assert!(manifest.contains("android:scheme=\"myapp\""), "{manifest}");
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// Every non-host `--deeplink-https-host` form is refused, naming the
+    /// flag, before any file exists.
+    #[test]
+    fn run_rejects_invalid_deeplink_https_host_before_writing_any_file() {
+        for (n, host) in [
+            "https://links.example.com",
+            "links.example.com/app",
+            "links.example.com:443",
+            "user@links.example.com",
+            "",
+            "links example.com",
+            "-links.example.com",
+            "links-.example.com",
+            "10.0.0.1",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dest = unique_temp_dir(&format!("invalid-https-host-{n}"));
+            let mut args = base_args(&dest);
+            args.deeplink_https_host = Some(host.to_string());
+
+            let err = run(args).unwrap_err();
+            assert!(err.to_string().contains("--deeplink-https-host"), "{err}");
+            assert!(!dest.exists(), "`{host}` wrote {}", dest.display());
+        }
+    }
+
+    /// An upper-case host is accepted and lower-cased in every file it
+    /// lands in; with iOS in the default platform set the Runner target
+    /// signs with the new associated-domains entitlements file.
+    #[test]
+    fn run_accepts_deeplink_https_host_and_lower_cases_it() {
+        let dest = unique_temp_dir("https-host");
+        let mut args = base_args(&dest);
+        args.deeplink_https_host = Some("Links.Example.COM".to_string());
+
+        assert_eq!(run(args).unwrap(), 0);
+        let manifest =
+            std::fs::read_to_string(dest.join("android/app/src/main/AndroidManifest.xml")).unwrap();
+        assert!(
+            manifest.contains("android:scheme=\"https\" android:host=\"links.example.com\""),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("android:autoVerify=\"true\""),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("android:launchMode=\"singleTop\""),
+            "{manifest}"
+        );
+        let entitlements =
+            std::fs::read_to_string(dest.join("ios/Runner/Runner.entitlements")).unwrap();
+        assert!(
+            entitlements.contains("<string>applinks:links.example.com</string>"),
+            "{entitlements}"
+        );
+        let toml = std::fs::read_to_string(dest.join("frust.toml")).unwrap();
+        assert!(
+            toml.contains("https-host = \"links.example.com\""),
+            "{toml}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// `--platforms android` with the flag writes the Android filter and no
+    /// iOS file at all.
+    #[test]
+    fn run_with_deeplink_https_host_and_android_only_writes_no_ios_file() {
+        let dest = unique_temp_dir("https-host-android-only");
+        let mut args = base_args(&dest);
+        args.platforms.list = Some("android".to_string());
+        args.deeplink_https_host = Some("links.example.com".to_string());
+
+        assert_eq!(run(args).unwrap(), 0);
+        assert!(!dest.join("ios").exists());
+        let manifest =
+            std::fs::read_to_string(dest.join("android/app/src/main/AndroidManifest.xml")).unwrap();
+        assert!(
+            manifest.contains("android:autoVerify=\"true\""),
+            "{manifest}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// Without the flag no entitlements file is written.
+    #[test]
+    fn run_without_deeplink_https_host_writes_no_entitlements() {
+        let dest = unique_temp_dir("no-https-host");
+        assert_eq!(run(base_args(&dest)).unwrap(), 0);
+        assert!(dest.join("ios/Runner/Info.plist").exists());
+        assert!(!dest.join("ios/Runner/Runner.entitlements").exists());
+        let pbxproj =
+            std::fs::read_to_string(dest.join("ios/Runner.xcodeproj/project.pbxproj")).unwrap();
+        assert!(!pbxproj.contains("CODE_SIGN_ENTITLEMENTS"), "{pbxproj}");
+
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn run_design_system_rejects_deeplink_https_host() {
+        let dest = unique_temp_dir("design-system-rejects-https-host");
+        let mut args = base_args(&dest);
+        args.design_system = true;
+        args.deeplink_https_host = Some("links.example.com".to_string());
+
+        let err = run(args).unwrap_err();
+        assert!(err.to_string().contains("--design-system"), "{err}");
+        assert!(!dest.join("Cargo.toml").exists());
 
         let _ = std::fs::remove_dir_all(&dest);
     }

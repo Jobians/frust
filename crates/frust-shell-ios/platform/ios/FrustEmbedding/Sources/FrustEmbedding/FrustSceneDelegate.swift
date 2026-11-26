@@ -27,6 +27,14 @@ import UIKit
 // `FrustViewController.handleDeepLink(_:)`, which queues until `frust_init`
 // has a handle.
 //
+// Universal links: an https link opened through an associated domain arrives
+// as an `NSUserActivity` of type `NSUserActivityTypeBrowsingWeb` rather than as
+// a URL context. A cold-start one is in `connectionOptions.userActivities`
+// (used only when no URL context is present, since the controller queues a
+// single pending link); a running-app one arrives via `scene(_:continue:)`.
+// The activity's `webpageURL` is forwarded through the same `handleDeepLink(_:)`
+// as a custom-scheme link; every other activity type is ignored.
+//
 // Windowing (iPadOS 26+): an app subclass may override
 // `preferredWindowingControlStyle(for:)` (returning `.automatic`, `.unified`
 // or `.minimal`; gate it with `#available(iOS 26.0, *)`) and set
@@ -74,7 +82,13 @@ open class FrustSceneDelegate: UIResponder, UIWindowSceneDelegate {
         // Cold-start deep link, if the app was launched via a URL. Queued
         // by the controller until `frust_init` has a handle (it hasn't
         // run yet at this point — see `FrustViewController.pendingDeepLink`).
+        // A universal link (web-browsing activity) is used only when no URL
+        // context is present.
         if let url = connectionOptions.urlContexts.first?.url {
+            controller.handleDeepLink(url)
+        } else if let url = connectionOptions.userActivities
+            .lazy.compactMap({ Self.universalLinkURL(of: $0) }).first
+        {
             controller.handleDeepLink(url)
         }
     }
@@ -88,5 +102,23 @@ open class FrustSceneDelegate: UIResponder, UIWindowSceneDelegate {
             let controller = frustViewController
         else { return }
         controller.handleDeepLink(url)
+    }
+
+    /// A running app's universal link: an `NSUserActivity` of type
+    /// `NSUserActivityTypeBrowsingWeb` whose `webpageURL` is forwarded through
+    /// `handleDeepLink(_:)`, exactly like a custom-scheme link. Any other
+    /// activity type is ignored.
+    open func scene(_ scene: UIScene, continue userActivity: NSUserActivity) {
+        guard let url = Self.universalLinkURL(of: userActivity),
+            let controller = frustViewController
+        else { return }
+        controller.handleDeepLink(url)
+    }
+
+    /// The `webpageURL` of a web-browsing activity, or `nil` for any other
+    /// activity type or a missing URL.
+    private static func universalLinkURL(of activity: NSUserActivity) -> URL? {
+        guard activity.activityType == NSUserActivityTypeBrowsingWeb else { return nil }
+        return activity.webpageURL
     }
 }

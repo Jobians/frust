@@ -8,8 +8,9 @@ pub mod renderer;
 #[allow(unused_imports)]
 // NameError/DeepLinkError: public API surface for future callers matching on variants
 pub use context::{
-    DeepLinkError, DesignSystemContext, FrustDependency, NameError, TemplateContext, title_case,
-    validate_deeplink_scheme, validate_project_name,
+    DeepLinkError, DesignSystemContext, FrustDependency, HttpsHostError, NameError,
+    TemplateContext, title_case, validate_deeplink_https_host, validate_deeplink_scheme,
+    validate_project_name,
 };
 
 use std::collections::BTreeMap;
@@ -359,6 +360,49 @@ pub fn generate_with_platforms(
     arch: Option<&str>,
     platforms: &[ScaffoldPlatform],
 ) -> Result<Vec<PathBuf>> {
+    generate_with_https_host(
+        dest,
+        ctx,
+        template_dir_override,
+        overwrite,
+        arch,
+        platforms,
+        None,
+    )
+}
+
+/// The iOS entitlement a claimed https deep link needs.
+const ASSOCIATED_DOMAINS_KEY: &str = "com.apple.developer.associated-domains";
+
+/// The entitlements file the Runner target signs with once one is written.
+const RUNNER_ENTITLEMENTS_REL: &str = "ios/Runner/Runner.entitlements";
+
+/// [`generate_with_platforms`], plus a claimed https deep link
+/// (`--deeplink-https-host`) when `https_host` is `Some`.
+///
+/// The host is validated and lower-cased by [`validate_deeplink_https_host`]
+/// before any file is written, and rendered as the Android manifest's
+/// `android:autoVerify` intent filter and the `frust.toml` `[deeplink]`
+/// record. When iOS is among `platforms`, the Runner target is then given
+/// the `com.apple.developer.associated-domains` entitlement
+/// (`applinks:<host>`, `webcredentials:<host>`) through the same writer
+/// `frust plugin add` uses, which creates `ios/Runner/Runner.entitlements`
+/// and sets `CODE_SIGN_ENTITLEMENTS`. `None` renders exactly what
+/// [`generate_with_platforms`] always rendered and writes no entitlements.
+pub fn generate_with_https_host(
+    dest: &Path,
+    ctx: &TemplateContext,
+    template_dir_override: Option<&Path>,
+    overwrite: bool,
+    arch: Option<&str>,
+    platforms: &[ScaffoldPlatform],
+    https_host: Option<&str>,
+) -> Result<Vec<PathBuf>> {
+    // The one validation of the host (its errors name the flag themselves).
+    let https_host = https_host
+        .map(validate_deeplink_https_host)
+        .transpose()
+        .map_err(anyhow::Error::from)?;
     check_destination(dest, overwrite)?;
 
     if let Some(tag) = arch
@@ -397,6 +441,11 @@ pub fn generate_with_platforms(
     // (falsy in minijinja) when no arch is selected, matching the pattern
     // `platform_render_vars` uses for platform flags.
     render_vars.insert("arch", arch.unwrap_or("").to_string());
+    // Same empty-is-falsy shape for the claimed https deep link.
+    render_vars.insert(
+        "deeplink_https_host",
+        https_host.clone().unwrap_or_default(),
+    );
     let path_vars = ctx.path_vars();
 
     let mut written = Vec::with_capacity(manifest.len());
@@ -455,6 +504,33 @@ pub fn generate_with_platforms(
             &path_vars,
         )?;
         written.push(out_relative);
+    }
+
+    if let Some(host) = https_host.as_deref()
+        && platforms.contains(&ScaffoldPlatform::Ios)
+    {
+        let entitlements = dest.join(RUNNER_ENTITLEMENTS_REL);
+        let before = fs::read(&entitlements).ok();
+        let domains: Vec<std::borrow::Cow<'static, str>> = vec![
+            format!("applinks:{host}").into(),
+            format!("webcredentials:{host}").into(),
+        ];
+        // Replace, not skip: a re-run with another host must not leave the
+        // previous host's domains in a file an earlier run created. The
+        // converse (a later run with no host) is deliberately a no-op: the
+        // scaffold never deletes a user's file, so an earlier run's
+        // entitlements stay as they are, silently.
+        crate::plugin::apply::replace_ios_entitlement(
+            dest,
+            ASSOCIATED_DOMAINS_KEY,
+            &crate::plugin::IosEntitlementValue::StringArray(domains.into()),
+            "Universal links and shared web credentials for the app's https host",
+        )
+        .map_err(|err| anyhow!("writing the iOS associated-domains entitlement: {err}"))?;
+        let rel = PathBuf::from(RUNNER_ENTITLEMENTS_REL);
+        if fs::read(&entitlements).ok() != before && !written.contains(&rel) {
+            written.push(rel);
+        }
     }
     Ok(written)
 }
@@ -1639,6 +1715,342 @@ mod tests {
         assert!(toml.contains("host = \"open\""), "{toml}");
 
         let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// The Runner target's Debug, Release and Profile configurations.
+    const RUNNER_CONFIG_IDS: [&str; 3] = [
+        "ABCDABCDABCDABCDABCD000E",
+        "ABCDABCDABCDABCDABCD000F",
+        "ABCDABCDABCDABCDABCD0026",
+    ];
+
+    /// The `{ .. }` body of the pbxproj object `id`.
+    fn pbx_object_body<'a>(pbxproj: &'a str, id: &str) -> &'a str {
+        let start = pbxproj
+            .find(&format!("\t\t{id} /*"))
+            .unwrap_or_else(|| panic!("no object `{id}`:\n{pbxproj}"));
+        let end = start + pbxproj[start..].find("\n\t\t};\n").unwrap();
+        &pbxproj[start..end]
+    }
+
+    /// An https host alone renders the `autoVerify` App Links filter and
+    /// `singleTop`, records the host in `frust.toml`, and gives the Runner
+    /// target the associated-domains entitlement in every configuration.
+    #[test]
+    fn generate_with_https_host_renders_app_links_and_associated_domains() {
+        let dest = unique_temp_dir("https-host");
+        let ctx = test_context();
+        let written = generate_with_https_host(
+            &dest,
+            &ctx,
+            None,
+            false,
+            None,
+            ScaffoldPlatform::DEFAULT,
+            Some("Links.Example.com"),
+        )
+        .unwrap();
+
+        let manifest =
+            fs::read_to_string(dest.join("android/app/src/main/AndroidManifest.xml")).unwrap();
+        let filter = "\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20</intent-filter>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<intent-filter android:autoVerify=\"true\">\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<action android:name=\"android.intent.action.VIEW\" />\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<category android:name=\"android.intent.category.DEFAULT\" />\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<category android:name=\"android.intent.category.BROWSABLE\" />\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20<data android:scheme=\"https\" android:host=\"links.example.com\" />\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20</intent-filter>\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20</activity>\n";
+        assert!(manifest.contains(filter), "{manifest}");
+        assert_eq!(
+            manifest.matches("android:launchMode=\"singleTop\"").count(),
+            1,
+            "{manifest}"
+        );
+        // No custom-scheme filter: the scheme was not given.
+        assert_eq!(manifest.matches("<intent-filter").count(), 2, "{manifest}");
+
+        let toml = fs::read_to_string(dest.join("frust.toml")).unwrap();
+        assert!(
+            toml.contains("[deeplink]\nhttps-host = \"links.example.com\"\n\n"),
+            "{toml}"
+        );
+        assert!(!toml.contains("scheme = "), "{toml}");
+        crate::manifest::parse(&toml).expect("the scaffolded frust.toml must parse");
+
+        let entitlements = fs::read_to_string(dest.join(RUNNER_ENTITLEMENTS_REL)).unwrap();
+        assert!(
+            entitlements.contains(
+                "\t<key>com.apple.developer.associated-domains</key>\n\
+                 \t<array>\n\
+                 \t\t<string>applinks:links.example.com</string>\n\
+                 \t\t<string>webcredentials:links.example.com</string>\n\
+                 \t</array>\n\
+                 </dict>\n\
+                 </plist>\n"
+            ),
+            "{entitlements}"
+        );
+        assert!(entitlements.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
+        assert!(written.contains(&PathBuf::from(RUNNER_ENTITLEMENTS_REL)));
+
+        let pbxproj =
+            fs::read_to_string(dest.join("ios/Runner.xcodeproj/project.pbxproj")).unwrap();
+        for id in RUNNER_CONFIG_IDS {
+            assert!(
+                pbx_object_body(&pbxproj, id)
+                    .contains("CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;"),
+                "configuration `{id}` lacks the setting:\n{pbxproj}"
+            );
+        }
+        assert_eq!(
+            pbxproj.matches("CODE_SIGN_ENTITLEMENTS").count(),
+            RUNNER_CONFIG_IDS.len(),
+            "{pbxproj}"
+        );
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// The scheme and the https host together render both filters, one
+    /// `singleTop`, and both `frust.toml` records.
+    #[test]
+    fn generate_with_scheme_and_https_host_renders_both_filters() {
+        let dest = unique_temp_dir("scheme-and-https-host");
+        let mut ctx = test_context();
+        ctx.deeplink_scheme = Some("myapp".into());
+        ctx.deeplink_host = Some("open".into());
+        generate_with_https_host(
+            &dest,
+            &ctx,
+            None,
+            false,
+            None,
+            ScaffoldPlatform::DEFAULT,
+            Some("links.example.com"),
+        )
+        .unwrap();
+
+        let manifest =
+            fs::read_to_string(dest.join("android/app/src/main/AndroidManifest.xml")).unwrap();
+        assert_eq!(manifest.matches("android:launchMode").count(), 1);
+        assert!(
+            manifest.contains("android:scheme=\"myapp\" android:host=\"open\""),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("android:scheme=\"https\" android:host=\"links.example.com\""),
+            "{manifest}"
+        );
+        assert_eq!(
+            manifest.matches("<intent-filter").count(),
+            manifest.matches("</intent-filter>").count()
+        );
+
+        let toml = fs::read_to_string(dest.join("frust.toml")).unwrap();
+        assert!(
+            toml.contains(
+                "[deeplink]\nscheme = \"myapp\"\nhost = \"open\"\nhttps-host = \"links.example.com\"\n\n"
+            ),
+            "{toml}"
+        );
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// Scaffolds `host` over `dest` (with `--overwrite` when `overwrite`).
+    fn scaffold_with_host(dest: &Path, overwrite: bool, host: Option<&str>) -> Vec<PathBuf> {
+        generate_with_https_host(
+            dest,
+            &test_context(),
+            None,
+            overwrite,
+            None,
+            ScaffoldPlatform::DEFAULT,
+            host,
+        )
+        .unwrap()
+    }
+
+    /// The `associated-domains` array an entitlements file must carry for
+    /// `host`, as the scaffold writes it.
+    fn domains_block(host: &str) -> String {
+        format!(
+            "\t<key>com.apple.developer.associated-domains</key>\n\
+             \t<array>\n\
+             \t\t<string>applinks:{host}</string>\n\
+             \t\t<string>webcredentials:{host}</string>\n\
+             \t</array>\n"
+        )
+    }
+
+    /// Re-running with another host rewrites the iOS associated domains so
+    /// every file names the new host, and the entitlements stay valid.
+    #[test]
+    fn overwrite_with_another_https_host_rewrites_associated_domains() {
+        let dest = unique_temp_dir("https-host-rewrite");
+        scaffold_with_host(&dest, false, Some("a.example.com"));
+        let written = scaffold_with_host(&dest, true, Some("b.example.com"));
+
+        let entitlements = fs::read_to_string(dest.join(RUNNER_ENTITLEMENTS_REL)).unwrap();
+        assert!(
+            entitlements.contains(&domains_block("b.example.com")),
+            "{entitlements}"
+        );
+        assert!(!entitlements.contains("a.example.com"), "{entitlements}");
+        assert_eq!(
+            entitlements
+                .matches("com.apple.developer.associated-domains")
+                .count(),
+            1,
+            "{entitlements}"
+        );
+        assert!(entitlements.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
+        assert!(
+            entitlements.ends_with("</dict>\n</plist>\n"),
+            "{entitlements}"
+        );
+        assert_eq!(entitlements.matches("<dict>").count(), 1);
+        assert!(written.contains(&PathBuf::from(RUNNER_ENTITLEMENTS_REL)));
+
+        let pbxproj =
+            fs::read_to_string(dest.join("ios/Runner.xcodeproj/project.pbxproj")).unwrap();
+        for id in RUNNER_CONFIG_IDS {
+            assert!(
+                pbx_object_body(&pbxproj, id)
+                    .contains("CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;"),
+                "configuration `{id}` lacks the setting:\n{pbxproj}"
+            );
+        }
+        let manifest =
+            fs::read_to_string(dest.join("android/app/src/main/AndroidManifest.xml")).unwrap();
+        assert!(
+            manifest.contains("android:host=\"b.example.com\""),
+            "{manifest}"
+        );
+        assert!(!manifest.contains("a.example.com"), "{manifest}");
+        let toml = fs::read_to_string(dest.join("frust.toml")).unwrap();
+        assert!(toml.contains("https-host = \"b.example.com\""), "{toml}");
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// The rewrite replaces only the associated-domains value: an unrelated
+    /// key already in the entitlements file survives.
+    #[test]
+    fn overwrite_with_another_https_host_keeps_unrelated_entitlement_keys() {
+        let dest = unique_temp_dir("https-host-rewrite-extra");
+        scaffold_with_host(&dest, false, Some("a.example.com"));
+        let path = dest.join(RUNNER_ENTITLEMENTS_REL);
+        let original = fs::read_to_string(&path).unwrap();
+        let extra = "\t<key>aps-environment</key>\n\t<string>development</string>\n";
+        fs::write(
+            &path,
+            original.replace("</dict>", &format!("{extra}</dict>")),
+        )
+        .unwrap();
+
+        scaffold_with_host(&dest, true, Some("b.example.com"));
+
+        let entitlements = fs::read_to_string(&path).unwrap();
+        assert!(entitlements.contains(extra), "{entitlements}");
+        assert!(
+            entitlements.contains(&domains_block("b.example.com")),
+            "{entitlements}"
+        );
+        assert!(!entitlements.contains("a.example.com"), "{entitlements}");
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// Overwriting with the same host leaves the entitlements bytes alone and
+    /// does not report the file as written by the entitlement step.
+    #[test]
+    fn overwrite_with_the_same_https_host_changes_nothing() {
+        let dest = unique_temp_dir("https-host-same");
+        scaffold_with_host(&dest, false, Some("a.example.com"));
+        let path = dest.join(RUNNER_ENTITLEMENTS_REL);
+        let before = fs::read(&path).unwrap();
+
+        let written = scaffold_with_host(&dest, true, Some("a.example.com"));
+
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!written.contains(&PathBuf::from(RUNNER_ENTITLEMENTS_REL)));
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// A later run with no https host leaves an earlier run's entitlements
+    /// file alone.
+    #[test]
+    fn overwrite_without_an_https_host_leaves_the_entitlements_file() {
+        let dest = unique_temp_dir("https-host-dropped");
+        scaffold_with_host(&dest, false, Some("a.example.com"));
+        let path = dest.join(RUNNER_ENTITLEMENTS_REL);
+        let before = fs::read(&path).unwrap();
+
+        scaffold_with_host(&dest, true, None);
+
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// A scaffold without iOS writes no iOS file for the https host.
+    #[test]
+    fn generate_with_https_host_and_no_ios_writes_no_ios_file() {
+        let dest = unique_temp_dir("https-host-no-ios");
+        let written = generate_with_https_host(
+            &dest,
+            &test_context(),
+            None,
+            false,
+            None,
+            &[ScaffoldPlatform::Android],
+            Some("links.example.com"),
+        )
+        .unwrap();
+
+        assert!(!dest.join("ios").exists());
+        assert!(written.iter().all(|path| !path.starts_with("ios")));
+        let manifest =
+            fs::read_to_string(dest.join("android/app/src/main/AndroidManifest.xml")).unwrap();
+        assert!(
+            manifest.contains("android:autoVerify=\"true\""),
+            "{manifest}"
+        );
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// Without the host no entitlements file is written and the pbxproj
+    /// names none; an invalid host is refused before anything is written.
+    #[test]
+    fn generate_with_https_host_none_or_invalid_writes_no_entitlements() {
+        let dest = unique_temp_dir("https-host-none");
+        let ctx = test_context();
+        generate(&dest, &ctx, None, false, None).unwrap();
+        assert!(!dest.join(RUNNER_ENTITLEMENTS_REL).exists());
+        let pbxproj =
+            fs::read_to_string(dest.join("ios/Runner.xcodeproj/project.pbxproj")).unwrap();
+        assert!(!pbxproj.contains("CODE_SIGN_ENTITLEMENTS"), "{pbxproj}");
+        let toml = fs::read_to_string(dest.join("frust.toml")).unwrap();
+        assert!(!toml.contains("[deeplink]"), "{toml}");
+        let _ = fs::remove_dir_all(&dest);
+
+        let refused = unique_temp_dir("https-host-invalid");
+        let err = generate_with_https_host(
+            &refused,
+            &ctx,
+            None,
+            false,
+            None,
+            ScaffoldPlatform::DEFAULT,
+            Some("https://links.example.com"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--deeplink-https-host"), "{err}");
+        assert!(!refused.exists());
     }
 
     #[test]

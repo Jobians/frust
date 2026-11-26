@@ -9,9 +9,10 @@
 //! `CARGO_BIN_EXE_frust` rather than calling `scaffold::generate`
 //! in-process (frust-cli is binary-only, no `lib` target).
 //!
-//! Ignored by default: it shells out to `xcodebuild`/`plutil`, which only
-//! exist on macOS with the Xcode command-line tools installed. Run
-//! explicitly on such a machine:
+//! The tests that shell out to `xcodebuild`/`plutil` are ignored by default:
+//! those tools only exist on macOS with the Xcode command-line tools
+//! installed (the text-only checks run everywhere). Run them explicitly on
+//! such a machine:
 //! `cargo test -p frust-cli --test create_ios -- --ignored --nocapture`
 
 use std::path::{Path, PathBuf};
@@ -215,6 +216,152 @@ fn create_ios_project_with_deeplink_scheme_has_valid_plist() {
         "`plutil -lint` failed on {}:\n{}",
         plist.display(),
         String::from_utf8_lossy(&lint.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+/// The Runner target's Debug, Release and Profile configurations, by the
+/// object ids the template's `project.pbxproj` gives them.
+const RUNNER_CONFIG_IDS: [&str; 3] = [
+    "ABCDABCDABCDABCDABCD000E",
+    "ABCDABCDABCDABCDABCD000F",
+    "ABCDABCDABCDABCDABCD0026",
+];
+
+/// Runs `frust create` (no wiring) for an `--deeplink-https-host` project
+/// into a fresh destination, returning it.
+fn create_with_https_host(project_name: &str, extra: &[&str]) -> PathBuf {
+    let dest = unique_dest();
+    let _ = std::fs::remove_dir_all(&dest);
+    let frust_path = workspace_frust_path();
+    let mut args = vec![
+        "create",
+        dest.to_str().expect("dest path is valid UTF-8"),
+        "--project-name",
+        project_name,
+        "--org",
+        "dev.frust",
+        "--deeplink-https-host",
+        "Links.Example.com",
+        "--no-sync",
+        "--frust-path",
+        frust_path.to_str().expect("frust_path is valid UTF-8"),
+    ];
+    args.extend_from_slice(extra);
+    let status = Command::new(env!("CARGO_BIN_EXE_frust"))
+        .args(&args)
+        .status()
+        .expect("failed to spawn `frust create`");
+    assert!(status.success(), "`frust create` exited non-zero");
+    dest
+}
+
+/// `--deeplink-https-host` gives the Runner target an entitlements file
+/// with both associated-domains entries, well-formed plist XML, and
+/// `CODE_SIGN_ENTITLEMENTS` in all three Runner configurations. Runs on any
+/// host; the `plutil` leg below needs macOS.
+#[test]
+fn create_ios_project_with_deeplink_https_host_signs_with_associated_domains() {
+    let dest = create_with_https_host("fk_ios_applinks_app", &[]);
+
+    let entitlements = std::fs::read_to_string(dest.join("ios/Runner/Runner.entitlements"))
+        .expect("reading Runner.entitlements");
+    assert!(
+        entitlements.starts_with(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \
+             \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+             <plist version=\"1.0\">\n<dict>\n"
+        ),
+        "{entitlements}"
+    );
+    assert!(
+        entitlements.ends_with(
+            "\t<key>com.apple.developer.associated-domains</key>\n\
+             \t<array>\n\
+             \t\t<string>applinks:links.example.com</string>\n\
+             \t\t<string>webcredentials:links.example.com</string>\n\
+             \t</array>\n\
+             </dict>\n\
+             </plist>\n"
+        ),
+        "{entitlements}"
+    );
+    for tag in ["plist", "dict", "array", "key", "string"] {
+        assert_eq!(
+            entitlements.matches(&format!("<{tag}>")).count()
+                + entitlements.matches(&format!("<{tag} ")).count(),
+            entitlements.matches(&format!("</{tag}>")).count(),
+            "unbalanced <{tag}> in:\n{entitlements}"
+        );
+    }
+
+    let pbxproj = std::fs::read_to_string(dest.join("ios/Runner.xcodeproj/project.pbxproj"))
+        .expect("reading project.pbxproj");
+    for id in RUNNER_CONFIG_IDS {
+        let start = pbxproj
+            .find(&format!("\t\t{id} /*"))
+            .unwrap_or_else(|| panic!("no configuration `{id}`:\n{pbxproj}"));
+        let end = start + pbxproj[start..].find("\n\t\t};\n").unwrap();
+        assert!(
+            pbxproj[start..end].contains("CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;"),
+            "configuration `{id}` lacks CODE_SIGN_ENTITLEMENTS:\n{pbxproj}"
+        );
+    }
+    assert_eq!(pbxproj.matches("CODE_SIGN_ENTITLEMENTS").count(), 3);
+
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+/// With `--platforms android` the flag still succeeds and writes no iOS
+/// file at all.
+#[test]
+fn create_android_only_project_with_deeplink_https_host_writes_no_ios_file() {
+    let dest = create_with_https_host("fk_android_applinks_app", &["--platforms", "android"]);
+
+    assert!(!dest.join("ios").exists());
+    let manifest =
+        std::fs::read_to_string(dest.join("android/app/src/main/AndroidManifest.xml")).unwrap();
+    assert!(
+        manifest.contains("<intent-filter android:autoVerify=\"true\">"),
+        "{manifest}"
+    );
+    assert!(
+        manifest.contains("android:scheme=\"https\" android:host=\"links.example.com\""),
+        "{manifest}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dest);
+}
+
+/// The `--deeplink-https-host` entitlements file lints with `plutil`, and
+/// the project still parses with `xcodebuild -list`.
+#[test]
+#[ignore = "shells out to `xcodebuild`/`plutil` (macOS + Xcode command-line tools only); run explicitly with `--ignored`"]
+fn create_ios_project_with_deeplink_https_host_lints() {
+    let dest = create_with_https_host("fk_ios_applinks_lint_app", &[]);
+
+    let entitlements = dest.join("ios/Runner/Runner.entitlements");
+    let lint = Command::new("plutil")
+        .arg("-lint")
+        .arg(&entitlements)
+        .output()
+        .expect("failed to spawn `plutil`");
+    assert!(
+        lint.status.success(),
+        "`plutil -lint` failed on {}:\n{}",
+        entitlements.display(),
+        String::from_utf8_lossy(&lint.stderr)
+    );
+    let list = Command::new("xcodebuild")
+        .args(["-list", "-project"])
+        .arg(dest.join("ios/Runner.xcodeproj"))
+        .output()
+        .expect("failed to spawn `xcodebuild`");
+    assert!(
+        list.status.success(),
+        "`xcodebuild -list` failed:\n{}",
+        String::from_utf8_lossy(&list.stderr)
     );
 
     let _ = std::fs::remove_dir_all(&dest);
