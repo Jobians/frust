@@ -114,11 +114,10 @@ pub use serve::{
 /// `./pkg/app.js` default — see the module doc's `--out-name` section.
 pub const BINDGEN_OUT_NAME: &str = "app";
 
-/// The `wasm-bindgen` version this workspace pins (LAW — the root
-/// `Cargo.toml`'s `[workspace.dependencies]` row reads
-/// `wasm-bindgen = "=0.2.128"`, exact because the crate and the host
+/// The `wasm-bindgen` version this workspace pins (LAW — `crates/frust-testing`
+/// reads `wasm-bindgen = "=0.2.128"`, exact because the crate and the host
 /// `wasm-bindgen-cli` share a schema version and the CLI refuses a
-/// mismatched pair).
+/// mismatched pair; the published crates require it only as a minimum).
 ///
 /// Carried as a constant so the host-tool check
 /// (`crate::doctor::wasm_bindgen_cli`) names a version rather than a

@@ -585,6 +585,12 @@ share one version. Or commit `Cargo.lock` and read the Breaking block before run
   `ios/` directory, so the iOS link lines no longer block an add there: an app without `ios/` can
   add `onnx`, and one that has `android/` can add `auth-session` and the other plugins whose iOS
   side is only link lines. A project with `ios/` but no `project.pbxproj` still fails.
+- `frust-ui` and `frust-shell-web` require `wasm-bindgen` 0.2.128 or newer instead of exactly
+  0.2.128. The exact pin, which must equal the installed `wasm-bindgen-cli`, stays in the app's own
+  manifest, where new apps already have it and `frust build web` already checks it. Before, an app
+  could not use any dependency that needs a newer `wasm-bindgen` (for example SurrealDB 4, which
+  needs 0.2.129), even when it never builds for the browser, because Cargo resolves the lockfile for
+  every target. No migration: an app that pins `=0.2.128` keeps resolving 0.2.128.
 - The framework's Android pthread key use: each crate keeps its per-thread state in one struct, so
   the framework links 7 thread-local statics (57 before). On a OnePlus 9 (Android 15) the native-widgets
   demo links 33 in all (84 before) and ends a full walk with 82 pthread keys free (40 before).

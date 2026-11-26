@@ -42,9 +42,10 @@
 //!
 //! `wasm-bindgen`'s generated glue and its CLI share a schema version, and the
 //! crate's own tooling refuses a mismatch outright: the pair is a lockstep
-//! contract, not a compatible-range one. That is why this repository pins the
-//! crate exactly (`=0.2.128`, derived from the host CLI — see
-//! `examples/web-spike/Cargo.toml`'s own derivation) and why
+//! contract, not a compatible-range one. That is why this repository's apps
+//! and tests pin the crate exactly (`=0.2.128`, derived from the host CLI —
+//! see `examples/web-spike/Cargo.toml`'s own derivation; the published crates
+//! ask only for that minimum, so an app may pin a newer one) and why
 //! [`bindgen_check`] compares for *equality* against whatever the project
 //! declares rather than asking whether one satisfies the other. A project
 //! declaring no `wasm-bindgen` dependency at all is reported as
