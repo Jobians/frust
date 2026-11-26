@@ -30,9 +30,8 @@ wgpu = { version = "30.0.1", default-features = false, features = [
 winit = "0.30.13"
 
 # --- Browser shell (wasm32-unknown-unknown) rows -------------------------------
-# Minimum, not exact, so apps may take a newer `wasm-bindgen`. The exact pin matching the host
-# `wasm-bindgen-cli` (0.2.128) lives in each app's manifest and, here, in frust-testing; its lockstep
-# partners (futures/js-sys/web-sys, `wasm-bindgen-test`) are listed in docs/SHELLS_DEVELOPMENT.md.
+# Minimum, not exact: the exact pin equal to the host `wasm-bindgen-cli` (0.2.128) is each app's own, here
+# frust-testing's; futures/js-sys/web-sys and `wasm-bindgen-test` move in lockstep (docs/SHELLS_DEVELOPMENT.md).
 wasm-bindgen = "0.2.128"
 wasm-bindgen-futures = "0.4.77"
 js-sys = "0.3.104"
