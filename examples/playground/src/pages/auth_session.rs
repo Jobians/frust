@@ -253,6 +253,39 @@ fn fire_busy(_state: &mut PlaygroundState) {
     });
 }
 
+/// `Cancel in 5 s`: start a session with [`AuthSession::start_with_cancel`]
+/// against `cookie.html` (a page that never redirects) and cancel it from the
+/// app five seconds later, while the browser is still in front.
+///
+/// The cancel is called from a plain thread, not from a `frust::time` timer:
+/// the app's own timers do not run while it is in the background, and the
+/// handle is `Send`, so this is how an app cancels behind a browser. The
+/// status line reads `Cancel in 5 s -> Ok(Cancelled), cancel called at 5.0 s`
+/// once the app is back in front (the line itself is written on the UI
+/// thread). A following button press finds the session slot free.
+fn fire_cancel_after_delay(_state: &mut PlaygroundState) {
+    let started = std::time::Instant::now();
+    let (session, cancel) = AuthSession::start_with_cancel(request_for("cookie.html"));
+    let called_at_ms = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let called_at_ms_writer = std::sync::Arc::clone(&called_at_ms);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(5));
+        cancel.cancel();
+        let ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
+        called_at_ms_writer.store(ms, std::sync::atomic::Ordering::SeqCst);
+    });
+    spawn_local(async move {
+        let result = session.await;
+        let ms = called_at_ms.load(std::sync::atomic::Ordering::SeqCst);
+        let called = if ms == 0 {
+            "cancel not called yet".to_string()
+        } else {
+            format!("cancel called at {:.1} s", f64::from(ms) / 1000.0)
+        };
+        status_sig().set(format!("Cancel in 5 s -> {}, {called}", render(&result)));
+    });
+}
+
 /// Percent-encode `value` for a URI query value — RFC 3986 unreserved bytes
 /// (`ALPHA DIGIT - . _ ~`) pass through, everything else becomes an
 /// uppercase `%XX` per byte. `frust-oauth-native`'s own equivalent
@@ -527,6 +560,12 @@ pub fn page(_state: &PlaygroundState) -> impl View<PlaygroundState> {
                         .style(ButtonStyle::Secondary)
                         .small(),
                 ),
+        )
+        .child(SizedBox(None, Some(8.0)))
+        .child(
+            button("Cancel in 5 s", fire_cancel_after_delay)
+                .style(ButtonStyle::Secondary)
+                .small(),
         )
         .child(SizedBox(None, Some(8.0)))
         .child(text(status_line).size(12.0))
