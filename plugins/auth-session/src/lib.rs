@@ -788,6 +788,11 @@ impl AuthSession {
     /// back with an **inert** handle: cancelling it does nothing, and in
     /// particular never touches the session whose presence made this
     /// request `Busy`.
+    ///
+    /// While the browser is in front the app is in the background, where its
+    /// UI-thread timers (`frust::time`) do not run: a cancel scheduled on one
+    /// fires only when the user comes back. To end a session on a deadline,
+    /// call the handle from another thread; it is `Send + Sync` for that.
     pub fn start_with_cancel(
         req: AuthSessionRequest,
     ) -> (
