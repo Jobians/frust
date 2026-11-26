@@ -143,6 +143,23 @@ fn reset_initial_for_test() {
         .expect("frust-reactive: deep_link initial mutex poisoned") = None;
 }
 
+/// The scheme of `url` for log lines: the text before the first `:`, at most 32
+/// characters, and only if it is ASCII alphanumeric plus `+`, `-`, `.`;
+/// otherwise `?`. Never returns any other part of the URL.
+fn loggable_scheme(url: &str) -> &str {
+    match url.split_once(':') {
+        Some((scheme, _))
+            if scheme.len() <= 32
+                && scheme
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')) =>
+        {
+            scheme
+        }
+        _ => "?",
+    }
+}
+
 /// Deliver a platform deep link (cold-start or warm) into the process-wide
 /// source. Called by a shell (the Android/iOS FFI glue) on the UI
 /// thread; app code never calls this directly.
@@ -173,11 +190,15 @@ pub fn push_deep_link(url: impl Into<String>) {
     }
 
     if ReactiveRuntime::get().is_none() {
+        // The URL itself is never logged: an https link or sign-in redirect
+        // can carry a code or token. Scheme and length are enough to diagnose.
         eprintln!(
-            "frust-reactive: push_deep_link(\"{url}\") dropped — ReactiveRuntime::init has \
-             not run yet. A shell should queue a link platform-side until its native handle \
-             exists; reaching this indicates an odd init-ordering race, not normal \
-             operation."
+            "frust-reactive: push_deep_link(scheme `{}`, {} bytes) dropped — \
+             ReactiveRuntime::init has not run yet. A shell should queue a link \
+             platform-side until its native handle exists; reaching this indicates an odd \
+             init-ordering race, not normal operation.",
+            loggable_scheme(&url),
+            url.len()
         );
         return;
     }
@@ -406,6 +427,44 @@ mod tests {
             link2.sequence > link1.sequence,
             "second sequence should be higher"
         );
+    }
+
+    /// An https URL with query and fragment is delivered byte for byte, and a
+    /// custom-scheme push followed by an https push arrive in order.
+    #[test]
+    fn https_link_delivered_verbatim_and_in_order() {
+        let _guard = crate::WAKER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (waker, _) = recording_waker();
+        let _rt = ReactiveRuntime::init(waker);
+
+        let https = "https://example.com/approvals/42?x=1&y=2#frag";
+        push_deep_link(https);
+        let first = deep_links().latest.get_untracked().unwrap();
+        assert_eq!(first.url, https);
+
+        push_deep_link("frust-test://approvals/7");
+        let custom = deep_links().latest.get_untracked().unwrap();
+        assert_eq!(custom.url, "frust-test://approvals/7");
+        assert!(first.sequence < custom.sequence);
+
+        push_deep_link(https);
+        let again = deep_links().latest.get_untracked().unwrap();
+        assert_eq!(again.url, https);
+        assert!(custom.sequence < again.sequence);
+    }
+
+    /// The dropped-push log line names only a sanitized scheme.
+    #[test]
+    fn loggable_scheme_never_leaks_the_rest() {
+        assert_eq!(loggable_scheme("https://h/p?code=secret#t"), "https");
+        assert_eq!(loggable_scheme("my-app+x.y://a"), "my-app+x.y");
+        assert_eq!(loggable_scheme("/just/a/path?code=secret"), "?");
+        assert_eq!(loggable_scheme("no colon"), "?");
+        assert_eq!(loggable_scheme("bad scheme:rest"), "?");
+        assert_eq!(loggable_scheme(&format!("{}:x", "a".repeat(33))), "?");
+        assert_eq!(loggable_scheme(&format!("{}:x", "a".repeat(32))).len(), 32);
     }
 
     /// Criterion: the UI-thread contract is enforced (mirrors
