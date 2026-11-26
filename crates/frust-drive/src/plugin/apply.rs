@@ -299,7 +299,7 @@ pub(super) fn prepare_add<'e>(
                 comment,
             } = contribution
             {
-                plan_ios_entitlement(project_root, key, value, comment)?;
+                plan_ios_entitlement(project_root, key, value, comment, false)?;
             }
         }
     }
@@ -3015,7 +3015,7 @@ pub(super) fn ios_entitlement_present(
     value: &IosEntitlementValue,
     comment: &str,
 ) -> Result<bool, PluginAddError> {
-    Ok(plan_ios_entitlement(project_root, key, value, comment)?.is_noop())
+    Ok(plan_ios_entitlement(project_root, key, value, comment, false)?.is_noop())
 }
 
 /// Request entitlement `key` on the Runner target: the key in the
@@ -3031,7 +3031,30 @@ pub(crate) fn apply_ios_entitlement(
     value: &IosEntitlementValue,
     comment: &str,
 ) -> Result<AddOutcome, PluginAddError> {
-    let plan = plan_ios_entitlement(project_root, key, value, comment)?;
+    let plan = plan_ios_entitlement(project_root, key, value, comment, false)?;
+    write_entitlement_plan(project_root, plan)
+}
+
+/// Like [`apply_ios_entitlement`], but when an entitlements file already
+/// carries `key` with a different value, that value is replaced in place
+/// (every other key and comment is left as it is). For the scaffold only,
+/// which is the documented single writer of its key; the plugin contribution
+/// path keeps its skip-if-present rule through [`apply_ios_entitlement`].
+pub(crate) fn replace_ios_entitlement(
+    project_root: &Path,
+    key: &str,
+    value: &IosEntitlementValue,
+    comment: &str,
+) -> Result<AddOutcome, PluginAddError> {
+    let plan = plan_ios_entitlement(project_root, key, value, comment, true)?;
+    write_entitlement_plan(project_root, plan)
+}
+
+/// Writes `plan`: entitlements files first, then the pbxproj.
+fn write_entitlement_plan(
+    project_root: &Path,
+    plan: EntitlementPlan,
+) -> Result<AddOutcome, PluginAddError> {
     if plan.is_noop() {
         return Ok(AddOutcome::AlreadyPresent);
     }
@@ -3057,12 +3080,14 @@ pub(crate) fn apply_ios_entitlement(
 /// `CODE_SIGN_ENTITLEMENTS` names; a configuration without one is given the
 /// file the others already agree on, or [`ENTITLEMENTS_SETTING`] when none
 /// (or more than one) is named. The key then goes into every file in that
-/// set that lacks it.
+/// set that lacks it. With `replace`, a file that has the key with another
+/// value gets that value rewritten instead of being skipped.
 fn plan_ios_entitlement(
     project_root: &Path,
     key: &str,
     value: &IosEntitlementValue,
     comment: &str,
+    replace: bool,
 ) -> Result<EntitlementPlan, PluginAddError> {
     let src = read_required(&project_root.join(PBXPROJ_REL), PBXPROJ_REL)?;
     let configs = runner_target_configurations(&src)?;
@@ -3139,6 +3164,12 @@ fn plan_ios_entitlement(
             }
         };
         if text.contains(&presence) {
+            if replace
+                && let Some(edited) = replace_entitlement_value(&text, key, value, &rel)?
+                && edited != text
+            {
+                files.push((rel, edited));
+            }
             continue;
         }
         let edited = insert_before_anchor(&text, "</dict>", &block, &rel)?;
@@ -3154,7 +3185,16 @@ fn plan_ios_entitlement(
 /// The tab-indented `<!-- comment -->` / `<key>` / value lines one
 /// entitlement adds to the root `<dict>`, key and string values XML-escaped.
 fn entitlement_block(key: &str, value: &IosEntitlementValue, comment: &str) -> String {
-    let value = match value {
+    format!(
+        "\t<!-- {comment} -->\n\t<key>{}</key>\n{}",
+        xml_escape(key),
+        entitlement_value_xml(value)
+    )
+}
+
+/// The tab-indented, newline-terminated plist value element(s) for `value`.
+fn entitlement_value_xml(value: &IosEntitlementValue) -> String {
+    match value {
         IosEntitlementValue::Bool(true) => "\t<true/>\n".to_string(),
         IosEntitlementValue::Bool(false) => "\t<false/>\n".to_string(),
         IosEntitlementValue::String(text) => format!("\t<string>{}</string>\n", xml_escape(text)),
@@ -3167,11 +3207,75 @@ fn entitlement_block(key: &str, value: &IosEntitlementValue, comment: &str) -> S
             out.push_str("\t</array>\n");
             out
         }
+    }
+}
+
+/// `text` with the value following `<key>key</key>` replaced by `value`, or
+/// `None` when the key is absent. The element after the key is located by
+/// tag matching (nested elements of the same name included), so any prior
+/// value type is replaced whole. A value that cannot be delimited is
+/// [`PluginAddError::MalformedProjectFile`] rather than a guess.
+fn replace_entitlement_value(
+    text: &str,
+    key: &str,
+    value: &IosEntitlementValue,
+    rel: &str,
+) -> Result<Option<String>, PluginAddError> {
+    let malformed = || PluginAddError::MalformedProjectFile(rel.to_string());
+    let marker = format!("<key>{}</key>", xml_escape(key));
+    let Some(key_at) = text.find(&marker) else {
+        return Ok(None);
     };
-    format!(
-        "\t<!-- {comment} -->\n\t<key>{}</key>\n{value}",
-        xml_escape(key)
-    )
+    let after_key = key_at + marker.len();
+    let rest = &text[after_key..];
+    let start = after_key + (rest.len() - rest.trim_start().len());
+    let tail = &text[start..];
+    if !tail.starts_with('<') {
+        return Err(malformed());
+    }
+    let tag_end = tail.find('>').ok_or_else(malformed)?;
+    let open = &tail[1..tag_end];
+    let end = if let Some(name) = open.strip_suffix('/') {
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            return Err(malformed());
+        }
+        start + tag_end + 1
+    } else {
+        let name = open.split_whitespace().next().ok_or_else(malformed)?;
+        let open_tag = format!("<{name}");
+        let close_tag = format!("</{name}>");
+        let mut depth = 1usize;
+        let mut at = tag_end + 1;
+        loop {
+            let next_close = tail[at..].find(&close_tag).ok_or_else(malformed)? + at;
+            // An opening tag of the same name before that close nests.
+            match tail[at..next_close].find(&open_tag) {
+                Some(rel_open) => {
+                    let open_at = at + rel_open;
+                    let inner_end = tail[open_at..].find('>').ok_or_else(malformed)? + open_at;
+                    if !tail[open_at..inner_end].ends_with('/') {
+                        depth += 1;
+                    }
+                    at = inner_end + 1;
+                }
+                None => {
+                    depth -= 1;
+                    at = next_close + close_tag.len();
+                    if depth == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        start + at
+    };
+    let replacement = entitlement_value_xml(value);
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..after_key]);
+    out.push('\n');
+    out.push_str(replacement.trim_end_matches('\n'));
+    out.push_str(&text[end..]);
+    Ok(Some(out))
 }
 
 /// `text` with the three characters XML character data cannot carry

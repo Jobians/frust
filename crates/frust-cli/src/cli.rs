@@ -112,8 +112,8 @@ pub enum Command {
         /// `--overwrite`/`--template-dir`/`--frust-path` still apply.
         /// `--org`/`--description` are unused (a design-system crate has no
         /// bundle identifier or app manifest); `--deeplink-scheme`/
-        /// `--deeplink-host`/`--deeplink-https-host`/`--arch` are rejected outright rather than
-        /// silently ignored, since a plain library crate has no deep-link
+        /// `--deeplink-host`/`--deeplink-https-host`/`--arch` are rejected outright
+        /// rather than silently ignored, since a plain library crate has no deep-link
         /// config or app-architecture variant for them to apply to.
         #[arg(long = "design-system")]
         design_system: bool,

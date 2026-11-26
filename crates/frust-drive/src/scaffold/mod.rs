@@ -398,10 +398,11 @@ pub fn generate_with_https_host(
     platforms: &[ScaffoldPlatform],
     https_host: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
+    // The one validation of the host (its errors name the flag themselves).
     let https_host = https_host
         .map(validate_deeplink_https_host)
         .transpose()
-        .map_err(|err| anyhow!("invalid --deeplink-https-host: {err}"))?;
+        .map_err(anyhow::Error::from)?;
     check_destination(dest, overwrite)?;
 
     if let Some(tag) = arch
@@ -514,7 +515,12 @@ pub fn generate_with_https_host(
             format!("applinks:{host}").into(),
             format!("webcredentials:{host}").into(),
         ];
-        crate::plugin::apply::apply_ios_entitlement(
+        // Replace, not skip: a re-run with another host must not leave the
+        // previous host's domains in a file an earlier run created. The
+        // converse (a later run with no host) is deliberately a no-op: the
+        // scaffold never deletes a user's file, so an earlier run's
+        // entitlements stay as they are, silently.
+        crate::plugin::apply::replace_ios_entitlement(
             dest,
             ASSOCIATED_DOMAINS_KEY,
             &crate::plugin::IosEntitlementValue::StringArray(domains.into()),
@@ -1848,6 +1854,144 @@ mod tests {
             ),
             "{toml}"
         );
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// Scaffolds `host` over `dest` (with `--overwrite` when `overwrite`).
+    fn scaffold_with_host(dest: &Path, overwrite: bool, host: Option<&str>) -> Vec<PathBuf> {
+        generate_with_https_host(
+            dest,
+            &test_context(),
+            None,
+            overwrite,
+            None,
+            ScaffoldPlatform::DEFAULT,
+            host,
+        )
+        .unwrap()
+    }
+
+    /// The `associated-domains` array an entitlements file must carry for
+    /// `host`, as the scaffold writes it.
+    fn domains_block(host: &str) -> String {
+        format!(
+            "\t<key>com.apple.developer.associated-domains</key>\n\
+             \t<array>\n\
+             \t\t<string>applinks:{host}</string>\n\
+             \t\t<string>webcredentials:{host}</string>\n\
+             \t</array>\n"
+        )
+    }
+
+    /// Re-running with another host rewrites the iOS associated domains so
+    /// every file names the new host, and the entitlements stay valid.
+    #[test]
+    fn overwrite_with_another_https_host_rewrites_associated_domains() {
+        let dest = unique_temp_dir("https-host-rewrite");
+        scaffold_with_host(&dest, false, Some("a.example.com"));
+        let written = scaffold_with_host(&dest, true, Some("b.example.com"));
+
+        let entitlements = fs::read_to_string(dest.join(RUNNER_ENTITLEMENTS_REL)).unwrap();
+        assert!(
+            entitlements.contains(&domains_block("b.example.com")),
+            "{entitlements}"
+        );
+        assert!(!entitlements.contains("a.example.com"), "{entitlements}");
+        assert_eq!(
+            entitlements
+                .matches("com.apple.developer.associated-domains")
+                .count(),
+            1,
+            "{entitlements}"
+        );
+        assert!(entitlements.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"));
+        assert!(
+            entitlements.ends_with("</dict>\n</plist>\n"),
+            "{entitlements}"
+        );
+        assert_eq!(entitlements.matches("<dict>").count(), 1);
+        assert!(written.contains(&PathBuf::from(RUNNER_ENTITLEMENTS_REL)));
+
+        let pbxproj =
+            fs::read_to_string(dest.join("ios/Runner.xcodeproj/project.pbxproj")).unwrap();
+        for id in RUNNER_CONFIG_IDS {
+            assert!(
+                pbx_object_body(&pbxproj, id)
+                    .contains("CODE_SIGN_ENTITLEMENTS = Runner/Runner.entitlements;"),
+                "configuration `{id}` lacks the setting:\n{pbxproj}"
+            );
+        }
+        let manifest =
+            fs::read_to_string(dest.join("android/app/src/main/AndroidManifest.xml")).unwrap();
+        assert!(
+            manifest.contains("android:host=\"b.example.com\""),
+            "{manifest}"
+        );
+        assert!(!manifest.contains("a.example.com"), "{manifest}");
+        let toml = fs::read_to_string(dest.join("frust.toml")).unwrap();
+        assert!(toml.contains("https-host = \"b.example.com\""), "{toml}");
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// The rewrite replaces only the associated-domains value: an unrelated
+    /// key already in the entitlements file survives.
+    #[test]
+    fn overwrite_with_another_https_host_keeps_unrelated_entitlement_keys() {
+        let dest = unique_temp_dir("https-host-rewrite-extra");
+        scaffold_with_host(&dest, false, Some("a.example.com"));
+        let path = dest.join(RUNNER_ENTITLEMENTS_REL);
+        let original = fs::read_to_string(&path).unwrap();
+        let extra = "\t<key>aps-environment</key>\n\t<string>development</string>\n";
+        fs::write(
+            &path,
+            original.replace("</dict>", &format!("{extra}</dict>")),
+        )
+        .unwrap();
+
+        scaffold_with_host(&dest, true, Some("b.example.com"));
+
+        let entitlements = fs::read_to_string(&path).unwrap();
+        assert!(entitlements.contains(extra), "{entitlements}");
+        assert!(
+            entitlements.contains(&domains_block("b.example.com")),
+            "{entitlements}"
+        );
+        assert!(!entitlements.contains("a.example.com"), "{entitlements}");
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// Overwriting with the same host leaves the entitlements bytes alone and
+    /// does not report the file as written by the entitlement step.
+    #[test]
+    fn overwrite_with_the_same_https_host_changes_nothing() {
+        let dest = unique_temp_dir("https-host-same");
+        scaffold_with_host(&dest, false, Some("a.example.com"));
+        let path = dest.join(RUNNER_ENTITLEMENTS_REL);
+        let before = fs::read(&path).unwrap();
+
+        let written = scaffold_with_host(&dest, true, Some("a.example.com"));
+
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!written.contains(&PathBuf::from(RUNNER_ENTITLEMENTS_REL)));
+
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    /// A later run with no https host leaves an earlier run's entitlements
+    /// file alone.
+    #[test]
+    fn overwrite_without_an_https_host_leaves_the_entitlements_file() {
+        let dest = unique_temp_dir("https-host-dropped");
+        scaffold_with_host(&dest, false, Some("a.example.com"));
+        let path = dest.join(RUNNER_ENTITLEMENTS_REL);
+        let before = fs::read(&path).unwrap();
+
+        scaffold_with_host(&dest, true, None);
+
+        assert_eq!(fs::read(&path).unwrap(), before);
 
         let _ = fs::remove_dir_all(&dest);
     }

@@ -73,11 +73,6 @@ fn run_with(args: CreateArgs, sync: WireFn<'_>) -> Result<u8> {
         scaffold::validate_deeplink_scheme(scheme)
             .with_context(|| format!("invalid --deeplink-scheme `{scheme}`"))?;
     }
-    let https_host = args
-        .deeplink_https_host
-        .as_deref()
-        .map(scaffold::validate_deeplink_https_host)
-        .transpose()?;
 
     let ctx = TemplateContext {
         title_case_name: scaffold::title_case(&project_name),
@@ -117,7 +112,7 @@ fn run_with(args: CreateArgs, sync: WireFn<'_>) -> Result<u8> {
         args.overwrite,
         args.arch.as_deref(),
         &platforms,
-        https_host.as_deref(),
+        args.deeplink_https_host.as_deref(),
     )?;
 
     println!("Created {} file(s) in {}", written.len(), dest.display());
@@ -402,6 +397,10 @@ mod tests {
             "user@links.example.com",
             "",
             "links example.com",
+            "-links.example.com",
+            "links-.example.com",
+            "10.0.0.1",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com",
         ]
         .into_iter()
         .enumerate()
