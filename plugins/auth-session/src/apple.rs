@@ -94,23 +94,40 @@
 //! discards it and its [`release_live`] finds no matching entry. An entry
 //! for any other generation is never touched.
 //!
-//! # The iOS 15 floor and the deprecated initializer
+//! # Two initializers, one runtime check
 //!
-//! `-initWithURL:callbackURLScheme:completionHandler:` is marked
-//! `#[deprecated]` by the binding in favour of iOS 17.4's
-//! `-initWithURL:callback:completionHandler:` (which takes an
-//! `ASWebAuthenticationSessionCallback` and can express an HTTPS App-Link
-//! callback as well as a custom scheme). This crate's deployment floor is
-//! iOS 15, where the newer initializer does not exist at all, so
-//! [`make_session`] keeps the older one behind a narrowly scoped
-//! `#[allow(deprecated)]` — the same shape `frust-haptics`'s `impact` uses
-//! for its own header-translator deprecation. Raising the floor to 17.4 is
-//! the only thing that would change this.
+//! iOS 17.4 / macOS 14.4 added `-initWithURL:callback:completionHandler:`,
+//! which takes an `ASWebAuthenticationSessionCallback` — either
+//! `+callbackWithCustomScheme:` or `+callbackWithHTTPSHost:path:` — and is
+//! the only way to have the session catch an https redirect. This crate's
+//! deployment floor is iOS 15, where neither that class nor that initializer
+//! exists, so the choice is made at run time by [`callback_class_available`]:
+//! an Objective-C class lookup for `ASWebAuthenticationSessionCallback`, not
+//! an OS-version parse. [`make_session`] then takes one of two paths:
+//!
+//! - **Class present** (iOS 17.4+ / macOS 14.4+): a callback object of
+//!   either form, handed to the new initializer.
+//! - **Class absent** (below the floor): a custom-scheme request goes
+//!   through the older `-initWithURL:callbackURLScheme:completionHandler:`
+//!   exactly as before, behind a narrowly scoped `#[allow(deprecated)]` —
+//!   the same shape `frust-haptics`'s `impact` uses for its own
+//!   header-translator deprecation. An https request never gets this far:
+//!   [`https_callback_supported`] answers the same lookup, and `crate`
+//!   refuses the request before the busy slot is claimed. [`make_session`]
+//!   still keeps a defensive [`AuthSessionError::HttpsCallbackUnsupported`]
+//!   for it rather than a panic.
+//!
+//! Apple requires an https callback host to be one of the app's associated
+//! domains (the binding's header says "associated web credentials domains");
+//! which associated-domains service is checked, and whether a query or
+//! fragment on the redirect reaches the completion handler, is not
+//! documented. Whatever URL arrives is matched against the request by
+//! [`crate::resolve`], not here.
 //!
 //! # The callback is intercepted in-process
 //!
 //! Apple's documented precondition still applies: an app using a custom
-//! `callbackURLScheme` must register that scheme in its `Info.plist` under
+//! callback scheme must register that scheme in its `Info.plist` under
 //! `CFBundleURLTypes`. What does **not** happen is the app ever seeing the
 //! redirect as a URL open — `ASWebAuthenticationSession` intercepts the
 //! callback itself inside the browser tab it owns and hands it straight to
@@ -128,8 +145,11 @@
 //! - [`start`]'s one `MainThreadMarker::new_unchecked()`, proving that a
 //!   `dispatch_get_main_queue()` callback runs on the real main thread
 //!   (`frust-haptics`'s apple backend's identical claim).
-//! - [`make_session`]'s initializer call, whose whole caller contract is
-//!   the completion-block lifetime — stated on that function.
+//! - [`make_session`]'s and [`make_scheme_session`]'s initializer calls,
+//!   whose whole caller contract is the completion-block lifetime — stated
+//!   on [`make_session`] — and [`make_session`]'s two
+//!   `ASWebAuthenticationSessionCallback` class-method calls, made only
+//!   after [`callback_class_available`] found the class.
 //! - [`start_on_main`]'s two property setters, its stale-session `-cancel`,
 //!   [`cancel_on_main`]'s `-cancel` and [`present`]'s `-start` call, each a
 //!   plain message send to a live session on the main thread.
@@ -158,12 +178,13 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::Retained;
-use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{AnyClass, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_authentication_services::{
     ASPresentationAnchor, ASWebAuthenticationPresentationContextProviding,
-    ASWebAuthenticationSession, ASWebAuthenticationSessionCompletionHandler,
-    ASWebAuthenticationSessionErrorCode, ASWebAuthenticationSessionErrorDomain,
+    ASWebAuthenticationSession, ASWebAuthenticationSessionCallback,
+    ASWebAuthenticationSessionCompletionHandler, ASWebAuthenticationSessionErrorCode,
+    ASWebAuthenticationSessionErrorDomain,
 };
 use objc2_foundation::{NSError, NSString, NSURL};
 
@@ -288,43 +309,46 @@ fn as_presentation_anchor(window: Retained<NSWindow>) -> Retained<ASPresentation
 /// Hand the session to the main queue — see this module's doc.
 pub(crate) fn start(req: AuthSessionRequest, token: SessionToken) -> Result<(), AuthSessionError> {
     // `crate` refuses an https request before reaching here while
-    // [`https_callback_supported`] answers `false`; this arm only keeps the
-    // backend from ever presenting one without that check.
-    let scheme = match &req.callback {
-        AuthCallback::CustomScheme(scheme) => scheme.clone(),
-        AuthCallback::Https { .. } => return Err(AuthSessionError::HttpsCallbackUnsupported),
-    };
+    // [`https_callback_supported`] answers `false`; this check only keeps
+    // the backend from ever handing one to the main queue without it.
+    if matches!(req.callback, AuthCallback::Https { .. }) && !https_callback_supported() {
+        return Err(AuthSessionError::HttpsCallbackUnsupported);
+    }
     DispatchQueue::main().exec_async(move || {
         // SAFETY: this closure is submitted to `dispatch_get_main_queue()`,
         // which always executes its blocks on the actual OS main thread, so
         // constructing a `MainThreadMarker` here without re-checking is
         // sound (`plugins/haptics/src/apple.rs`'s identical claim).
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        start_on_main(mtm, req, &scheme, token);
+        start_on_main(mtm, req, token);
     });
     Ok(())
 }
 
 /// Whether this backend can start an [`crate::AuthCallback::Https`]
-/// session: not yet — sessions are built with the custom-scheme
-/// initializer only. `crate` asks this before claiming the busy slot and
-/// refuses an https request with
-/// [`AuthSessionError::HttpsCallbackUnsupported`] when it answers `false`.
+/// session: exactly when the OS has `ASWebAuthenticationSessionCallback`
+/// (iOS 17.4+ / macOS 14.4+, module doc's *Two initializers, one runtime
+/// check*). `crate` asks this before claiming the busy slot and refuses an
+/// https request with [`AuthSessionError::HttpsCallbackUnsupported`] when
+/// it answers `false`. Callable from any thread.
 pub(crate) fn https_callback_supported() -> bool {
-    false
+    callback_class_available()
 }
 
-/// Build, configure and present the session for `req`, whose custom
-/// callback scheme [`start`] has already extracted as `scheme`. Runs on the
-/// main queue; every failure path resolves the live session rather than
+/// Whether the Objective-C runtime has the `ASWebAuthenticationSessionCallback`
+/// class — and with it `-initWithURL:callback:completionHandler:`, which
+/// shipped in the same OS release. A class lookup rather than an OS-version
+/// parse; `objc_getClass` is thread-safe, so this is callable from any
+/// thread.
+fn callback_class_available() -> bool {
+    AnyClass::get(c"ASWebAuthenticationSessionCallback").is_some()
+}
+
+/// Build, configure and present the session for `req`. Runs on the main
+/// queue; every failure path resolves the live session rather than
 /// returning, because [`start`] has already told its caller `Ok(())` by the
 /// time this runs.
-fn start_on_main(
-    mtm: MainThreadMarker,
-    req: AuthSessionRequest,
-    scheme: &str,
-    token: SessionToken,
-) {
+fn start_on_main(mtm: MainThreadMarker, req: AuthSessionRequest, token: SessionToken) {
     // The one identity this session has: what `crate::resolve` attributes
     // an outcome by, and what [`LIVE`]'s entry is tagged with.
     let generation = token.generation;
@@ -384,15 +408,21 @@ fn start_on_main(
         release_live(generation);
     });
 
-    let scheme = NSString::from_str(scheme);
     // The block is heap-allocated and outlives this call: it is moved into
     // `LIVE` below and released only after completion.
     let completion: ASWebAuthenticationSessionCompletionHandler =
         std::ptr::from_ref(&*block).cast_mut();
     // SAFETY: `completion` points at `block`, which lives until
     // `release_live` clears `LIVE` after the session has completed — longer
-    // than the session itself can call it.
-    let session = unsafe { make_session(&url, &scheme, completion) };
+    // than the session itself can call it. On the error path no session
+    // exists, so nothing can call `completion` once `block` drops here.
+    let session = match unsafe { make_session(&url, &req.callback, completion) } {
+        Ok(session) => session,
+        Err(err) => {
+            crate::resolve(generation, Err(err));
+            return;
+        }
+    };
 
     // SAFETY: two property writes on a freshly built session, on the main
     // thread, before `-start`. `presentationContextProvider` is a weak
@@ -514,19 +544,78 @@ fn present(generation: u64, session: &ASWebAuthenticationSession) {
     }
 }
 
-/// `-[ASWebAuthenticationSession initWithURL:callbackURLScheme:completionHandler:]`.
+/// A session for `url` that completes on `callback`.
 ///
-/// Deprecated in favour of the iOS 17.4 `-initWithURL:callback:completionHandler:`,
-/// which does not exist on this crate's iOS 15 floor — see the module doc's
-/// *The iOS 15 floor and the deprecated initializer*.
+/// With `ASWebAuthenticationSessionCallback` present (iOS 17.4+ / macOS
+/// 14.4+), `-initWithURL:callback:completionHandler:` with a callback object
+/// of either form. Without it, a custom scheme goes through the deprecated
+/// `-initWithURL:callbackURLScheme:completionHandler:` exactly as before,
+/// and an https callback is refused with
+/// [`AuthSessionError::HttpsCallbackUnsupported`] — `crate` already refuses
+/// that request before it reaches the backend, so this is a defensive path,
+/// not a panic. See the module doc's *Two initializers, one runtime check*.
 ///
 /// # Safety
 ///
 /// `completion` must point at a live block of the
 /// `void (^)(NSURL *, NSError *)` shape, and that block must stay alive for
 /// as long as the returned session can call it.
-#[allow(deprecated)]
 unsafe fn make_session(
+    url: &NSURL,
+    callback: &AuthCallback,
+    completion: ASWebAuthenticationSessionCompletionHandler,
+) -> Result<Retained<ASWebAuthenticationSession>, AuthSessionError> {
+    if !callback_class_available() {
+        return match callback {
+            // SAFETY: the caller's contract, passed through unchanged.
+            AuthCallback::CustomScheme(scheme) => {
+                Ok(unsafe { make_scheme_session(url, &NSString::from_str(scheme), completion) })
+            }
+            AuthCallback::Https { .. } => Err(AuthSessionError::HttpsCallbackUnsupported),
+        };
+    }
+
+    // SAFETY: both class methods are plain factory calls with live strings,
+    // on a class the runtime has just been seen to contain (the binding's
+    // class lookup would otherwise panic).
+    let callback = unsafe {
+        match callback {
+            AuthCallback::CustomScheme(scheme) => {
+                ASWebAuthenticationSessionCallback::callbackWithCustomScheme(&NSString::from_str(
+                    scheme,
+                ))
+            }
+            AuthCallback::Https { host, path } => {
+                ASWebAuthenticationSessionCallback::callbackWithHTTPSHost_path(
+                    &NSString::from_str(host),
+                    &NSString::from_str(path),
+                )
+            }
+        }
+    };
+    // SAFETY: a designated initializer on a fresh allocation, with a live
+    // URL and callback object; the initializer shipped in the same OS
+    // release as the callback class just found. `completion`'s validity is
+    // the caller's.
+    Ok(unsafe {
+        ASWebAuthenticationSession::initWithURL_callback_completionHandler(
+            ASWebAuthenticationSession::alloc(),
+            url,
+            &callback,
+            completion,
+        )
+    })
+}
+
+/// `-[ASWebAuthenticationSession initWithURL:callbackURLScheme:completionHandler:]`,
+/// the only initializer below iOS 17.4 / macOS 14.4 — deprecated by the
+/// binding in favour of the one [`make_session`] prefers.
+///
+/// # Safety
+///
+/// As [`make_session`].
+#[allow(deprecated)]
+unsafe fn make_scheme_session(
     url: &NSURL,
     scheme: &NSString,
     completion: ASWebAuthenticationSessionCompletionHandler,

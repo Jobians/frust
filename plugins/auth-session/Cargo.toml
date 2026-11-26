@@ -59,6 +59,7 @@ dispatch2 = { version = "0.3", default-features = false, features = [
 objc2-authentication-services = { version = "0.3", default-features = false, features = [
     "std",
     "ASWebAuthenticationSession",
+    "ASWebAuthenticationSessionCallback",
     "ASFoundation",
     "block2",
 ] }
