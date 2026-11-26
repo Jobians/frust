@@ -84,7 +84,7 @@ internal fun chooseCustomTabsProvider(
  * ## The contract (LAW — see `plugins/auth-session/src/android.rs`)
  *
  * This class's fully-qualified name (`dev.frust.authsession.FrustAuthSessionHost`)
- * and the names of its `@JvmStatic` entry points ([start]) are looked up by
+ * and the names of its `@JvmStatic` entry points ([start], [cancel]) are looked up by
  * string from the Rust side through the application classloader, and
  * [nativeOnAuthSessionResult]'s mangled JNI symbol
  * (`Java_dev_frust_authsession_FrustAuthSessionHost_nativeOnAuthSessionResult`)
@@ -120,7 +120,33 @@ internal fun chooseCustomTabsProvider(
  * [pending] is cleared *before* [nativeOnAuthSessionResult] is called in
  * [onActivityResumed], so a second resume with the same (already-consumed)
  * intent — or any resume once no session is pending — cannot re-deliver a
- * result. Exactly one native callback answers each [start].
+ * result. At most one native callback answers each [start]: exactly one,
+ * unless [cancel] reaches that session first (clearing [pending], or
+ * stopping its launch before it runs), in which case the native side has
+ * already resolved that session itself and none is sent.
+ *
+ * ## Cancelling a session
+ *
+ * [cancel] resolves nothing itself (the native side already has) and closes
+ * nothing: Android has no API to close a Custom Tab, so **the browser stays
+ * in front until the user leaves it**, and a redirect it delivers afterwards
+ * finds no pending session. What [cancel] guarantees, whatever thread it and
+ * [start] are called on:
+ *
+ * - **A launch that has not run yet never opens a tab.** [cancel] records the
+ *   generation in [cancelledGenerations] at once, on the calling thread, and
+ *   a [launch] for a recorded generation returns without launching.
+ * - **The cancel always runs after that session's launch.** [cancelOnMain] is
+ *   always posted to [mainHandler] — never run inline, even on the main
+ *   thread — and the native side can only call [cancel] after [start] has
+ *   returned, by which time a posted launch is already queued ahead of it on
+ *   the same handler. So [cancelOnMain] clears any [pending] its own launch
+ *   set, and it is also what removes the generation from
+ *   [cancelledGenerations] again: every recorded generation is removed by its
+ *   own posted [cancelOnMain], so the set never holds more than the cancels
+ *   still waiting in the queue.
+ * - **A cancel never touches another session.** Both the skip and the clear
+ *   match on the generation only.
  *
  * ## The double-delivery note
  *
@@ -168,14 +194,18 @@ object FrustAuthSessionHost {
     /** Guards a single [Application.registerActivityLifecycleCallbacks] call. */
     private var lifecycleCallbacksRegistered: Boolean = false
 
-    /** Posts a queued [start] onto the main thread; see [start]'s own doc. */
+    /**
+     * Posts a queued [start] and every [cancel] onto the main thread; see
+     * [start]'s own doc and the class doc's "Cancelling a session".
+     */
     private val mainHandler = Handler(Looper.getMainLooper())
 
     /**
      * The one session this host is waiting on a redirect for, or `null` when
      * none is in flight. Set by a successful [launch], cleared the instant
-     * [onActivityResumed] answers it (or decides it cannot) — see the class
-     * doc's one-delivery rule.
+     * [onActivityResumed] answers it (or decides it cannot), or by
+     * [cancelOnMain] for its own generation — see the class doc's
+     * one-delivery rule. Main-thread only.
      */
     private var pending: Pending? = null
 
@@ -186,6 +216,14 @@ object FrustAuthSessionHost {
      * the next `onNewIntent`/relaunch.
      */
     private var consumedIntent: Intent? = null
+
+    /**
+     * Generations [cancel] was called for whose posted [cancelOnMain] has not
+     * run yet — read by [launch] so a launch queued before the cancel opens no
+     * tab (the class doc's "Cancelling a session"). Written from any thread,
+     * so every access holds the set's own monitor.
+     */
+    private val cancelledGenerations = HashSet<Long>()
 
     /**
      * One in-flight session: its [generation] (echoed back on every
@@ -280,6 +318,44 @@ object FrustAuthSessionHost {
     }
 
     /**
+     * Cancel the session [generation] names. Called from any thread by Rust
+     * (`plugins/auth-session/src/android.rs`'s `cancel`), after the native
+     * side has already resolved that session as cancelled — so this host
+     * never calls [nativeOnAuthSessionResult] for it.
+     *
+     * Records [generation] in [cancelledGenerations] at once, so a [launch]
+     * still queued for it opens no tab, then posts [cancelOnMain] through
+     * [mainHandler] — always posted, even from the main thread, so it runs
+     * after any launch already queued there (the class doc's "Cancelling a
+     * session"). Opens and closes nothing: the browser stays in front until
+     * the user leaves it.
+     */
+    @JvmStatic
+    fun cancel(generation: Long) {
+        synchronized(cancelledGenerations) { cancelledGenerations.add(generation) }
+        if (!mainHandler.post { cancelOnMain(generation) }) {
+            // Only a quitting main looper refuses a post, and nothing launches
+            // after that either: drop the record rather than keep it.
+            synchronized(cancelledGenerations) { cancelledGenerations.remove(generation) }
+        }
+    }
+
+    /**
+     * Clears [pending] only when it is still [generation]'s, so a later
+     * resume or a late redirect can neither resolve nor cancel anything for
+     * the cancelled session, and a cancel for an old generation can never
+     * clear a newer session's [pending]. Also forgets [generation] in
+     * [cancelledGenerations]: any [launch] for it was queued ahead of this
+     * call and has already run. Must run on the main thread.
+     */
+    private fun cancelOnMain(generation: Long) {
+        synchronized(cancelledGenerations) { cancelledGenerations.remove(generation) }
+        val p = pending ?: return
+        if (p.generation != generation) return
+        pending = null
+    }
+
+    /**
      * Launches the Custom Tab. Must run on the main thread — both [start]
      * call sites guarantee that. Returns the same code [start] documents.
      *
@@ -288,8 +364,13 @@ object FrustAuthSessionHost {
      * stale session behind) and is rolled back to `null` by both `catch`
      * arms below, so a launch that fails never leaves a pending session that
      * will never resolve.
+     *
+     * A [generation] in [cancelledGenerations] returns `0` without launching
+     * anything: the native side has already resolved that session as
+     * cancelled, so there is no tab to open and no result to report.
      */
     private fun launch(url: String, callbackScheme: String, ephemeral: Boolean, generation: Long): Int {
+        if (synchronized(cancelledGenerations) { generation in cancelledGenerations }) return 0
         val act = activity ?: return 1
         return try {
             val builder = CustomTabsIntent.Builder()

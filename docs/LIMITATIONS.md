@@ -7567,17 +7567,19 @@ heavily under fat LTO's dead-code elimination and identical-code folding, leavin
 
 ---
 
-### `auth-session-no-cancel-v1` — no way to cancel a live session from Rust
+### `auth-session-android-cancel-leaves-tab-open` — a cancelled Android session's browser tab stays open
 
-**Observed**: `AuthSession` exposes no `cancel` method — once `start` returns a pending future, it only resolves when the identity provider redirects, the user dismisses the platform tab themselves, or a platform-level failure occurs; there is no programmatic way for an app to dismiss a live session (e.g. on its own timeout or navigation-away). Dropping the awaited future (not awaiting it, or awaiting and then discarding the result) releases the session Busy slot immediately without waiting for platform resolution — but it does **not** end the platform UI: on Android the Custom Tab stays on screen until the user closes it (a redirect it delivers afterwards finds no pending session and is dropped); on iOS/macOS the presented `ASWebAuthenticationSession` sheet stays up until the user dismisses it or the next `AuthSession::start` `-cancel`s it in favour of the new session (its `CanceledLogin` completion is then discarded as a stale generation).
+**Observed**: `AuthSessionCancel::cancel` (from `AuthSession::start_with_cancel`) resolves the live session as `AuthSessionOutcome::Cancelled` exactly once and frees the one-session slot, but on Android the Custom Tab stays open until the user leaves it: there is no platform API to close a Custom Tab, so the Kotlin host only forgets the pending session. A redirect the tab delivers afterwards finds no pending session and is dropped on the Rust side. On iOS/macOS the same call dismisses the `ASWebAuthenticationSession` sheet. A session started with plain `AuthSession::start`, or whose future is merely dropped, has no cancel at all and likewise leaves the Android tab (and the Apple sheet) up.
 
-**Applies to**: `AuthSession::start`'s platform backends only — Android, iOS, macOS (the in-app browser-tab path). `LoopbackSession` is unaffected: it exposes `LoopbackCancel::cancel` plus a mandatory `LoopbackOptions::timeout`, so a desktop loopback session always has a programmatic way out.
+**Applies to**: Android only, for `AuthSession::start_with_cancel`'s handle. `LoopbackSession` is unaffected (it has `LoopbackCancel::cancel` and a mandatory `LoopbackOptions::timeout`).
 
-**Why accepted**: v1 scope — the one-session `Busy` guard (this crate's *Exactly one live session* doc section) means a stuck session still cannot wedge a later one forever, even with no cancel path and no forced cleanup — dropping the future frees the slot for a new session.
+**Workaround**: none that closes the tab. The app can treat `Cancelled` as final, show its own signed-out state, and let the user dismiss the tab. Call the handle from a non-UI thread when cancelling on a deadline: UI-thread timers do not run while the browser is in front.
 
-**Trigger for removal**: `AuthSession::cancel` exists (dismissing `ASWebAuthenticationSession` via `-cancel`, finishing the Android Custom Tab activity), resolving the live session with `AuthSessionOutcome::Cancelled`.
+**Why accepted**: Chrome Custom Tabs expose no close API; the only alternatives (relaunching the app's own Activity over the tab, or replacing the tab) are not reliable across browsers and are out of scope. The slot is freed and the outcome is delivered, so a stuck session cannot wedge a later one.
 
-**Evidence**: `plugins/auth-session/src/lib.rs`'s public API (`AuthSession::start`/`is_supported` only); `plugins/auth-session/README.md` §2.
+**Trigger for removal**: Custom Tabs gain a supported close or dismiss call, or the Android backend moves to a surface the host can dismiss.
+
+**Evidence**: `plugins/auth-session/platform/android/src/main/kotlin/dev/frust/authsession/FrustAuthSessionHost.kt`'s `cancel` entry point; `plugins/auth-session/src/lib.rs`'s `AuthSessionCancel` rustdoc (*Android* bullet).
 
 ---
 

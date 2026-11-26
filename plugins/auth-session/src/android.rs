@@ -15,6 +15,7 @@
 //! | Direction | Member | Notes |
 //! |---|---|---|
 //! | Rust → Kotlin | `@JvmStatic fun start(url: String, callbackScheme: String, ephemeral: Boolean, generation: Long): Int` — `(Ljava/lang/String;Ljava/lang/String;ZJ)I` | Resolved once via `context.getClassLoader().loadClass(...)` (the `FrustIapHost`/`FrustBiometric` mechanism — see [`host_class`]) and cached. |
+//! | Rust → Kotlin | `@JvmStatic fun cancel(generation: Long)` — `(J)V` | [`cancel`]'s call: a launch not yet run for `generation` opens no tab, and the pending session is forgotten only if it is still `generation`'s, on the main thread — see *Cancelling a live session*. |
 //! | Kotlin → Rust | [`Java_dev_frust_authsession_FrustAuthSessionHost_nativeOnAuthSessionResult`]`(env, class, generation: jlong, kind: jint, url: JString)` | The host's one callback into Rust — see *Two numbering schemes* below. |
 //!
 //! # The generation round trip
@@ -83,6 +84,32 @@
 //! double-delivery note* — the callback URL also reaches
 //! `frust::deep_links()` as an ordinary deep link; this future is the single
 //! authoritative source for it, never that stream.
+//!
+//! # Cancelling a live session
+//!
+//! [`cancel`] is [`crate::AuthSessionCancel::cancel`]'s backend hook. By the
+//! time it runs, `crate` has already resolved the session `Cancelled` and
+//! freed the Busy slot, so nothing the host reports for that generation
+//! afterwards can complete anything. It calls the host's `cancel`, which
+//! resolves the session on the host side and clears its pending state:
+//!
+//! - it records the generation at once, so a launch for it that is still
+//!   posted to the main thread (a [`start`] made off the main thread) opens
+//!   no tab when it runs;
+//! - it always posts its main-thread half to the same handler as that
+//!   launch — never inline, even when called on the main thread — so it runs
+//!   after the launch whatever thread either call came from, and clears
+//!   `pending` **only** when it still carries this generation: a later
+//!   resume or a late redirect then finds no pending session, and a cancel
+//!   for an old generation can never clear a newer session's `pending`.
+//!
+//! Nothing closes the Custom Tab: Android has no API for that, so **the
+//! browser stays open** in front of the app until the user leaves it, and
+//! the redirect it may still deliver is dropped by the host as unsolicited.
+//!
+//! A failure to reach the host (no platform handles, the Gradle module not
+//! linked, a JNI error) is not reported anywhere but a debug trace: the
+//! session is already resolved, and there is no caller left to tell.
 //!
 //! # `unsafe`
 //!
@@ -223,6 +250,31 @@ pub(crate) fn start(req: AuthSessionRequest, token: SessionToken) -> Result<(), 
             ))),
         }
     })
+}
+
+/// The backend half of [`crate::AuthSessionCancel::cancel`] — call the
+/// host's `cancel(generation)` (module doc's *Cancelling a live session*).
+/// Called from any thread, with `crate::ACTIVE` already released and
+/// `generation` already resolved `Cancelled`.
+pub(crate) fn cancel(generation: u64) {
+    let cancelled = with_host(|env, class| {
+        run_jni(env, "FrustAuthSessionHost.cancel", |env| {
+            env.call_static_method(
+                class,
+                jni_str!("cancel"),
+                jni_sig!("(J)V"),
+                // The same reinterpretation `start` makes.
+                &[JValue::Long(generation as jlong)],
+            )?
+            .v()
+        })
+    });
+    if cancelled.is_err() {
+        // No `log` dependency (the platform-plugin charter), and no caller
+        // to report to: the session is already resolved.
+        #[cfg(debug_assertions)]
+        eprintln!("frust-auth-session: the host could not be asked to cancel the session");
+    }
 }
 
 // --- JNI plumbing (mirrors `plugins/iap/src/android.rs`'s `with_host`/

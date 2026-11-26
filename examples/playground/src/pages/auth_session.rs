@@ -80,7 +80,9 @@
 //! port only (never the full redirect URI, though neither is secret) —
 //! `loopback port: none` until the first bind.
 
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use frust::{
     ButtonStyle, Color, EdgeInsets, FlexChild, Get, GetUntracked, Padding, RwSignal, Set, SizedBox,
@@ -250,6 +252,39 @@ fn fire_busy(_state: &mut PlaygroundState) {
     spawn_local(async move {
         let result = second.await;
         status_sig().set(format!("Busy -> {}", render(&result)));
+    });
+}
+
+/// `Cancel in 5 s`: start a session with [`AuthSession::start_with_cancel`]
+/// against `cookie.html` (a page that never redirects) and cancel it from the
+/// app five seconds later, while the browser is still in front.
+///
+/// The cancel is called from a plain thread, not from a `frust::time` timer:
+/// the app's own timers do not run while it is in the background, and the
+/// handle is `Send`, so this is how an app cancels behind a browser. The
+/// status line reads `Cancel in 5 s -> Ok(Cancelled), cancel called at 5.0 s`
+/// once the app is back in front (the line itself is written on the UI
+/// thread). A following button press finds the session slot free.
+fn fire_cancel_after_delay(_state: &mut PlaygroundState) {
+    let started = Instant::now();
+    let (session, cancel) = AuthSession::start_with_cancel(request_for("cookie.html"));
+    // Set once, BEFORE `cancel()`: the session resolves inside that call,
+    // so a time stored after it returns could still be missing when the
+    // status line below reads it.
+    let called_at = Arc::new(OnceLock::<Duration>::new());
+    let called_at_writer = Arc::clone(&called_at);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(5));
+        let _ = called_at_writer.set(started.elapsed());
+        cancel.cancel();
+    });
+    spawn_local(async move {
+        let result = session.await;
+        let called = match called_at.get() {
+            Some(at) => format!("cancel called at {:.1} s", at.as_secs_f64()),
+            None => "cancel not called yet".to_string(),
+        };
+        status_sig().set(format!("Cancel in 5 s -> {}, {called}", render(&result)));
     });
 }
 
@@ -527,6 +562,12 @@ pub fn page(_state: &PlaygroundState) -> impl View<PlaygroundState> {
                         .style(ButtonStyle::Secondary)
                         .small(),
                 ),
+        )
+        .child(SizedBox(None, Some(8.0)))
+        .child(
+            button("Cancel in 5 s", fire_cancel_after_delay)
+                .style(ButtonStyle::Secondary)
+                .small(),
         )
         .child(SizedBox(None, Some(8.0)))
         .child(text(status_line).size(12.0))

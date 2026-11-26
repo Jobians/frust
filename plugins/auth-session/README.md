@@ -204,7 +204,9 @@ The one-live-session slot (the same one [`AuthSession::start`] claims) is claime
     (`auth-session-android-callback-rides-intent-filter` in
     [LIMITATIONS.md](https://github.com/frust-rs/frust/blob/main/docs/LIMITATIONS.md)). PKCE + `state` (§ 3.4) are
     the caller's defence. Dropping the awaited future releases the Busy slot
-    but does not close the tab (`auth-session-no-cancel-v1`).
+    but does not close the tab; to end a session, start it with
+    `AuthSession::start_with_cancel` and call the handle's `cancel` (the tab
+    still stays open on Android: `auth-session-android-cancel-leaves-tab-open`).
 - **Desktop (Linux, Windows, macOS):** use [`LoopbackSession`] instead. On
   Linux and Windows, `AuthSession::start` with a custom scheme still answers
   [`AuthSessionError::NoHandler`] (no platform authentication user agent
@@ -272,7 +274,10 @@ The slot frees the moment the live session resolves — by outcome, by error, or
 failing without ever calling back — so a stuck session can never wedge every later one behind it.
 Dropping the awaited future frees the slot too, but frees only this crate's bookkeeping: the
 platform UI stays up (Android: until the user closes the tab; iOS/macOS: until the user dismisses
-the sheet or the next `start` cancels it) — `auth-session-no-cancel-v1` in
+the sheet or the next `start` cancels it). To end a session, start it with
+`AuthSession::start_with_cancel` and call the returned handle's `cancel`: the future resolves
+`Cancelled` and the slot frees, and the Apple sheet is dismissed, but the Android tab stays open —
+`auth-session-android-cancel-leaves-tab-open` in
 [LIMITATIONS.md](https://github.com/frust-rs/frust/blob/main/docs/LIMITATIONS.md).
 
 ---

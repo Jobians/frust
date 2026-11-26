@@ -25,3 +25,10 @@ pub(crate) fn start(
 ) -> Result<(), AuthSessionError> {
     Err(AuthSessionError::NoHandler)
 }
+
+/// The backend half of [`crate::AuthSessionCancel::cancel`]: nothing to
+/// tear down, since [`start`] never presents a session. Reached only through
+/// a session a test claimed without this backend; `crate` has already
+/// resolved it [`crate::AuthSessionOutcome::Cancelled`] by the time this
+/// runs.
+pub(crate) fn cancel(_generation: u64) {}

@@ -83,8 +83,13 @@
 //! afterwards finds no pending session and is dropped); on iOS/macOS the
 //! presented `ASWebAuthenticationSession` sheet stays up until the user
 //! dismisses it or the next [`AuthSession::start`] cancels it in favour of
-//! the new session. There is no cancel API in v1 (`auth-session-no-cancel-v1`
-//! in `docs/LIMITATIONS.md`).
+//! the new session. To end a live session programmatically, start it with
+//! [`AuthSession::start_with_cancel`] instead and call
+//! [`AuthSessionCancel::cancel`]: the future resolves
+//! [`AuthSessionOutcome::Cancelled`], the slot is freed, and the backend is
+//! asked to tear its UI down (`-cancel` on Apple; on Android, where no API
+//! closes a Custom Tab, the tab stays open until the user leaves it — see
+//! [`AuthSessionCancel`]).
 //!
 //! # Security
 //!
@@ -276,6 +281,30 @@ impl fmt::Debug for AuthSessionRequest {
 /// hand-written impl below prints `Callback { url_len: N }` rather than the
 /// URL itself. Read the URL by matching the value — `Callback(url)` — never
 /// out of a `Debug` rendering.
+///
+/// # Leaving the app while a session is live
+///
+/// What the future resolves to when the user switches away from the app
+/// while a custom-scheme session is live differs per platform:
+///
+/// - **Android**: nothing resolves while the app is in the background, and
+///   returning to a task whose top is still the Custom Tab resumes the tab,
+///   not the app, so that resolves nothing either. The first time one of
+///   the app's own Activities resumes *without* the callback intent — the
+///   user backing out of the tab, or returning to an app Activity by any
+///   route other than the redirect — the session resolves
+///   [`Self::Cancelled`], indistinguishable from a dismissed tab
+///   (`auth-session-android-resume-means-cancelled-v1` in
+///   `docs/LIMITATIONS.md`). A tab still open at that point stays open.
+/// - **iOS / macOS**: this crate watches no app-lifecycle event; the future
+///   resolves only from the `ASWebAuthenticationSession` completion handler.
+///   Backgrounding the app reports no completion by itself, so the future
+///   stays pending and the sheet is still presented when the app returns;
+///   it resolves on the redirect, the user's own dismissal
+///   ([`Self::Cancelled`]), [`AuthSessionCancel::cancel`], or a platform
+///   error.
+/// - **[`LoopbackSession`]** (desktop): the listener keeps waiting whether
+///   or not the app is focused, bounded by [`LoopbackOptions::timeout`].
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq)]
 pub enum AuthSessionOutcome {
@@ -283,8 +312,11 @@ pub enum AuthSessionOutcome {
     /// the full callback URL, including its query string (the authorization
     /// code and any `state`).
     Callback(String),
-    /// The user dismissed the in-app browser tab before the identity
-    /// provider ever redirected.
+    /// The session ended before the identity provider ever redirected: the
+    /// user dismissed the in-app browser tab, the app called
+    /// [`AuthSessionCancel::cancel`] (or [`LoopbackCancel::cancel`]), or — on
+    /// Android — an Activity resumed without the callback (see *Leaving the
+    /// app while a session is live* above).
     Cancelled,
 }
 
@@ -457,6 +489,68 @@ fn take_live(generation: u64) -> Option<Live> {
     }
 }
 
+/// Cancel generation `generation`'s session — [`AuthSessionCancel::cancel`]'s
+/// whole body. If that session is still the live one, it is completed with
+/// [`AuthSessionOutcome::Cancelled`] (exactly once: [`take_live`] empties the
+/// slot under the lock, so a racing platform result or a second cancel finds
+/// nothing), the Busy slot is thereby free, and only then is the backend
+/// asked to tear down its UI. A finished session, an abandoned one, or a
+/// newer generation is left untouched and the backend is never called. A
+/// platform result that arrives for `generation` afterwards finds no live
+/// session of that generation and is discarded by [`resolve`].
+fn cancel_generation(generation: u64) {
+    let Some(live) = take_live(generation) else {
+        return;
+    };
+    // The lock is already released (`take_live`): sending wakes the caller,
+    // whose continuation may start the next session — which must not
+    // deadlock on `ACTIVE`, and which the backend hook below cannot touch,
+    // since that hook is itself guarded by `generation`.
+    live.sender.send(Ok(AuthSessionOutcome::Cancelled));
+    backend::cancel(generation);
+}
+
+/// The Apple backend's dismissal-grace bookkeeping: when it last sent a
+/// session `-cancel`, and so how much longer a new session's `-start` must
+/// wait for that sheet to finish animating out (`apple`'s module doc,
+/// *Waiting out a dismissal*). Pure arithmetic over caller-supplied
+/// instants, with no Apple API in it, so it lives here — where the host test
+/// binary can reach it — rather than in the `target_vendor = "apple"`-only
+/// `apple` module, which keeps one in its main-thread state.
+#[cfg(any(target_vendor = "apple", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DismissalGrace {
+    /// When the most recent `-cancel` was sent; `None` before the first.
+    cancelled_at: Option<std::time::Instant>,
+}
+
+#[cfg(any(target_vendor = "apple", test))]
+impl DismissalGrace {
+    /// No `-cancel` sent yet: nothing to wait for.
+    pub(crate) const fn new() -> Self {
+        Self { cancelled_at: None }
+    }
+
+    /// A session was sent `-cancel` at `now`; the grace window restarts
+    /// from it, whatever was recorded before.
+    pub(crate) fn record_cancel(&mut self, now: std::time::Instant) {
+        self.cancelled_at = Some(now);
+    }
+
+    /// How much longer a `-start` must wait at `now` for a dismissal that
+    /// takes `grace` — `None` when no `-cancel` was ever recorded or the
+    /// last one is at least `grace` old, so a start with no recent cancel is
+    /// never delayed.
+    pub(crate) fn remaining(
+        &self,
+        now: std::time::Instant,
+        grace: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        let elapsed = now.saturating_duration_since(self.cancelled_at?);
+        grace.checked_sub(elapsed).filter(|left| !left.is_zero())
+    }
+}
+
 /// Release generation `generation`'s slot without completing anything —
 /// the hook `oneshot::Receiver`'s `Drop` calls when the caller drops the
 /// future [`AuthSession::start`] returned. A later platform result for that
@@ -624,14 +718,20 @@ enum StartFuture {
 }
 
 impl StartFuture {
-    fn new(req: AuthSessionRequest) -> Self {
+    /// Validate `req`, claim the slot and hand the session to the backend.
+    /// Also returns the generation the session was accepted under — `None`
+    /// when it never reached a backend-presented state (a validation
+    /// failure, [`AuthSessionError::Busy`], or the backend's own synchronous
+    /// refusal), which is what makes [`AuthSession::start_with_cancel`]'s
+    /// handle inert on exactly those paths.
+    fn begin(req: AuthSessionRequest) -> (Self, Option<u64>) {
         if let Err(err) = validate(&req) {
-            return StartFuture::Ready(Some(Err(err)));
+            return (StartFuture::Ready(Some(Err(err))), None);
         }
 
         let mut active = lock_active();
         if active.is_some() {
-            return StartFuture::Ready(Some(Err(AuthSessionError::Busy)));
+            return (StartFuture::Ready(Some(Err(AuthSessionError::Busy))), None);
         }
 
         let generation = next_generation();
@@ -647,7 +747,7 @@ impl StartFuture {
         drop(active);
 
         match backend::start(req, SessionToken { generation }) {
-            Ok(()) => StartFuture::Pending(receiver),
+            Ok(()) => (StartFuture::Pending(receiver), Some(generation)),
             Err(err) => {
                 // The backend rejected the request before ever presenting a
                 // session UI (`unsupported`'s blanket refusal, or a real
@@ -655,7 +755,7 @@ impl StartFuture {
                 // slot and resolve the receiver with that error, rather than
                 // leaving it live for nothing to ever complete.
                 resolve(generation, Err(err));
-                StartFuture::Pending(receiver)
+                (StartFuture::Pending(receiver), None)
             }
         }
     }
@@ -706,10 +806,43 @@ impl AuthSession {
     /// once a session is genuinely presented — [`AuthSessionOutcome`] or a
     /// later [`AuthSessionError::Platform`] once the platform actually
     /// responds.
+    ///
+    /// A session started here cannot be cancelled programmatically; use
+    /// [`Self::start_with_cancel`] when the app may need to end it itself.
+    /// What the future resolves to when the user leaves the app mid-session
+    /// is listed on [`AuthSessionOutcome`] (*Leaving the app while a session
+    /// is live*).
     pub fn start(
         req: AuthSessionRequest,
     ) -> impl Future<Output = Result<AuthSessionOutcome, AuthSessionError>> + Send + 'static {
-        StartFuture::new(req)
+        StartFuture::begin(req).0
+    }
+
+    /// [`Self::start`], plus an [`AuthSessionCancel`] handle that ends this
+    /// one session from any thread.
+    ///
+    /// The future behaves exactly like [`Self::start`]'s, with the same
+    /// validation, Busy guard, errors and security contract (this crate
+    /// doc's *Security* section) — the handle adds a way out and changes
+    /// nothing else. A request refused at start ([`AuthSessionError::
+    /// InvalidUrl`], [`AuthSessionError::Busy`], or a backend's synchronous
+    /// pre-dispatch failure such as [`AuthSessionError::NoHandler`]) comes
+    /// back with an **inert** handle: cancelling it does nothing, and in
+    /// particular never touches the session whose presence made this
+    /// request `Busy`.
+    ///
+    /// While the browser is in front the app is in the background, where its
+    /// UI-thread timers (`frust::time`) do not run: a cancel scheduled on one
+    /// fires only when the user comes back. To end a session on a deadline,
+    /// call the handle from another thread; it is `Send + Sync` for that.
+    pub fn start_with_cancel(
+        req: AuthSessionRequest,
+    ) -> (
+        impl Future<Output = Result<AuthSessionOutcome, AuthSessionError>> + Send + 'static,
+        AuthSessionCancel,
+    ) {
+        let (future, generation) = StartFuture::begin(req);
+        (future, AuthSessionCancel { generation })
     }
 
     /// Whether [`Self::start`] (a custom-scheme callback) has a backend on
@@ -731,6 +864,60 @@ impl AuthSession {
     }
 }
 
+/// Cancels the one [`AuthSession`] [`AuthSession::start_with_cancel`]
+/// returned it for, from any thread — the custom-scheme counterpart of
+/// [`LoopbackCancel`].
+///
+/// While that session is still the live one, [`Self::cancel`] resolves its
+/// future with [`AuthSessionOutcome::Cancelled`] (exactly once), frees the
+/// one-live-session slot (this crate doc's *Exactly one live session*) so
+/// the next [`AuthSession::start`] is accepted at once — never refused
+/// [`AuthSessionError::Busy`] — and then asks the platform to tear the
+/// browser UI down:
+///
+/// - **iOS / macOS**: the retained `ASWebAuthenticationSession` is sent
+///   `-cancel` on the main queue, which dismisses its sheet. A completion
+///   the framework still reports afterwards is discarded as a stale
+///   generation. A session started right after the cancel is accepted at
+///   once too, but its own sheet appears only after a short dismissal delay
+///   (half a second at most) that lets the cancelled one finish animating
+///   out — the platform refuses to present over a sheet still on its way
+///   down.
+/// - **Android**: there is no API to close a Custom Tab. The host forgets
+///   the pending session, and a launch for it that had not run yet opens no
+///   tab; a tab already open **stays open** in front of the app until the
+///   user leaves it, and a redirect it delivers later finds no pending
+///   session and is dropped (it still reaches the app's own deep-link
+///   stream — this crate doc's *The Android double-delivery note*).
+///
+/// Every step is keyed to the session's generation: once that session has
+/// finished (by outcome, error, a previous cancel, or the caller dropping
+/// its future), `cancel` does nothing — it never ends, frees or tears down a
+/// newer session. A platform result that arrives later for the cancelled
+/// session is discarded. A handle returned for a request refused at start is
+/// inert ([`AuthSession::start_with_cancel`]).
+#[derive(Clone)]
+pub struct AuthSessionCancel {
+    /// The generation of the session this handle cancels; `None` for an
+    /// inert handle.
+    generation: Option<u64>,
+}
+
+impl AuthSessionCancel {
+    /// Request cancellation — see the type's doc.
+    pub fn cancel(&self) {
+        if let Some(generation) = self.generation {
+            cancel_generation(generation);
+        }
+    }
+}
+
+impl fmt::Debug for AuthSessionCancel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthSessionCancel").finish_non_exhaustive()
+    }
+}
+
 /// Serializes every test in this crate that touches [`ACTIVE`] — it is one
 /// process-global static, so two tests racing on it (Rust runs `#[test]`s on
 /// separate threads within one binary by default) would flake into each
@@ -744,6 +931,7 @@ pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 mod tests {
     use std::task::{RawWaker, RawWakerVTable, Waker};
+    use std::time::{Duration, Instant};
 
     use super::*;
 
@@ -936,6 +1124,288 @@ mod tests {
             assert_ne!(live.generation, 0, "a generation is never zero");
             assert_eq!(live.callback_scheme, "frustplay");
         });
+    }
+
+    /// A cancel handle for `generation`, as
+    /// [`AuthSession::start_with_cancel`] would have returned for a session
+    /// [`live_session`] claimed.
+    fn cancel_handle(generation: u64) -> AuthSessionCancel {
+        AuthSessionCancel {
+            generation: Some(generation),
+        }
+    }
+
+    #[test]
+    fn the_cancel_handle_is_clone_send_sync_and_debug_prints_nothing() {
+        fn assert_traits<T: Clone + Send + Sync + fmt::Debug + 'static>() {}
+        assert_traits::<AuthSessionCancel>();
+        assert_eq!(
+            format!("{:?}", cancel_handle(7)),
+            "AuthSessionCancel { .. }"
+        );
+    }
+
+    #[test]
+    fn cancel_resolves_the_live_session_cancelled_exactly_once() {
+        with_clean_active(|| {
+            let (generation, mut fut) = live_session("frustplay");
+            let handle = cancel_handle(generation);
+            assert_eq!(poll_once(&mut fut), Poll::Pending);
+
+            handle.cancel();
+            assert_eq!(
+                poll_once(&mut fut),
+                Poll::Ready(Ok(AuthSessionOutcome::Cancelled))
+            );
+            assert!(lock_active().is_none(), "cancel must release the slot");
+
+            // A second cancel — from the same handle or a clone — completes
+            // nothing more.
+            handle.clone().cancel();
+            handle.cancel();
+            assert_eq!(poll_once(&mut fut), Poll::Pending);
+            assert!(lock_active().is_none());
+        });
+    }
+
+    #[test]
+    fn cancel_after_completion_is_a_no_op() {
+        with_clean_active(|| {
+            let (generation, mut fut) = live_session("frustplay");
+            resolve(
+                generation,
+                Ok(AuthSessionOutcome::Callback(
+                    "frustplay://auth/callback?code=x".to_string(),
+                )),
+            );
+
+            cancel_handle(generation).cancel();
+            assert_eq!(
+                poll_once(&mut fut),
+                Poll::Ready(Ok(AuthSessionOutcome::Callback(
+                    "frustplay://auth/callback?code=x".to_string()
+                ))),
+                "the outcome that completed first must stand"
+            );
+            assert_eq!(poll_once(&mut fut), Poll::Pending);
+            assert!(lock_active().is_none());
+        });
+    }
+
+    #[test]
+    fn cancelling_generation_n_leaves_generation_n_plus_one_live() {
+        with_clean_active(|| {
+            let (first, first_fut) = live_session("frustplay");
+            let stale = cancel_handle(first);
+            // The caller abandons the first session; a newer one starts.
+            drop(first_fut);
+            let (second, mut second_fut) = live_session("frustplay");
+            assert_ne!(first, second);
+
+            stale.cancel();
+            assert_eq!(poll_once(&mut second_fut), Poll::Pending);
+            assert_eq!(
+                lock_active().as_ref().map(|live| live.generation),
+                Some(second),
+                "a stale handle must leave the newer session live"
+            );
+
+            // The newer session's own handle still works.
+            cancel_handle(second).cancel();
+            assert_eq!(
+                poll_once(&mut second_fut),
+                Poll::Ready(Ok(AuthSessionOutcome::Cancelled))
+            );
+        });
+    }
+
+    #[test]
+    fn busy_clears_after_cancel() {
+        with_clean_active(|| {
+            let (generation, _fut) = live_session("frustplay");
+            let mut busy = AuthSession::start(valid_request());
+            assert_eq!(
+                poll_once(&mut busy),
+                Poll::Ready(Err(AuthSessionError::Busy))
+            );
+
+            cancel_handle(generation).cancel();
+            let mut next = AuthSession::start(valid_request());
+            assert_ne!(
+                poll_once(&mut next),
+                Poll::Ready(Err(AuthSessionError::Busy)),
+                "the slot must be free for the next start after a cancel"
+            );
+        });
+    }
+
+    #[test]
+    fn a_late_platform_result_for_a_cancelled_generation_is_ignored() {
+        with_clean_active(|| {
+            let (generation, mut fut) = live_session("frustplay");
+            cancel_handle(generation).cancel();
+            assert_eq!(
+                poll_once(&mut fut),
+                Poll::Ready(Ok(AuthSessionOutcome::Cancelled))
+            );
+
+            // With nothing live: the late redirect is discarded.
+            resolve(
+                generation,
+                Ok(AuthSessionOutcome::Callback(
+                    "frustplay://auth/callback?code=late".to_string(),
+                )),
+            );
+            assert_eq!(poll_once(&mut fut), Poll::Pending);
+            assert!(lock_active().is_none());
+
+            // With a newer session live: the late result neither completes
+            // nor releases it.
+            let (newer, mut newer_fut) = live_session("frustplay");
+            resolve(generation, Ok(AuthSessionOutcome::Cancelled));
+            assert_eq!(poll_once(&mut newer_fut), Poll::Pending);
+            assert_eq!(
+                lock_active().as_ref().map(|live| live.generation),
+                Some(newer)
+            );
+        });
+    }
+
+    #[test]
+    fn an_inert_handle_does_nothing() {
+        with_clean_active(|| {
+            // Refused for an invalid URL: inert.
+            let mut req = valid_request();
+            req.url = "http://issuer.example/authorize".to_string();
+            let (mut invalid, invalid_handle) = AuthSession::start_with_cancel(req);
+            assert!(invalid_handle.generation.is_none());
+            assert_eq!(
+                poll_once(&mut invalid),
+                Poll::Ready(Err(AuthSessionError::InvalidUrl))
+            );
+
+            // Refused as Busy: inert, and cancelling it must not end the
+            // session whose presence made it Busy.
+            let (generation, mut live_fut) = live_session("frustplay");
+            let (mut busy, busy_handle) = AuthSession::start_with_cancel(valid_request());
+            assert!(busy_handle.generation.is_none());
+            assert_eq!(
+                poll_once(&mut busy),
+                Poll::Ready(Err(AuthSessionError::Busy))
+            );
+
+            invalid_handle.cancel();
+            busy_handle.cancel();
+            assert_eq!(poll_once(&mut live_fut), Poll::Pending);
+            assert_eq!(
+                lock_active().as_ref().map(|live| live.generation),
+                Some(generation)
+            );
+        });
+    }
+
+    /// On a target whose backend refuses synchronously, the handle comes
+    /// back inert too, and the future resolves exactly as `start`'s does.
+    #[cfg(not(any(target_os = "android", target_vendor = "apple")))]
+    #[test]
+    fn a_backend_refusal_returns_an_inert_handle() {
+        with_clean_active(|| {
+            let (mut fut, handle) = AuthSession::start_with_cancel(valid_request());
+            assert!(handle.generation.is_none());
+            assert_eq!(
+                poll_once(&mut fut),
+                Poll::Ready(Err(AuthSessionError::NoHandler))
+            );
+            handle.cancel();
+            assert!(lock_active().is_none());
+        });
+    }
+
+    /// On Apple the backend accepts, so `start_with_cancel` hands back a
+    /// live handle; cancelling it resolves the future at once, without the
+    /// main queue (never driven under a test binary) having run.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn apple_start_with_cancel_returns_a_live_handle_that_cancels() {
+        with_clean_active(|| {
+            let (mut fut, handle) = AuthSession::start_with_cancel(valid_request());
+            assert!(handle.generation.is_some());
+            assert_eq!(poll_once(&mut fut), Poll::Pending);
+
+            handle.cancel();
+            assert_eq!(
+                poll_once(&mut fut),
+                Poll::Ready(Ok(AuthSessionOutcome::Cancelled))
+            );
+            assert!(lock_active().is_none());
+        });
+    }
+
+    /// The grace every [`DismissalGrace`] test waits out.
+    const GRACE: Duration = Duration::from_millis(500);
+
+    /// With no `-cancel` ever recorded, a start is never delayed.
+    #[test]
+    fn dismissal_grace_without_a_cancel_never_delays() {
+        let grace = DismissalGrace::new();
+        assert_eq!(grace.remaining(Instant::now(), GRACE), None);
+    }
+
+    /// A start right after a cancel waits the whole grace; one made part
+    /// way through waits only what is left of it.
+    #[test]
+    fn dismissal_grace_counts_down_from_the_cancel() {
+        let cancelled = Instant::now();
+        let mut grace = DismissalGrace::new();
+        grace.record_cancel(cancelled);
+
+        assert_eq!(grace.remaining(cancelled, GRACE), Some(GRACE));
+        assert_eq!(
+            grace.remaining(cancelled + Duration::from_millis(200), GRACE),
+            Some(Duration::from_millis(300))
+        );
+    }
+
+    /// Once the grace has run out — exactly at its end or any time after —
+    /// a start goes ahead at once.
+    #[test]
+    fn dismissal_grace_ends_after_the_delay() {
+        let cancelled = Instant::now();
+        let mut grace = DismissalGrace::new();
+        grace.record_cancel(cancelled);
+
+        assert_eq!(grace.remaining(cancelled + GRACE, GRACE), None);
+        assert_eq!(
+            grace.remaining(cancelled + Duration::from_secs(60), GRACE),
+            None
+        );
+    }
+
+    /// A later cancel restarts the window from its own instant.
+    #[test]
+    fn a_later_cancel_restarts_the_dismissal_grace() {
+        let first = Instant::now();
+        let second = first + Duration::from_millis(400);
+        let mut grace = DismissalGrace::new();
+        grace.record_cancel(first);
+        grace.record_cancel(second);
+
+        assert_eq!(
+            grace.remaining(first + Duration::from_millis(600), GRACE),
+            Some(Duration::from_millis(300))
+        );
+    }
+
+    /// An instant earlier than the recorded cancel (never produced on one
+    /// thread, but not ruled out by the type) counts as no time elapsed.
+    #[test]
+    fn dismissal_grace_clamps_an_instant_before_the_cancel() {
+        let earlier = Instant::now();
+        let cancelled = earlier + Duration::from_millis(100);
+        let mut grace = DismissalGrace::new();
+        grace.record_cancel(cancelled);
+
+        assert_eq!(grace.remaining(earlier, GRACE), Some(GRACE));
     }
 
     #[test]
