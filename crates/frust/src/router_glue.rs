@@ -105,9 +105,11 @@ fn normalize_deep_link(raw: &str) -> String {
     };
 
     if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
-        // Rule 2, universal/App Links: drop the host.
-        return match rest.find('/') {
-            Some(idx) => rest[idx..].to_string(),
+        // Rule 2, universal/App Links: drop the host. The authority ends at
+        // the first `/` or `?`; a query right after the host sits under `/`.
+        return match rest.find(['/', '?']) {
+            Some(idx) if rest[idx..].starts_with('/') => rest[idx..].to_string(),
+            Some(idx) => format!("/{}", &rest[idx..]),
             None => "/".to_string(),
         };
     }
@@ -135,7 +137,9 @@ fn normalize_deep_link(raw: &str) -> String {
 /// [`deep_links()`](frust_reactive::deep_links). The host of an `http(s)` link
 /// is dropped, so any claimed host maps to the same routes; the host of a
 /// custom-scheme link is treated as the first path segment
-/// (`myapp://approvals/42` routes to `/approvals/42`). Construct once with [`router_with_deep_links`] (or
+/// (`myapp://approvals/42` routes to `/approvals/42`).
+///
+/// Construct once with [`router_with_deep_links`] (or
 /// [`RouterDeepLinks::new`] directly) — typically from `Component::init`,
 /// storing the result in `Component::State` — then call
 /// [`track`](Self::track) from every `Component::build` to keep navigating on
@@ -726,5 +730,27 @@ mod tests {
     fn normalize_https_host_only_with_and_without_fragment() {
         assert_eq!(normalize_deep_link("https://example.com"), "/");
         assert_eq!(normalize_deep_link("https://example.com#f"), "/");
+    }
+
+    #[test]
+    fn normalize_https_query_directly_after_host() {
+        // The authority ends at the first `/` or `?`, so a query with no
+        // path keeps its query under the root path.
+        assert_eq!(
+            normalize_deep_link("https://links.example.com?invite=abc"),
+            "/?invite=abc"
+        );
+        assert_eq!(
+            normalize_deep_link("https://links.example.com/?invite=abc"),
+            "/?invite=abc"
+        );
+        assert_eq!(normalize_deep_link("https://links.example.com"), "/");
+    }
+
+    #[test]
+    fn normalize_custom_scheme_host_with_query() {
+        // The host of a custom-scheme link is the first path segment, so
+        // the query stays attached to that segment's route.
+        assert_eq!(normalize_deep_link("myapp://open?x=1"), "/open?x=1");
     }
 }
