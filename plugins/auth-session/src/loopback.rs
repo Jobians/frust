@@ -125,8 +125,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    AuthSessionError, AuthSessionOutcome, Live, lock_active, next_generation, oneshot,
-    release_if_live, resolve, url, validate_https_url,
+    AuthCallback, AuthSessionError, AuthSessionOutcome, Live, lock_active, next_generation,
+    oneshot, release_if_live, resolve, url, validate_https_url,
 };
 
 /// The [`LoopbackOptions::timeout`] [`LoopbackOptions::new`] fills in: five
@@ -293,11 +293,13 @@ impl LoopbackSession {
             }
             let generation = next_generation();
             let (sender, receiver) = oneshot::channel(generation);
-            // The `http` scheme makes `crate::checked_callback` accept only
-            // an `http://` callback for this session.
+            // A scheme-only `http` callback makes `crate::checked_callback`
+            // accept only an `http://` callback for this session. It is never
+            // validated (`http` is a denied custom scheme for a request);
+            // this listener's own request checks pin the host and path.
             *active = Some(Live {
                 generation,
-                callback_scheme: "http".into(),
+                callback: AuthCallback::CustomScheme("http".into()),
                 sender,
             });
             (generation, receiver)
@@ -1530,11 +1532,8 @@ mod tests {
         #[test]
         fn a_bound_session_makes_both_backends_busy() {
             let _guard = serial();
-            let request = AuthSessionRequest {
-                url: "https://issuer.example/authorize".to_string(),
-                callback_scheme: "frustplay".to_string(),
-                ephemeral: false,
-            };
+            let request =
+                AuthSessionRequest::custom_scheme("https://issuer.example/authorize", "frustplay");
             let session = bind("/callback");
             assert_eq!(
                 LoopbackSession::bind(LoopbackOptions::new("/callback")).unwrap_err(),

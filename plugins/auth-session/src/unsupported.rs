@@ -32,3 +32,11 @@ pub(crate) fn start(
 /// resolved it [`crate::AuthSessionOutcome::Cancelled`] by the time this
 /// runs.
 pub(crate) fn cancel(_generation: u64) {}
+
+/// Whether this backend can start an [`crate::AuthCallback::Https`]
+/// session: never — it starts no session at all. `crate` asks this before
+/// claiming the busy slot and refuses an https request with
+/// [`AuthSessionError::HttpsCallbackUnsupported`] when it answers `false`.
+pub(crate) fn https_callback_supported() -> bool {
+    false
+}

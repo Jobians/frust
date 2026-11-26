@@ -172,7 +172,7 @@ use objc2_app_kit::{NSApplication, NSWindow};
 #[cfg(target_os = "ios")]
 use objc2_ui_kit::{UIApplication, UISceneActivationState, UIWindow, UIWindowScene};
 
-use crate::{AuthSessionError, AuthSessionOutcome, AuthSessionRequest, SessionToken};
+use crate::{AuthCallback, AuthSessionError, AuthSessionOutcome, AuthSessionRequest, SessionToken};
 
 /// The window type `ASPresentationAnchor` actually is on this platform —
 /// `UIWindow` on iOS, `NSWindow` on macOS (the binding itself erases both to
@@ -287,21 +287,44 @@ fn as_presentation_anchor(window: Retained<NSWindow>) -> Retained<ASPresentation
 
 /// Hand the session to the main queue — see this module's doc.
 pub(crate) fn start(req: AuthSessionRequest, token: SessionToken) -> Result<(), AuthSessionError> {
+    // `crate` refuses an https request before reaching here while
+    // [`https_callback_supported`] answers `false`; this arm only keeps the
+    // backend from ever presenting one without that check.
+    let scheme = match &req.callback {
+        AuthCallback::CustomScheme(scheme) => scheme.clone(),
+        AuthCallback::Https { .. } => return Err(AuthSessionError::HttpsCallbackUnsupported),
+    };
     DispatchQueue::main().exec_async(move || {
         // SAFETY: this closure is submitted to `dispatch_get_main_queue()`,
         // which always executes its blocks on the actual OS main thread, so
         // constructing a `MainThreadMarker` here without re-checking is
         // sound (`plugins/haptics/src/apple.rs`'s identical claim).
         let mtm = unsafe { MainThreadMarker::new_unchecked() };
-        start_on_main(mtm, req, token);
+        start_on_main(mtm, req, &scheme, token);
     });
     Ok(())
 }
 
-/// Build, configure and present the session. Runs on the main queue; every
-/// failure path resolves the live session rather than returning, because
-/// [`start`] has already told its caller `Ok(())` by the time this runs.
-fn start_on_main(mtm: MainThreadMarker, req: AuthSessionRequest, token: SessionToken) {
+/// Whether this backend can start an [`crate::AuthCallback::Https`]
+/// session: not yet — sessions are built with the custom-scheme
+/// initializer only. `crate` asks this before claiming the busy slot and
+/// refuses an https request with
+/// [`AuthSessionError::HttpsCallbackUnsupported`] when it answers `false`.
+pub(crate) fn https_callback_supported() -> bool {
+    false
+}
+
+/// Build, configure and present the session for `req`, whose custom
+/// callback scheme [`start`] has already extracted as `scheme`. Runs on the
+/// main queue; every failure path resolves the live session rather than
+/// returning, because [`start`] has already told its caller `Ok(())` by the
+/// time this runs.
+fn start_on_main(
+    mtm: MainThreadMarker,
+    req: AuthSessionRequest,
+    scheme: &str,
+    token: SessionToken,
+) {
     // The one identity this session has: what `crate::resolve` attributes
     // an outcome by, and what [`LIVE`]'s entry is tagged with.
     let generation = token.generation;
@@ -361,7 +384,7 @@ fn start_on_main(mtm: MainThreadMarker, req: AuthSessionRequest, token: SessionT
         release_live(generation);
     });
 
-    let scheme = NSString::from_str(&req.callback_scheme);
+    let scheme = NSString::from_str(scheme);
     // The block is heap-allocated and outlives this call: it is moved into
     // `LIVE` below and released only after completion.
     let completion: ASWebAuthenticationSessionCompletionHandler =
@@ -505,7 +528,7 @@ fn present(generation: u64, session: &ASWebAuthenticationSession) {
 #[allow(deprecated)]
 unsafe fn make_session(
     url: &NSURL,
-    callback_scheme: &NSString,
+    scheme: &NSString,
     completion: ASWebAuthenticationSessionCompletionHandler,
 ) -> Retained<ASWebAuthenticationSession> {
     // SAFETY: a designated initializer on a fresh allocation, with a live
@@ -514,7 +537,7 @@ unsafe fn make_session(
         ASWebAuthenticationSession::initWithURL_callbackURLScheme_completionHandler(
             ASWebAuthenticationSession::alloc(),
             url,
-            Some(callback_scheme),
+            Some(scheme),
             completion,
         )
     }

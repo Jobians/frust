@@ -62,12 +62,7 @@ let request = AuthorizationRequest {
 let url = request.build(&state, &verifier.challenge())?;
 
 // 3. The in-app browser tab.
-let outcome = AuthSession::start(AuthSessionRequest {
-    url,
-    callback_scheme: "com.example.app".to_string(),
-    ephemeral: false,
-})
-.await?;
+let outcome = AuthSession::start(AuthSessionRequest::custom_scheme(url, "com.example.app")).await?;
 let AuthSessionOutcome::Callback(callback_url) = outcome else {
     return Ok(()); // the user cancelled
 };

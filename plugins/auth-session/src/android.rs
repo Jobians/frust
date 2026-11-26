@@ -150,7 +150,7 @@ use jni::refs::Global;
 use jni::sys::{jint, jlong};
 use jni::{Env, EnvUnowned, jni_sig, jni_str};
 
-use crate::{AuthSessionError, AuthSessionOutcome, AuthSessionRequest, SessionToken};
+use crate::{AuthCallback, AuthSessionError, AuthSessionOutcome, AuthSessionRequest, SessionToken};
 
 /// The Kotlin host's fully-qualified class name (binary/dotted form, as
 /// `ClassLoader.loadClass` expects — **not** the slash form `FindClass`
@@ -216,10 +216,17 @@ static HOST_CLASS: OnceLock<Global<JClass<'static>>> = OnceLock::new();
 /// so [`crate::resolve`] can attribute the result (module doc's *The
 /// generation round trip*).
 pub(crate) fn start(req: AuthSessionRequest, token: SessionToken) -> Result<(), AuthSessionError> {
+    // `crate` refuses an https request before reaching here while
+    // [`https_callback_supported`] answers `false`; this arm only keeps the
+    // backend from ever launching one without that check.
+    let scheme = match &req.callback {
+        AuthCallback::CustomScheme(scheme) => scheme,
+        AuthCallback::Https { .. } => return Err(AuthSessionError::HttpsCallbackUnsupported),
+    };
     with_host(|env, class| {
         let code = run_jni(env, "FrustAuthSessionHost.start", |env| {
             let url = env.new_string(&req.url)?;
-            let scheme = env.new_string(&req.callback_scheme)?;
+            let scheme = env.new_string(scheme)?;
             env.call_static_method(
                 class,
                 jni_str!("start"),
@@ -250,6 +257,15 @@ pub(crate) fn start(req: AuthSessionRequest, token: SessionToken) -> Result<(), 
             ))),
         }
     })
+}
+
+/// Whether this backend can start an [`crate::AuthCallback::Https`]
+/// session: not yet — the Custom Tabs host catches custom-scheme redirects
+/// only. `crate` asks this before claiming the busy slot and refuses an
+/// https request with [`AuthSessionError::HttpsCallbackUnsupported`] when it
+/// answers `false`.
+pub(crate) fn https_callback_supported() -> bool {
+    false
 }
 
 /// The backend half of [`crate::AuthSessionCancel::cancel`] — call the

@@ -204,11 +204,7 @@ fn gap_h(w: f64) -> FlexChild<PlaygroundState> {
 fn request_for(path: &str) -> AuthSessionRequest {
     let base = base_url_sig().get_untracked();
     let ephemeral = ephemeral_sig().get_untracked();
-    AuthSessionRequest {
-        url: format!("{base}{path}"),
-        callback_scheme: CALLBACK_SCHEME.to_string(),
-        ephemeral,
-    }
+    AuthSessionRequest::custom_scheme(format!("{base}{path}"), CALLBACK_SCHEME).ephemeral(ephemeral)
 }
 
 /// Render a session outcome for the status label. The plugin's `Debug` for
