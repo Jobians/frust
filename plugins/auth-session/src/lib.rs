@@ -52,7 +52,7 @@
 //! second [`AuthSession::start`] call while one is still live resolves
 //! immediately to [`AuthSessionError::Busy`] rather than queuing or
 //! replacing the first (an in-app browser tab is a modal, single-instance
-//! UI surface on every backend platform). The busy slot is **shared across
+//! UI surface on each platform that has one). The busy slot is **shared across
 //! both backends**: a bound [`LoopbackSession`] holds the same slot from
 //! [`LoopbackSession::bind`] until it resolves or is dropped, so while one is
 //! live both [`AuthSession::start`] and a second [`LoopbackSession::bind`]
@@ -108,6 +108,16 @@
 //! code verifier this app generated, and the `state` check binds the
 //! callback to the request this app made; without both, a callback that
 //! reaches this future is enough to complete someone else's flow.
+//!
+//! **The `https` form.** An [`AuthCallback::Https`] session catches its
+//! redirect in-session only when the callback host is a domain associated
+//! with the app. When it is not, the session does not catch the redirect —
+//! it stays in the browser, or opens as an ordinary link — and the future
+//! resolves only once the session is dismissed (by the user, or through
+//! [`AuthSessionCancel::cancel`]). A URL that does come back is still checked
+//! for scheme, host and path before it is handed over; that is a consistency
+//! check on the platform's delivery, not proof of where the redirect came
+//! from, so PKCE and `state` bind here exactly as they do for a custom scheme.
 //!
 //! # Desktop loopback
 //!
@@ -174,9 +184,11 @@
 //! The first column is about [`AuthCallback::CustomScheme`] requests. An
 //! [`AuthCallback::Https`] request (a claimed `https` redirect, the form RFC
 //! 8252 §7.2 prefers where a platform supports it) is validated like any
-//! other and then refused with [`AuthSessionError::HttpsCallbackUnsupported`]
-//! on every target today, before the busy slot is claimed and before any UI
-//! appears.
+//! other, then started only on Apple systems that have the
+//! `ASWebAuthenticationSessionCallback` API: iOS 17.4 or later, macOS 14.4 or
+//! later. On Android, on targets without a backend, and on older Apple
+//! systems it is refused with [`AuthSessionError::HttpsCallbackUnsupported`],
+//! before the busy slot is claimed and before any UI appears.
 //!
 //! # The Android double-delivery note
 //!
@@ -269,11 +281,16 @@ pub enum AuthCallback {
     ///
     /// `host` is a bare DNS name — ASCII letters, digits, `-` and `.` only,
     /// so no scheme, port or userinfo; at most 253 bytes in labels of 1-63
-    /// bytes that neither start nor end with `-`. `path` starts with `/` and
-    /// contains no `?` and no `#`.
+    /// bytes that neither start nor end with `-`. `path` starts with `/`,
+    /// then holds only RFC 3986 path characters — ASCII letters and digits,
+    /// `-` `.` `_` `~`, `!` `$` `&` `'` `(` `)` `*` `+` `,` `;` `=`, `:`
+    /// `@` `/`, and `%` followed by exactly two hex digits — with no `.` or
+    /// `..` segment. The path is compared byte for byte with the delivered
+    /// URL's, so write a percent-escape exactly as the provider sends it.
     ///
-    /// No backend starts an `https` session yet: [`AuthSession::start`]
-    /// answers [`AuthSessionError::HttpsCallbackUnsupported`] for one.
+    /// Started on Apple systems with the callback API (iOS 17.4 or later,
+    /// macOS 14.4 or later); elsewhere [`AuthSession::start`] answers
+    /// [`AuthSessionError::HttpsCallbackUnsupported`] for one.
     ///
     /// [`host`]: AuthCallback::Https::host
     /// [`path`]: AuthCallback::Https::path
@@ -324,7 +341,12 @@ impl AuthSessionRequest {
     }
 
     /// A non-ephemeral request for `url` that completes on a redirect to
-    /// `https://<host><path>` ([`AuthCallback::Https`]).
+    /// `https://<host><path>` ([`AuthCallback::Https`]). `path` must start
+    /// with `/` and hold only RFC 3986 path characters, a `%` always followed
+    /// by two hex digits, with no `.` or `..` segment (the full rule is on
+    /// [`AuthCallback::Https`]); it is compared byte for byte with the
+    /// delivered URL's path, so write a percent-escape exactly as the
+    /// provider sends it. [`AuthSession::start`] checks both rules.
     pub fn https(url: impl Into<String>, host: impl Into<String>, path: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -432,8 +454,8 @@ pub enum AuthSessionError {
     /// form's rules: a custom scheme outside this crate's scheme rule table
     /// (1-64 bytes, lowercase-alpha first byte, lowercase-alnum/`+`/`-`/`.`
     /// thereafter, not one of the denied well-known schemes), or an `https`
-    /// host that is not a bare DNS name or a path that does not start with
-    /// `/` or contains `?` or `#` (see [`AuthCallback`]).
+    /// host that is not a bare DNS name or a path outside the path rule (see
+    /// [`AuthCallback::Https`]).
     #[error("auth session: request URL is not an absolute https URL or the callback is invalid")]
     InvalidUrl,
 
@@ -476,8 +498,9 @@ pub enum AuthSessionError {
     /// The request names an [`AuthCallback::Https`] redirect, and this
     /// target's backend cannot start a session that catches one. Answered
     /// after validation, before the busy slot is claimed and before any UI
-    /// appears — so it never makes another request `Busy`. Today every
-    /// backend answers this; a custom-scheme request is unaffected.
+    /// appears — so it never makes another request `Busy`. Answered on
+    /// Android, on targets without a backend, and on Apple systems older
+    /// than iOS 17.4 / macOS 14.4; a custom-scheme request is unaffected.
     #[error("auth session: https callbacks are not supported on this platform")]
     HttpsCallbackUnsupported,
 }
@@ -533,12 +556,21 @@ struct Live {
     /// backend was started with; only a result carrying it may complete
     /// this session.
     generation: u64,
-    /// The [`AuthSessionRequest::callback`] this session asked for, kept so
-    /// [`resolve`] can re-check a delivered callback URL against it rather
-    /// than trusting the platform to have filtered.
-    callback: AuthCallback,
+    /// What a delivered callback URL must match, kept so [`resolve`] can
+    /// re-check it rather than trusting the platform to have filtered.
+    callback: LiveCallback,
     /// The channel half that completes the caller's future.
     sender: oneshot::Sender,
+}
+
+/// What [`checked_callback`] checks a live session's callback URL against.
+#[derive(Debug, PartialEq, Eq)]
+enum LiveCallback {
+    /// An [`AuthSession`]: the [`AuthSessionRequest::callback`] it asked for.
+    Request(AuthCallback),
+    /// A [`LoopbackSession`] listener: the URL must be `http`. The listener's
+    /// own request checks have already pinned its host, port and path.
+    Loopback,
 }
 
 /// The one live session's slot.
@@ -708,7 +740,8 @@ pub(crate) fn resolve(generation: u64, outcome: Result<AuthSessionOutcome, AuthS
 ///   before its first `:`, compared ASCII-case-insensitively —
 ///   [`validate_callback_scheme`] already restricts the requested scheme to
 ///   lowercase) is not the requested one, or which has no scheme at all
-///   ([`CALLBACK_SCHEME_MISMATCH`]);
+///   ([`CALLBACK_SCHEME_MISMATCH`]); for [`LiveCallback::Loopback`], the
+///   same check against `http`;
 /// - for [`AuthCallback::Https`], a URL that fails
 ///   [`https_callback_matches`] ([`CALLBACK_HTTPS_MISMATCH`]).
 ///
@@ -716,7 +749,7 @@ pub(crate) fn resolve(generation: u64, outcome: Result<AuthSessionOutcome, AuthS
 /// authenticity check: a matching scheme, host or path proves nothing about
 /// who sent the redirect (this crate doc's *Security* section).
 fn checked_callback(
-    callback: &AuthCallback,
+    callback: &LiveCallback,
     outcome: Result<AuthSessionOutcome, AuthSessionError>,
 ) -> Result<AuthSessionOutcome, AuthSessionError> {
     let Ok(AuthSessionOutcome::Callback(url)) = &outcome else {
@@ -725,23 +758,29 @@ fn checked_callback(
     if url.is_empty() {
         return Err(AuthSessionError::Platform(CALLBACK_WITHOUT_URL.to_string()));
     }
-    match callback {
-        AuthCallback::CustomScheme(scheme) => match url.find(':') {
-            Some(colon) if url[..colon].eq_ignore_ascii_case(scheme) => outcome,
-            _ => Err(AuthSessionError::Platform(
-                CALLBACK_SCHEME_MISMATCH.to_string(),
-            )),
-        },
-        AuthCallback::Https { host, path } => {
-            if https_callback_matches(url, host, path) {
-                outcome
-            } else {
-                Err(AuthSessionError::Platform(
-                    CALLBACK_HTTPS_MISMATCH.to_string(),
-                ))
-            }
+    let (matches, mismatch) = match callback {
+        LiveCallback::Request(AuthCallback::CustomScheme(scheme)) => {
+            (scheme_matches(url, scheme), CALLBACK_SCHEME_MISMATCH)
         }
+        LiveCallback::Loopback => (scheme_matches(url, "http"), CALLBACK_SCHEME_MISMATCH),
+        LiveCallback::Request(AuthCallback::Https { host, path }) => (
+            https_callback_matches(url, host, path),
+            CALLBACK_HTTPS_MISMATCH,
+        ),
+    };
+    if matches {
+        outcome
+    } else {
+        Err(AuthSessionError::Platform(mismatch.to_string()))
     }
+}
+
+/// Whether `url`'s scheme — the bytes before its first `:` — is `scheme`,
+/// compared ASCII-case-insensitively. A URL with no `:` has no scheme and
+/// never matches.
+fn scheme_matches(url: &str, scheme: &str) -> bool {
+    url.find(':')
+        .is_some_and(|colon| url[..colon].eq_ignore_ascii_case(scheme))
 }
 
 /// Whether `url` is a redirect to `https://<host><path>`: scheme `https`
@@ -809,15 +848,65 @@ fn validate_https_host(host: &str) -> Result<(), AuthSessionError> {
     }
 }
 
-/// Validate an [`AuthCallback::Https`] path: starts with `/`, and contains
-/// no `?` and no `#` (a query or fragment belongs to the callback URL the
-/// provider sends, never to the redirect being claimed).
+/// Validate an [`AuthCallback::Https`] path: a `/`, then only RFC 3986 path
+/// bytes ([`is_https_path_byte`]) and `%` + two hex digits, with no `.` or
+/// `..` segment. The delivered URL carries its path percent-encoded and
+/// [`https_callback_matches`] compares byte for byte, so a path holding
+/// anything else (a space, a non-ASCII byte, a stray `%`, a `?` or `#`) could
+/// never match and would lose the genuine redirect as a mismatch.
 fn validate_https_path(path: &str) -> Result<(), AuthSessionError> {
-    if path.starts_with('/') && !path.contains(['?', '#']) {
-        Ok(())
-    } else {
-        Err(AuthSessionError::InvalidUrl)
+    let Some(rest) = path.strip_prefix('/') else {
+        return Err(AuthSessionError::InvalidUrl);
+    };
+    let bytes = rest.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let escape = bytes.get(index + 1..index + 3);
+            if !escape.is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit)) {
+                return Err(AuthSessionError::InvalidUrl);
+            }
+            index += 3;
+        } else if is_https_path_byte(bytes[index]) {
+            index += 1;
+        } else {
+            return Err(AuthSessionError::InvalidUrl);
+        }
     }
+    if rest
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(AuthSessionError::InvalidUrl);
+    }
+    Ok(())
+}
+
+/// An RFC 3986 path byte other than a percent-escape: `unreserved`
+/// (ASCII letters and digits, `-` `.` `_` `~`), `sub-delims`
+/// (`!` `$` `&` `'` `(` `)` `*` `+` `,` `;` `=`), `:`, `@` and `/`.
+fn is_https_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'-' | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+                | b'/'
+        )
 }
 
 /// Validate an authorization URL: the `url` module's rule table, narrowed to
@@ -910,6 +999,17 @@ impl StartFuture {
     /// refusal), which is what makes [`AuthSession::start_with_cancel`]'s
     /// handle inert on exactly those paths.
     fn begin(req: AuthSessionRequest) -> (Self, Option<u64>) {
+        Self::begin_with(req, backend::https_callback_supported, backend::start)
+    }
+
+    /// [`Self::begin`] with the backend's two entry points injected — the
+    /// seam that keeps unit tests from ever handing an accepted request to a
+    /// real platform backend (`loopback`'s `start_with_opener` precedent).
+    fn begin_with(
+        req: AuthSessionRequest,
+        https_callback_supported: impl FnOnce() -> bool,
+        start: impl FnOnce(AuthSessionRequest, SessionToken) -> Result<(), AuthSessionError>,
+    ) -> (Self, Option<u64>) {
         if let Err(err) = validate(&req) {
             return (StartFuture::Ready(Some(Err(err))), None);
         }
@@ -917,9 +1017,7 @@ impl StartFuture {
         // The one place that asks a backend whether it can catch an `https`
         // redirect: before the slot is claimed, so the refusal never makes
         // another request `Busy`, and before the backend presents anything.
-        if matches!(req.callback, AuthCallback::Https { .. })
-            && !backend::https_callback_supported()
-        {
+        if matches!(req.callback, AuthCallback::Https { .. }) && !https_callback_supported() {
             return (
                 StartFuture::Ready(Some(Err(AuthSessionError::HttpsCallbackUnsupported))),
                 None,
@@ -935,7 +1033,7 @@ impl StartFuture {
         let (sender, receiver) = oneshot::channel(generation);
         *active = Some(Live {
             generation,
-            callback: req.callback.clone(),
+            callback: LiveCallback::Request(req.callback.clone()),
             sender,
         });
         // Release the lock before calling into the backend: a backend whose
@@ -943,7 +1041,7 @@ impl StartFuture {
         // deadlock on a lock this function itself is still holding.
         drop(active);
 
-        match backend::start(req, SessionToken { generation }) {
+        match start(req, SessionToken { generation }) {
             Ok(()) => (StartFuture::Pending(receiver), Some(generation)),
             Err(err) => {
                 // The backend rejected the request before ever presenting a
@@ -996,7 +1094,8 @@ impl AuthSession {
     /// touched, and resolved on the future's first poll rather than
     /// deferred. [`AuthSessionError::HttpsCallbackUnsupported`] for a valid
     /// [`AuthCallback::Https`] request on a backend that cannot catch one
-    /// (every backend today), also resolved on first poll and without
+    /// (Android, targets without a backend, and Apple systems older than
+    /// iOS 17.4 / macOS 14.4), also resolved on first poll and without
     /// claiming the busy slot. [`AuthSessionError::Busy`] if another
     /// [`AuthSession`] is already live, also resolved on first poll.
     /// Otherwise, per platform:
@@ -1282,10 +1381,24 @@ mod tests {
         let (sender, receiver) = oneshot::channel(generation);
         *lock_active() = Some(Live {
             generation,
-            callback,
+            callback: LiveCallback::Request(callback),
             sender,
         });
         (generation, StartFuture::Pending(receiver))
+    }
+
+    /// [`AuthSession::start_with_cancel`] against a stand-in backend that
+    /// accepts every request (an `https` one included) and presents nothing.
+    /// No test hands a request a real backend would accept to that backend:
+    /// on Apple it would queue a real session on the main queue, so every
+    /// accepted path below — custom scheme and `https` — goes through this
+    /// instead, and the Apple presentation path is covered at the device
+    /// gate only. Shared with the `loopback` tests.
+    pub(crate) fn start_with_accepting_backend(
+        req: AuthSessionRequest,
+    ) -> (StartFuture, AuthSessionCancel) {
+        let (future, generation) = StartFuture::begin_with(req, || true, |_req, _token| Ok(()));
+        (future, AuthSessionCancel { generation })
     }
 
     /// On a target with no in-app browser tab (desktop Linux and Windows,
@@ -1317,17 +1430,14 @@ mod tests {
         });
     }
 
-    /// On Apple, `start` hands the whole present sequence to the main queue
-    /// and returns accepted, so the future is genuinely pending and the
-    /// slot stays claimed until a completion (or the caller's drop) frees
-    /// it. Nothing here drives the main queue: the enqueued block never
-    /// runs under a test binary, which is exactly the "claimed, nothing
-    /// resolved yet" state being asserted.
-    #[cfg(target_vendor = "apple")]
+    /// A backend that accepts (Apple hands the present sequence to the main
+    /// queue and returns at once) leaves the future genuinely pending, with
+    /// the slot claimed for the request's callback until a completion, a
+    /// cancel or the caller's drop frees it.
     #[test]
-    fn apple_backend_leaves_the_session_pending_with_the_slot_claimed() {
+    fn an_accepting_backend_leaves_the_session_pending_with_the_slot_claimed() {
         with_clean_active(|| {
-            let mut fut = AuthSession::start(valid_request());
+            let (mut fut, _handle) = start_with_accepting_backend(valid_request());
             assert_eq!(poll_once(&mut fut), Poll::Pending);
 
             let active = lock_active();
@@ -1335,7 +1445,7 @@ mod tests {
             assert_ne!(live.generation, 0, "a generation is never zero");
             assert_eq!(
                 live.callback,
-                AuthCallback::CustomScheme("frustplay".to_string())
+                LiveCallback::Request(AuthCallback::CustomScheme("frustplay".to_string()))
             );
         });
     }
@@ -1444,10 +1554,10 @@ mod tests {
             );
 
             cancel_handle(generation).cancel();
-            let mut next = AuthSession::start(valid_request());
-            assert_ne!(
+            let (mut next, _handle) = start_with_accepting_backend(valid_request());
+            assert_eq!(
                 poll_once(&mut next),
-                Poll::Ready(Err(AuthSessionError::Busy)),
+                Poll::Pending,
                 "the slot must be free for the next start after a cancel"
             );
         });
@@ -1535,14 +1645,12 @@ mod tests {
         });
     }
 
-    /// On Apple the backend accepts, so `start_with_cancel` hands back a
-    /// live handle; cancelling it resolves the future at once, without the
-    /// main queue (never driven under a test binary) having run.
-    #[cfg(target_vendor = "apple")]
+    /// A backend that accepts gets a live handle back; cancelling it
+    /// resolves the future at once, before the backend has reported anything.
     #[test]
-    fn apple_start_with_cancel_returns_a_live_handle_that_cancels() {
+    fn an_accepted_start_returns_a_live_handle_that_cancels() {
         with_clean_active(|| {
-            let (mut fut, handle) = AuthSession::start_with_cancel(valid_request());
+            let (mut fut, handle) = start_with_accepting_backend(valid_request());
             assert!(handle.generation.is_some());
             assert_eq!(poll_once(&mut fut), Poll::Pending);
 
@@ -1768,13 +1876,10 @@ mod tests {
                 "dropping the caller's future must release the slot"
             );
 
-            // The next start is accepted rather than rejected as `Busy` —
-            // whatever this target's backend then makes of it.
-            let mut next = AuthSession::start(valid_request());
-            assert_ne!(
-                poll_once(&mut next),
-                Poll::Ready(Err(AuthSessionError::Busy))
-            );
+            // The next start is accepted rather than rejected as `Busy`.
+            let (mut next, _handle) = start_with_accepting_backend(valid_request());
+            assert_eq!(poll_once(&mut next), Poll::Pending);
+            drop(next);
 
             // And the abandoned session's own late result is discarded.
             resolve(generation, Ok(AuthSessionOutcome::Cancelled));
@@ -1960,7 +2065,31 @@ mod tests {
 
     #[test]
     fn https_callback_path_rules() {
-        for path in ["/", "/cb", "/oauth/callback", "/a/b/c.html", "/Case"] {
+        for path in [
+            // Leading slash, letters and digits.
+            "/",
+            "/cb",
+            "/oauth/callback",
+            "/a/b/c.html",
+            "/Case",
+            "/v2/0123456789",
+            // Unreserved punctuation, dots inside a segment included.
+            "/a-b.c_d~e",
+            "/.well-known/cb",
+            "/a/.../b",
+            "/a..b",
+            // Every sub-delim.
+            "/!$&'()*+,;=",
+            // `:` and `@`.
+            "/user@host:8080",
+            // Empty segments and a trailing slash.
+            "/a//b",
+            "/cb/",
+            // Percent-escapes, either hex case.
+            "/a%20b",
+            "/%2F%2f",
+            "/%aF%Fa%09",
+        ] {
             assert_eq!(
                 validate_https_path(path),
                 Ok(()),
@@ -1968,13 +2097,45 @@ mod tests {
             );
         }
         for path in [
+            // No leading slash.
             "",
             "cb",
             "oauth/callback",
+            // Query and fragment delimiters.
             "/cb?x=1",
             "/cb#frag",
             "/?",
             "/#",
+            // Bytes outside the RFC 3986 path set.
+            "/a b",
+            "/caf\u{e9}",
+            "/a\tb",
+            "/a\"b",
+            "/a<b>",
+            "/a\\b",
+            "/a[b]",
+            "/a^b",
+            "/a`b",
+            "/a{b}",
+            "/a|b",
+            "/a\u{7f}",
+            // Broken percent-escapes.
+            "/%",
+            "/a%",
+            "/a%2",
+            "/a%zz",
+            "/a%2G",
+            "/a%%20",
+            // `.` and `..` segments.
+            "/.",
+            "/..",
+            "/./cb",
+            "/../cb",
+            "/a/./b",
+            "/a/../b",
+            "/a/.",
+            "/a/..",
+            "/a/../",
         ] {
             assert_eq!(
                 validate_https_path(path),
@@ -1998,6 +2159,9 @@ mod tests {
             ("example.com", "cb"),
             ("example.com", "/cb?x"),
             ("example.com", "/cb#x"),
+            ("example.com", "/c b"),
+            ("example.com", "/cb%"),
+            ("example.com", "/../cb"),
         ] {
             assert_eq!(
                 validate(&AuthSessionRequest::https(
@@ -2129,58 +2293,99 @@ mod tests {
         });
     }
 
-    /// On a backend that cannot catch an https redirect (every backend
-    /// today), a valid https request is refused on first poll with
-    /// `HttpsCallbackUnsupported`, the slot is never claimed, the cancel
-    /// handle is inert, and a following custom-scheme start is not `Busy`.
-    /// On a backend that can, the request is not refused that way.
+    /// Off Apple no backend catches an https redirect, so a valid https
+    /// request is refused on first poll with `HttpsCallbackUnsupported`, the
+    /// slot is never claimed, the cancel handle is inert, and a following
+    /// custom-scheme start is not `Busy`. Not built for Apple targets, where
+    /// a system with the callback API would accept the request and queue a
+    /// real session: the Apple https path is covered at the device gate only.
+    #[cfg(not(target_vendor = "apple"))]
     #[test]
     fn an_https_request_is_refused_without_claiming_the_slot() {
         with_clean_active(|| {
             let (mut fut, handle) = AuthSession::start_with_cancel(https_request());
-            if !backend::https_callback_supported() {
-                assert_eq!(
-                    poll_once(&mut fut),
-                    Poll::Ready(Err(AuthSessionError::HttpsCallbackUnsupported))
-                );
-                assert!(handle.generation.is_none(), "the handle must be inert");
-                assert!(lock_active().is_none(), "the slot must never be claimed");
+            assert_eq!(
+                poll_once(&mut fut),
+                Poll::Ready(Err(AuthSessionError::HttpsCallbackUnsupported))
+            );
+            assert!(handle.generation.is_none(), "the handle must be inert");
+            assert!(lock_active().is_none(), "the slot must never be claimed");
 
-                let mut next = AuthSession::start(valid_request());
-                let next = poll_once(&mut next);
-                assert_ne!(next, Poll::Ready(Err(AuthSessionError::Busy)));
-                assert_ne!(
-                    next,
-                    Poll::Ready(Err(AuthSessionError::HttpsCallbackUnsupported)),
-                    "a custom-scheme request takes the unchanged path"
-                );
-            } else {
-                assert_ne!(
-                    poll_once(&mut fut),
-                    Poll::Ready(Err(AuthSessionError::HttpsCallbackUnsupported))
-                );
-            }
+            let mut next = AuthSession::start(valid_request());
+            let next = poll_once(&mut next);
+            assert_ne!(next, Poll::Ready(Err(AuthSessionError::Busy)));
+            assert_ne!(
+                next,
+                Poll::Ready(Err(AuthSessionError::HttpsCallbackUnsupported)),
+                "a custom-scheme request takes the unchanged path"
+            );
         });
     }
 
-    /// With a session live, an https request is refused before the Busy
-    /// check on a backend that cannot catch one (and is `Busy` on one that
-    /// can); either way the live session is untouched.
+    /// With a session live, an https request is refused off Apple before the
+    /// Busy check, and the live session is untouched. Not built for Apple
+    /// targets, for the reason on the test above.
+    #[cfg(not(target_vendor = "apple"))]
     #[test]
     fn an_https_refusal_leaves_a_live_session_alone() {
         with_clean_active(|| {
             let (generation, mut live_fut) = live_session("frustplay");
             let mut fut = AuthSession::start(https_request());
-            let expected = if backend::https_callback_supported() {
-                AuthSessionError::Busy
-            } else {
-                AuthSessionError::HttpsCallbackUnsupported
-            };
-            assert_eq!(poll_once(&mut fut), Poll::Ready(Err(expected)));
+            assert_eq!(
+                poll_once(&mut fut),
+                Poll::Ready(Err(AuthSessionError::HttpsCallbackUnsupported))
+            );
             assert_eq!(poll_once(&mut live_fut), Poll::Pending);
             assert_eq!(
                 lock_active().as_ref().map(|live| live.generation),
                 Some(generation)
+            );
+        });
+    }
+
+    /// The https decision on every target, Apple included, through stand-in
+    /// backends: a backend that cannot catch one is never called and the
+    /// slot is never claimed; one that can is handed the request, and the
+    /// slot is claimed for its host and path.
+    #[test]
+    fn the_backend_predicate_alone_decides_an_https_request() {
+        with_clean_active(|| {
+            let mut reached = false;
+            let (mut refused, generation) = StartFuture::begin_with(
+                https_request(),
+                || false,
+                |_req, _token| {
+                    reached = true;
+                    Ok(())
+                },
+            );
+            assert_eq!(
+                poll_once(&mut refused),
+                Poll::Ready(Err(AuthSessionError::HttpsCallbackUnsupported))
+            );
+            assert!(generation.is_none());
+            assert!(!reached, "a refused request must never reach the backend");
+            assert!(lock_active().is_none());
+
+            let mut handed = None;
+            let (mut accepted, generation) = StartFuture::begin_with(
+                https_request(),
+                || true,
+                |req, _token| {
+                    handed = Some(req.callback);
+                    Ok(())
+                },
+            );
+            assert_eq!(poll_once(&mut accepted), Poll::Pending);
+            assert!(generation.is_some());
+            let expected = AuthCallback::Https {
+                host: "app.example.com".to_string(),
+                path: "/oauth/callback".to_string(),
+            };
+            assert_eq!(handed, Some(expected.clone()));
+            assert_eq!(
+                lock_active().as_ref().map(|live| &live.callback),
+                Some(&LiveCallback::Request(expected))
             );
         });
     }
