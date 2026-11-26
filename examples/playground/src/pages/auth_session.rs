@@ -80,7 +80,9 @@
 //! port only (never the full redirect URI, though neither is secret) —
 //! `loopback port: none` until the first bind.
 
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use frust::{
     ButtonStyle, Color, EdgeInsets, FlexChild, Get, GetUntracked, Padding, RwSignal, Set, SizedBox,
@@ -264,23 +266,23 @@ fn fire_busy(_state: &mut PlaygroundState) {
 /// once the app is back in front (the line itself is written on the UI
 /// thread). A following button press finds the session slot free.
 fn fire_cancel_after_delay(_state: &mut PlaygroundState) {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
     let (session, cancel) = AuthSession::start_with_cancel(request_for("cookie.html"));
-    let called_at_ms = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let called_at_ms_writer = std::sync::Arc::clone(&called_at_ms);
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(5));
+    // Set once, BEFORE `cancel()`: the session resolves inside that call,
+    // so a time stored after it returns could still be missing when the
+    // status line below reads it.
+    let called_at = Arc::new(OnceLock::<Duration>::new());
+    let called_at_writer = Arc::clone(&called_at);
+    thread::spawn(move || {
+        thread::sleep(Duration::from_secs(5));
+        let _ = called_at_writer.set(started.elapsed());
         cancel.cancel();
-        let ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
-        called_at_ms_writer.store(ms, std::sync::atomic::Ordering::SeqCst);
     });
     spawn_local(async move {
         let result = session.await;
-        let ms = called_at_ms.load(std::sync::atomic::Ordering::SeqCst);
-        let called = if ms == 0 {
-            "cancel not called yet".to_string()
-        } else {
-            format!("cancel called at {:.1} s", f64::from(ms) / 1000.0)
+        let called = match called_at.get() {
+            Some(at) => format!("cancel called at {:.1} s", at.as_secs_f64()),
+            None => "cancel not called yet".to_string(),
         };
         status_sig().set(format!("Cancel in 5 s -> {}, {called}", render(&result)));
     });
