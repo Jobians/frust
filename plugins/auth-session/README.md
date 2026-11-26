@@ -59,11 +59,11 @@ needs nothing extra — the objc2 binding's own link attribute applies there.
 ```rust
 use frust_auth_session::{AuthSession, AuthSessionOutcome, AuthSessionRequest};
 
-let req = AuthSessionRequest {
-    url: "https://issuer.example/authorize?client_id=…&redirect_uri=com.example.app:/oauth2redirect".to_string(),
-    callback_scheme: "com.example.app".to_string(),
-    ephemeral: false,
-};
+let req = AuthSessionRequest::custom_scheme(
+    "https://issuer.example/authorize?client_id=…&redirect_uri=com.example.app:/oauth2redirect",
+    "com.example.app",
+);
+// Optional: `.ephemeral(true)` for a private session with no persisted cookies.
 
 // Poll from the UI thread's local executor (`frust::spawn_local`) or any
 // other executor — resolution is driven by the platform's own main thread,

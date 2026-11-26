@@ -125,8 +125,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::{
-    AuthSessionError, AuthSessionOutcome, Live, lock_active, next_generation, oneshot,
-    release_if_live, resolve, url, validate_https_url,
+    AuthSessionError, AuthSessionOutcome, Live, LiveCallback, lock_active, next_generation,
+    oneshot, release_if_live, resolve, url, validate_https_url,
 };
 
 /// The [`LoopbackOptions::timeout`] [`LoopbackOptions::new`] fills in: five
@@ -293,11 +293,12 @@ impl LoopbackSession {
             }
             let generation = next_generation();
             let (sender, receiver) = oneshot::channel(generation);
-            // The `http` scheme makes `crate::checked_callback` accept only
-            // an `http://` callback for this session.
+            // `crate::checked_callback` accepts only an `http` URL for a
+            // loopback entry; this listener's own request checks pin the
+            // host, port and path.
             *active = Some(Live {
                 generation,
-                callback_scheme: "http".into(),
+                callback: LiveCallback::Loopback,
                 sender,
             });
             (generation, receiver)
@@ -1104,6 +1105,43 @@ mod tests {
         assert!(lock_active().is_none(), "no slot may be claimed");
     }
 
+    /// A loopback entry passes an `http` callback URL through unchanged and
+    /// refuses any other scheme, with the scheme-mismatch message.
+    #[test]
+    fn a_loopback_entry_accepts_only_an_http_callback() {
+        let check = |url: &str| {
+            crate::checked_callback(
+                &LiveCallback::Loopback,
+                Ok(AuthSessionOutcome::Callback(url.to_string())),
+            )
+        };
+        for url in [
+            "http://127.0.0.1:4000/callback?code=x&state=y",
+            "HTTP://127.0.0.1:4000/callback",
+        ] {
+            assert_eq!(
+                check(url),
+                Ok(AuthSessionOutcome::Callback(url.to_string())),
+                "{url:?}"
+            );
+        }
+        for url in [
+            "https://127.0.0.1:4000/callback?code=x",
+            "frustplay://127.0.0.1:4000/callback?code=x",
+            "httpx://127.0.0.1:4000/callback",
+            "127.0.0.1:4000/callback",
+            "no-scheme",
+        ] {
+            assert_eq!(
+                check(url),
+                Err(AuthSessionError::Platform(
+                    "callback URL scheme does not match the requested callback scheme".to_string()
+                )),
+                "{url:?}"
+            );
+        }
+    }
+
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     #[test]
     fn bind_reports_no_handler_off_desktop() {
@@ -1290,6 +1328,11 @@ mod tests {
             assert_eq!(
                 session.redirect_uri(),
                 format!("http://127.0.0.1:{}/oauth/callback", addr.port())
+            );
+            assert_eq!(
+                lock_active().as_ref().map(|live| &live.callback),
+                Some(&LiveCallback::Loopback),
+                "bind claims the slot as a loopback entry"
             );
         }
 
@@ -1530,11 +1573,8 @@ mod tests {
         #[test]
         fn a_bound_session_makes_both_backends_busy() {
             let _guard = serial();
-            let request = AuthSessionRequest {
-                url: "https://issuer.example/authorize".to_string(),
-                callback_scheme: "frustplay".to_string(),
-                ephemeral: false,
-            };
+            let request =
+                AuthSessionRequest::custom_scheme("https://issuer.example/authorize", "frustplay");
             let session = bind("/callback");
             assert_eq!(
                 LoopbackSession::bind(LoopbackOptions::new("/callback")).unwrap_err(),
@@ -1550,7 +1590,10 @@ mod tests {
             drop(session);
 
             assert_slot_free();
-            let mut custom = std::pin::pin!(AuthSession::start(request));
+            // A stand-in backend: on macOS the real one would queue a real
+            // session on the main queue.
+            let (custom, _handle) = crate::tests::start_with_accepting_backend(request);
+            let mut custom = std::pin::pin!(custom);
             assert_ne!(
                 poll_once(custom.as_mut()),
                 Poll::Ready(Err(AuthSessionError::Busy))
